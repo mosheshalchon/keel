@@ -25651,11 +25651,22 @@ render();
 
     host.innerHTML = '<div class="hl-loading">Loading time-series data…</div>';
 
-    // Load all lines for all uploads — via cache (fetched once, reused across views).
-    const uploadIds = uploads.map(u => u.id);
-    const tsCacheKey = 'all:' + uploadIds.slice().sort().join(',');
+    // Load lines — but only for the uploads we'll actually display. The view
+    // defaults to the last 8 weeks (monthly: 12 months); fetching/aggregating all
+    // 40 uploads (~10k lines) when only 8 weeks show was the 8s lag on this tab.
+    // We pick the recent uploads here; the "show all weeks" expander sets
+    // _distInvTimeSeriesShowAllWeeks=true which loads the full history on demand.
+    const uploadsByDateDesc = uploads.slice().sort((a, b) => String(b.report_date).localeCompare(String(a.report_date)));
+    // Distinct report_dates, newest first.
+    const distinctDatesDesc = [...new Set(uploadsByDateDesc.map(u => String(u.report_date)))];
+    const weeksToLoad = _distInvTimeSeriesShowAllWeeks ? distinctDatesDesc.length
+      : (_distInvTimeSeriesPeriod === 'monthly' ? 9999 : 10); // ~10 weeks covers the 8-week view + buffer
+    const keepDates = new Set(distinctDatesDesc.slice(0, weeksToLoad));
+    const uploadsToUse = _distInvTimeSeriesShowAllWeeks ? uploads : uploads.filter(u => keepDates.has(String(u.report_date)));
+    const uploadIds = uploadsToUse.map(u => u.id);
+    const tsCacheKey = 'ts:' + (_distInvTimeSeriesShowAllWeeks ? 'all' : 'recent') + ':' + uploadIds.slice().sort().join(',');
     const lines = await getInventoryLines(uploadIds, tsCacheKey);
-    console.log('[Time Series] lines (cached):', lines.length, 'across', uploadIds.length, 'uploads');
+    console.log('[Time Series] lines (cached):', lines.length, 'across', uploadIds.length, 'uploads', _distInvTimeSeriesShowAllWeeks ? '(all history)' : '(recent weeks)');
 
     // Products / UPC map (cached). findProduct adapts the shared UPC finder to a line.
     const { productById, findProductByUpc } = await getInventoryProductMap();
@@ -26286,22 +26297,27 @@ render();
         _distInvTimeSeriesExpandedGroups = new Set();
         renderTimeSeriesTable();
       });
-      // Weekly / Monthly period toggle
+      // Weekly / Monthly period toggle. Monthly needs more history (12 months) than
+      // the recent-weeks fetch window, so re-run the outer render to re-fetch.
       host.querySelectorAll('.hl-dist-ts-period').forEach(btn => {
         btn.addEventListener('click', () => {
           if (_distInvTimeSeriesPeriod !== btn.dataset.period) {
             _distInvTimeSeriesPeriod = btn.dataset.period;
             _distInvTimeSeriesExpandedGroups = new Set();
+            renderDistInventoryTimeSeries(host, uploads);
+          } else {
+            renderTimeSeriesTable();
           }
-          renderTimeSeriesTable();
         });
       });
 
-      // Wire the weeks expand/collapse toggle (weekly mode).
+      // Wire the weeks expand/collapse toggle (weekly mode). Toggling changes how
+      // many uploads we FETCH (recent vs all history), so we re-run the outer render
+      // (which re-fetches via cache) rather than just re-pivoting the current data.
       const weeksToggleBtn = document.getElementById('hl-dist-ts-weeks-toggle');
       if (weeksToggleBtn) weeksToggleBtn.addEventListener('click', () => {
         _distInvTimeSeriesShowAllWeeks = !_distInvTimeSeriesShowAllWeeks;
-        renderTimeSeriesTable();
+        renderDistInventoryTimeSeries(host, uploads);
       });
 
       // Wire "show more" to raise the row cap by 40 and re-render.
