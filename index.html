@@ -24268,9 +24268,8 @@ render();
   // Shows how the reforecast got from the clone's pure-forecast baseline to its
   // final number: baseline → actuals applied → distribution decisions →
   // assumption changes → final reforecast. Computes live from current state.
-  // Display-unit mode for the reforecast bridge: 'dollars' (full $) or 'thousands'
-  // ($000s, rounded to the nearest thousand to cut single-digit noise).
-  let _fcBridgeUnit = 'thousands';
+  // Bridge display measure: 'dollars' (revenue, $) or 'units' (cases, no $).
+  let _fcBridgeUnit = 'dollars';
   async function renderReforecastBridge(scenario) {
     const host = document.getElementById('hl-fc-bridge-host');
     if (!host) return;
@@ -24278,13 +24277,18 @@ render();
     const sb = window.Auth.getClient();
     const session = HL.session || {};
     const brandId = scenario.brand_id || session.brandId;
-    // Unit-aware formatters. 'thousands' divides by 1000 and rounds, showing $000s
-    // so values aren't carried to single dollars (noise). 'dollars' is full precision.
-    const unitMode = _fcBridgeUnit;
-    const scaleVal = (n) => unitMode === 'thousands' ? Math.round(n / 1000) : Math.round(n);
-    const unitSuffix = unitMode === 'thousands' ? 'K' : '';
-    const fmtMoney = (n) => (n < 0 ? '−$' : '$') + Math.abs(scaleVal(n)).toLocaleString() + unitSuffix;
-    const fmtSigned = (n) => (n < 0 ? '−$' : '+$') + Math.abs(scaleVal(n)).toLocaleString() + unitSuffix;
+    // Bridge measure: 'dollars' = revenue ($), 'units' = cases (no $ sign).
+    // The forecast rows carry BOTH r.monthly (revenue) and r.monthlyUnits (cases),
+    // so Units mode runs the same waterfall math sourced from the units arrays.
+    const measure = (_fcBridgeUnit === 'units') ? 'units' : 'dollars';
+    const metricKey = (measure === 'units') ? 'units' : 'amount';
+    const srcOf = (r) => (measure === 'units') ? (r.monthlyUnits || []) : (r.monthly || []);
+    const fmtMoney = (n) => (measure === 'units')
+      ? (n < 0 ? '−' : '') + Math.abs(Math.round(n)).toLocaleString()
+      : (n < 0 ? '−$' : '$') + Math.abs(Math.round(n)).toLocaleString();
+    const fmtSigned = (n) => (measure === 'units')
+      ? (n < 0 ? '−' : '+') + Math.abs(Math.round(n)).toLocaleString()
+      : (n < 0 ? '−$' : '+$') + Math.abs(Math.round(n)).toLocaleString();
     host.innerHTML = `<div class="hl-loading">Computing bridge…</div>`;
 
     let result, actuals;
@@ -24322,14 +24326,15 @@ render();
           parentName = parent.name;
           const pRes = await computeForecast(parent);
           parentTotal = 0;
-          for (const r of pRes.rows) for (let i = 0; i < pRes.numMonths; i++) parentTotal += (r.monthly[i] || 0);
+          const pSrc = (r) => (measure === 'units') ? (r.monthlyUnits || []) : (r.monthly || []);
+          for (const r of pRes.rows) { const arr = pSrc(r); for (let i = 0; i < pRes.numMonths; i++) parentTotal += (arr[i] || 0); }
         }
       } catch (e) { parentTotal = null; }
     }
 
     // This clone's current pure forecast (reflects any INPUT edits already made).
     let cloneForecast = 0;
-    for (const r of rows) for (let i = 0; i < numMonths; i++) cloneForecast += (r.monthly[i] || 0);
+    for (const r of rows) { const arr = srcOf(r); for (let i = 0; i < numMonths; i++) cloneForecast += (arr[i] || 0); }
 
     const startVal = (parentTotal != null) ? parentTotal : cloneForecast;
 
@@ -24340,24 +24345,64 @@ render();
 
     // STEP 1: UPDATE ACTUALS — for locked months, replace forecast with actual.
     // Net = sum(actual − forecast) over locked months. Positive = actuals beat plan.
+    // We track which actuals were matched to a forecast row so we can also surface
+    // actuals for items that AREN'T forecasted (so the actuals total ties to Sales
+    // Pacing). The matched-actuals sum is keyed by UPC (or name) and counted ONCE
+    // per key — important because some items share a UPC (e.g. retail vs food-service
+    // shells both on 892453001075); byUpc already sums them, so a single forecast
+    // row on that UPC absorbs the combined actual without double-counting.
     let actualsNet = 0;
+    let matchedActualTotal = 0;     // actuals (locked months) that mapped to a forecast row
+    let totalLockedActual = 0;      // ALL actuals across every item, locked months
+    let unforecastedActual = 0;     // actuals for items with NO forecast row
     if (lockThrough) {
       const itemAgg = new Map();
       for (const r of rows) {
         const key = r.unitUpc ? 'upc:' + r.unitUpc : 'name:' + r.itemName;
         if (!itemAgg.has(key)) itemAgg.set(key, { unitUpc: r.unitUpc, itemName: r.itemName, fcByMonth: new Array(numMonths).fill(0) });
         const it = itemAgg.get(key);
-        for (let i = 0; i < numMonths; i++) it.fcByMonth[i] += (r.monthly[i] || 0);
+        const arr = srcOf(r);
+        for (let i = 0; i < numMonths; i++) it.fcByMonth[i] += (arr[i] || 0);
       }
+      // Track which actuals slots (by their map identity) we've consumed, to avoid
+      // counting a shared-UPC actual twice if two forecast rows resolve to it.
+      const consumedUpcKeys = new Set();
+      const consumedNameKeys = new Set();
       for (const it of itemAgg.values()) {
+        // Determine which actuals slot this forecast item resolves to (UPC first).
+        const uk = spUpcKey(it.unitUpc);
+        const resolvedByUpc = uk && actuals.byUpc.has(uk);
+        const nk = spNormName(it.itemName);
         for (let i = 0; i < numMonths; i++) {
           if (!isLockedMonth(monthKeys[i])) continue;
-          const a = lookupItemActual(actuals, it.unitUpc, it.itemName, monthKeys[i], 'amount');
+          const a = lookupItemActual(actuals, it.unitUpc, it.itemName, monthKeys[i], metricKey);
           const fc = it.fcByMonth[i];
           actualsNet += ((a != null ? a : 0) - fc);
+          if (a != null) matchedActualTotal += a;
+        }
+        if (resolvedByUpc) consumedUpcKeys.add(uk); else if (actuals.byName.has(nk)) consumedNameKeys.add(nk);
+      }
+      // Total actuals across ALL items (locked months), counting each UPC slot once
+      // and each name-only slot (no UPC) once.
+      const seenUpc = new Set();
+      for (const [uk, slot] of actuals.byUpc.entries()) {
+        seenUpc.add(uk);
+        for (let i = 0; i < numMonths; i++) {
+          if (!isLockedMonth(monthKeys[i])) continue;
+          const v = slot[monthKeys[i]] ? slot[monthKeys[i]][metricKey === 'units' ? 'units' : 'amount'] : null;
+          if (v != null) {
+            totalLockedActual += Number(v);
+            if (!consumedUpcKeys.has(uk)) unforecastedActual += Number(v);
+          }
         }
       }
+      // Name-only actuals (items that never had a UPC) are already represented in
+      // byUpc when they have one; items with truly no UPC are rare here and folded
+      // into the byUpc pass above via spResolveUpc, so no separate name pass needed.
     }
+
+    // Unforecasted actuals = sales of items not in this forecast. Surface as its own
+    // step so the actuals total ties to Sales Pacing even when some items aren't forecasted.
 
     // DISTRIBUTION DECISIONS — rejected zeroes go-forward; pushed suppresses
     // months before the new start. Negative = revenue removed.
@@ -24367,27 +24412,29 @@ render();
       if ((r.businessType || 'base') !== 'expansion') continue;
       const dec = expDecisions[`${r.retailerName}|${r.itemName}`];
       if (!dec) continue;
+      const arr = srcOf(r);
       if (dec.status === 'didnt') {
         let lost = 0;
-        for (let i = 0; i < numMonths; i++) { if (!isLockedMonth(monthKeys[i])) lost += (r.monthly[i] || 0); }
+        for (let i = 0; i < numMonths; i++) { if (!isLockedMonth(monthKeys[i])) lost += (arr[i] || 0); }
         decisionsNet -= lost;
         if (lost) decisionDetail.push({ label: `${r.itemName} @ ${r.retailerName} — rejected`, val: -lost });
       } else if (dec.status === 'pushed' && dec.pushTo) {
         let suppressed = 0;
-        for (let i = 0; i < numMonths; i++) { if (!isLockedMonth(monthKeys[i]) && monthKeys[i] < dec.pushTo) suppressed += (r.monthly[i] || 0); }
+        for (let i = 0; i < numMonths; i++) { if (!isLockedMonth(monthKeys[i]) && monthKeys[i] < dec.pushTo) suppressed += (arr[i] || 0); }
         decisionsNet -= suppressed;
         if (suppressed) decisionDetail.push({ label: `${r.itemName} @ ${r.retailerName} — pushed to ${dec.pushTo.slice(0,7)}`, val: -suppressed });
       }
     }
 
-    // FINAL — start + actuals + inputs + decisions.
-    const finalTotal = startVal + actualsNet + inputsDelta + decisionsNet;
+    // FINAL — start + actuals + inputs + decisions + unforecasted actuals.
+    const finalTotal = startVal + actualsNet + inputsDelta + decisionsNet + unforecastedActual;
 
     // Build the waterfall steps in the order the analyst works:
-    // Start → Step 1 (lock actuals) → Step 2 (update inputs) → decisions → Final.
+    // Start → Step 1 (lock actuals) → unforecasted actuals → Step 2 (inputs) → decisions → Final.
     const steps = [
       { label: parentName ? `Original — ${parentName}` : 'Original forecast', val: startVal, kind: 'start' },
       { label: lockThrough ? `Step 1 · Update Actuals (through ${lockThrough.slice(0,7)})` : 'Step 1 · Update Actuals (none locked)', val: actualsNet, kind: 'delta' },
+      ...(unforecastedActual ? [{ label: 'Actuals · non-forecasted items', val: unforecastedActual, kind: 'delta' }] : []),
       { label: 'Step 2 · Update Inputs', val: inputsDelta, kind: 'delta' },
       { label: 'Distribution decisions', val: decisionsNet, kind: 'delta' },
       { label: 'Final reforecast', val: finalTotal, kind: 'end' },
@@ -24474,13 +24521,13 @@ render();
         ${labelsSvg}
       </svg>`;
 
-    const unitLabel = unitMode === 'thousands' ? '$000s' : 'Dollars';
+    const unitLabel = (measure === 'units') ? 'Cases' : 'Dollars';
     const unitToggle = `
       <div style="display:flex;align-items:center;gap:8px;">
-        <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;">Units:</span>
+        <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;">View:</span>
         <div style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:5px;overflow:hidden;">
-          <button class="hl-bridge-unit" data-unit="thousands" style="background:${unitMode === 'thousands' ? 'var(--ink)' : 'var(--paper)'};color:${unitMode === 'thousands' ? 'var(--paper)' : 'var(--ink-2)'};border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;padding:5px 12px;cursor:pointer;text-transform:uppercase;">$000s</button>
-          <button class="hl-bridge-unit" data-unit="dollars" style="background:${unitMode === 'dollars' ? 'var(--ink)' : 'var(--paper)'};color:${unitMode === 'dollars' ? 'var(--paper)' : 'var(--ink-2)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.04em;padding:5px 12px;cursor:pointer;text-transform:uppercase;">Dollars</button>
+          <button class="hl-bridge-unit" data-unit="dollars" style="background:${measure === 'dollars' ? 'var(--ink)' : 'var(--paper)'};color:${measure === 'dollars' ? 'var(--paper)' : 'var(--ink-2)'};border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;padding:5px 12px;cursor:pointer;text-transform:uppercase;">Dollars</button>
+          <button class="hl-bridge-unit" data-unit="units" style="background:${measure === 'units' ? 'var(--ink)' : 'var(--paper)'};color:${measure === 'units' ? 'var(--paper)' : 'var(--ink-2)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.04em;padding:5px 12px;cursor:pointer;text-transform:uppercase;">Units</button>
         </div>
       </div>`;
 
