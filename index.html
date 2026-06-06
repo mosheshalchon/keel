@@ -25318,6 +25318,78 @@ render();
     return `${monthAbbrev} ${y}`;
   }
 
+  // ─── Inventory data cache ───────────────────────────────────────────────
+  // The Distributor tab was re-fetching ALL inventory lines AND re-fetching the
+  // products table AND rebuilding the UPC→product map on EVERY view (snapshot vs
+  // time-series) and EVERY tab visit. With ~10k+ lines and 40 uploads that was the
+  // 7–8s lag. These caches fetch once and reuse across views/visits; they're
+  // cleared when inventory data actually changes (a new upload — see clearInventoryCache).
+  let _invLinesCache = new Map();   // cacheKey → lines[]
+  let _invProductCache = null;      // { productById, productByUpc, findProductByUpc }
+  function clearInventoryCache() { _invLinesCache = new Map(); _invProductCache = null; }
+  window.clearInventoryCache = clearInventoryCache;
+
+  // Fetch (paginated) and cache inventory lines for a set of upload IDs.
+  async function getInventoryLines(uploadIds, cacheKey) {
+    if (_invLinesCache.has(cacheKey)) return _invLinesCache.get(cacheKey);
+    const sb = window.Auth.getClient();
+    const PAGE = 1000;
+    let lines = [];
+    // One query with .in() across all uploads, paginated — far fewer round-trips
+    // than the old per-upload loop.
+    let from = 0;
+    while (true) {
+      const { data: page, error } = await sb.from('distributor_inventory_lines')
+        .select('*').in('upload_id', uploadIds)
+        .range(from, from + PAGE - 1).order('id', { ascending: true });
+      if (error) { console.error('Inventory fetch error:', error); break; }
+      if (!page || page.length === 0) break;
+      lines = lines.concat(page);
+      if (page.length < PAGE) break;
+      from += PAGE;
+    }
+    _invLinesCache.set(cacheKey, lines);
+    return lines;
+  }
+
+  // Fetch + build (and cache) the products lookup used to enrich inventory lines.
+  async function getInventoryProductMap() {
+    if (_invProductCache) return _invProductCache;
+    const sb = window.Auth.getClient();
+    const brandId = window.BrandLibrary?.getSession()?.brandId;
+    const { data: products } = await sb.from('products')
+      .select('id, unit_upc, item_description, category, product_line').eq('brand_id', brandId);
+    const productById = new Map();
+    const productByUpc = new Map();
+    const addUpc = (k, p) => { if (k && !productByUpc.has(k)) productByUpc.set(k, p); };
+    for (const p of (products || [])) {
+      productById.set(p.id, p);
+      if (!p.unit_upc) continue;
+      const k = String(p.unit_upc).replace(/[^0-9]/g, '');
+      if (!k) continue;
+      addUpc(k, p); addUpc('0' + k, p);
+      if (k.startsWith('0')) addUpc(k.slice(1), p);
+      if (k.length >= 11) addUpc(k.slice(0, 11), p);
+      if (k.length >= 12) addUpc(k.slice(0, 12), p);
+      if (k.length >= 11) addUpc(k.slice(-11), p);
+      if (k.length >= 12) addUpc(k.slice(-12), p);
+    }
+    const findProductByUpc = (raw) => {
+      if (!raw) return null;
+      const d = String(raw).replace(/[^0-9]/g, '');
+      if (!d) return null;
+      return productByUpc.get(d)
+          || productByUpc.get('0' + d)
+          || (d.startsWith('0') ? productByUpc.get(d.slice(1)) : null)
+          || (d.length >= 11 ? productByUpc.get(d.slice(-11)) : null)
+          || (d.length >= 12 ? productByUpc.get(d.slice(-12)) : null)
+          || (d.length >= 11 ? productByUpc.get(d.slice(0, 11)) : null)
+          || (d.length >= 12 ? productByUpc.get(d.slice(0, 12)) : null);
+    };
+    _invProductCache = { productById, productByUpc, findProductByUpc };
+    return _invProductCache;
+  }
+
   async function renderDistInventoryView() {
     const host = document.getElementById('hl-dist-body');
     if (!host) return;
@@ -25412,58 +25484,13 @@ render();
       uploadIdsToLoad = [uploadId];
     }
 
-    // Load lines for the upload(s). Paginated because Supabase silently caps
-    // .select() at 1000 rows.
-    const PAGE_SIZE_INV = 1000;
-    let lines = [];
-    for (const uid of uploadIdsToLoad) {
-      let from = 0;
-      while (true) {
-        const { data: pageData, error: pageErr } = await sb.from('distributor_inventory_lines')
-          .select('*')
-          .eq('upload_id', uid)
-          .range(from, from + PAGE_SIZE_INV - 1)
-          .order('id', { ascending: true });
-        if (pageErr) { console.error('Inventory page fetch error:', pageErr); break; }
-        if (!pageData || pageData.length === 0) break;
-        lines = lines.concat(pageData);
-        if (pageData.length < PAGE_SIZE_INV) break;
-        from += PAGE_SIZE_INV;
-      }
-    }
-    console.log('[Inventory] total lines fetched:', lines.length, isAll ? '(all distributors)' : 'for upload ' + uploadId);
+    // Load lines for the upload(s) — via cache (fetched once, reused across views).
+    const cacheKey = isAll ? 'all:' + uploadIdsToLoad.slice().sort().join(',') : 'one:' + uploadId;
+    const lines = await getInventoryLines(uploadIdsToLoad, cacheKey);
+    console.log('[Inventory] lines (cached):', lines.length, isAll ? '(all distributors)' : 'for upload ' + uploadId);
 
-    // Load products for category/product_line linkage
-    const { data: products } = await sb.from('products')
-      .select('id, unit_upc, item_description, category, product_line').eq('brand_id', brandId);
-    const productById = new Map();
-    const productByUpc = new Map();
-    const addUpc = (key, product) => { if (key && !productByUpc.has(key)) productByUpc.set(key, product); };
-    for (const p of (products || [])) {
-      productById.set(p.id, p);
-      if (!p.unit_upc) continue;
-      const k = String(p.unit_upc).replace(/[^0-9]/g, '');
-      if (!k) continue;
-      addUpc(k, p);
-      addUpc('0' + k, p);
-      if (k.startsWith('0')) addUpc(k.slice(1), p);
-      if (k.length >= 11) addUpc(k.slice(0, 11), p);
-      if (k.length >= 12) addUpc(k.slice(0, 12), p);
-      if (k.length >= 11) addUpc(k.slice(-11), p);
-      if (k.length >= 12) addUpc(k.slice(-12), p);
-    }
-    const findProductByUpc = (raw) => {
-      if (!raw) return null;
-      const d = String(raw).replace(/[^0-9]/g, '');
-      if (!d) return null;
-      return productByUpc.get(d)
-          || productByUpc.get('0' + d)
-          || (d.startsWith('0') ? productByUpc.get(d.slice(1)) : null)
-          || (d.length >= 11 ? productByUpc.get(d.slice(-11)) : null)
-          || (d.length >= 12 ? productByUpc.get(d.slice(-12)) : null)
-          || (d.length >= 11 ? productByUpc.get(d.slice(0, 11)) : null)
-          || (d.length >= 12 ? productByUpc.get(d.slice(0, 12)) : null);
-    };
+    // Products / UPC map (cached).
+    const { productById, findProductByUpc } = await getInventoryProductMap();
 
     // Enrich each line with category/product_line from Brand Library
     const enriched = (lines || []).map(l => {
@@ -25624,57 +25651,17 @@ render();
 
     host.innerHTML = '<div class="hl-loading">Loading time-series data…</div>';
 
-    // Load all lines for all uploads — paginated to bypass Supabase's default 1000-row limit
-    // on .select() (otherwise rows past 1000 are silently dropped → missing columns in TS view).
+    // Load all lines for all uploads — via cache (fetched once, reused across views).
     const uploadIds = uploads.map(u => u.id);
-    const PAGE_SIZE = 1000;
-    let lines = [];
-    let from = 0;
-    while (true) {
-      const { data: pageData, error: pageErr } = await sb.from('distributor_inventory_lines')
-        .select('*')
-        .in('upload_id', uploadIds)
-        .range(from, from + PAGE_SIZE - 1)
-        .order('id', { ascending: true });
-      if (pageErr) { console.error('Time series page fetch error:', pageErr); break; }
-      if (!pageData || pageData.length === 0) break;
-      lines = lines.concat(pageData);
-      if (pageData.length < PAGE_SIZE) break;  // last page
-      from += PAGE_SIZE;
-    }
-    console.log('[Time Series] total lines fetched:', lines.length, 'across', uploadIds.length, 'uploads');
+    const tsCacheKey = 'all:' + uploadIds.slice().sort().join(',');
+    const lines = await getInventoryLines(uploadIds, tsCacheKey);
+    console.log('[Time Series] lines (cached):', lines.length, 'across', uploadIds.length, 'uploads');
 
-    // Load products for category/product_line linkage
-    const { data: products } = await sb.from('products')
-      .select('id, unit_upc, item_description, category, product_line').eq('brand_id', brandId);
-    const productById = new Map();
-    const productByUpc = new Map();
-    const addUpc = (k, p) => { if (k && !productByUpc.has(k)) productByUpc.set(k, p); };
-    for (const p of (products || [])) {
-      productById.set(p.id, p);
-      if (!p.unit_upc) continue;
-      const k = String(p.unit_upc).replace(/[^0-9]/g, '');
-      if (!k) continue;
-      addUpc(k, p);
-      addUpc('0' + k, p);
-      if (k.startsWith('0')) addUpc(k.slice(1), p);
-      if (k.length >= 11) addUpc(k.slice(0, 11), p);
-      if (k.length >= 12) addUpc(k.slice(0, 12), p);
-      if (k.length >= 11) addUpc(k.slice(-11), p);
-      if (k.length >= 12) addUpc(k.slice(-12), p);
-    }
+    // Products / UPC map (cached). findProduct adapts the shared UPC finder to a line.
+    const { productById, findProductByUpc } = await getInventoryProductMap();
     const findProduct = (l) => {
       if (l.product_id && productById.has(l.product_id)) return productById.get(l.product_id);
-      if (!l.unit_upc) return null;
-      const d = String(l.unit_upc).replace(/[^0-9]/g, '');
-      if (!d) return null;
-      return productByUpc.get(d)
-          || productByUpc.get('0' + d)
-          || (d.startsWith('0') ? productByUpc.get(d.slice(1)) : null)
-          || (d.length >= 11 ? productByUpc.get(d.slice(-11)) : null)
-          || (d.length >= 12 ? productByUpc.get(d.slice(-12)) : null)
-          || (d.length >= 11 ? productByUpc.get(d.slice(0, 11)) : null)
-          || (d.length >= 12 ? productByUpc.get(d.slice(0, 12)) : null);
+      return findProductByUpc(l.unit_upc);
     };
 
     // Build upload→meta map (for week label + distributor)
@@ -31006,6 +30993,7 @@ render();
         status.style.color = totalCasepackMissing > 0 ? '#7a5a1a' : 'var(--won)';
         setTimeout(() => {
           modal.remove();
+          clearInventoryCache();
           renderDistInventoryView();
         }, totalCasepackMissing > 0 ? 4000 : 1200);
       } catch (err) {
@@ -31245,6 +31233,7 @@ render();
             if (!confirm('Delete this inventory upload and all its lines? This cannot be undone.')) return;
             await sb.from('distributor_inventory_uploads').delete().eq('id', btn.dataset.id);
             modal.remove();
+            clearInventoryCache();
             openDistInvUploadsHistory(tab);
             if (typeof renderDistInventoryView === 'function') renderDistInventoryView();
           });
