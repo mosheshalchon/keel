@@ -24268,6 +24268,9 @@ render();
   // Shows how the reforecast got from the clone's pure-forecast baseline to its
   // final number: baseline → actuals applied → distribution decisions →
   // assumption changes → final reforecast. Computes live from current state.
+  // Display-unit mode for the reforecast bridge: 'dollars' (full $) or 'thousands'
+  // ($000s, rounded to the nearest thousand to cut single-digit noise).
+  let _fcBridgeUnit = 'thousands';
   async function renderReforecastBridge(scenario) {
     const host = document.getElementById('hl-fc-bridge-host');
     if (!host) return;
@@ -24275,8 +24278,13 @@ render();
     const sb = window.Auth.getClient();
     const session = HL.session || {};
     const brandId = scenario.brand_id || session.brandId;
-    const fmtMoney = (n) => (n < 0 ? '−$' : '$') + Math.abs(Math.round(n)).toLocaleString();
-    const fmtSigned = (n) => (n < 0 ? '−$' : '+$') + Math.abs(Math.round(n)).toLocaleString();
+    // Unit-aware formatters. 'thousands' divides by 1000 and rounds, showing $000s
+    // so values aren't carried to single dollars (noise). 'dollars' is full precision.
+    const unitMode = _fcBridgeUnit;
+    const scaleVal = (n) => unitMode === 'thousands' ? Math.round(n / 1000) : Math.round(n);
+    const unitSuffix = unitMode === 'thousands' ? 'K' : '';
+    const fmtMoney = (n) => (n < 0 ? '−$' : '$') + Math.abs(scaleVal(n)).toLocaleString() + unitSuffix;
+    const fmtSigned = (n) => (n < 0 ? '−$' : '+$') + Math.abs(scaleVal(n)).toLocaleString() + unitSuffix;
     host.innerHTML = `<div class="hl-loading">Computing bridge…</div>`;
 
     let result, actuals;
@@ -24385,34 +24393,96 @@ render();
       { label: 'Final reforecast', val: finalTotal, kind: 'end' },
     ];
 
-    // Waterfall geometry — track cumulative so deltas stack.
-    const cum = [startVal, startVal + actualsNet, startVal + actualsNet + inputsDelta, finalTotal];
-    const maxV = Math.max(startVal, finalTotal, ...cum, 0) * 1.08 || 1;
-    const barW = (v) => Math.max(0, (v / maxV) * 100);
+    // ─── Vertical waterfall geometry ───
+    // x-axis = steps (columns); y-axis = value. Start/Final are bars from zero;
+    // deltas are floating bars spanning from the prior cumulative to the new one,
+    // with connector lines between consecutive columns (classic waterfall look).
+    const cumLevels = [];   // running cumulative AFTER each step
+    {
+      let run = 0;
+      steps.forEach((s) => {
+        if (s.kind === 'start') { run = s.val; cumLevels.push(run); }
+        else if (s.kind === 'end') { cumLevels.push(s.val); }
+        else { const prev = run; run = run + s.val; cumLevels.push(run); s._from = prev; s._to = run; }
+      });
+    }
+    const allLevels = [0, ...cumLevels, startVal, finalTotal];
+    const yMax = Math.max(...allLevels) * 1.08 || 1;
+    const yMin = Math.min(0, ...allLevels);
+    const yRange = (yMax - yMin) || 1;
 
-    let running = 0;
-    const rowsHtml = steps.map((s, idx) => {
-      let leftPct, widthPct, color, valLabel;
-      if (s.kind === 'start') {
-        leftPct = 0; widthPct = barW(s.val); color = 'var(--ink-3)'; running = s.val; valLabel = fmtMoney(s.val);
-      } else if (s.kind === 'end') {
-        leftPct = 0; widthPct = barW(s.val); color = 'var(--ink)'; valLabel = fmtMoney(s.val);
-      } else {
-        const start = running; const end = running + s.val;
-        leftPct = barW(Math.min(start, end)); widthPct = Math.max(0.6, barW(Math.abs(s.val)));
-        color = s.val >= 0 ? 'var(--won,#3a7a3a)' : 'var(--lost)';
-        running = end; valLabel = fmtSigned(s.val);
+    // SVG canvas
+    const W = 760, H = 380, padL = 56, padR = 16, padTop = 28, padBot = 92;
+    const plotW = W - padL - padR, plotH = H - padTop - padBot;
+    const n = steps.length;
+    const slot = plotW / n;
+    const barW2 = Math.min(86, slot * 0.56);
+    const yOf = (v) => padTop + (yMax - v) / yRange * plotH;
+    const xCenter = (i) => padL + slot * i + slot / 2;
+
+    const wonColor = 'var(--won,#3a7a3a)';
+    const lostColor = 'var(--lost,#b3302a)';
+
+    // Y gridlines (4 ticks)
+    const ticks = 4;
+    let gridSvg = '';
+    for (let t = 0; t <= ticks; t++) {
+      const v = yMin + (yRange * t / ticks);
+      const y = yOf(v);
+      gridSvg += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--rule-softer,#e7e3da)" stroke-width="1"/>`;
+      gridSvg += `<text x="${padL - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end" font-family="var(--mono)" font-size="9" fill="var(--ink-3)">${fmtMoney(v).replace('+','')}</text>`;
+    }
+
+    let barsSvg = '', connSvg = '', labelsSvg = '';
+    let prevTopY = null;
+    steps.forEach((s, i) => {
+      const cx = xCenter(i);
+      const x = cx - barW2 / 2;
+      let topV, botV, color, valLabel, isDelta = false;
+      if (s.kind === 'start') { topV = s.val; botV = 0; color = 'var(--ink-3)'; valLabel = fmtMoney(s.val); }
+      else if (s.kind === 'end') { topV = s.val; botV = 0; color = 'var(--ink)'; valLabel = fmtMoney(s.val); }
+      else { isDelta = true; topV = Math.max(s._from, s._to); botV = Math.min(s._from, s._to); color = s.val >= 0 ? wonColor : lostColor; valLabel = fmtSigned(s.val); }
+      const yTop = yOf(topV), yBot = yOf(botV);
+      const barH = Math.max(2, yBot - yTop);
+      barsSvg += `<rect x="${x.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW2.toFixed(1)}" height="${barH.toFixed(1)}" rx="2" fill="${color}" opacity="${isDelta ? 0.9 : 1}"/>`;
+      // connector from previous bar's relevant edge to this bar's start edge
+      if (i > 0) {
+        const yConn = yOf(cumLevels[i - 1]);
+        connSvg += `<line x1="${(xCenter(i - 1) + barW2 / 2).toFixed(1)}" y1="${yConn.toFixed(1)}" x2="${x.toFixed(1)}" y2="${yConn.toFixed(1)}" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="3 3" opacity="0.5"/>`;
       }
-      return `
-        <div style="display:flex;align-items:center;gap:14px;padding:9px 0;border-bottom:1px solid var(--rule-soft);">
-          <div style="width:230px;flex-shrink:0;font-family:var(--sans);font-size:13px;color:${s.kind === 'delta' ? 'var(--ink-2)' : 'var(--ink)'};font-weight:${s.kind === 'delta' ? '400' : '600'};">${esc(s.label)}</div>
-          <div style="flex:1;position:relative;height:26px;background:var(--bone-2);border-radius:3px;">
-            <div style="position:absolute;left:${leftPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-radius:3px;opacity:${s.kind === 'delta' ? 0.85 : 1};"></div>
-          </div>
-          <div style="width:130px;text-align:right;flex-shrink:0;font-family:var(--mono);font-size:13px;font-weight:600;color:${s.kind === 'delta' ? (s.val >= 0 ? 'var(--won,#3a7a3a)' : 'var(--lost)') : 'var(--ink)'};">${valLabel}</div>
+      // value label above the bar
+      const labelY = yTop - 7;
+      labelsSvg += `<text x="${cx.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="${isDelta ? color : 'var(--ink)'}">${valLabel}</text>`;
+      // step label below axis (wrap to 2 lines)
+      const words = s.label.split(' ');
+      let line1 = '', line2 = '';
+      for (const w of words) { if ((line1 + ' ' + w).trim().length <= 16 && !line2) line1 = (line1 + ' ' + w).trim(); else line2 = (line2 + ' ' + w).trim(); }
+      labelsSvg += `<text x="${cx.toFixed(1)}" y="${(padTop + plotH + 18).toFixed(1)}" text-anchor="middle" font-family="var(--sans)" font-size="10" fill="${isDelta ? 'var(--ink-2)' : 'var(--ink)'}" font-weight="${isDelta ? '400' : '600'}">${esc(line1)}</text>`;
+      if (line2) labelsSvg += `<text x="${cx.toFixed(1)}" y="${(padTop + plotH + 31).toFixed(1)}" text-anchor="middle" font-family="var(--sans)" font-size="10" fill="${isDelta ? 'var(--ink-2)' : 'var(--ink)'}" font-weight="${isDelta ? '400' : '600'}">${esc(line2)}</text>`;
+    });
+
+    // baseline (zero line)
+    const zeroY = yOf(0);
+    const baselineSvg = `<line x1="${padL}" y1="${zeroY.toFixed(1)}" x2="${W - padR}" y2="${zeroY.toFixed(1)}" stroke="var(--ink-3)" stroke-width="1.5"/>`;
+
+    const waterfallSvg = `
+      <svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block;" xmlns="http://www.w3.org/2000/svg">
+        ${gridSvg}
+        ${connSvg}
+        ${baselineSvg}
+        ${barsSvg}
+        ${labelsSvg}
+      </svg>`;
+
+    const unitLabel = unitMode === 'thousands' ? '$000s' : 'Dollars';
+    const unitToggle = `
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;">Units:</span>
+        <div style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:5px;overflow:hidden;">
+          <button class="hl-bridge-unit" data-unit="thousands" style="background:${unitMode === 'thousands' ? 'var(--ink)' : 'var(--paper)'};color:${unitMode === 'thousands' ? 'var(--paper)' : 'var(--ink-2)'};border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;padding:5px 12px;cursor:pointer;text-transform:uppercase;">$000s</button>
+          <button class="hl-bridge-unit" data-unit="dollars" style="background:${unitMode === 'dollars' ? 'var(--ink)' : 'var(--paper)'};color:${unitMode === 'dollars' ? 'var(--paper)' : 'var(--ink-2)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.04em;padding:5px 12px;cursor:pointer;text-transform:uppercase;">Dollars</button>
         </div>
-      `;
-    }).join('');
+      </div>`;
 
     const netChange = finalTotal - startVal;
     const detailHtml = decisionDetail.length ? `
@@ -24423,11 +24493,15 @@ render();
 
     host.innerHTML = `
       <div style="max-width:900px;">
-        <p style="font-family:var(--serif);font-style:italic;font-size:13px;color:var(--ink-3);margin:0 0 18px 0;max-width:640px;">
-          How this reforecast moved from the original number (what it was cloned from) to its current total. Step 1 locks actuals for closed months — those months can't change after. Step 2 captures input edits (velocity, doors, lift, seasonality) on the open months. Increases vs the original are positive; decreases are negative.
-        </p>
-        <div style="background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;padding:18px 22px;">
-          ${rowsHtml}
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin:0 0 18px 0;flex-wrap:wrap;">
+          <p style="font-family:var(--serif);font-style:italic;font-size:13px;color:var(--ink-3);margin:0;max-width:560px;">
+            How this reforecast moved from the original number (what it was cloned from) to its current total. Step 1 locks actuals for closed months — those months can't change after. Step 2 captures input edits (velocity, doors, lift, seasonality) on the open months. Increases vs the original are positive; decreases are negative.
+          </p>
+          ${unitToggle}
+        </div>
+        <div style="background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;padding:18px 16px 8px 16px;overflow-x:auto;">
+          ${waterfallSvg}
+          <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;text-align:right;padding:0 6px 6px 0;">All values in ${unitLabel}</div>
         </div>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding:14px 22px;background:var(--bone-2);border-radius:8px;flex-wrap:wrap;gap:12px;">
           <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;">Net change from baseline</div>
@@ -24436,6 +24510,14 @@ render();
         ${detailHtml}
       </div>
     `;
+
+    // Wire the units toggle — flip mode and re-render the bridge.
+    host.querySelectorAll('.hl-bridge-unit').forEach(btn => {
+      btn.addEventListener('click', () => {
+        _fcBridgeUnit = btn.dataset.unit;
+        renderReforecastBridge(scenario);
+      });
+    });
   }
 
   // Commit a reforecast's pending distribution decisions to its real lines, log
