@@ -4330,6 +4330,15 @@ window.Auth = (function() {
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: false,
+        // supabase-js uses the Web Locks API (navigator.locks) to serialize auth
+        // operations across tabs. In some browsers/conditions that lock can fail to
+        // acquire/release and getSession() hangs forever — which surfaced here as a
+        // persistent "Supabase took too long to respond" boot timeout even though
+        // Supabase itself was healthy. We override with a pass-through lock that just
+        // runs the operation (no cross-tab serialization), which avoids the hang.
+        // Trade-off: concurrent token refreshes across many tabs aren't serialized,
+        // which is acceptable for this app's usage.
+        lock: async (_name, _acquireTimeout, fn) => fn(),
       },
     });
     return _client;
