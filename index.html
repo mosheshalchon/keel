@@ -6173,9 +6173,23 @@ window.SpinsConverter = (function() {
           const sheetName = sheetNames[si];
           const sheet = wb.Sheets[sheetName];
           if (!sheet) continue;
-          const aoa = XLSX.utils.sheet_to_json(sheet, {
-            header: 1, defval: null, blankrows: false, raw: true,
-          });
+          // MEMORY: for large sheets (600k+ rows) sheet_to_json builds a second
+          // giant array and can exhaust worker memory (was returning empty headers).
+          // With dense:true the sheet already holds its cells in sheet["!data"]
+          // (array of row-arrays of cell objects). We read that directly and pull
+          // .v values per cell — no second full-size copy.
+          const dense = sheet['!data'];
+          const cellVal = (cell) => (cell == null ? null : (cell.v == null ? null : cell.v));
+          let aoa;
+          if (Array.isArray(dense)) {
+            // Lazily map only the cells we touch; build a lightweight row accessor.
+            aoa = { length: dense.length, _dense: dense,
+              get(r) { const dr = dense[r]; if (!dr) return null; const out = new Array(dr.length); for (let c = 0; c < dr.length; c++) out[c] = cellVal(dr[c]); return out; } };
+          } else {
+            // Fallback: non-dense sheet — use the original conversion.
+            const arr = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null, blankrows: false, raw: true });
+            aoa = { length: arr.length, get(r) { return arr[r] || null; } };
+          }
           // Header row = the row that actually contains SPINS column names.
           // We look for a row containing recognizable headers (Geography / Dollars /
           // Brand / UPC) rather than just "first row with enough cells", because some
@@ -6189,9 +6203,10 @@ window.SpinsConverter = (function() {
             return (has('dollars') || has('geography') || has('brand') || has('upc'));
           };
           for (let r = 0; r < Math.min(40, aoa.length); r++) {
-            if (looksLikeHeader(aoa[r])) {
+            const hr = aoa.get(r);
+            if (looksLikeHeader(hr)) {
               headerRowIdx = r;
-              headers = (aoa[r] || []).map((c) => (c == null ? '' : String(c).trim()));
+              headers = (hr || []).map((c) => (c == null ? '' : String(c).trim()));
               break;
             }
           }
@@ -6199,7 +6214,7 @@ window.SpinsConverter = (function() {
           // recognizable header row was found.
           if (!headers.length) {
             for (let r = 0; r < Math.min(25, aoa.length); r++) {
-              const row = aoa[r] || [];
+              const row = aoa.get(r) || [];
               const filled = row.filter((c) => c !== null && c !== '').length;
               if (filled >= 6) { headerRowIdx = r; headers = row.map((c) => (c == null ? '' : String(c).trim())); break; }
             }
@@ -6253,7 +6268,8 @@ window.SpinsConverter = (function() {
           const dateIdx = headers.findIndex((h) => /Time Period End Date/i.test(h));
           if (dateIdx >= 0) {
             for (let r = headerRowIdx + 1; r < Math.min(headerRowIdx + 5, aoa.length); r++) {
-              const v = aoa[r] && aoa[r][dateIdx];
+              const dr = aoa.get(r);
+              const v = dr && dr[dateIdx];
               if (v) { periodDates[sheetName] = String(v).slice(0, 10); break; }
             }
           }
@@ -6262,7 +6278,7 @@ window.SpinsConverter = (function() {
           let processed = 0;
 
           for (let r = headerRowIdx + 1; r < aoa.length; r++) {
-            const row = aoa[r];
+            const row = aoa.get(r);
             if (!row) continue;
             const geo = row[colIdx['Geography']];
             const brand = row[colIdx['Brand']];
@@ -6468,7 +6484,189 @@ window.SpinsConverter = (function() {
     });
   }
 
-  return { convertXlsx };
+  // ── CSV streaming worker ──────────────────────────────────────────────
+  // SPINS exports for some categories come as ONE flat sheet (Time Period is a
+  // COLUMN, not a sheet) with 600k+ rows — too large for reliable in-browser xlsx
+  // parsing. Saved as CSV, we stream it line-by-line: ~4s, ~40MB memory for 627k
+  // rows (verified), vs xlsx which fails. Produces the SAME payload shape as the
+  // xlsx worker so everything downstream is unchanged.
+  function csvWorkerSource() {
+    /* eslint-disable */
+    function progress(stage, pct, detail) { self.postMessage({ type:'progress', stage, pct, detail }); }
+    function classifyMetric(label) {
+      const s = String(label || '');
+      if (/per\s*store|per\s*item|%|ACV|ARP|Stores\s*Selling|Average/i.test(s)) return 'mean';
+      if (/^(Dollars|Units|TDP)(,\s*Yago)?$/i.test(s)) return 'sum';
+      return 'mean';
+    }
+    function metricCode(idx) { return 'm' + idx; }
+    function toNumber(v) {
+      if (v === null || v === undefined || v === '') return null;
+      if (typeof v === 'number') return isFinite(v) ? v : null;
+      const s = String(v).replace(/[$,]/g, '').trim();
+      if (s === '' || s === '-') return null;
+      const n = Number(s);
+      return isFinite(n) ? n : null;
+    }
+    // Minimal RFC-4180-ish CSV line parser (handles quoted fields & escaped quotes).
+    function parseLine(line) {
+      const out = []; let cur = '', q = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (q) { if (ch === '"') { if (line[i+1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+        else { if (ch === '"') q = true; else if (ch === ',') { out.push(cur); cur = ''; } else cur += ch; }
+      }
+      out.push(cur); return out;
+    }
+    const DIMENSIONAL = new Set(['Geography','Time Period','Time Period End Date','Product Universe','Product Level','Department','Category','Subcategory','Brand','UPC','Description','Labeled Gluten Free','LABELED GLUTEN FREE','Storage','STORAGE','Storage Type','Manufacturer','Item Type']);
+
+    self.onmessage = async (e) => {
+      const { file } = e.data;
+      try {
+        progress('reading', 0, 'Streaming CSV...');
+        const stream = file.stream().pipeThrough(new TextDecoderStream());
+        const reader = stream.getReader();
+        let buf = '';
+        let header = null, idx = {}, metrics = null, metricIdxs = [];
+        let gGeo, gPer, gBrand, gDesc, gUpc, gDate;
+        const acc = new Map();
+        const allGeos = new Set(), allBrands = new Set(), allWindows = new Set();
+        const itemsByBrand = new Map();
+        const periodDates = {};
+        let n = 0, bytes = 0;
+        const size = file.size || 0;
+
+        const handleRow = (cells) => {
+          if (!header) {
+            header = cells.map(h => String(h == null ? '' : h).trim());
+            header.forEach((h, i) => { idx[h] = i; });
+            gGeo = idx['Geography']; gPer = idx['Time Period']; gBrand = idx['Brand'];
+            gDesc = idx['Description']; gUpc = idx['UPC']; gDate = idx['Time Period End Date'];
+            // metric columns: from 'Dollars' onward, excluding dimensional
+            const dollarsIdx = header.findIndex(h => /^Dollars$/i.test(h));
+            const startIdx = dollarsIdx >= 0 ? dollarsIdx : 11;
+            metrics = [];
+            for (let i = 0; i < header.length; i++) {
+              const h = header[i];
+              if (!h || i < startIdx || DIMENSIONAL.has(h)) continue;
+              metrics.push({ name: h, colIdx: i, kind: classifyMetric(h) });
+            }
+            metricIdxs = metrics;
+            return;
+          }
+          const geo = cells[gGeo], window = cells[gPer], brand = cells[gBrand];
+          if (!geo || !brand || !window) return;
+          allGeos.add(geo); allBrands.add(brand); allWindows.add(window);
+          if (gDate != null && cells[gDate] && !periodDates['CSV']) periodDates['CSV'] = String(cells[gDate]).slice(0,10);
+          let item = (gDesc != null ? cells[gDesc] : null) || (gUpc != null ? cells[gUpc] : null);
+          if (item != null && String(item).trim()) {
+            const itemStr = String(item).trim();
+            let set = itemsByBrand.get(brand); if (!set) { set = new Set(); itemsByBrand.set(brand, set); }
+            set.add(itemStr);
+          }
+          const key = geo + '|CSV|' + window + '|' + brand;
+          let bucket = acc.get(key);
+          if (!bucket) { bucket = { sums:{}, counts:{} }; acc.set(key, bucket); }
+          for (const m of metricIdxs) {
+            const v = toNumber(cells[m.colIdx]);
+            if (v !== null) {
+              bucket.sums[m.name] = (bucket.sums[m.name] || 0) + v;
+              if (m.kind === 'mean') bucket.counts[m.name] = (bucket.counts[m.name] || 0) + 1;
+            }
+          }
+          n++;
+          if (n % 50000 === 0) {
+            const pct = size ? Math.min(92, 2 + Math.round((bytes / size) * 88)) : 50;
+            progress('aggregating', pct, n.toLocaleString() + ' rows');
+          }
+        };
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.length;
+          buf += value;
+          let nl;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            let line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            if (line.endsWith('\r')) line = line.slice(0, -1);
+            if (line.length) handleRow(parseLine(line));
+          }
+        }
+        if (buf.trim().length) handleRow(parseLine(buf.trim()));
+
+        if (!metrics || !metrics.length) {
+          throw new Error('No metric columns detected in CSV. Headers: [' + (header || []).filter(Boolean).join(' | ') + ']');
+        }
+
+        progress('finalizing', 95, 'Building output...');
+        const geos = [...allGeos].sort();
+        const brands = [...allBrands].sort();
+        const windows = ['04 Weeks','12 Weeks','24 Weeks','52 Weeks'].filter(w => allWindows.has(w));
+        for (const w of allWindows) if (!windows.includes(w)) windows.push(w);
+        const periods = ['CSV'];
+        const geoI = new Map(geos.map((v,i)=>[v,i]));
+        const brandI = new Map(brands.map((v,i)=>[v,i]));
+        const periodI = new Map(periods.map((v,i)=>[v,i]));
+        const windowI = new Map(windows.map((v,i)=>[v,i]));
+        const metricCodes = metrics.map((_,i)=>metricCode(i));
+        const metricLabels = {}, metricKinds = {};
+        metrics.forEach((m,i)=>{ metricLabels[metricCodes[i]] = m.name; metricKinds[metricCodes[i]] = m.kind; });
+        const round2 = (x)=> (x==null||!isFinite(x))?0:Math.round(x*100)/100;
+        const rows = [];
+        for (const [key, bucket] of acc.entries()) {
+          const [geo, period, window, brand] = key.split('|');
+          const row = [geoI.get(geo), brandI.get(brand), periodI.get(period), windowI.get(window)];
+          for (const m of metrics) {
+            const total = bucket.sums[m.name];
+            if (total === undefined) { row.push(0); continue; }
+            if (m.kind === 'mean') { const c = bucket.counts[m.name]||0; row.push(c?round2(total/c):0); }
+            else row.push(round2(total));
+          }
+          rows.push(row);
+        }
+        const itemsByBrandIdx = {};
+        for (const [bl, set] of itemsByBrand.entries()) { const i = brandI.get(bl); if (i!==undefined && set.size) itemsByBrandIdx[i] = [...set].sort(); }
+        const totalItems = Object.values(itemsByBrandIdx).reduce((a,arr)=>a+arr.length,0);
+        const payload = { version:2, category:'SPINS Data', periodDates, geos, brands, periods, windows,
+          metrics: metricCodes, metricLabels, metricKinds, itemsByBrand: itemsByBrandIdx, rows };
+        progress('finalizing', 100, 'Done · ' + rows.length.toLocaleString() + ' rows · ' + totalItems.toLocaleString() + ' items');
+        self.postMessage({ type:'done', payload });
+      } catch (err) {
+        self.postMessage({ type:'error', message: (err && (err.message||err.name)) || String(err), stack: err && err.stack });
+      }
+    };
+    /* eslint-enable */
+  }
+
+  function convertCsv(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const src = '(' + csvWorkerSource.toString() + ')()';
+      const blob = new Blob([src], { type: 'application/javascript' });
+      const url = URL.createObjectURL(blob);
+      const w = new Worker(url);
+      const cleanup = () => { try { w.terminate(); } catch {} URL.revokeObjectURL(url); };
+      w.onmessage = (e) => {
+        const m = e.data || {};
+        if (m.type === 'progress') { if (typeof onProgress === 'function') onProgress(m); }
+        else if (m.type === 'done') { cleanup(); resolve(m.payload); }
+        else if (m.type === 'error') { cleanup(); reject(new Error(m.message || 'CSV worker failed')); }
+      };
+      w.onerror = (e) => { cleanup(); reject(new Error(e.message || 'CSV worker crashed')); };
+      // Pass the File directly; the worker streams it (no full-file copy).
+      w.postMessage({ file });
+    });
+  }
+
+  // Route by file type: CSV → streaming CSV worker; xlsx/xls → SheetJS worker.
+  function convert(file, onProgress) {
+    const name = (file && file.name || '').toLowerCase();
+    if (name.endsWith('.csv') || file.type === 'text/csv') return convertCsv(file, onProgress);
+    return convertXlsx(file, onProgress);
+  }
+
+  return { convertXlsx, convertCsv, convert };
 })();
 
 </script>
@@ -31700,7 +31898,7 @@ render();
             rebuild the cache.
           </p>
           <button class="ins-empty-cta" data-ins-action="upload">Replace dataset (.xlsx)</button>
-          <input type="file" id="ins-upload-input" accept=".xlsx,.xls,.json,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
+          <input type="file" id="ins-upload-input" accept=".csv,.xlsx,.xls,.json,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
           <div id="ins-upload-progress" style="display:none; margin-top: 24px; max-width: 440px; margin-left: auto; margin-right: auto;">
             <div class="ins-progress-bar"><div class="ins-progress-fill" id="ins-progress-fill"></div></div>
             <div class="ins-progress-label" id="ins-progress-label">Reading file...</div>
@@ -31773,7 +31971,7 @@ render();
           swaps in this period's data.
         </p>
         <button class="ins-empty-cta" data-ins-action="upload">Upload SPINS dataset (.xlsx)</button>
-        <input type="file" id="ins-upload-input" accept=".xlsx,.xls,.json,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
+        <input type="file" id="ins-upload-input" accept=".csv,.xlsx,.xls,.json,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
         <div id="ins-upload-progress" style="display:none; margin-top: 24px; max-width: 440px; margin-left: auto; margin-right: auto;">
           <div class="ins-progress-bar"><div class="ins-progress-fill" id="ins-progress-fill"></div></div>
           <div class="ins-progress-label" id="ins-progress-label">Reading file...</div>
@@ -32174,7 +32372,7 @@ render();
           </div>
         ` : ''}
         <button class="ins-btn-link" data-ins-action="upload">↻ Add / replace category data</button>
-        <input type="file" id="ins-upload-input" accept=".xlsx,.xls,.json,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
+        <input type="file" id="ins-upload-input" accept=".csv,.xlsx,.xls,.json,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
       </div>
       <div id="ins-upload-progress" style="display:none; margin-top: 12px;">
         <div class="ins-progress-bar"><div class="ins-progress-fill" id="ins-progress-fill"></div></div>
@@ -33850,7 +34048,7 @@ render();
         showProgress(true);
         setProgress(2, 'Reading file...');
         setMsg(`Converting ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB) — this can take a few minutes for large files.`);
-        payload = await SpinsConverter.convertXlsx(file, (p) => {
+        payload = await SpinsConverter.convert(file, (p) => {
           setProgress(p.pct || 0, p.detail || p.stage || 'Working...');
         });
         // Estimate size for the meta record
