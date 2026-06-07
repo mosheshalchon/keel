@@ -5885,9 +5885,88 @@ window.SpinsStorage = (function() {
 
   // Save: write the dataset + a tiny meta.json to shared Supabase Storage, and
   // update the local cache. meta.json lets other users cheaply detect a new upload.
+  // Merge a freshly-uploaded payload INTO an existing category payload so snapshots
+  // accumulate into a time series. Rows are keyed by (geo, period, window, brand);
+  // any period present in the NEW payload fully replaces that period in the old one
+  // (clean re-upload of a date), while periods only in the old payload are kept.
+  // Both payloads share the compact [geoIdx,brandIdx,periodIdx,windowIdx,...metrics]
+  // row shape, so we decode to labels, union dictionaries, then re-encode.
+  function mergePayloads(oldP, newP) {
+    if (!oldP || !oldP.rows || !oldP.rows.length) return newP;
+    if (!newP || !newP.rows || !newP.rows.length) return oldP;
+    // Metrics must line up; if metric sets differ, fall back to the new payload
+    // (safer than mixing mismatched columns).
+    const sameMetrics = JSON.stringify(oldP.metrics) === JSON.stringify(newP.metrics) &&
+                        JSON.stringify(oldP.metricLabels) === JSON.stringify(newP.metricLabels);
+    if (!sameMetrics) {
+      console.warn('SPINS merge: metric columns differ between uploads — replacing instead of merging.');
+      return newP;
+    }
+    const newPeriods = new Set(newP.periods || []);
+    // Union dictionaries
+    const geos = [...new Set([...(oldP.geos||[]), ...(newP.geos||[])])].sort();
+    const brands = [...new Set([...(oldP.brands||[]), ...(newP.brands||[])])].sort();
+    const windows = [];
+    for (const w of ['04 Weeks','12 Weeks','24 Weeks','52 Weeks']) {
+      if ((oldP.windows||[]).includes(w) || (newP.windows||[]).includes(w)) windows.push(w);
+    }
+    for (const w of [...(oldP.windows||[]), ...(newP.windows||[])]) if (!windows.includes(w)) windows.push(w);
+    const periods = [...new Set([...(oldP.periods||[]), ...(newP.periods||[])])].sort();
+    const gI = new Map(geos.map((v,i)=>[v,i]));
+    const bI = new Map(brands.map((v,i)=>[v,i]));
+    const pI = new Map(periods.map((v,i)=>[v,i]));
+    const wI = new Map(windows.map((v,i)=>[v,i]));
+    const mLen = (newP.metrics||[]).length;
+    const reencode = (P, skipReplacedPeriods) => {
+      const out = [];
+      const og = P.geos||[], ob = P.brands||[], op = P.periods||[], ow = P.windows||[];
+      for (const row of P.rows) {
+        const periodLabel = op[row[2]];
+        if (skipReplacedPeriods && newPeriods.has(periodLabel)) continue; // new file replaces this date
+        const nr = [ gI.get(og[row[0]]), bI.get(ob[row[1]]), pI.get(periodLabel), wI.get(ow[row[3]]) ];
+        for (let m = 0; m < mLen; m++) nr.push(row[4 + m]);
+        out.push(nr);
+      }
+      return out;
+    };
+    const rows = reencode(oldP, true).concat(reencode(newP, false));
+    // Union itemsByBrand (brandIdx-keyed) → rebuild on merged brand indices
+    const itemsByBrand = {};
+    const addItems = (P) => {
+      const ob = P.brands||[];
+      for (const [idxStr, arr] of Object.entries(P.itemsByBrand||{})) {
+        const label = ob[Number(idxStr)]; if (label == null) continue;
+        const ni = bI.get(label); if (ni == null) continue;
+        const set = itemsByBrand[ni] || (itemsByBrand[ni] = new Set());
+        for (const it of arr) set.add(it);
+      }
+    };
+    addItems(oldP); addItems(newP);
+    const itemsByBrandIdx = {};
+    for (const [k, set] of Object.entries(itemsByBrand)) itemsByBrandIdx[k] = [...set].sort();
+    const periodDates = Object.assign({}, oldP.periodDates || {}, newP.periodDates || {});
+    return {
+      version: 2,
+      category: newP.category || oldP.category,
+      periodDates, geos, brands, periods, windows,
+      metrics: newP.metrics, metricLabels: newP.metricLabels, metricKinds: newP.metricKinds,
+      itemsByBrand: itemsByBrandIdx, rows,
+    };
+  }
+
   async function saveDataset(payload, meta) {
     const sb = window.Auth.getClient();
     const category = normCat(meta.category || payload?.category || 'pizza');
+    // ACCUMULATE: by default, merge this upload into the category's existing dataset
+    // so snapshots build a time series. Pass meta.replace=true to overwrite instead.
+    if (!meta.replace) {
+      try {
+        const existing = await loadDataset(category);
+        if (existing && existing.payload && existing.payload.rows && existing.payload.rows.length) {
+          payload = mergePayloads(existing.payload, payload);
+        }
+      } catch (e) { console.warn('SPINS accumulate: could not load existing dataset, saving as-is:', e); }
+    }
     const metaObj = {
       fileName: meta.fileName,
       uploadedAt: new Date().toISOString(),
@@ -6511,6 +6590,23 @@ window.SpinsConverter = (function() {
       const n = Number(s);
       return isFinite(n) ? n : null;
     }
+    // Normalize a SPINS date ("3/22/26", "03/22/2026", or ISO) to YYYY-MM-DD.
+    function normDate(s) {
+      if (!s) return null;
+      s = String(s).trim();
+      const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+      if (mdy) {
+        let y = parseInt(mdy[3], 10); if (y < 100) y += 2000;
+        const m = String(parseInt(mdy[1],10)).padStart(2,'0');
+        const d = String(parseInt(mdy[2],10)).padStart(2,'0');
+        return `${y}-${m}-${d}`;
+      }
+      const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+      const dt = new Date(s);
+      if (!isNaN(dt.getTime())) return dt.toISOString().slice(0,10);
+      return null;
+    }
     // Minimal RFC-4180-ish CSV line parser (handles quoted fields & escaped quotes).
     function parseLine(line) {
       const out = []; let cur = '', q = false;
@@ -6522,6 +6618,14 @@ window.SpinsConverter = (function() {
       out.push(cur); return out;
     }
     const DIMENSIONAL = new Set(['Geography','Time Period','Time Period End Date','Product Universe','Product Level','Department','Category','Subcategory','Brand','UPC','Description','Labeled Gluten Free','LABELED GLUTEN FREE','Storage','STORAGE','Storage Type','Manufacturer','Item Type']);
+    // Canonical SPINS column order, used when a file has NO header row (some CSV
+    // exports drop it). Matches the standard 13 leading dimensional columns; metric
+    // columns after position 13 get generic names (the values still aggregate).
+    const SPINS_LAYOUT = ['Geography','Time Period','Time Period End Date','Product Universe','Product Level','Department','Category','Subcategory','Brand','UPC','Description','Labeled Gluten Free','Storage','Dollars','Dollars Yago','Units','Units Yago','Avg % ACV','Avg % ACV Yago','TDP','TDP Yago','ARP','ARP Yago','Units % Promo','Units % Promo Yago','# of Stores Selling','# of Stores Selling Yago','Avg Weekly $ Per Store','Avg Weekly $ Per Store Yago','Avg Weekly Units Per Store','Avg Weekly Units Per Store Yago'];
+    const looksLikeHeader = (cells) => {
+      const low = cells.map(c => String(c == null ? '' : c).trim().toLowerCase());
+      return low.includes('geography') || low.includes('brand') || low.includes('dollars');
+    };
 
     self.onmessage = async (e) => {
       const { file } = e.data;
@@ -6544,24 +6648,38 @@ window.SpinsConverter = (function() {
         const atgRows = [];   // array of objects keyed by header (like sheet_to_json)
         let fullHeader = null;
 
+        // Build the column map from a header array (real or synthesized layout).
+        const setupColumns = (hdr) => {
+          header = hdr.map(h => String(h == null ? '' : h).trim());
+          fullHeader = header.slice();
+          idx = {};
+          header.forEach((h, i) => { idx[h] = i; });
+          gGeo = idx['Geography']; gPer = idx['Time Period']; gBrand = idx['Brand'];
+          gDesc = idx['Description']; gUpc = idx['UPC']; gDate = idx['Time Period End Date'];
+          const dollarsIdx = header.findIndex(h => /^Dollars$/i.test(h));
+          const startIdx = dollarsIdx >= 0 ? dollarsIdx : 13;
+          metrics = [];
+          for (let i = 0; i < header.length; i++) {
+            const h = header[i];
+            if (!h || i < startIdx || DIMENSIONAL.has(h)) continue;
+            metrics.push({ name: h, colIdx: i, kind: classifyMetric(h) });
+          }
+          metricIdxs = metrics;
+        };
+
         const handleRow = (cells) => {
           if (!header) {
-            header = cells.map(h => String(h == null ? '' : h).trim());
-            fullHeader = header.slice();
-            header.forEach((h, i) => { idx[h] = i; });
-            gGeo = idx['Geography']; gPer = idx['Time Period']; gBrand = idx['Brand'];
-            gDesc = idx['Description']; gUpc = idx['UPC']; gDate = idx['Time Period End Date'];
-            // metric columns: from 'Dollars' onward, excluding dimensional
-            const dollarsIdx = header.findIndex(h => /^Dollars$/i.test(h));
-            const startIdx = dollarsIdx >= 0 ? dollarsIdx : 11;
-            metrics = [];
-            for (let i = 0; i < header.length; i++) {
-              const h = header[i];
-              if (!h || i < startIdx || DIMENSIONAL.has(h)) continue;
-              metrics.push({ name: h, colIdx: i, kind: classifyMetric(h) });
+            // First row: is it a header, or did the export drop the header and
+            // start with data? Detect, and synthesize the standard layout if headerless.
+            if (looksLikeHeader(cells)) {
+              setupColumns(cells);
+              return;   // consume the header row
             }
-            metricIdxs = metrics;
-            return;
+            // Headerless: apply known SPINS layout and FALL THROUGH to process this
+            // row as data (don't return).
+            const layout = SPINS_LAYOUT.slice(0, Math.max(SPINS_LAYOUT.length, cells.length));
+            while (layout.length < cells.length) layout.push('Col' + layout.length);
+            setupColumns(layout);
           }
           const geo = cells[gGeo], window = cells[gPer], brand = cells[gBrand];
           if (!geo || !brand || !window) return;
@@ -6572,14 +6690,21 @@ window.SpinsConverter = (function() {
             atgRows.push(obj);
           }
           allGeos.add(geo); allBrands.add(brand); allWindows.add(window);
-          if (gDate != null && cells[gDate] && !periodDates['CSV']) periodDates['CSV'] = String(cells[gDate]).slice(0,10);
+          // Period = the row's Time Period End Date, normalized to YYYY-MM-DD, so
+          // each snapshot upload is tagged with its real date and can accumulate
+          // into a time series across uploads. Falls back to 'CSV' if no date.
+          let period = 'CSV';
+          if (gDate != null && cells[gDate]) {
+            const norm = normDate(String(cells[gDate]).trim());
+            if (norm) { period = norm; periodDates[period] = norm; }
+          }
           let item = (gDesc != null ? cells[gDesc] : null) || (gUpc != null ? cells[gUpc] : null);
           if (item != null && String(item).trim()) {
             const itemStr = String(item).trim();
             let set = itemsByBrand.get(brand); if (!set) { set = new Set(); itemsByBrand.set(brand, set); }
             set.add(itemStr);
           }
-          const key = geo + '|CSV|' + window + '|' + brand;
+          const key = geo + '|' + period + '|' + window + '|' + brand;
           let bucket = acc.get(key);
           if (!bucket) { bucket = { sums:{}, counts:{} }; acc.set(key, bucket); }
           for (const m of metricIdxs) {
@@ -6596,11 +6721,13 @@ window.SpinsConverter = (function() {
           }
         };
 
+        let bomStripped = false;
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
           bytes += value.length;
           buf += value;
+          if (!bomStripped) { if (buf.charCodeAt(0) === 0xFEFF) buf = buf.slice(1); bomStripped = true; }
           let nl;
           while ((nl = buf.indexOf('\n')) >= 0) {
             let line = buf.slice(0, nl);
@@ -6620,7 +6747,10 @@ window.SpinsConverter = (function() {
         const brands = [...allBrands].sort();
         const windows = ['04 Weeks','12 Weeks','24 Weeks','52 Weeks'].filter(w => allWindows.has(w));
         for (const w of allWindows) if (!windows.includes(w)) windows.push(w);
-        const periods = ['CSV'];
+        // Periods = the distinct end-dates seen, sorted chronologically. (Falls back
+        // to ['CSV'] only if no dates were present.)
+        let periods = Object.keys(periodDates).sort();
+        if (!periods.length) periods = ['CSV'];
         const geoI = new Map(geos.map((v,i)=>[v,i]));
         const brandI = new Map(brands.map((v,i)=>[v,i]));
         const periodI = new Map(periods.map((v,i)=>[v,i]));
@@ -35316,13 +35446,25 @@ render();
     let buf = '';
     let header = null, brandIdx = -1;
     const out = [];
+    const SPINS_LAYOUT = ['Geography','Time Period','Time Period End Date','Product Universe','Product Level','Department','Category','Subcategory','Brand','UPC','Description','Labeled Gluten Free','Storage','Dollars','Dollars Yago','Units','Units Yago','Avg % ACV','Avg % ACV Yago','TDP','TDP Yago','ARP','ARP Yago','Units % Promo','Units % Promo Yago','# of Stores Selling','# of Stores Selling Yago','Avg Weekly $ Per Store','Avg Weekly $ Per Store Yago','Avg Weekly Units Per Store','Avg Weekly Units Per Store Yago'];
+    const isHeaderRow = (cells) => {
+      const low = cells.map(c => String(c == null ? '' : c).trim().toLowerCase());
+      return low.includes('geography') || low.includes('brand') || low.includes('dollars');
+    };
+    const setHeader = (hdr) => {
+      header = hdr.map(h => String(h == null ? '' : h).trim());
+      brandIdx = header.findIndex(h => h.trim().toLowerCase() === 'brand');
+    };
     const handle = (line) => {
       if (!line.length) return;
       const cells = parseLine(line);
       if (!header) {
-        header = cells.map(h => String(h == null ? '' : h).trim());
-        brandIdx = header.findIndex(h => h.trim().toLowerCase() === 'brand');
-        return;
+        if (isHeaderRow(cells)) { setHeader(cells); return; }   // consume real header
+        // Headerless export — apply standard SPINS layout, then fall through.
+        const layout = SPINS_LAYOUT.slice();
+        while (layout.length < cells.length) layout.push('Col' + layout.length);
+        setHeader(layout);
+        // do NOT return — process this first row as data
       }
       // Brand filter while streaming — only keep our brand's rows.
       if (brandIdx >= 0) {
@@ -35333,10 +35475,12 @@ render();
       for (let i = 0; i < header.length; i++) obj[header[i]] = cells[i] != null ? cells[i] : '';
       out.push(obj);
     };
+    let bomStripped = false;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += value;
+      if (!bomStripped) { if (buf.charCodeAt(0) === 0xFEFF) buf = buf.slice(1); bomStripped = true; }
       let nl;
       while ((nl = buf.indexOf('\n')) >= 0) {
         let line = buf.slice(0, nl); buf = buf.slice(nl + 1);
