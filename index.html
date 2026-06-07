@@ -36042,28 +36042,26 @@ render();
       });
     }
 
-    // ── Drop discontinued / negligible items ──
-    // An item appears once per time-period window (4wk, 12wk). Keep an item at a
-    // retailer only if its Dollars exceed $1000 in AT LEAST ONE window; otherwise
-    // it's discontinued/negligible and we don't import it. Applied per retailer,
-    // per item (keyed by product_id when matched, else raw_upc).
-    const SALES_THRESHOLD = 1000;
-    let droppedLowSales = 0;
-    for (const [, group] of retailerGroups) {
-      const maxDollarsByItem = new Map();
-      const keyOf = (it) => (it.product_id != null ? 'p:' + it.product_id : 'u:' + (it.raw_upc || it.raw_item_name || ''));
-      for (const it of group.items) {
-        const k = keyOf(it);
-        const d = (it.dollars != null && isFinite(it.dollars)) ? it.dollars : 0;
-        if (!maxDollarsByItem.has(k) || d > maxDollarsByItem.get(k)) maxDollarsByItem.set(k, d);
-      }
+    // ── Keep only items in the Brand Library + capture reconcile data ──
+    // Your Brand Library (products table) is the source of truth for active items.
+    // We only import SPINS items whose UPC matched a Brand Library product (i.e.
+    // product_id is set); anything not in the Brand Library is discontinued/unknown
+    // and is skipped. We also capture, per retailer, the set of UPCs that appeared
+    // in THIS file (universe) and the set we kept, so after writing we remove any
+    // existing retailer_items whose UPC is in this file but no longer in the Brand
+    // Library. Scoped to this file's UPCs, so other categories are never touched.
+    let droppedNotInLibrary = 0;
+    const reconcileByRetailer = new Map();  // retailerName -> { fileUpcs:Set, keepUpcs:Set }
+    const normU = (u) => String(u == null ? '' : u).replace(/\D/g, '');
+    for (const [name, group] of retailerGroups) {
+      const fileUpcs = new Set(), keepUpcs = new Set();
+      for (const it of group.items) if (it.raw_upc) fileUpcs.add(normU(it.raw_upc));
       const before = group.items.length;
-      group.items = group.items.filter(it => maxDollarsByItem.get(keyOf(it)) > SALES_THRESHOLD);
-      droppedLowSales += (before - group.items.length);
-    }
-    // Drop retailers left with no items after filtering.
-    for (const [name, group] of [...retailerGroups]) {
-      if (group.items.length === 0) retailerGroups.delete(name);
+      // Keep only items matched to a Brand Library product.
+      group.items = group.items.filter(it => it.product_id != null);
+      droppedNotInLibrary += (before - group.items.length);
+      for (const it of group.items) if (it.raw_upc) keepUpcs.add(normU(it.raw_upc));
+      reconcileByRetailer.set(name, { fileUpcs, keepUpcs });
     }
 
     // Count matched / unmatched across all rows
@@ -36095,11 +36093,10 @@ render();
           ${brandSkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Other brands skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${brandSkipped}</td></tr>` : ''}
           ${timePeriodSkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— 24/52-week rows skipped (kept 4 + 12)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${timePeriodSkipped}</td></tr>` : ''}
           <tr><td style="padding:4px 0;color:var(--ink-3);">— Aggregator rows skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${aggregatorSkipped}</td></tr>
-          ${droppedLowSales > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Low-sales items skipped (≤$1,000)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${droppedLowSales}</td></tr>` : ''}
+          ${droppedNotInLibrary > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Skipped (not in Brand Library)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${droppedNotInLibrary}</td></tr>` : ''}
           ${emptySkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Empty geography skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${emptySkipped}</td></tr>` : ''}
           <tr><td style="padding:4px 0;">Item rows to import</td><td style="text-align:right;font-family:var(--mono);">${totalRows}</td></tr>
-          <tr><td style="padding:4px 0;color:var(--won);">— Matched to products (UPC)</td><td style="text-align:right;font-family:var(--mono);color:var(--won);">${matchedRows}</td></tr>
-          <tr><td style="padding:4px 0;color:#c4a747;">— Unmatched (kept anyway)</td><td style="text-align:right;font-family:var(--mono);color:#c4a747;">${unmatchedRows}</td></tr>
+          <tr><td style="padding:4px 0;color:var(--won);">— In Brand Library (imported)</td><td style="text-align:right;font-family:var(--mono);color:var(--won);">${matchedRows}</td></tr>
           <tr><td style="padding:8px 0 4px 0;border-top:1px solid var(--rule-soft);">Retailers</td><td style="text-align:right;font-family:var(--mono);padding-top:8px;border-top:1px solid var(--rule-soft);">${retailerGroups.size}</td></tr>
           <tr><td style="padding:4px 0;">— Existing (will add items)</td><td style="text-align:right;font-family:var(--mono);">${existingRetailers.size}</td></tr>
           <tr><td style="padding:4px 0;color:var(--won);">— New (will be created)</td><td style="text-align:right;font-family:var(--mono);color:var(--won);">${willCreate.length}</td></tr>
@@ -36133,6 +36130,7 @@ render();
       if (confirmBtn) confirmBtn.disabled = true;
       let retailersCreated = 0, itemsUpserted = 0, itemErrors = 0;
       const firstFewErrors = [];
+      const retailerIdByName = new Map();  // for the reconcile-delete step
 
       // For each retailer group: find-or-create the retailer, then upsert items
       for (const [name, group] of retailerGroups) {
@@ -36158,6 +36156,7 @@ render();
             continue;
           }
         }
+        if (retailerRow) retailerIdByName.set(name, retailerRow.id);
 
         // Upsert items for this retailer.
         // We can't use Supabase's upsert with partial unique indexes (PostgREST
@@ -36331,6 +36330,39 @@ render();
         }
       }
 
+      // ── Reconcile: remove discontinued items ──
+      // For each retailer, delete existing retailer_items whose UPC appeared in THIS
+      // file (so same category) but did NOT qualify this time (≤$1000). Scoped to the
+      // file's UPCs, so items from other categories are never touched.
+      let removedDiscontinued = 0;
+      try {
+        for (const [name, rec] of reconcileByRetailer) {
+          const rid = retailerIdByName.get(name);
+          if (!rid) continue;
+          if (!rec.fileUpcs || rec.fileUpcs.size === 0) continue;
+          const { data: existing } = await sb.from('retailer_items')
+            .select('id, raw_upc').eq('brand_id', brandId).eq('retailer_id', rid);
+          if (!existing) continue;
+          const toDelete = [];
+          for (const row of existing) {
+            const u = String(row.raw_upc == null ? '' : row.raw_upc).replace(/\D/g, '');
+            if (!u) continue;
+            // UPC is part of this file's universe but didn't qualify → discontinued.
+            if (rec.fileUpcs.has(u) && !rec.keepUpcs.has(u)) toDelete.push(row.id);
+          }
+          if (toDelete.length) {
+            // delete in chunks
+            for (let i = 0; i < toDelete.length; i += 100) {
+              const chunk = toDelete.slice(i, i + 100);
+              const { error: delErr } = await sb.from('retailer_items').delete().in('id', chunk);
+              if (!delErr) removedDiscontinued += chunk.length;
+              else console.warn('Reconcile delete failed:', delErr.message);
+            }
+          }
+        }
+      } catch (recErr) { console.warn('Reconcile step error (non-fatal):', recErr); }
+      if (removedDiscontinued > 0) console.log(`[SPINs uploader] Removed ${removedDiscontinued} discontinued items (≤$1000, in-file UPCs).`);
+
       // Log the actuals counters summary so user can see what happened
       console.log('[SPINs uploader] Actuals write summary:', window._spinsActualsCounters);
       window._spinsActualsCounters = null;  // reset for next upload
@@ -36338,7 +36370,7 @@ render();
       if (itemErrors > 0) {
         setStatus(`Imported ${itemsUpserted} items across ${retailerGroups.size} retailers (${retailersCreated} new). ${itemErrors} errors — see Console. First: ${firstFewErrors[0]}`, 'var(--lost)');
       } else {
-        setStatus(`✓ Imported ${itemsUpserted} items across ${retailerGroups.size} retailers (${retailersCreated} new retailers created).`, 'var(--won)');
+        setStatus(`✓ Imported ${itemsUpserted} items · removed ${removedDiscontinued} discontinued · ${retailerGroups.size} retailers (${retailersCreated} new).`, 'var(--won)');
       }
       if (previewEl) previewEl.innerHTML = '';
       // Refresh the retailer grid so new retailers show up (only when on that page).
