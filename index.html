@@ -15977,6 +15977,11 @@ render();
 
       // Period types present in the data
       const periodTypes = [...new Set((actuals || []).map(a => a.period_type).filter(Boolean))].sort();
+      // Distinct period-end dates (most recent first) — we default the view to the latest.
+      const periodDates = [...new Set((actuals || []).map(a => a.period_end).filter(Boolean))].sort().reverse();
+      const latestDate = periodDates[0] || '';
+      // Categories present (from the matched product)
+      const categories = [...new Set((actuals || []).map(a => productsById.get(a.product_id)?.category).filter(Boolean))].sort();
 
       html += `
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;">
@@ -15984,9 +15989,17 @@ render();
             <option value="">All retailers</option>
             ${retailerNames.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}
           </select>
+          <select id="hl-actuals-category-filter" style="padding:6px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+            <option value="">All categories</option>
+            ${categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}
+          </select>
           <select id="hl-actuals-item-filter" style="padding:6px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);min-width:200px;">
             <option value="">All items</option>
             ${itemNames.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}
+          </select>
+          <select id="hl-actuals-date-filter" style="padding:6px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+            <option value="">All dates</option>
+            ${periodDates.map(d => `<option value="${esc(d)}"${d === latestDate ? ' selected' : ''}>${esc(d)}</option>`).join('')}
           </select>
           <select id="hl-actuals-period-filter" style="padding:6px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
             <option value="">All periods</option>
@@ -16004,6 +16017,7 @@ render();
               <tr>
                 <th>Period</th>
                 <th>Retailer</th>
+                <th>Category</th>
                 <th>Item</th>
                 <th style="text-align:right;">Doors</th>
                 <th style="text-align:right;">Units</th>
@@ -16029,9 +16043,10 @@ render();
                   ? '<span style="display:inline-block;background:#7a6b3d;color:white;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:1px 5px;border-radius:3px;">L12</span>'
                   : '<span style="display:inline-block;background:var(--ink-3);color:white;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:1px 5px;border-radius:3px;">' + esc(periodLabel) + '</span>';
                 return `
-                  <tr data-retailer="${esc(r?.name || '')}" data-item="${esc(p?.item_description || '')}" data-source="${esc(a.source)}" data-period="${esc(a.period_type || '')}">
+                  <tr data-retailer="${esc(r?.name || '')}" data-item="${esc(p?.item_description || '')}" data-source="${esc(a.source)}" data-period="${esc(a.period_type || '')}" data-date="${esc(a.period_end || '')}" data-category="${esc(p?.category || '')}">
                     <td style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(a.period_end)}<br>${periodBadge}</td>
                     <td class="text">${esc(r?.name || '(unknown)')}</td>
+                    <td class="text" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(p?.category || '—')}</td>
                     <td class="text">${esc(p?.item_description || '(unknown)')}</td>
                     <td style="text-align:right;font-family:var(--mono);">${fmtNum(a.doors)}</td>
                     <td style="text-align:right;font-family:var(--mono);">${fmtNum(a.units_sold)}</td>
@@ -16054,21 +16069,34 @@ render();
     // Wire filter handlers
     const applyActualsFilters = () => {
       const retVal = document.getElementById('hl-actuals-retailer-filter')?.value || '';
+      const catVal = document.getElementById('hl-actuals-category-filter')?.value || '';
       const itemVal = document.getElementById('hl-actuals-item-filter')?.value || '';
+      const dateVal = document.getElementById('hl-actuals-date-filter')?.value || '';
       const periodVal = document.getElementById('hl-actuals-period-filter')?.value || '';
       const srcVal = document.getElementById('hl-actuals-source-filter')?.value || '';
+      let shown = 0;
       host.querySelectorAll('#hl-actuals-tbody tr').forEach(tr => {
         const matchRet = !retVal || tr.dataset.retailer === retVal;
+        const matchCat = !catVal || tr.dataset.category === catVal;
         const matchItem = !itemVal || tr.dataset.item === itemVal;
+        const matchDate = !dateVal || tr.dataset.date === dateVal;
         const matchPeriod = !periodVal || tr.dataset.period === periodVal;
         const matchSrc = !srcVal || tr.dataset.source === srcVal;
-        tr.style.display = (matchRet && matchItem && matchPeriod && matchSrc) ? '' : 'none';
+        const show = matchRet && matchCat && matchItem && matchDate && matchPeriod && matchSrc;
+        tr.style.display = show ? '' : 'none';
+        if (show) shown++;
       });
+      const cnt = document.getElementById('hl-actuals-shown-count');
+      if (cnt) cnt.textContent = shown.toLocaleString();
     };
     document.getElementById('hl-actuals-retailer-filter')?.addEventListener('change', applyActualsFilters);
+    document.getElementById('hl-actuals-category-filter')?.addEventListener('change', applyActualsFilters);
     document.getElementById('hl-actuals-item-filter')?.addEventListener('change', applyActualsFilters);
+    document.getElementById('hl-actuals-date-filter')?.addEventListener('change', applyActualsFilters);
     document.getElementById('hl-actuals-period-filter')?.addEventListener('change', applyActualsFilters);
     document.getElementById('hl-actuals-source-filter')?.addEventListener('change', applyActualsFilters);
+    // Apply once on load so the default (latest date) filter takes effect immediately.
+    applyActualsFilters();
 
     // Wire add button
     document.getElementById('hl-actuals-add-btn').addEventListener('click', () => openActualEntryModal());
