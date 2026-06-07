@@ -25693,22 +25693,111 @@ render();
     });
   }
 
-  function renderPromosPage() {
-    renderPlaceholder({
-      activeId: 'promos',
-      eyebrow: '— Promotional planning',
-      title: 'Promos.',
-      subtitle: '<em>Forward calendar</em>, ROI tracking, and post-event analysis.',
-      scope: [
-        { title: 'Promo calendar', desc: 'Plan TPRs, displays, and feature ads by retailer.' },
-        { title: 'ROI snapshots', desc: 'Pre/post lift analysis with margin impact.' },
-        { title: 'Buyer commitment tracking', desc: 'What was agreed vs what was executed.' },
-      ],
-      dataSummary: [
-        { key: 'Recent wins', val: BrandLibrary.getDecisions().filter(d => d.outcome === 'won').length },
-        { key: 'Brand', val: BrandLibrary.getBrand().name },
-      ],
-    });
+  async function renderPromosPage() {
+    const session = HL.mountPage('promos');
+    if (!session) return;
+    const main = document.getElementById('main-content');
+    const brandId = window.BrandLibrary.getSession().brandId;
+    const sb = window.Auth.getClient();
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    main.innerHTML = `
+      <div class="eyebrow">— Promotional planning</div>
+      <h1 class="page-title">Promos.</h1>
+      <p class="page-meta">Retailers and the items they carry, sourced from your SPINS uploads. Build promos on top of this.</p>
+      <div id="hl-promo-body" style="margin-top:20px;"><div class="hl-loading">Loading retailers…</div></div>
+    `;
+
+    // Load retailers + all their carried items (across every category) in two queries.
+    const [{ data: retailers }, { data: items }] = await Promise.all([
+      sb.from('retailers').select('*').eq('brand_id', brandId),
+      sb.from('retailer_items').select('*').eq('brand_id', brandId),
+    ]);
+    const body = document.getElementById('hl-promo-body');
+    if (!retailers || retailers.length === 0) {
+      body.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:32px;text-align:center;">No retailers yet. Upload SPINS data in Insights to populate retailers and their items.</div>`;
+      return;
+    }
+
+    // Join product descriptions for items that matched a product.
+    const productIds = [...new Set((items || []).map(i => i.product_id).filter(Boolean))];
+    const productsById = new Map();
+    if (productIds.length) {
+      // chunk to avoid huge IN lists
+      for (let i = 0; i < productIds.length; i += 200) {
+        const { data: prods } = await sb.from('products').select('id, item_description, category, unit_upc').in('id', productIds.slice(i, i+200));
+        (prods || []).forEach(p => productsById.set(p.id, p));
+      }
+    }
+
+    // Group items by retailer_id.
+    const itemsByRetailer = new Map();
+    for (const it of (items || [])) {
+      if (!itemsByRetailer.has(it.retailer_id)) itemsByRetailer.set(it.retailer_id, []);
+      itemsByRetailer.get(it.retailer_id).push(it);
+    }
+
+    // Sort retailers by item count (most carried first), then name.
+    const rows = retailers.map(r => ({ r, items: itemsByRetailer.get(r.id) || [] }))
+      .sort((a, b) => b.items.length - a.items.length || String(a.r.name).localeCompare(String(b.r.name)));
+
+    const itemName = (it) => {
+      const p = it.product_id ? productsById.get(it.product_id) : null;
+      return (p && p.item_description) || it.raw_item_name || it.raw_upc || '(unnamed item)';
+    };
+    const itemCat = (it) => {
+      const p = it.product_id ? productsById.get(it.product_id) : null;
+      return it.category || (p && p.category) || '—';
+    };
+
+    body.innerHTML = `
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;">${rows.length} retailers · ${(items||[]).length.toLocaleString()} carried items</div>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        ${rows.map((row, idx) => {
+          // Distinct categories carried at this retailer (for the summary line).
+          const catsHere = [...new Set(row.items.map(itemCat).filter(c => c && c !== '—'))];
+          return `
+          <div style="border:1px solid var(--rule-soft);border-radius:8px;overflow:hidden;">
+            <button class="hl-promo-retailer" data-idx="${idx}" style="width:100%;text-align:left;background:var(--paper);border:none;padding:14px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+              <div>
+                <div style="font-family:var(--serif);font-size:16px;font-weight:600;color:var(--ink);">${esc(row.r.name)}</div>
+                <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">${row.items.length} item${row.items.length===1?'':'s'}${catsHere.length?' · '+catsHere.map(esc).join(', '):''}</div>
+              </div>
+              <span class="hl-promo-caret" data-idx="${idx}" style="font-family:var(--mono);color:var(--ink-3);font-size:12px;">▸</span>
+            </button>
+            <div class="hl-promo-items" data-idx="${idx}" style="display:none;border-top:1px solid var(--rule-softer);padding:8px 16px 14px;">
+              ${row.items.length === 0 ? `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:8px 0;">No items recorded.</div>` : `
+                <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                  <thead><tr>
+                    <th style="text-align:left;padding:6px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">Item</th>
+                    <th style="text-align:left;padding:6px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">Category</th>
+                    <th style="text-align:left;padding:6px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">UPC</th>
+                  </tr></thead>
+                  <tbody>
+                    ${row.items.slice().sort((a,b)=>itemName(a).localeCompare(itemName(b))).map(it => `
+                      <tr style="border-top:1px solid var(--rule-softer);">
+                        <td style="padding:6px 8px;">${esc(itemName(it))}</td>
+                        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(itemCat(it))}</td>
+                        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(it.raw_upc || '—')}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>`}
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    `;
+
+    // Expand/collapse retailers
+    body.querySelectorAll('.hl-promo-retailer').forEach(btn => btn.addEventListener('click', () => {
+      const idx = btn.dataset.idx;
+      const panel = body.querySelector(`.hl-promo-items[data-idx="${idx}"]`);
+      const caret = body.querySelector(`.hl-promo-caret[data-idx="${idx}"]`);
+      const open = panel.style.display !== 'none';
+      panel.style.display = open ? 'none' : '';
+      if (caret) caret.textContent = open ? '▸' : '▾';
+    }));
   }
 
   let _distActiveSubTab = 'inventory';  // 'inventory' | 'sales' | 'service-levels'
