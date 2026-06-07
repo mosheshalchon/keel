@@ -25730,28 +25730,43 @@ render();
       }
     }
 
-    // Group items by retailer_id.
+    // Group items by retailer_id, deduped by normalized UPC. When the same UPC has
+    // multiple rows (e.g. a Brand-Library-matched one and a raw one), keep the
+    // matched row (it carries the Brand Library name/UPC).
+    const normU = (u) => String(u == null ? '' : u).replace(/\D/g, '');
     const itemsByRetailer = new Map();
     for (const it of (items || [])) {
-      if (!itemsByRetailer.has(it.retailer_id)) itemsByRetailer.set(it.retailer_id, []);
-      itemsByRetailer.get(it.retailer_id).push(it);
+      if (!itemsByRetailer.has(it.retailer_id)) itemsByRetailer.set(it.retailer_id, new Map());
+      const byUpc = itemsByRetailer.get(it.retailer_id);
+      // Dedup key: normalized raw UPC (both the matched and the leftover null-product
+      // row carry the same raw_upc), falling back to Brand Library UPC or product id.
+      const prod = it.product_id ? productsById.get(it.product_id) : null;
+      const key = normU(it.raw_upc) || normU(prod && prod.unit_upc) || (it.product_id ? 'p:'+it.product_id : 'id:'+it.id);
+      const existing = byUpc.get(key);
+      // Keep the matched row over an unmatched one; otherwise keep the first.
+      if (!existing || (!existing.product_id && it.product_id)) byUpc.set(key, it);
     }
 
     // Sort retailers by item count (most carried first), then name.
-    const rows = retailers.map(r => ({ r, items: itemsByRetailer.get(r.id) || [] }))
+    const rows = retailers.map(r => ({ r, items: [...(itemsByRetailer.get(r.id) || new Map()).values()] }))
       .sort((a, b) => b.items.length - a.items.length || String(a.r.name).localeCompare(String(b.r.name)));
 
     const itemName = (it) => {
       const p = it.product_id ? productsById.get(it.product_id) : null;
       return (p && p.item_description) || it.raw_item_name || it.raw_upc || '(unnamed item)';
     };
+    const itemUpc = (it) => {
+      const p = it.product_id ? productsById.get(it.product_id) : null;
+      return (p && p.unit_upc) || it.raw_upc || '—';
+    };
     const itemCat = (it) => {
       const p = it.product_id ? productsById.get(it.product_id) : null;
       return it.category || (p && p.category) || '—';
     };
 
+    const totalDeduped = rows.reduce((a, r) => a + r.items.length, 0);
     body.innerHTML = `
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;">${rows.length} retailers · ${(items||[]).length.toLocaleString()} carried items</div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;">${rows.length} retailers · ${totalDeduped.toLocaleString()} carried items</div>
       <div style="display:flex;flex-direction:column;gap:8px;">
         ${rows.map((row, idx) => {
           // Distinct categories carried at this retailer (for the summary line).
@@ -25778,7 +25793,7 @@ render();
                       <tr style="border-top:1px solid var(--rule-softer);">
                         <td style="padding:6px 8px;">${esc(itemName(it))}</td>
                         <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(itemCat(it))}</td>
-                        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(it.raw_upc || '—')}</td>
+                        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(itemUpc(it))}</td>
                       </tr>
                     `).join('')}
                   </tbody>
@@ -36060,6 +36075,19 @@ render();
       // Keep only items matched to a Brand Library product.
       group.items = group.items.filter(it => it.product_id != null);
       droppedNotInLibrary += (before - group.items.length);
+      // Dedupe by normalized UPC (the same UPC appears across windows/descriptions,
+      // and historically as both matched and null-product rows) so each UPC becomes
+      // ONE retailer_items row. Prefer a row with a product_id (Brand Library match),
+      // then the one with the most sales signal.
+      const byUpcKey = new Map();
+      for (const it of group.items) {
+        const k = normU(it.raw_upc) || ('p:' + it.product_id);
+        const cur = byUpcKey.get(k);
+        if (!cur) { byUpcKey.set(k, it); continue; }
+        const score = (x) => ((x.product_id != null ? 1e12 : 0) + ((x.dollars != null && isFinite(x.dollars)) ? x.dollars : 0));
+        if (score(it) > score(cur)) byUpcKey.set(k, it);
+      }
+      group.items = [...byUpcKey.values()];
       for (const it of group.items) if (it.raw_upc) keepUpcs.add(normU(it.raw_upc));
       reconcileByRetailer.set(name, { fileUpcs, keepUpcs });
     }
@@ -36330,38 +36358,58 @@ render();
         }
       }
 
-      // ── Reconcile: remove discontinued items ──
-      // For each retailer, delete existing retailer_items whose UPC appeared in THIS
-      // file (so same category) but did NOT qualify this time (≤$1000). Scoped to the
-      // file's UPCs, so items from other categories are never touched.
-      let removedDiscontinued = 0;
+      // ── Reconcile: remove discontinued items + collapse duplicates ──
+      // For each retailer:
+      //  (a) delete existing items whose UPC was in THIS file but is no longer kept
+      //      (discontinued / not in Brand Library), scoped to the file's UPCs; and
+      //  (b) collapse duplicate rows that share the same product_id (or same UPC) —
+      //      keep one, delete the rest — so each item appears once.
+      let removedDiscontinued = 0, removedDupes = 0;
       try {
         for (const [name, rec] of reconcileByRetailer) {
           const rid = retailerIdByName.get(name);
           if (!rid) continue;
-          if (!rec.fileUpcs || rec.fileUpcs.size === 0) continue;
           const { data: existing } = await sb.from('retailer_items')
-            .select('id, raw_upc').eq('brand_id', brandId).eq('retailer_id', rid);
+            .select('id, raw_upc, product_id').eq('brand_id', brandId).eq('retailer_id', rid);
           if (!existing) continue;
-          const toDelete = [];
-          for (const row of existing) {
-            const u = String(row.raw_upc == null ? '' : row.raw_upc).replace(/\D/g, '');
-            if (!u) continue;
-            // UPC is part of this file's universe but didn't qualify → discontinued.
-            if (rec.fileUpcs.has(u) && !rec.keepUpcs.has(u)) toDelete.push(row.id);
-          }
-          if (toDelete.length) {
-            // delete in chunks
-            for (let i = 0; i < toDelete.length; i += 100) {
-              const chunk = toDelete.slice(i, i + 100);
-              const { error: delErr } = await sb.from('retailer_items').delete().in('id', chunk);
-              if (!delErr) removedDiscontinued += chunk.length;
-              else console.warn('Reconcile delete failed:', delErr.message);
+          const toDelete = new Set();
+          // (a) discontinued: UPC in this file but not kept
+          if (rec.fileUpcs && rec.fileUpcs.size) {
+            for (const row of existing) {
+              const u = String(row.raw_upc == null ? '' : row.raw_upc).replace(/\D/g, '');
+              if (!u) continue;
+              if (rec.fileUpcs.has(u) && !rec.keepUpcs.has(u)) toDelete.add(row.id);
             }
           }
+          // (b) duplicates: collapse rows sharing the same normalized UPC. When a UPC
+          // has both a Brand-Library-matched row (product_id set) and an unmatched
+          // (product_id null) leftover, KEEP the matched one and delete the rest.
+          const bestByUpc = new Map();   // upc -> row to keep
+          for (const row of existing) {
+            if (toDelete.has(row.id)) continue;
+            const u = String(row.raw_upc == null ? '' : row.raw_upc).replace(/\D/g, '');
+            const key = u || (row.product_id != null ? 'p:' + row.product_id : null);
+            if (!key) continue;
+            const cur = bestByUpc.get(key);
+            if (!cur) { bestByUpc.set(key, row); continue; }
+            // Prefer the row WITH a product_id; if both/neither, keep the first and drop the other.
+            const keepRow = (row.product_id != null && cur.product_id == null) ? row : cur;
+            const dropRow = keepRow === row ? cur : row;
+            toDelete.add(dropRow.id); removedDupes++;
+            bestByUpc.set(key, keepRow);
+          }
+          const ids = [...toDelete];
+          for (let i = 0; i < ids.length; i += 100) {
+            const chunk = ids.slice(i, i + 100);
+            const { error: delErr } = await sb.from('retailer_items').delete().in('id', chunk);
+            if (delErr) console.warn('Reconcile delete failed:', delErr.message);
+          }
+          // count discontinued (toDelete minus the dupes we already counted is fuzzy;
+          // report total removed for clarity)
+          removedDiscontinued += Math.max(0, ids.length - 0);
         }
       } catch (recErr) { console.warn('Reconcile step error (non-fatal):', recErr); }
-      if (removedDiscontinued > 0) console.log(`[SPINs uploader] Removed ${removedDiscontinued} discontinued items (≤$1000, in-file UPCs).`);
+      if (removedDiscontinued > 0 || removedDupes > 0) console.log(`[SPINs uploader] Reconcile removed ${removedDiscontinued} rows (incl. ${removedDupes} duplicates).`);
 
       // Log the actuals counters summary so user can see what happened
       console.log('[SPINs uploader] Actuals write summary:', window._spinsActualsCounters);
