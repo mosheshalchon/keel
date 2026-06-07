@@ -5945,10 +5945,13 @@ window.SpinsStorage = (function() {
     const itemsByBrandIdx = {};
     for (const [k, set] of Object.entries(itemsByBrand)) itemsByBrandIdx[k] = [...set].sort();
     const periodDates = Object.assign({}, oldP.periodDates || {}, newP.periodDates || {});
+    // Per-period provenance for the upload-history view. Keep old entries, replace
+    // entries for periods present in the new upload.
+    const periodMeta = Object.assign({}, oldP.periodMeta || {});
     return {
       version: 2,
       category: newP.category || oldP.category,
-      periodDates, geos, brands, periods, windows,
+      periodDates, periodMeta, geos, brands, periods, windows,
       metrics: newP.metrics, metricLabels: newP.metricLabels, metricKinds: newP.metricKinds,
       itemsByBrand: itemsByBrandIdx, rows,
     };
@@ -5957,6 +5960,17 @@ window.SpinsStorage = (function() {
   async function saveDataset(payload, meta) {
     const sb = window.Auth.getClient();
     const category = normCat(meta.category || payload?.category || 'pizza');
+    // Capture which periods THIS upload contributed (before merge re-labels indices).
+    const uploadedPeriods = (payload && payload.periods) ? payload.periods.slice() : [];
+    const uploadedAt = new Date().toISOString();
+    // Count rows per period in this upload (for the history view).
+    const rowCountByPeriod = {};
+    if (payload && payload.rows) {
+      for (const r of payload.rows) {
+        const pl = payload.periods[r[2]];
+        rowCountByPeriod[pl] = (rowCountByPeriod[pl] || 0) + 1;
+      }
+    }
     // ACCUMULATE: by default, merge this upload into the category's existing dataset
     // so snapshots build a time series. Pass meta.replace=true to overwrite instead.
     if (!meta.replace) {
@@ -5966,6 +5980,11 @@ window.SpinsStorage = (function() {
           payload = mergePayloads(existing.payload, payload);
         }
       } catch (e) { console.warn('SPINS accumulate: could not load existing dataset, saving as-is:', e); }
+    }
+    // Stamp per-period provenance for the periods this file contributed.
+    payload.periodMeta = payload.periodMeta || {};
+    for (const pl of uploadedPeriods) {
+      payload.periodMeta[pl] = { fileName: meta.fileName || '—', uploadedAt, rowCount: rowCountByPeriod[pl] || 0 };
     }
     const metaObj = {
       fileName: meta.fileName,
@@ -6075,6 +6094,50 @@ window.SpinsStorage = (function() {
   }
 
   // Clear: remove a category's shared dataset + meta AND its local cache.
+  // Remove one period (date) from a category's accumulated dataset — drops its rows
+  // and rebuilds the dictionaries. Used by the upload-history "Delete" button.
+  async function removePeriod(cat, periodLabel) {
+    const category = normCat(cat || 'pizza');
+    const rec = await loadDataset(category);
+    if (!rec || !rec.payload) return false;
+    const p = rec.payload;
+    const keepPeriods = (p.periods || []).filter(x => x !== periodLabel);
+    if (keepPeriods.length === (p.periods || []).length) return false; // nothing to remove
+    if (keepPeriods.length === 0) { await clearDataset(category); return true; } // last one → clear
+    // Re-index to the reduced period set.
+    const oldPeriods = p.periods;
+    const keepSet = new Set(keepPeriods);
+    const newPeriodIdx = new Map(keepPeriods.map((v,i)=>[v,i]));
+    const rows = [];
+    for (const r of p.rows) {
+      const pl = oldPeriods[r[2]];
+      if (!keepSet.has(pl)) continue;
+      const nr = r.slice();
+      nr[2] = newPeriodIdx.get(pl);
+      rows.push(nr);
+    }
+    const periodDates = {}; for (const k of keepPeriods) if (p.periodDates && p.periodDates[k]) periodDates[k] = p.periodDates[k];
+    const periodMeta = {}; for (const k of keepPeriods) if (p.periodMeta && p.periodMeta[k]) periodMeta[k] = p.periodMeta[k];
+    const newPayload = Object.assign({}, p, { periods: keepPeriods, periodDates, periodMeta, rows });
+    await saveDataset(newPayload, { fileName: '(period removed)', category, categoryLabel: rec.meta?.categoryLabel || category, replace: true });
+    return true;
+  }
+
+  // List accumulated periods for a category with provenance (for history view).
+  async function listPeriods(cat) {
+    const category = normCat(cat || 'pizza');
+    const rec = await loadDataset(category);
+    if (!rec || !rec.payload) return [];
+    const p = rec.payload;
+    return (p.periods || []).map(pl => ({
+      period: pl,
+      date: (p.periodDates && p.periodDates[pl]) || pl,
+      fileName: (p.periodMeta && p.periodMeta[pl] && p.periodMeta[pl].fileName) || '—',
+      uploadedAt: (p.periodMeta && p.periodMeta[pl] && p.periodMeta[pl].uploadedAt) || null,
+      rowCount: (p.periodMeta && p.periodMeta[pl] && p.periodMeta[pl].rowCount) || null,
+    }));
+  }
+
   async function clearDataset(cat) {
     const category = normCat(cat || 'pizza');
     try {
@@ -6117,7 +6180,7 @@ window.SpinsStorage = (function() {
   }
 
   return {
-    saveDataset, loadDataset, clearDataset, listCategories,
+    saveDataset, loadDataset, clearDataset, listCategories, removePeriod, listPeriods,
     parseUploadedJson, validatePayload,
   };
 })();
@@ -32525,6 +32588,7 @@ render();
           </div>
         ` : ''}
         <button class="ins-btn-link" data-ins-action="upload">↻ Add / replace category data</button>
+        <button class="ins-btn-link" data-ins-action="history">☰ Upload history</button>
         <input type="file" id="ins-upload-input" accept=".csv,.xlsx,.xls,.json,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none;" />
       </div>
       <div id="ins-upload-progress" style="display:none; margin-top: 12px;">
@@ -34118,6 +34182,104 @@ render();
   // ─── Category picker (shown before uploading a SPINS file) ───
   // Lets the user pick an existing category or type a new one. Open-ended so any
   // category (Pizza/Bread/Handheld/…) can be added later without code changes.
+  // ─── SPINS upload history modal ───
+  // Per-category list of accumulated periods (each = one uploaded snapshot) showing
+  // file, date, row count — with a Delete button to remove a period. Mirrors the
+  // distributor upload-history modal.
+  async function openSpinsUploadHistory() {
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const fmtDate = (s) => { if (!s) return '—'; try { return new Date(s).toLocaleDateString(); } catch { return String(s).slice(0,10); } };
+
+    const cats = await SpinsStorage.listCategories();
+    let activeCat = (__insActiveCategory && cats.some(c => c.slug === __insActiveCategory)) ? __insActiveCategory : (cats[0] && cats[0].slug);
+
+    let modal = document.getElementById('hl-spins-uph-modal');
+    if (modal) modal.remove();
+    modal = document.createElement('div');
+    modal.id = 'hl-spins-uph-modal';
+    modal.className = 'hl-modal-backdrop';
+    modal.innerHTML = `
+      <div class="hl-modal" style="max-width:680px;">
+        <div class="hl-modal-header">
+          <h2 style="margin:0;">SPINS upload history</h2>
+          <button class="hl-modal-close" id="hl-spins-uph-close">×</button>
+        </div>
+        <div class="hl-modal-body">
+          <div id="hl-spins-uph-tabs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;"></div>
+          <div id="hl-spins-uph-body"></div>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const close = () => modal.remove();
+    modal.querySelector('#hl-spins-uph-close').addEventListener('click', close);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+
+    const renderTabs = () => {
+      const tabsEl = modal.querySelector('#hl-spins-uph-tabs');
+      if (!cats.length) { tabsEl.innerHTML = ''; return; }
+      tabsEl.innerHTML = cats.map(c => `
+        <button class="hl-spins-uph-tab" data-cat="${esc(c.slug)}" style="background:${c.slug===activeCat?'var(--ink)':'var(--paper)'};color:${c.slug===activeCat?'var(--paper)':'var(--ink-2)'};border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--mono);font-size:11px;letter-spacing:0.05em;padding:6px 14px;cursor:pointer;text-transform:uppercase;">${esc(c.label)}</button>
+      `).join('');
+      tabsEl.querySelectorAll('.hl-spins-uph-tab').forEach(b => b.addEventListener('click', () => { activeCat = b.dataset.cat; renderTabs(); renderBody(); }));
+    };
+
+    const renderBody = async () => {
+      const body = modal.querySelector('#hl-spins-uph-body');
+      if (!cats.length) { body.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);text-align:center;padding:32px;">No SPINS data uploaded yet.</div>`; return; }
+      body.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:20px;">Loading…</div>`;
+      const periods = await SpinsStorage.listPeriods(activeCat);
+      if (!periods.length) { body.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);text-align:center;padding:32px;">No periods stored for this category.</div>`; return; }
+      // Most recent first
+      periods.sort((a,b) => String(b.date).localeCompare(String(a.date)));
+      body.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead style="position:sticky;top:0;background:var(--bone-2);z-index:1;">
+            <tr>
+              <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Period (date)</th>
+              <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">File</th>
+              <th style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Rows</th>
+              <th style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Uploaded</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${periods.map(p => `
+              <tr style="border-top:1px solid var(--rule-softer);">
+                <td style="padding:6px 10px;font-family:var(--mono);">${esc(p.date)}</td>
+                <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(p.fileName || '—')}</td>
+                <td style="padding:6px 10px;text-align:right;font-family:var(--mono);">${p.rowCount != null ? p.rowCount.toLocaleString() : '—'}</td>
+                <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(fmtDate(p.uploadedAt))}</td>
+                <td style="padding:6px 10px;text-align:right;">
+                  <button class="hl-spins-uph-del" data-period="${esc(p.period)}" style="background:transparent;border:1px solid var(--lost);color:var(--lost);font-family:var(--mono);font-size:9px;letter-spacing:0.06em;padding:4px 8px;cursor:pointer;text-transform:uppercase;border-radius:3px;">Delete</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>`;
+      body.querySelectorAll('.hl-spins-uph-del').forEach(btn => btn.addEventListener('click', async () => {
+        if (!confirm(`Remove the ${btn.dataset.period} snapshot from ${activeCat}? This deletes that period's data from the accumulated dataset.`)) return;
+        btn.disabled = true; btn.textContent = '…';
+        try {
+          await SpinsStorage.removePeriod(activeCat, btn.dataset.period);
+          // Refresh categories (a category may now be empty) and re-render.
+          const fresh = await SpinsStorage.listCategories();
+          cats.length = 0; fresh.forEach(c => cats.push(c));
+          if (!cats.some(c => c.slug === activeCat)) activeCat = cats[0] && cats[0].slug;
+          renderTabs();
+          if (cats.length) await renderBody(); else body.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);text-align:center;padding:32px;">No SPINS data left.</div>`;
+          if (typeof renderInsightsPage === 'function') renderInsightsPage();
+        } catch (e) {
+          console.error('Remove period failed:', e);
+          btn.disabled = false; btn.textContent = 'Delete';
+          alert('Could not remove that period — see console.');
+        }
+      }));
+    };
+
+    renderTabs();
+    renderBody();
+  }
+
   function promptSpinsCategory(cb) {
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const existing = __insCategories || [];
@@ -34298,6 +34460,8 @@ render();
           __insActiveCategory = slug;
           renderInsightsPage();
         }
+      } else if (action === 'history') {
+        openSpinsUploadHistory();
       }
     });
 
