@@ -36042,6 +36042,30 @@ render();
       });
     }
 
+    // ── Drop discontinued / negligible items ──
+    // An item appears once per time-period window (4wk, 12wk). Keep an item at a
+    // retailer only if its Dollars exceed $1000 in AT LEAST ONE window; otherwise
+    // it's discontinued/negligible and we don't import it. Applied per retailer,
+    // per item (keyed by product_id when matched, else raw_upc).
+    const SALES_THRESHOLD = 1000;
+    let droppedLowSales = 0;
+    for (const [, group] of retailerGroups) {
+      const maxDollarsByItem = new Map();
+      const keyOf = (it) => (it.product_id != null ? 'p:' + it.product_id : 'u:' + (it.raw_upc || it.raw_item_name || ''));
+      for (const it of group.items) {
+        const k = keyOf(it);
+        const d = (it.dollars != null && isFinite(it.dollars)) ? it.dollars : 0;
+        if (!maxDollarsByItem.has(k) || d > maxDollarsByItem.get(k)) maxDollarsByItem.set(k, d);
+      }
+      const before = group.items.length;
+      group.items = group.items.filter(it => maxDollarsByItem.get(keyOf(it)) > SALES_THRESHOLD);
+      droppedLowSales += (before - group.items.length);
+    }
+    // Drop retailers left with no items after filtering.
+    for (const [name, group] of [...retailerGroups]) {
+      if (group.items.length === 0) retailerGroups.delete(name);
+    }
+
     // Count matched / unmatched across all rows
     let totalRows = 0, matchedRows = 0, unmatchedRows = 0;
     for (const [, group] of retailerGroups) {
@@ -36071,6 +36095,7 @@ render();
           ${brandSkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Other brands skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${brandSkipped}</td></tr>` : ''}
           ${timePeriodSkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— 24/52-week rows skipped (kept 4 + 12)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${timePeriodSkipped}</td></tr>` : ''}
           <tr><td style="padding:4px 0;color:var(--ink-3);">— Aggregator rows skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${aggregatorSkipped}</td></tr>
+          ${droppedLowSales > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Low-sales items skipped (≤$1,000)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${droppedLowSales}</td></tr>` : ''}
           ${emptySkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Empty geography skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${emptySkipped}</td></tr>` : ''}
           <tr><td style="padding:4px 0;">Item rows to import</td><td style="text-align:right;font-family:var(--mono);">${totalRows}</td></tr>
           <tr><td style="padding:4px 0;color:var(--won);">— Matched to products (UPC)</td><td style="text-align:right;font-family:var(--mono);color:var(--won);">${matchedRows}</td></tr>
