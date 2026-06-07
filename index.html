@@ -6152,6 +6152,8 @@ window.SpinsConverter = (function() {
         ]);
 
         let detectedMetrics = null; // [{ name, colIdx, kind: 'sum' | 'mean' }]
+        let _diagHeaders = null;    // headers seen on the first sheet (for error diagnostics)
+        let _diagSheet = null;
 
         // Per-sheet processing: parse to AOA, find header row,
         // index needed columns, accumulate aggregates.
@@ -6174,19 +6176,36 @@ window.SpinsConverter = (function() {
           const aoa = XLSX.utils.sheet_to_json(sheet, {
             header: 1, defval: null, blankrows: false, raw: true,
           });
-          // Header row = first row with > N filled cells, search
-          // first 25 rows for safety
+          // Header row = the row that actually contains SPINS column names.
+          // We look for a row containing recognizable headers (Geography / Dollars /
+          // Brand / UPC) rather than just "first row with enough cells", because some
+          // exports have title or metadata rows above the header that would otherwise
+          // be mistaken for it.
           let headerRowIdx = 0;
           let headers = [];
-          for (let r = 0; r < Math.min(25, aoa.length); r++) {
-            const row = aoa[r] || [];
-            const filled = row.filter((c) => c !== null && c !== '').length;
-            if (filled >= 6) {
+          const looksLikeHeader = (row) => {
+            const cells = (row || []).map(c => (c == null ? '' : String(c).trim().toLowerCase()));
+            const has = (name) => cells.some(c => c === name);
+            return (has('dollars') || has('geography') || has('brand') || has('upc'));
+          };
+          for (let r = 0; r < Math.min(40, aoa.length); r++) {
+            if (looksLikeHeader(aoa[r])) {
               headerRowIdx = r;
-              headers = row.map((c) => (c == null ? '' : String(c).trim()));
+              headers = (aoa[r] || []).map((c) => (c == null ? '' : String(c).trim()));
               break;
             }
           }
+          // Fallback to the old heuristic (first row with >=6 filled cells) if no
+          // recognizable header row was found.
+          if (!headers.length) {
+            for (let r = 0; r < Math.min(25, aoa.length); r++) {
+              const row = aoa[r] || [];
+              const filled = row.filter((c) => c !== null && c !== '').length;
+              if (filled >= 6) { headerRowIdx = r; headers = row.map((c) => (c == null ? '' : String(c).trim())); break; }
+            }
+          }
+
+          if (_diagHeaders === null) { _diagHeaders = headers.slice(0, 40); _diagSheet = sheetName; }
 
           // Build column index for the dimensional columns we care about
           const colIdx = {};
@@ -6296,7 +6315,8 @@ window.SpinsConverter = (function() {
         }
 
         if (!detectedMetrics || !detectedMetrics.length) {
-          throw new Error('No metric columns detected (looked for a "Dollars" column and measures after it). Check that this is a standard SPINS export.');
+          const seen = (_diagHeaders || []).filter(Boolean).join(' | ');
+          throw new Error('No metric columns detected. Headers found on sheet "' + (_diagSheet || '?') + '": [' + seen + ']');
         }
 
         // Build dictionaries
