@@ -25721,6 +25721,79 @@ render();
     });
   }
 
+  // ─── Promo calculation engine (mirrors Promotion_Estimator.xlsx exactly) ───
+  // Given a set of inputs, returns all computed outputs. Single source of truth used
+  // by both the promo card (live preview) and on save.
+  function computePromoLine(inp) {
+    const n = (v) => { const x = Number(v); return isFinite(x) ? x : 0; };
+    const atg = n(inp.atg_gross_price);
+    const distMarkup = n(inp.dist_markup);
+    const srp = n(inp.srp);
+    const edlp = n(inp.edlp);
+    const baseUpspw = n(inp.base_upspw);
+    const edlpLift = n(inp.edlp_lift_override);
+    const items = n(inp.num_items);
+    const doors = n(inp.doors);
+    const lift = n(inp.lift);
+    const events = n(inp.p1_events);
+    const wksPer = n(inp.p1_wks_per_event);
+    const scanUnit = n(inp.scan_bb_unit);
+    const distFeePct = inp.distributor_fee_pct == null ? 0.10 : n(inp.distributor_fee_pct);
+
+    const baseCost = atg * (1 + distMarkup);                 // Estimated Retailer Base Cost
+    const edlpCost = baseCost - edlp;                        // Retailer EDLP Cost
+    const retailerMargin = srp ? (srp - edlpCost) / srp : 0; // Retailer margin (K)
+
+    const avgWklyBaseUnits = doors * items * baseUpspw * (1 + edlpLift);
+    const wklyPromoUnits = avgWklyBaseUnits * (1 + lift);
+    const wklyIncremental = wklyPromoUnits - avgWklyBaseUnits;
+    const promoWeeks = events * wksPer;
+    const annualBaseEdlpUnits = avgWklyBaseUnits * 52;
+    const incrementalUnits = wklyIncremental * promoWeeks;
+    const totalUnits = annualBaseEdlpUnits + incrementalUnits;   // TOTAL units (Z)
+    const totalUnitsPromo = wklyPromoUnits * promoWeeks;          // Total Units Promo (AA)
+
+    const grossSales = totalUnits * atg;                     // Annual GSV / Gross Sales (AB)
+    const scanDollars = totalUnitsPromo * scanUnit;          // Scan $
+    const distributorFees = scanDollars * distFeePct;        // Distributor Fees
+    const annualEdlpSpend = avgWklyBaseUnits * 52 * edlp;    // Annual EDLP Spend
+    const annualTradeSpend = scanDollars + distributorFees + annualEdlpSpend; // (AG)
+    const tradeRate = grossSales ? annualTradeSpend / grossSales : 0;          // (AH)
+    const netSales = grossSales - annualTradeSpend;
+
+    return {
+      retailer_margin: retailerMargin,
+      avg_wkly_base_units: avgWklyBaseUnits,
+      wkly_promo_units: wklyPromoUnits,
+      promo_weeks: promoWeeks,
+      annual_units: totalUnits,
+      total_units_promo: totalUnitsPromo,
+      annual_gross_sales: grossSales,
+      scan_dollars: scanDollars,
+      distributor_fees: distributorFees,
+      annual_edlp_spend: annualEdlpSpend,
+      annual_trade_spend: annualTradeSpend,
+      trade_rate: tradeRate,
+      net_sales: netSales,
+    };
+  }
+
+  // Compute the per-event date windows from a start date, # events, and weeks/event.
+  // Event i runs for (wksPer) weeks, back-to-back. Returns array of {start,end} ISO.
+  function computePromoEventDates(startDateISO, events, wksPer) {
+    const out = [];
+    if (!startDateISO || !events) return out;
+    const base = new Date(startDateISO + 'T00:00:00');
+    if (isNaN(base.getTime())) return out;
+    const dur = Math.max(1, Math.round(wksPer)) * 7;  // days per event
+    for (let i = 0; i < Math.round(events); i++) {
+      const s = new Date(base.getTime()); s.setDate(s.getDate() + i * dur);
+      const e = new Date(s.getTime()); e.setDate(e.getDate() + dur - 1);
+      out.push({ start: s.toISOString().slice(0,10), end: e.toISOString().slice(0,10) });
+    }
+    return out;
+  }
+
   async function renderPromosPage() {
     const session = HL.mountPage('promos');
     if (!session) return;
@@ -25728,119 +25801,138 @@ render();
     const brandId = window.BrandLibrary.getSession().brandId;
     const sb = window.Auth.getClient();
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
+    const pct = (n) => (n == null || !isFinite(n)) ? '—' : (n * 100).toFixed(1) + '%';
+    const num = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
 
     main.innerHTML = `
-      <div class="eyebrow">— Promotional planning</div>
-      <h1 class="page-title">Promos.</h1>
-      <p class="page-meta">Retailers and the items they carry, sourced from your SPINS uploads. Build promos on top of this.</p>
-      <div id="hl-promo-body" style="margin-top:20px;"><div class="hl-loading">Loading retailers…</div></div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
+        <div>
+          <div class="eyebrow">— Promotional planning</div>
+          <h1 class="page-title">Promos.</h1>
+          <p class="page-meta">Annual promo plan by retailer. Expand a retailer to see individual promo lines.</p>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
+          <button id="hl-promo-add" style="background:var(--ink);color:var(--paper);border:none;border-radius:6px;padding:10px 20px;font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer;">+ Add promo</button>
+          <button id="hl-promo-upload" style="background:transparent;color:var(--ink-2);border:1px solid var(--rule-soft);border-radius:6px;padding:7px 16px;font-family:var(--sans);font-size:12px;cursor:pointer;">↥ Upload promos (Excel)</button>
+          <input type="file" id="hl-promo-upload-input" accept=".xlsx,.xls,.csv" style="display:none;" />
+        </div>
+      </div>
+      <div id="hl-promo-summary" style="margin-top:20px;"><div class="hl-loading">Loading promos…</div></div>
     `;
 
-    // Load retailers + all their carried items (across every category) in two queries.
-    const [{ data: retailers }, { data: items }] = await Promise.all([
-      sb.from('retailers').select('*').eq('brand_id', brandId),
-      sb.from('retailer_items').select('*').eq('brand_id', brandId),
+    document.getElementById('hl-promo-add').addEventListener('click', () => openPromoCard(null));
+    document.getElementById('hl-promo-upload').addEventListener('click', () => document.getElementById('hl-promo-upload-input').click());
+    document.getElementById('hl-promo-upload-input').addEventListener('change', (e) => {
+      const f = e.target.files?.[0];
+      if (f) handlePromoExcelUpload(f);
+      e.target.value = '';
+    });
+
+    // Load promos + retailer names
+    const [{ data: promos }, { data: retailers }] = await Promise.all([
+      sb.from('promos').select('*').eq('brand_id', brandId),
+      sb.from('retailers').select('id, name').eq('brand_id', brandId),
     ]);
-    const body = document.getElementById('hl-promo-body');
-    if (!retailers || retailers.length === 0) {
-      body.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:32px;text-align:center;">No retailers yet. Upload SPINS data in Insights to populate retailers and their items.</div>`;
+    const retById = new Map((retailers || []).map(r => [r.id, r.name]));
+    const summaryEl = document.getElementById('hl-promo-summary');
+
+    if (!promos || promos.length === 0) {
+      summaryEl.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:32px;text-align:center;background:var(--bone-2);border-radius:8px;">No promos yet. Click "+ Add promo" to build one, or upload an Excel file of promos.</div>`;
       return;
     }
 
-    // Join product descriptions for items that matched a product.
-    const productIds = [...new Set((items || []).map(i => i.product_id).filter(Boolean))];
-    const productsById = new Map();
-    if (productIds.length) {
-      // chunk to avoid huge IN lists
-      for (let i = 0; i < productIds.length; i += 200) {
-        const { data: prods } = await sb.from('products').select('id, item_description, category, unit_upc').in('id', productIds.slice(i, i+200));
-        (prods || []).forEach(p => productsById.set(p.id, p));
-      }
+    // Group promo lines by retailer
+    const byRetailer = new Map();
+    for (const p of promos) {
+      if (!byRetailer.has(p.retailer_id)) byRetailer.set(p.retailer_id, []);
+      byRetailer.get(p.retailer_id).push(p);
     }
 
-    // Group items by retailer_id, deduped by normalized UPC. When the same UPC has
-    // multiple rows (e.g. a Brand-Library-matched one and a raw one), keep the
-    // matched row (it carries the Brand Library name/UPC).
-    const normU = (u) => String(u == null ? '' : u).replace(/\D/g, '');
-    const itemsByRetailer = new Map();
-    for (const it of (items || [])) {
-      if (!itemsByRetailer.has(it.retailer_id)) itemsByRetailer.set(it.retailer_id, new Map());
-      const byUpc = itemsByRetailer.get(it.retailer_id);
-      // Dedup key: normalized raw UPC (both the matched and the leftover null-product
-      // row carry the same raw_upc), falling back to Brand Library UPC or product id.
-      const prod = it.product_id ? productsById.get(it.product_id) : null;
-      const key = normU(it.raw_upc) || normU(prod && prod.unit_upc) || (it.product_id ? 'p:'+it.product_id : 'id:'+it.id);
-      const existing = byUpc.get(key);
-      // Keep the matched row over an unmatched one; otherwise keep the first.
-      if (!existing || (!existing.product_id && it.product_id)) byUpc.set(key, it);
+    // Build summary rows (aggregate per retailer; weighted avgs for margin/trade-rate)
+    const rows = [];
+    for (const [rid, lines] of byRetailer) {
+      const annualUnits = lines.reduce((a, l) => a + (l.annual_units || 0), 0);
+      const grossSales = lines.reduce((a, l) => a + (l.annual_gross_sales || 0), 0);
+      const tradeSpend = lines.reduce((a, l) => a + (l.annual_trade_spend || 0), 0);
+      const events = lines.reduce((a, l) => a + (l.p1_events || 0), 0);
+      // weighted avg margin by gross sales; trade rate = total spend / total sales
+      const margin = grossSales ? lines.reduce((a, l) => a + (l.retailer_margin || 0) * (l.annual_gross_sales || 0), 0) / grossSales : 0;
+      const tradeRate = grossSales ? tradeSpend / grossSales : 0;
+      const avgWks = lines.length ? lines.reduce((a, l) => a + (l.p1_wks_per_event || 0), 0) / lines.length : 0;
+      rows.push({ rid, name: retById.get(rid) || '(unknown retailer)', lines, annualUnits, grossSales, tradeSpend, events, margin, tradeRate, avgWks });
     }
+    rows.sort((a, b) => b.grossSales - a.grossSales || a.name.localeCompare(b.name));
 
-    // Sort retailers by item count (most carried first), then name.
-    const rows = retailers.map(r => ({ r, items: [...(itemsByRetailer.get(r.id) || new Map()).values()] }))
-      .sort((a, b) => b.items.length - a.items.length || String(a.r.name).localeCompare(String(b.r.name)));
-
-    const itemName = (it) => {
-      const p = it.product_id ? productsById.get(it.product_id) : null;
-      return (p && p.item_description) || it.raw_item_name || it.raw_upc || '(unnamed item)';
-    };
-    const itemUpc = (it) => {
-      const p = it.product_id ? productsById.get(it.product_id) : null;
-      return (p && p.unit_upc) || it.raw_upc || '—';
-    };
-    const itemCat = (it) => {
-      const p = it.product_id ? productsById.get(it.product_id) : null;
-      return it.category || (p && p.category) || '—';
-    };
-
-    const totalDeduped = rows.reduce((a, r) => a + r.items.length, 0);
-    body.innerHTML = `
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;">${rows.length} retailers · ${totalDeduped.toLocaleString()} carried items</div>
-      <div style="display:flex;flex-direction:column;gap:8px;">
-        ${rows.map((row, idx) => {
-          // Distinct categories carried at this retailer (for the summary line).
-          const catsHere = [...new Set(row.items.map(itemCat).filter(c => c && c !== '—'))];
-          return `
-          <div style="border:1px solid var(--rule-soft);border-radius:8px;overflow:hidden;">
-            <button class="hl-promo-retailer" data-idx="${idx}" style="width:100%;text-align:left;background:var(--paper);border:none;padding:14px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:12px;">
-              <div>
-                <div style="font-family:var(--serif);font-size:16px;font-weight:600;color:var(--ink);">${esc(row.r.name)}</div>
-                <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">${row.items.length} item${row.items.length===1?'':'s'}${catsHere.length?' · '+catsHere.map(esc).join(', '):''}</div>
-              </div>
-              <span class="hl-promo-caret" data-idx="${idx}" style="font-family:var(--mono);color:var(--ink-3);font-size:12px;">▸</span>
-            </button>
-            <div class="hl-promo-items" data-idx="${idx}" style="display:none;border-top:1px solid var(--rule-softer);padding:8px 16px 14px;">
-              ${row.items.length === 0 ? `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:8px 0;">No items recorded.</div>` : `
-                <table style="width:100%;border-collapse:collapse;font-size:12px;">
-                  <thead><tr>
-                    <th style="text-align:left;padding:6px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">Item</th>
-                    <th style="text-align:left;padding:6px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">Category</th>
-                    <th style="text-align:left;padding:6px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">UPC</th>
-                  </tr></thead>
-                  <tbody>
-                    ${row.items.slice().sort((a,b)=>itemName(a).localeCompare(itemName(b))).map(it => `
-                      <tr style="border-top:1px solid var(--rule-softer);">
-                        <td style="padding:6px 8px;">${esc(itemName(it))}</td>
-                        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(itemCat(it))}</td>
-                        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(itemUpc(it))}</td>
-                      </tr>
-                    `).join('')}
-                  </tbody>
-                </table>`}
-            </div>
-          </div>`;
-        }).join('')}
+    const th = (label, right) => `<th style="text-align:${right?'right':'left'};padding:8px 10px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;">${label}</th>`;
+    summaryEl.innerHTML = `
+      <div class="hl-master-table-wrap">
+        <table class="hl-master-table" style="font-size:12px;">
+          <thead><tr>
+            ${th('Retailer')}${th('Retailer margin', true)}${th('# Events', true)}${th('Wks/event', true)}${th('Annual units', true)}${th('Annual gross sales', true)}${th('Annual trade spend', true)}${th('Trade rate', true)}${th('')}
+          </tr></thead>
+          <tbody>
+            ${rows.map((row, idx) => `
+              <tr class="hl-promo-srow" data-idx="${idx}" style="cursor:pointer;border-top:1px solid var(--rule-soft);">
+                <td class="text" style="padding:9px 10px;font-weight:600;">${esc(row.name)}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${pct(row.margin)}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${num(row.events)}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${row.avgWks ? row.avgWks.toFixed(0) : '—'}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${num(row.annualUnits)}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${money(row.grossSales)}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${money(row.tradeSpend)}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${pct(row.tradeRate)}</td>
+                <td style="text-align:right;padding:9px 10px;font-family:var(--mono);color:var(--ink-3);"><span class="hl-promo-caret" data-idx="${idx}">▸</span></td>
+              </tr>
+              <tr class="hl-promo-detail" data-idx="${idx}" style="display:none;">
+                <td colspan="9" style="padding:0 10px 10px;background:var(--bone-2);">
+                  <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:4px;">
+                    <thead><tr>
+                      ${th('Promoted group')}${th('Type')}${th('Margin', true)}${th('Events', true)}${th('Wks', true)}${th('Annual units', true)}${th('Gross sales', true)}${th('Trade spend', true)}${th('Trade rate', true)}${th('')}
+                    </tr></thead>
+                    <tbody>
+                      ${row.lines.map(l => `
+                        <tr style="border-top:1px solid var(--rule-softer);">
+                          <td class="text" style="padding:6px 10px;">${esc(l.promoted_group || '—')}</td>
+                          <td class="text" style="padding:6px 10px;font-family:var(--mono);font-size:10px;">${esc(l.promo_type === 'Direct' ? 'EDLP' : (l.promo_type || '—'))}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${pct(l.retailer_margin)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(l.p1_events)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(l.p1_wks_per_event)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(l.annual_units)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${money(l.annual_gross_sales)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${money(l.annual_trade_spend)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${pct(l.trade_rate)}</td>
+                          <td style="text-align:right;padding:6px 10px;"><button class="hl-promo-edit" data-id="${esc(l.id)}" style="background:transparent;border:1px solid var(--rule-soft);border-radius:3px;font-family:var(--mono);font-size:9px;padding:3px 8px;cursor:pointer;text-transform:uppercase;">Edit</button></td>
+                        </tr>
+                      `).join('')}
+                    </tbody>
+                  </table>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
       </div>
     `;
 
-    // Expand/collapse retailers
-    body.querySelectorAll('.hl-promo-retailer').forEach(btn => btn.addEventListener('click', () => {
-      const idx = btn.dataset.idx;
-      const panel = body.querySelector(`.hl-promo-items[data-idx="${idx}"]`);
-      const caret = body.querySelector(`.hl-promo-caret[data-idx="${idx}"]`);
-      const open = panel.style.display !== 'none';
-      panel.style.display = open ? 'none' : '';
+    summaryEl.querySelectorAll('.hl-promo-srow').forEach(tr => tr.addEventListener('click', (e) => {
+      if (e.target.closest('.hl-promo-edit')) return;
+      const idx = tr.dataset.idx;
+      const detail = summaryEl.querySelector(`.hl-promo-detail[data-idx="${idx}"]`);
+      const caret = summaryEl.querySelector(`.hl-promo-caret[data-idx="${idx}"]`);
+      const open = detail.style.display !== 'none';
+      detail.style.display = open ? 'none' : '';
       if (caret) caret.textContent = open ? '▸' : '▾';
     }));
+    summaryEl.querySelectorAll('.hl-promo-edit').forEach(btn => btn.addEventListener('click', () => openPromoCard(btn.dataset.id)));
+  }
+
+  // Placeholder hooks — implemented in the next build step (promo card + Excel upload)
+  async function openPromoCard(promoId) {
+    alert('Promo card coming next — ' + (promoId ? 'edit ' + promoId : 'new promo'));
+  }
+  async function handlePromoExcelUpload(file) {
+    alert('Excel promo upload coming next — ' + file.name);
   }
 
   let _distActiveSubTab = 'inventory';  // 'inventory' | 'sales' | 'service-levels'
