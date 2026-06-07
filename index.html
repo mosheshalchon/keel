@@ -6538,10 +6538,16 @@ window.SpinsConverter = (function() {
         const periodDates = {};
         let n = 0, bytes = 0;
         const size = file.size || 0;
+        // ATG row capture (for retailer_items) — collected in THIS single pass so the
+        // main thread never has to re-stream the (huge) file a second time.
+        const ATG_RE = /against the grain/i;
+        const atgRows = [];   // array of objects keyed by header (like sheet_to_json)
+        let fullHeader = null;
 
         const handleRow = (cells) => {
           if (!header) {
             header = cells.map(h => String(h == null ? '' : h).trim());
+            fullHeader = header.slice();
             header.forEach((h, i) => { idx[h] = i; });
             gGeo = idx['Geography']; gPer = idx['Time Period']; gBrand = idx['Brand'];
             gDesc = idx['Description']; gUpc = idx['UPC']; gDate = idx['Time Period End Date'];
@@ -6559,6 +6565,12 @@ window.SpinsConverter = (function() {
           }
           const geo = cells[gGeo], window = cells[gPer], brand = cells[gBrand];
           if (!geo || !brand || !window) return;
+          // Capture our brand's rows as header-keyed objects for retailer_items.
+          if (ATG_RE.test(String(brand))) {
+            const obj = {};
+            for (let i = 0; i < fullHeader.length; i++) obj[fullHeader[i]] = cells[i] != null ? cells[i] : '';
+            atgRows.push(obj);
+          }
           allGeos.add(geo); allBrands.add(brand); allWindows.add(window);
           if (gDate != null && cells[gDate] && !periodDates['CSV']) periodDates['CSV'] = String(cells[gDate]).slice(0,10);
           let item = (gDesc != null ? cells[gDesc] : null) || (gUpc != null ? cells[gUpc] : null);
@@ -6635,7 +6647,9 @@ window.SpinsConverter = (function() {
         const payload = { version:2, category:'SPINS Data', periodDates, geos, brands, periods, windows,
           metrics: metricCodes, metricLabels, metricKinds, itemsByBrand: itemsByBrandIdx, rows };
         progress('finalizing', 100, 'Done · ' + rows.length.toLocaleString() + ' rows · ' + totalItems.toLocaleString() + ' items');
-        self.postMessage({ type:'done', payload });
+        // atgRows = our brand's raw rows (header-keyed) for retailer_items — sent
+        // separately so it isn't persisted into the Insights dataset.
+        self.postMessage({ type:'done', payload, atgRows });
       } catch (err) {
         self.postMessage({ type:'error', message: (err && (err.message||err.name)) || String(err), stack: err && err.stack });
       }
@@ -6653,7 +6667,13 @@ window.SpinsConverter = (function() {
       w.onmessage = (e) => {
         const m = e.data || {};
         if (m.type === 'progress') { if (typeof onProgress === 'function') onProgress(m); }
-        else if (m.type === 'done') { cleanup(); resolve(m.payload); }
+        else if (m.type === 'done') {
+          cleanup();
+          // Attach our brand's rows (for retailer_items) onto the payload under a
+          // private key; the upload handler consumes and strips it before saving.
+          if (m.payload && m.atgRows) { try { m.payload.__atgRows = m.atgRows; } catch (e) {} }
+          resolve(m.payload);
+        }
         else if (m.type === 'error') { cleanup(); reject(new Error(m.message || 'CSV worker failed')); }
       };
       w.onerror = (e) => { cleanup(); reject(new Error(e.message || 'CSV worker crashed')); };
@@ -34042,7 +34062,7 @@ render();
     const isJson = /\.json$/i.test(file.name);
 
     try {
-      let payload, sizeBytes;
+      let payload, sizeBytes, preParsedAtgRows = null;
       if (isXlsx || isCsv) {
         // Convert in a Web Worker. CSV streams (handles 600k+ rows); xlsx uses
         // SheetJS. SpinsConverter.convert() auto-detects which path to use.
@@ -34055,6 +34075,11 @@ render();
         payload = await SpinsConverter.convert(file, (p) => {
           setProgress(p.pct || 0, p.detail || p.stage || 'Working...');
         });
+        // Pull out our brand's pre-parsed rows (collected during the SAME pass) so
+        // we DON'T re-read the big file for retailer_items. Strip before saving so
+        // they aren't persisted into the Insights dataset.
+        preParsedAtgRows = (payload && payload.__atgRows) || null;
+        if (payload) { try { delete payload.__atgRows; } catch (e) {} }
         // Estimate size for the meta record
         sizeBytes = JSON.stringify(payload).length;
       } else if (isJson) {
@@ -34080,8 +34105,12 @@ render();
       if ((isXlsx || isCsv) && typeof handleSpinsBulkUpload === 'function') {
         try {
           setMsg(`Updating retailer items from ${cat.label}…`);
+          // Pass the rows already parsed during conversion (CSV path) so the big
+          // file is NOT read a second time. If absent (xlsx path), the importer
+          // falls back to reading the file itself.
           await handleSpinsBulkUpload({
             file,
+            preParsedRows: preParsedAtgRows,
             autoConfirm: true,
             onStatus: (msg) => { setMsg(msg); },
           });
@@ -35344,7 +35373,11 @@ render();
     const isCsv = /\.csv$/i.test(file.name || '') || file.type === 'text/csv';
     let rows = [];
     try {
-      if (isCsv) {
+      if (opts && Array.isArray(opts.preParsedRows)) {
+        // Rows were already parsed (and brand-filtered) during conversion — reuse
+        // them so we never read the big file twice (prevents the OOM tab crash).
+        rows = opts.preParsedRows;
+      } else if (isCsv) {
         // Stream the CSV and keep ONLY Against-The-Grain rows (the file can be
         // 600k+ rows; we never hold them all). Produces the same array-of-objects
         // shape sheet_to_json would, using the header row for keys.
