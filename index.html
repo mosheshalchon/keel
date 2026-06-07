@@ -25927,10 +25927,216 @@ render();
     summaryEl.querySelectorAll('.hl-promo-edit').forEach(btn => btn.addEventListener('click', () => openPromoCard(btn.dataset.id)));
   }
 
-  // Placeholder hooks — implemented in the next build step (promo card + Excel upload)
+
+  // ─── Promo card (add / edit one promo line) ───
   async function openPromoCard(promoId) {
-    alert('Promo card coming next — ' + (promoId ? 'edit ' + promoId : 'new promo'));
+    const sb = window.Auth.getClient();
+    const brandId = window.BrandLibrary.getSession().brandId;
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    // Load retailers + (if editing) the existing promo
+    const { data: retailers } = await sb.from('retailers').select('id, name').eq('brand_id', brandId).order('name');
+    let existing = null;
+    if (promoId) {
+      const { data } = await sb.from('promos').select('*').eq('id', promoId).maybeSingle();
+      existing = data || null;
+    }
+
+    const e = existing || {};
+    const v = (k, d) => (e[k] != null ? e[k] : (d != null ? d : ''));
+
+    let modal = document.getElementById('hl-promo-card-modal');
+    if (modal) modal.remove();
+    modal = document.createElement('div');
+    modal.id = 'hl-promo-card-modal';
+    modal.className = 'hl-modal-backdrop';
+    const inp = (id, val, ph, step) => `<input id="${id}" type="number" step="${step||'any'}" value="${val===''?'':esc(val)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" />`;
+    const lbl = (t) => `<label style="display:block;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:3px;">${t}</label>`;
+
+    modal.innerHTML = `
+      <div class="hl-modal" style="max-width:880px;max-height:92vh;display:flex;flex-direction:column;">
+        <div class="hl-modal-header">
+          <h2 style="margin:0;">${promoId ? 'Edit promo' : 'New promo'}</h2>
+          <button class="hl-modal-close" id="hl-pc-close">×</button>
+        </div>
+        <div class="hl-modal-body" style="overflow-y:auto;">
+          <!-- Retailer + group + type -->
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:8px;">
+            <div>
+              ${lbl('Retailer *')}
+              <select id="hl-pc-retailer" style="width:100%;box-sizing:border-box;padding:7px 9px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+                <option value="">— Select retailer —</option>
+                ${(retailers||[]).map(r => `<option value="${esc(r.id)}" ${r.id===e.retailer_id?'selected':''}>${esc(r.name)}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              ${lbl('Promoted group')}
+              <input id="hl-pc-group" type="text" value="${esc(v('promoted_group'))}" placeholder="e.g. Bread, Pizza" style="width:100%;box-sizing:border-box;padding:7px 9px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" />
+            </div>
+            <div>
+              ${lbl('Promo type')}
+              <select id="hl-pc-type" style="width:100%;box-sizing:border-box;padding:7px 9px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+                ${[['Scan','Scan'],['Direct','EDLP'],['MCB','MCB']].map(([val,label]) => `<option value="${val}" ${e.promo_type===val?'selected':''}>${label}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+          <div id="hl-pc-items-note" style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-bottom:14px;min-height:16px;"></div>
+
+          <!-- Pricing inputs -->
+          <div class="hl-docs-label" style="margin-bottom:8px;">Pricing</div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
+            <div>${lbl('ATG gross price')}${inp('hl-pc-atg', v('atg_gross_price'), '4.87')}</div>
+            <div>${lbl('Dist markup')}${inp('hl-pc-markup', v('dist_markup'), '0.13')}</div>
+            <div>${lbl('Cur retail / SRP')}${inp('hl-pc-srp', v('srp'), '8.49')}</div>
+            <div>${lbl('EDLP ($ off)')}${inp('hl-pc-edlp', v('edlp', 0), '0.23')}</div>
+          </div>
+
+          <!-- Volume inputs -->
+          <div class="hl-docs-label" style="margin-bottom:8px;">Volume & promo</div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;">
+            <div>${lbl('Base UPSPW (velocity)')}${inp('hl-pc-upspw', v('base_upspw'), '1.2')}</div>
+            <div>${lbl('# Items')}${inp('hl-pc-items', v('num_items'), '1')}</div>
+            <div>${lbl('Doors')}${inp('hl-pc-doors', v('doors'), '845')}</div>
+            <div>${lbl('Lift')}${inp('hl-pc-lift', v('lift'), '0.35')}</div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
+            <div>${lbl('EDLP lift override')}${inp('hl-pc-edlplift', v('edlp_lift_override', 0), '0')}</div>
+            <div>${lbl('P1 # Events')}${inp('hl-pc-events', v('p1_events'), '8')}</div>
+            <div>${lbl('Wks per event')}${inp('hl-pc-wks', v('p1_wks_per_event'), '2')}</div>
+            <div>${lbl('Scan / BB unit ($)')}${inp('hl-pc-scan', v('scan_bb_unit'), '1.10')}</div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
+            <div>${lbl('Distributor fee % (scan)')}${inp('hl-pc-distfee', v('distributor_fee_pct', 0.10), '0.10')}</div>
+            <div>${lbl('First event start date')}<input id="hl-pc-startdate" type="date" value="${esc(v('start_date'))}" style="width:100%;box-sizing:border-box;padding:6px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" /></div>
+          </div>
+
+          <!-- Event date schedule (computed) -->
+          <div class="hl-docs-label" style="margin-bottom:8px;">Event schedule <span style="color:var(--ink-3);font-weight:normal;font-family:var(--serif);font-style:italic;text-transform:none;letter-spacing:0;">— computed from start date, # events, weeks/event</span></div>
+          <div id="hl-pc-schedule" style="background:var(--bone-2);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--mono);font-size:11px;color:var(--ink-2);">Enter a start date to see the schedule.</div>
+
+          <!-- Live calc preview -->
+          <div class="hl-docs-label" style="margin-bottom:8px;">Calculated</div>
+          <div id="hl-pc-calc" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;"></div>
+        </div>
+        <div class="hl-modal-footer" style="display:flex;justify-content:space-between;gap:10px;padding:14px 20px;border-top:1px solid var(--rule-soft);">
+          <div>${promoId ? `<button id="hl-pc-delete" style="background:transparent;border:1px solid var(--lost);color:var(--lost);border-radius:6px;padding:9px 16px;font-family:var(--sans);font-size:13px;cursor:pointer;">Delete</button>` : ''}</div>
+          <div style="display:flex;gap:10px;">
+            <button id="hl-pc-cancel" class="hl-btn-secondary">Cancel</button>
+            <button id="hl-pc-save" class="hl-btn-primary">${promoId ? 'Save changes' : 'Add promo'}</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+
+    const close = () => modal.remove();
+    modal.querySelector('#hl-pc-close').addEventListener('click', close);
+    modal.querySelector('#hl-pc-cancel').addEventListener('click', close);
+    modal.addEventListener('click', (ev) => { if (ev.target === modal) close(); });
+
+    const getInputs = () => ({
+      retailer_id: modal.querySelector('#hl-pc-retailer').value || null,
+      promoted_group: modal.querySelector('#hl-pc-group').value.trim() || null,
+      promo_type: modal.querySelector('#hl-pc-type').value,
+      atg_gross_price: parseFloat(modal.querySelector('#hl-pc-atg').value) || 0,
+      dist_markup: parseFloat(modal.querySelector('#hl-pc-markup').value) || 0,
+      srp: parseFloat(modal.querySelector('#hl-pc-srp').value) || 0,
+      edlp: parseFloat(modal.querySelector('#hl-pc-edlp').value) || 0,
+      base_upspw: parseFloat(modal.querySelector('#hl-pc-upspw').value) || 0,
+      num_items: parseFloat(modal.querySelector('#hl-pc-items').value) || 0,
+      doors: parseFloat(modal.querySelector('#hl-pc-doors').value) || 0,
+      lift: parseFloat(modal.querySelector('#hl-pc-lift').value) || 0,
+      edlp_lift_override: parseFloat(modal.querySelector('#hl-pc-edlplift').value) || 0,
+      p1_events: parseFloat(modal.querySelector('#hl-pc-events').value) || 0,
+      p1_wks_per_event: parseFloat(modal.querySelector('#hl-pc-wks').value) || 0,
+      scan_bb_unit: parseFloat(modal.querySelector('#hl-pc-scan').value) || 0,
+      distributor_fee_pct: modal.querySelector('#hl-pc-distfee').value === '' ? 0.10 : parseFloat(modal.querySelector('#hl-pc-distfee').value),
+      start_date: modal.querySelector('#hl-pc-startdate').value || null,
+    });
+
+    const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
+    const pctf = (n) => (n == null || !isFinite(n)) ? '—' : (n * 100).toFixed(1) + '%';
+    const numf = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
+    const calcCell = (label, val) => `<div style="background:var(--bone-2);border-radius:6px;padding:9px 11px;"><div style="font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${label}</div><div style="font-family:var(--mono);font-size:15px;font-weight:600;color:var(--ink);margin-top:2px;">${val}</div></div>`;
+
+    const recalc = () => {
+      const inputs = getInputs();
+      const r = computePromoLine(inputs);
+      modal.querySelector('#hl-pc-calc').innerHTML =
+        calcCell('Retailer margin', pctf(r.retailer_margin)) +
+        calcCell('Annual units', numf(r.annual_units)) +
+        calcCell('Annual gross sales', money(r.annual_gross_sales)) +
+        calcCell('Annual trade spend', money(r.annual_trade_spend)) +
+        calcCell('Trade rate', pctf(r.trade_rate)) +
+        calcCell('Scan $', money(r.scan_dollars)) +
+        calcCell('Distributor fees', money(r.distributor_fees)) +
+        calcCell('Net sales', money(r.net_sales));
+      // schedule
+      const dates = computePromoEventDates(inputs.start_date, inputs.p1_events, inputs.p1_wks_per_event);
+      const sched = modal.querySelector('#hl-pc-schedule');
+      if (!dates.length) { sched.textContent = 'Enter a start date (and events / weeks) to see the schedule.'; }
+      else {
+        sched.innerHTML = dates.map((d, i) => `<div style="display:flex;justify-content:space-between;padding:2px 0;"><span>Event ${i+1}</span><span>${d.start} → ${d.end}</span></div>`).join('');
+      }
+    };
+
+    // Auto-populate carried items count when retailer changes (informational)
+    const updateItemsNote = async () => {
+      const rid = modal.querySelector('#hl-pc-retailer').value;
+      const note = modal.querySelector('#hl-pc-items-note');
+      if (!rid) { note.textContent = ''; return; }
+      const { data: its } = await sb.from('retailer_items').select('id, raw_upc, product_id').eq('brand_id', brandId).eq('retailer_id', rid);
+      const norm = (u) => String(u==null?'':u).replace(/\D/g,'');
+      const uniq = new Set((its||[]).map(i => norm(i.raw_upc) || ('p:'+i.product_id)));
+      note.textContent = `This retailer carries ${uniq.size} item${uniq.size===1?'':'s'} (from SPINS). Use this to inform # items / doors below.`;
+    };
+
+    modal.querySelectorAll('input, select').forEach(el => el.addEventListener('input', recalc));
+    modal.querySelector('#hl-pc-retailer').addEventListener('change', updateItemsNote);
+    recalc();
+    if (e.retailer_id) updateItemsNote();
+
+    // Save
+    modal.querySelector('#hl-pc-save').addEventListener('click', async () => {
+      const inputs = getInputs();
+      if (!inputs.retailer_id) { alert('Please select a retailer.'); return; }
+      const computed = computePromoLine(inputs);
+      const eventDates = computePromoEventDates(inputs.start_date, inputs.p1_events, inputs.p1_wks_per_event);
+      const row = {
+        brand_id: brandId,
+        ...inputs,
+        event_dates: eventDates,
+        retailer_margin: computed.retailer_margin,
+        annual_units: computed.annual_units,
+        annual_gross_sales: computed.annual_gross_sales,
+        annual_trade_spend: computed.annual_trade_spend,
+        trade_rate: computed.trade_rate,
+        net_sales: computed.net_sales,
+        scan_dollars: computed.scan_dollars,
+        distributor_fees: computed.distributor_fees,
+        annual_edlp_spend: computed.annual_edlp_spend,
+        updated_at: new Date().toISOString(),
+      };
+      const saveBtn = modal.querySelector('#hl-pc-save');
+      saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+      let err;
+      if (promoId) ({ error: err } = await sb.from('promos').update(row).eq('id', promoId));
+      else ({ error: err } = await sb.from('promos').insert(row));
+      if (err) { alert('Save failed: ' + err.message); saveBtn.disabled = false; saveBtn.textContent = promoId ? 'Save changes' : 'Add promo'; return; }
+      close();
+      renderPromosPage();
+    });
+
+    // Delete
+    const delBtn = modal.querySelector('#hl-pc-delete');
+    if (delBtn) delBtn.addEventListener('click', async () => {
+      if (!confirm('Delete this promo line?')) return;
+      const { error } = await sb.from('promos').delete().eq('id', promoId);
+      if (error) { alert('Delete failed: ' + error.message); return; }
+      close();
+      renderPromosPage();
+    });
   }
+
   async function handlePromoExcelUpload(file) {
     alert('Excel promo upload coming next — ' + file.name);
   }
