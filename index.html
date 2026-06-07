@@ -5981,12 +5981,15 @@ window.SpinsStorage = (function() {
         } catch (e) { /* use derived label */ }
         cats.push({ slug, label });
       }
-      // Legacy single dataset (brand/dataset.json) shows as Pizza if no folders.
-      if (cats.length === 0) {
+      // Legacy single dataset (brand/dataset.json, pre-category) surfaces as Pizza,
+      // UNLESS an explicit 'pizza' folder already exists (which would supersede it).
+      // This runs regardless of how many category folders exist, so old pizza data
+      // keeps showing alongside newly-uploaded categories — no re-upload needed.
+      if (!cats.some(c => c.slug === 'pizza')) {
         try {
           const { data: md } = await sb.storage.from(SPINS_BUCKET).download(`${getBrandKey()}/dataset.json`);
           if (md) cats.push({ slug: 'pizza', label: 'Pizza' });
-        } catch (e) { /* none */ }
+        } catch (e) { /* no legacy data */ }
       }
       return cats.sort((a, b) => a.label.localeCompare(b.label));
     } catch (e) { return []; }
@@ -34067,6 +34070,28 @@ render();
       setMsg(`Saving ${cat.label} to shared workspace...`);
       await SpinsStorage.saveDataset(payload, { fileName: file.name, sizeBytes, category: cat.slug, categoryLabel: cat.label });
       __insActiveCategory = (cat.slug || 'pizza').toLowerCase();
+
+      // ── One upload feeds everything ──
+      // For raw SPINS files (xlsx/csv), also run the EXISTING Retailer Library
+      // import on the same file so retailer_items + forecast_actuals get populated
+      // — no separate upload needed. It UPSERTs by retailer+product, so categories
+      // accumulate (a retailer's pizza + bread items coexist). This reuses the
+      // proven pipeline unchanged; we only auto-confirm and route status here.
+      if ((isXlsx || isCsv) && typeof handleSpinsBulkUpload === 'function') {
+        try {
+          setMsg(`Updating retailer items from ${cat.label}…`);
+          await handleSpinsBulkUpload({
+            file,
+            autoConfirm: true,
+            onStatus: (msg) => { setMsg(msg); },
+          });
+        } catch (riErr) {
+          // Non-fatal: the Insights dataset is already saved. Surface a soft notice.
+          console.warn('Retailer-items population failed (Insights dataset still saved):', riErr);
+          setMsg(`Loaded ${cat.label}, but retailer-items update hit an issue — see console.`, '#7a5a1a');
+        }
+      }
+
       setMsg(`Loaded ${cat.label} · ${payload.rows.length.toLocaleString()} rows`, 'var(--won)');
       // Re-render the page so it picks up the new dataset
       setTimeout(() => {
@@ -35243,24 +35268,93 @@ render();
     return { skip: false, name: s, channel: null, legal: s };
   }
 
+  // Stream a (potentially huge) CSV and return only the rows whose Brand column
+  // matches brandRe, as array-of-objects keyed by header — mirroring what
+  // XLSX.utils.sheet_to_json(...) returns, so downstream parsing is identical.
+  // Streams line-by-line so a 600k-row file never lives fully in memory.
+  async function streamCsvFilteredToBrand(file, brandRe) {
+    const parseLine = (line) => {
+      const out = []; let cur = '', q = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (q) { if (ch === '"') { if (line[i+1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+        else { if (ch === '"') q = true; else if (ch === ',') { out.push(cur); cur = ''; } else cur += ch; }
+      }
+      out.push(cur); return out;
+    };
+    const stream = file.stream().pipeThrough(new TextDecoderStream());
+    const reader = stream.getReader();
+    let buf = '';
+    let header = null, brandIdx = -1;
+    const out = [];
+    const handle = (line) => {
+      if (!line.length) return;
+      const cells = parseLine(line);
+      if (!header) {
+        header = cells.map(h => String(h == null ? '' : h).trim());
+        brandIdx = header.findIndex(h => h.trim().toLowerCase() === 'brand');
+        return;
+      }
+      // Brand filter while streaming — only keep our brand's rows.
+      if (brandIdx >= 0) {
+        const bv = cells[brandIdx];
+        if (!bv || !brandRe.test(String(bv))) return;
+      }
+      const obj = {};
+      for (let i = 0; i < header.length; i++) obj[header[i]] = cells[i] != null ? cells[i] : '';
+      out.push(obj);
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += value;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        let line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        handle(line);
+      }
+    }
+    if (buf.trim().length) handle(buf.trim());
+    return out;
+  }
+
+  // Accepts either a DOM change event (Retailer Library button — unchanged behavior)
+  // OR an options object { file, autoConfirm, onStatus, silent } for programmatic use
+  // (e.g. triggered by the Insights upload so one upload feeds retailer_items too).
   async function handleSpinsBulkUpload(e) {
-    const file = e.target.files[0];
+    const opts = (e && e.file) ? e : null;          // programmatic call?
+    const file = opts ? opts.file : (e.target.files[0]);
     if (!file) return;
+    const autoConfirm = !!(opts && opts.autoConfirm);
     const status = document.getElementById('hl-spins-bulk-status');
     const previewEl = document.getElementById('hl-spins-preview');
-    const setStatus = (msg, color) => { if (status) { status.textContent = msg; status.style.color = color || 'var(--ink-3)'; } };
+    // setStatus routes to the Retailer Library DOM when present, and also to an
+    // optional onStatus callback (used by the Insights upload to drive its progress).
+    const setStatus = (msg, color) => {
+      if (status) { status.textContent = msg; status.style.color = color || 'var(--ink-3)'; }
+      if (opts && typeof opts.onStatus === 'function') opts.onStatus(msg, color);
+    };
     setStatus('Reading file…');
-    previewEl.innerHTML = '';
+    if (previewEl) previewEl.innerHTML = '';
 
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary.getSession().brandId;
 
+    const isCsv = /\.csv$/i.test(file.name || '') || file.type === 'text/csv';
     let rows = [];
     try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: 'array' });
-      const ws = wb.Sheets[wb.SheetNames[0]];
-      rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+      if (isCsv) {
+        // Stream the CSV and keep ONLY Against-The-Grain rows (the file can be
+        // 600k+ rows; we never hold them all). Produces the same array-of-objects
+        // shape sheet_to_json would, using the header row for keys.
+        rows = await streamCsvFilteredToBrand(file, /against the grain/i);
+      } else {
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+      }
     } catch (err) {
       setStatus('Could not read file: ' + (err.message || err), 'var(--lost)');
       return;
@@ -35538,7 +35632,8 @@ render();
 
     // Show preview
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    previewEl.innerHTML = `
+    if (previewEl && !autoConfirm) {
+      previewEl.innerHTML = `
       <div style="background:var(--bone-2);border-radius:8px;padding:18px;">
         <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;margin-bottom:10px;">Preview</div>
         <table style="width:100%;font-family:var(--serif);font-size:14px;border-collapse:collapse;">
@@ -35565,16 +35660,22 @@ render();
         </div>
       </div>
     `;
-    setStatus(`Parsed ${rows.length} rows. Review the preview, then click Confirm to import.`, 'var(--ink)');
+      setStatus(`Parsed ${rows.length} rows. Review the preview, then click Confirm to import.`, 'var(--ink)');
 
-    document.getElementById('hl-spins-cancel-btn').addEventListener('click', () => {
-      previewEl.innerHTML = '';
-      setStatus('Cancelled.', 'var(--ink-3)');
-    });
+      const cancelBtn = document.getElementById('hl-spins-cancel-btn');
+      if (cancelBtn) cancelBtn.addEventListener('click', () => {
+        previewEl.innerHTML = '';
+        setStatus('Cancelled.', 'var(--ink-3)');
+      });
+      const confirmBtnEl = document.getElementById('hl-spins-confirm-btn');
+      if (confirmBtnEl) confirmBtnEl.addEventListener('click', () => doImport());
+    }
 
-    document.getElementById('hl-spins-confirm-btn').addEventListener('click', async () => {
+    // The actual write. Called on Confirm click (Retailer Library) or directly
+    // (autoConfirm, e.g. from the Insights upload). Behavior identical either way.
+    const doImport = async () => {
       const confirmBtn = document.getElementById('hl-spins-confirm-btn');
-      confirmBtn.disabled = true;
+      if (confirmBtn) confirmBtn.disabled = true;
       let retailersCreated = 0, itemsUpserted = 0, itemErrors = 0;
       const firstFewErrors = [];
 
@@ -35784,10 +35885,18 @@ render();
       } else {
         setStatus(`✓ Imported ${itemsUpserted} items across ${retailerGroups.size} retailers (${retailersCreated} new retailers created).`, 'var(--won)');
       }
-      previewEl.innerHTML = '';
-      // Refresh the retailer grid so new retailers show up
-      await loadAndRenderRetailerGrid();
-    });
+      if (previewEl) previewEl.innerHTML = '';
+      // Refresh the retailer grid so new retailers show up (only when on that page).
+      if (!autoConfirm && typeof loadAndRenderRetailerGrid === 'function') {
+        try { await loadAndRenderRetailerGrid(); } catch (e) { /* not on retailer page */ }
+      }
+    };
+
+    // Programmatic callers (e.g. Insights upload) skip the preview/confirm and
+    // import immediately. The Retailer Library button path waits for the click.
+    if (autoConfirm) {
+      await doImport();
+    }
   }
 
   async function handleItemsUpload(e, retailer) {
