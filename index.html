@@ -5866,33 +5866,89 @@ window.SpinsStorage = (function() {
   }
 
   // ─── Public API ─────────────────────────────────────
-  // Each brand has at most one SPINS dataset at a time. Replacing it
-  // means uploading a new one (which overwrites).
-  function activeKey() { return `spins:${getBrandKey()}`; }
+  // SHARED storage (Piece 1): the SPINS dataset lives in a Supabase Storage bucket
+  // named 'spins' (one object per brand) so an ADMIN uploads ONCE and the WHOLE TEAM
+  // sees it — nobody else has to upload. The FULL dataset is stored (our brand AND
+  // all competitors), unchanged, because Insights needs the competitive view.
+  // IndexedDB is kept ONLY as a per-session cache so each user downloads the (large)
+  // payload once per session and then loads instantly.
+  const SPINS_BUCKET = 'spins';
+  function objectPath() { return `${getBrandKey()}/dataset.json`; }
+  function metaPath() { return `${getBrandKey()}/meta.json`; }
+  function localCacheKey() { return `spins:${getBrandKey()}`; }
 
+  // Save: write the dataset + a tiny meta.json to shared Supabase Storage, and
+  // update the local cache. meta.json lets other users cheaply detect a new upload.
   async function saveDataset(payload, meta) {
-    return put({
-      key: activeKey(),
-      payload,            // the parsed JSON object
-      meta: {
-        fileName: meta.fileName,
-        uploadedAt: new Date().toISOString(),
-        sizeBytes: meta.sizeBytes || 0,
-        category: payload?.category || 'SPINS Data',
-        periods: payload?.periods?.length || 0,
-        retailers: payload?.geos?.length || 0,
-        brands: payload?.brands?.length || 0,
-      },
-    });
+    const sb = window.Auth.getClient();
+    const metaObj = {
+      fileName: meta.fileName,
+      uploadedAt: new Date().toISOString(),
+      sizeBytes: meta.sizeBytes || 0,
+      category: payload?.category || meta.category || 'SPINS Data',
+      periods: payload?.periods?.length || 0,
+      retailers: payload?.geos?.length || 0,
+      brands: payload?.brands?.length || 0,
+    };
+    const json = JSON.stringify({ payload, meta: metaObj });
+    const blob = new Blob([json], { type: 'application/json' });
+    const { error } = await sb.storage.from(SPINS_BUCKET)
+      .upload(objectPath(), blob, { upsert: true, contentType: 'application/json' });
+    if (error) throw new Error('Shared SPINS upload failed: ' + (error.message || error));
+    // Tiny meta object (fast to fetch) so other users detect the new upload cheaply.
+    try {
+      const metaBlob = new Blob([JSON.stringify(metaObj)], { type: 'application/json' });
+      await sb.storage.from(SPINS_BUCKET).upload(metaPath(), metaBlob, { upsert: true, contentType: 'application/json' });
+    } catch (e) { console.warn('SPINS meta write failed (non-fatal):', e); }
+    try { await put({ key: localCacheKey(), payload, meta: metaObj, cachedAt: Date.now() }); }
+    catch (e) { console.warn('SPINS local cache write failed (non-fatal):', e); }
+    return true;
   }
 
+  // Load: return the shared dataset. Cheaply fetches meta.json first; if it matches
+  // the local cache, uses the cache (instant). If it's newer (admin re-uploaded) or
+  // there's no cache, downloads the full dataset and caches it. Returns {payload,meta}|null.
   async function loadDataset() {
-    const rec = await get(activeKey());
-    return rec || null;
+    const sb = window.Auth.getClient();
+    // 1) Fetch tiny meta.json to learn the current shared version.
+    let sharedMeta = null;
+    try {
+      const { data: md } = await sb.storage.from(SPINS_BUCKET).download(metaPath());
+      if (md) sharedMeta = JSON.parse(await md.text());
+    } catch (e) { /* meta missing — older upload or none */ }
+    // 2) If local cache matches the shared version, use it (instant).
+    try {
+      const cached = await get(localCacheKey());
+      if (cached && cached.payload) {
+        if (!sharedMeta || (cached.meta && cached.meta.uploadedAt === sharedMeta.uploadedAt)) {
+          return cached;
+        }
+      }
+    } catch (e) { /* cache miss — fall through to download */ }
+    // 3) Download the full shared dataset.
+    try {
+      const { data, error } = await sb.storage.from(SPINS_BUCKET).download(objectPath());
+      if (error || !data) return null;   // nothing uploaded yet for this brand
+      const parsed = JSON.parse(await data.text());
+      const rec = { payload: parsed.payload, meta: parsed.meta, cachedAt: Date.now() };
+      try { await put({ key: localCacheKey(), ...rec }); } catch (e) { /* best-effort */ }
+      return rec;
+    } catch (e) {
+      console.error('Shared SPINS load failed:', e);
+      // Last resort: stale cache is better than nothing.
+      try { const cached = await get(localCacheKey()); if (cached && cached.payload) return cached; } catch (e2) {}
+      return null;
+    }
   }
 
+  // Clear: remove the shared dataset + meta AND the local cache.
   async function clearDataset() {
-    return del(activeKey());
+    try {
+      const sb = window.Auth.getClient();
+      await sb.storage.from(SPINS_BUCKET).remove([objectPath(), metaPath()]);
+    } catch (e) { console.warn('Shared SPINS clear failed:', e); }
+    try { await del(localCacheKey()); } catch (e) { /* ignore */ }
+    return true;
   }
 
   // Validate a parsed JSON payload conforms to our shape.
