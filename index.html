@@ -34035,13 +34035,14 @@ render();
     };
 
     const isXlsx = /\.xlsx?$/i.test(file.name);
+    const isCsv = /\.csv$/i.test(file.name);
     const isJson = /\.json$/i.test(file.name);
 
     try {
       let payload, sizeBytes;
-      if (isXlsx) {
-        // Convert in a Web Worker — this can take a few minutes for
-        // large files, so we surface a progress bar.
+      if (isXlsx || isCsv) {
+        // Convert in a Web Worker. CSV streams (handles 600k+ rows); xlsx uses
+        // SheetJS. SpinsConverter.convert() auto-detects which path to use.
         if (typeof SpinsConverter === 'undefined') {
           throw new Error('Converter not available — please refresh and try again.');
         }
@@ -34059,7 +34060,7 @@ render();
         payload = parsed.payload;
         sizeBytes = parsed.sizeBytes;
       } else {
-        throw new Error('Unsupported file type. Use .xlsx (raw SPINS export) or .json (pre-converted).');
+        throw new Error('Unsupported file type. Use .csv or .xlsx (raw SPINS export) or .json (pre-converted).');
       }
 
       setProgress(100, 'Saving...');
