@@ -34829,7 +34829,16 @@ render();
     // from the upload.
     const { data: itemsRaw } = await sb.from('retailer_items')
       .select('*').eq('retailer_id', retailerId).order('updated_at', { ascending: false });
-    const items = itemsRaw || [];
+    // Dedupe by normalized UPC (the same UPC can have a matched row + a leftover
+    // null-product row). Keep the matched one (Brand Library name).
+    const _normU = (u) => String(u == null ? '' : u).replace(/\D/g, '');
+    const _byUpc = new Map();
+    for (const it of (itemsRaw || [])) {
+      const key = _normU(it.raw_upc) || (it.product_id ? 'p:'+it.product_id : 'id:'+it.id);
+      const cur = _byUpc.get(key);
+      if (!cur || (!cur.product_id && it.product_id)) _byUpc.set(key, it);
+    }
+    const items = [..._byUpc.values()];
     const productIds = [...new Set(items.map(i => i.product_id).filter(Boolean))];
     let productsById = new Map();
     if (productIds.length) {
@@ -36072,9 +36081,32 @@ render();
       const fileUpcs = new Set(), keepUpcs = new Set();
       for (const it of group.items) if (it.raw_upc) fileUpcs.add(normU(it.raw_upc));
       const before = group.items.length;
-      // Keep only items matched to a Brand Library product.
+      // (1) Keep only items matched to a Brand Library product.
       group.items = group.items.filter(it => it.product_id != null);
       droppedNotInLibrary += (before - group.items.length);
+      // (2) Recent-sales rule: keep an item only if its 12-week Dollars in the most
+      // recent period exceed $1000. (Falls back to 4-week if no 12-week row exists.)
+      // Compute, per UPC, the 12-week dollars at its latest date.
+      const SALES_THRESHOLD = 1000;
+      const best12wk = new Map();   // upc -> { date, dollars } from 12-week rows
+      const best4wk = new Map();    // upc -> { date, dollars } fallback
+      for (const it of group.items) {
+        const u = normU(it.raw_upc); if (!u) continue;
+        const d = (it.dollars != null && isFinite(it.dollars)) ? it.dollars : 0;
+        const dt = it.time_period_end_date || '';
+        const tgt = it.periodType === '12-week' ? best12wk : (it.periodType === '4-week' ? best4wk : null);
+        if (!tgt) continue;
+        const cur = tgt.get(u);
+        if (!cur || dt > cur.date) tgt.set(u, { date: dt, dollars: d });
+      }
+      const recentDollars = (u) => {
+        const a = best12wk.get(u); if (a) return a.dollars;
+        const b = best4wk.get(u); if (b) return b.dollars;
+        return 0;
+      };
+      const beforeSales = group.items.length;
+      group.items = group.items.filter(it => recentDollars(normU(it.raw_upc)) > SALES_THRESHOLD);
+      droppedNotInLibrary += (beforeSales - group.items.length);
       // Dedupe by normalized UPC (the same UPC appears across windows/descriptions,
       // and historically as both matched and null-product rows) so each UPC becomes
       // ONE retailer_items row. Prefer a row with a product_id (Brand Library match),
@@ -36121,7 +36153,7 @@ render();
           ${brandSkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Other brands skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${brandSkipped}</td></tr>` : ''}
           ${timePeriodSkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— 24/52-week rows skipped (kept 4 + 12)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${timePeriodSkipped}</td></tr>` : ''}
           <tr><td style="padding:4px 0;color:var(--ink-3);">— Aggregator rows skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${aggregatorSkipped}</td></tr>
-          ${droppedNotInLibrary > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Skipped (not in Brand Library)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${droppedNotInLibrary}</td></tr>` : ''}
+          ${droppedNotInLibrary > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Skipped (not in Brand Library or <$1k recent)</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${droppedNotInLibrary}</td></tr>` : ''}
           ${emptySkipped > 0 ? `<tr><td style="padding:4px 0;color:var(--ink-3);">— Empty geography skipped</td><td style="text-align:right;font-family:var(--mono);color:var(--ink-3);">${emptySkipped}</td></tr>` : ''}
           <tr><td style="padding:4px 0;">Item rows to import</td><td style="text-align:right;font-family:var(--mono);">${totalRows}</td></tr>
           <tr><td style="padding:4px 0;color:var(--won);">— In Brand Library (imported)</td><td style="text-align:right;font-family:var(--mono);color:var(--won);">${matchedRows}</td></tr>
