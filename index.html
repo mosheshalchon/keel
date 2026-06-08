@@ -23439,7 +23439,6 @@ render();
       // (which counts individual pieces, a finer granularity than the priced unit).
       // Dollars are unchanged (they stay units × each-price). Falls back to 1 if missing.
       const casePack = product && Number(product.case_pack) > 0 ? Number(product.case_pack) : 1;
-      if (window._fcDebug) console.log('[fcDebug]', (product&&product.item_description||'?').slice(0,24), 'case_pack=', product&&product.case_pack, '→ casePack used=', casePack);
 
       const monthly = new Array(numMonths).fill(0);
       const monthlyUnits = new Array(numMonths).fill(0);  // forecast UNITS per month (for $/units toggle)
@@ -24723,6 +24722,34 @@ render();
     items.sort((a, b) => b.total - a.total);
     const _rfActualsNetImpact = grandActualPortion - lockedForecastBaseline;  // actual vs forecast for closed period
 
+    // "Other" reconciliation to the Sales Pacing tab (the authoritative actuals total).
+    // This view only shows items mapped to forecast rows, so its actual columns can fall
+    // short of Sales Pacing (food-service, discontinued, unmapped SKUs). Other[month] =
+    // SalesPacing[month] − sum(shown item actuals[month]) for each locked month.
+    let spByMonth = {};
+    try {
+      const lockedKeys = monthKeys.filter(mk => isLockedMonth(mk));
+      if (lockedKeys.length) {
+        const { data: spRows } = await sb.from('sales_actuals')
+          .select('month, amount, units')
+          .eq('brand_id', brandId).eq('dimension', 'product').in('month', lockedKeys);
+        for (const r of (spRows || [])) {
+          const val = metric === 'units' ? Number(r.units || 0) : Number(r.amount || 0);
+          spByMonth[r.month] = (spByMonth[r.month] || 0) + val;
+        }
+      }
+    } catch (e) { spByMonth = {}; }
+    const otherByIdx = monthKeys.map((mk, i) => {
+      if (!isLockedMonth(mk)) return null;
+      let shown = 0; items.forEach(it => { if (it.series[i].kind === 'actual') shown += it.series[i].v; });
+      const spTotal = spByMonth[mk];
+      if (spTotal == null) return null;
+      const diff = spTotal - shown;
+      return Math.abs(diff) > 0.5 ? diff : 0;
+    });
+    const otherTotal = otherByIdx.reduce((s, v) => s + (v || 0), 0);
+    const hasOther = otherByIdx.some(v => v != null && v !== 0);
+
     const monthOptions = monthKeys.map((mk, i) => mk ? `<option value="${mk}" ${lockThrough === mk ? 'selected' : ''}>${esc(monthLabels[i])}</option>` : '').join('');
     const blendLabel = lockThrough
       ? `${lockedMonthsCount} month${lockedMonthsCount === 1 ? '' : 's'} actual + ${forecastMonthsCount} forecast`
@@ -24760,8 +24787,8 @@ render();
         </div>
         <div style="padding-left:18px;border-left:1px solid var(--rule-soft);">
           <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;">Reforecast total</div>
-          <div style="font-family:var(--mono);font-size:22px;font-weight:600;color:var(--ink);margin-top:2px;">${fmt(grandActualPortion + grandForecastPortion)}</div>
-          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-top:2px;">${fmt(grandActualPortion)} actual + ${fmt(grandForecastPortion)} forecast</div>
+          <div style="font-family:var(--mono);font-size:22px;font-weight:600;color:var(--ink);margin-top:2px;">${fmt(grandActualPortion + grandForecastPortion + otherTotal)}</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-top:2px;">${fmt(grandActualPortion + otherTotal)} actual + ${fmt(grandForecastPortion)} forecast</div>
         </div>
         ${anyActualMissing ? `<div style="color:#c4a747;font-family:var(--mono);font-size:10px;max-width:240px;">⚠ ${anyActualMissing} locked item-month${anyActualMissing === 1 ? '' : 's'} had no matching actual (shown as 0). Likely a UPC/name that doesn't match Sales Pacing.</div>` : ''}
       </div>` : ''}
@@ -24847,10 +24874,25 @@ render();
           <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink);border-left:1px solid var(--rule-soft);">${fmt(it.total)}</td>
         </tr>
       `).join('');
+      const otherCells = monthKeys.map((mk, i) => {
+        const locked = isLockedMonth(mk);
+        const bg = locked ? 'background:rgba(58,122,58,0.06);' : '';
+        const v = otherByIdx[i];
+        const txt = (v == null) ? '·' : fmt(v);
+        return `<td style="text-align:right;padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);font-style:italic;${bg}">${txt}</td>`;
+      }).join('');
+      const otherRow = hasOther ? `
+        <tr style="border-bottom:1px solid var(--rule-softer);background:rgba(0,0,0,0.015);">
+          <td style="position:sticky;left:0;background:var(--paper);text-align:left;padding:6px 10px;font-family:var(--sans);font-size:12px;color:var(--ink-3);font-style:italic;z-index:1;" title="Sales Pacing total minus the items shown above — non-forecasted items (food service, discontinued, unmapped SKUs).">Other (non-forecasted)</td>
+          ${otherCells}
+          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-3);font-style:italic;border-left:1px solid var(--rule-soft);">${fmt(otherTotal)}</td>
+        </tr>
+      ` : '';
       const totalCells = monthKeys.map((mk, i) => {
         const locked = isLockedMonth(mk);
         const bg = locked ? 'background:rgba(58,122,58,0.12);' : 'background:var(--bone-2);';
         let sum = 0; items.forEach(it => sum += it.series[i].v);
+        sum += (otherByIdx[i] || 0);
         return `<td style="text-align:right;padding:8px 8px;font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink);${bg}">${fmt(sum)}</td>`;
       }).join('');
       html += `
@@ -24865,10 +24907,11 @@ render();
             </thead>
             <tbody>
               ${bodyRows}
+              ${otherRow}
               <tr style="border-top:2px solid var(--ink);background:var(--bone-2);">
                 <td style="position:sticky;left:0;background:var(--bone-2);text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;font-weight:700;color:var(--ink);text-transform:uppercase;z-index:1;">Total</td>
                 ${totalCells}
-                <td style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink);border-left:1px solid var(--rule-soft);">${fmt(grandActualPortion + grandForecastPortion)}</td>
+                <td style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink);border-left:1px solid var(--rule-soft);">${fmt(grandActualPortion + grandForecastPortion + otherTotal)}</td>
               </tr>
             </tbody>
           </table>
@@ -40684,6 +40727,16 @@ render();
       entities = entities.filter(e => plSel.includes(plOf(e) || '— None —'));
     }
     if (entSel.length) entities = entities.filter(e => entSel.includes(e));
+
+    // Hide items with zero sales across the last 3 (display) months — keeps the
+    // table focused on active items, dropping discontinued/never-sold SKUs.
+    {
+      const last3 = windowMonths.slice(-3).map(w => w.key);
+      entities = entities.filter(e => {
+        const m = byEntity.get(e) || {};
+        return last3.some(k => Math.abs(Number(m[k] || 0)) > 0);
+      });
+    }
 
     // Comparison period drives the variance columns + headline.
     const periods = spComparisonPeriods(anchor, _spState.comparison);
