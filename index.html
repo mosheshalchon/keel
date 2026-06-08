@@ -24733,33 +24733,41 @@ render();
     items.sort((a, b) => b.total - a.total);
     const _rfActualsNetImpact = grandActualPortion - lockedForecastBaseline;  // actual vs forecast for closed period
 
-    // "Other" reconciliation to the Sales Pacing tab (the authoritative actuals total).
-    // This view only shows items mapped to forecast rows, so its actual columns can fall
-    // short of Sales Pacing (food-service, discontinued, unmapped SKUs). Other[month] =
-    // SalesPacing[month] − sum(shown item actuals[month]) for each locked month.
+    // Other = Sales Pacing total − what THIS view shows, per month. Dead simple.
+    // Sales Pacing total = ALL product sales_actuals for the month (Billed + Closed,
+    // every status). This view's shown total = the column sum (whatever's displayed).
+    // If they differ, "Other" is the difference. No locked-month gating, no matching.
     let spByMonth = {};
     try {
-      const lockedKeys = monthKeys.filter(mk => isLockedMonth(mk));
-      if (lockedKeys.length) {
-        const { data: spRows } = await sb.from('sales_actuals')
-          .select('month, amount, units')
-          .eq('brand_id', brandId).eq('dimension', 'product').in('month', lockedKeys);
-        for (const r of (spRows || [])) {
-          const val = metric === 'units' ? Number(r.units || 0) : Number(r.amount || 0);
-          spByMonth[r.month] = (spByMonth[r.month] || 0) + val;
-        }
+      const { data: spRows } = await sb.from('sales_actuals')
+        .select('month, amount, units')
+        .eq('brand_id', brandId).eq('dimension', 'product');
+      for (const r of (spRows || [])) {
+        const val = metric === 'units' ? Number(r.units || 0) : Number(r.amount || 0);
+        spByMonth[r.month] = (spByMonth[r.month] || 0) + val;
       }
     } catch (e) { spByMonth = {}; }
+    // What this view currently shows per month (the displayed column sum).
+    const shownByIdx = monthKeys.map((mk, i) => {
+      let shown = 0; items.forEach(it => { shown += (it.series[i] ? it.series[i].v : 0); });
+      return shown;
+    });
+    // Other[month] = SalesPacing[month] − shown[month]. Only where we have a Sales
+    // Pacing number for that month (the actual/closed months). Forecast-only months
+    // have no Sales Pacing actual, so no Other.
     const otherByIdx = monthKeys.map((mk, i) => {
-      if (!isLockedMonth(mk)) return null;
-      let shown = 0; items.forEach(it => { if (it.series[i].kind === 'actual') shown += it.series[i].v; });
-      const spTotal = spByMonth[mk];
-      if (spTotal == null) return null;
-      const diff = spTotal - shown;
-      return Math.abs(diff) > 0.5 ? diff : 0;
+      const sp = spByMonth[mk];
+      if (sp == null || sp === 0) return null;            // no actual sales that month
+      const diff = sp - shownByIdx[i];
+      return Math.round(diff);
     });
     const otherTotal = otherByIdx.reduce((s, v) => s + (v || 0), 0);
     const hasOther = otherByIdx.some(v => v != null && v !== 0);
+    if (window._otherDebug) {
+      console.log('[otherDebug] spByMonth=', spByMonth);
+      console.log('[otherDebug] shownByIdx=', shownByIdx);
+      console.log('[otherDebug] otherByIdx=', otherByIdx, 'hasOther=', hasOther);
+    }
     if (window._otherDebug) {
       console.log('[otherDebug] metric=', metric, 'lockThrough=', lockThrough);
       console.log('[otherDebug] monthKeys=', monthKeys);
