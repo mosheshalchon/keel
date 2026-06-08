@@ -25763,6 +25763,8 @@ render();
     const wksPer = n(inp.p1_wks_per_event);
     const scanUnit = n(inp.scan_bb_unit);
     const distFeePct = inp.distributor_fee_pct == null ? 0.10 : n(inp.distributor_fee_pct);
+    const adFees = n(inp.ad_fees);
+    const otherFees = n(inp.other_fees);
 
     const baseCost = atg * (1 + distMarkup);                 // Estimated Retailer Base Cost
     const edlpCost = baseCost - edlp;                        // Retailer EDLP Cost
@@ -25781,13 +25783,14 @@ render();
     const scanDollars = totalUnitsPromo * scanUnit;          // Scan $
     const distributorFees = scanDollars * distFeePct;        // Distributor Fees
     const annualEdlpSpend = avgWklyBaseUnits * 52 * edlp;    // Annual EDLP Spend
-    const annualTradeSpend = scanDollars + distributorFees + annualEdlpSpend; // (AG)
+    const annualTradeSpend = scanDollars + distributorFees + annualEdlpSpend + adFees + otherFees; // (AG) + ad/other
     const tradeRate = grossSales ? annualTradeSpend / grossSales : 0;          // (AH)
     const netSales = grossSales - annualTradeSpend;
 
     return {
       retailer_margin: retailerMargin,
       avg_wkly_base_units: avgWklyBaseUnits,
+      annual_base_units: annualBaseEdlpUnits,
       wkly_promo_units: wklyPromoUnits,
       promo_weeks: promoWeeks,
       annual_units: totalUnits,
@@ -25796,6 +25799,8 @@ render();
       scan_dollars: scanDollars,
       distributor_fees: distributorFees,
       annual_edlp_spend: annualEdlpSpend,
+      ad_fees: adFees,
+      other_fees: otherFees,
       annual_trade_spend: annualTradeSpend,
       trade_rate: tradeRate,
       net_sales: netSales,
@@ -25973,6 +25978,20 @@ render();
         ['Incremental units', `(${n(r.wkly_promo_units,0)} promo − ${n(avgBase,0)} base) wkly × ${n(r.promo_weeks,0)} promo wks = ${n(r.annual_units - avgBase*52,0)}`],
         ['TOTAL annual units', `${n(avgBase*52,0)} base + ${n(r.annual_units - avgBase*52,0)} incremental = ${n(r.annual_units,0)}`],
       ],
+      baseunits: [
+        ['Avg weekly base units', `${n(inp.doors,0)} doors × ${n(inp.num_items,0)} items × ${n(inp.base_upspw)} UPSPW × (1 + ${(inp.edlp_lift_override*100).toFixed(0)}% EDLP lift) = ${n(avgBase,0)}`],
+        ['Annual base units', `${n(avgBase,0)} × 52 wks = ${n(r.annual_base_units,0)}`],
+      ],
+      promounits: [
+        ['Weekly promo units', `${n(avgBase,0)} base × (1 + ${(inp.lift*100).toFixed(0)}% lift) = ${n(r.wkly_promo_units,0)}`],
+        ['Promo weeks', `${n(inp.p1_events,0)} events × ${n(inp.p1_wks_per_event,0)} wks = ${n(r.promo_weeks,0)}`],
+        ['Annual units on promo', `${n(r.wkly_promo_units,0)} × ${n(r.promo_weeks,0)} = ${n(r.total_units_promo,0)}`],
+      ],
+      edlp: [
+        ['Annual EDLP spend', `${n(avgBase,0)} base × 52 × ${$(inp.edlp)} EDLP = ${$(r.annual_edlp_spend)}`],
+      ],
+      adfees: [['Ad fees', `Fixed annual amount entered: ${$(r.ad_fees)}`]],
+      otherfees: [['Other fees', `Fixed annual amount entered: ${$(r.other_fees)}`]],
       gross: [
         ['Annual gross sales', `${n(r.annual_units,0)} total units × ${$(inp.atg_gross_price)} ATG = ${$(r.annual_gross_sales)}`],
       ],
@@ -25987,7 +26006,9 @@ render();
         ['Scan $', `${$(r.scan_dollars)}`],
         ['Distributor fees', `${$(r.distributor_fees)}`],
         ['Annual EDLP spend', `${n(avgBase,0)} base × 52 × ${$(inp.edlp)} EDLP = ${$(r.annual_edlp_spend)}`],
-        ['Annual trade spend', `${$(r.scan_dollars)} + ${$(r.distributor_fees)} + ${$(r.annual_edlp_spend)} = ${$(r.annual_trade_spend)}`],
+        ['Ad fees', `${$(r.ad_fees)}`],
+        ['Other fees', `${$(r.other_fees)}`],
+        ['Total trade spend', `${$(r.scan_dollars)} + ${$(r.distributor_fees)} + ${$(r.annual_edlp_spend)} + ${$(r.ad_fees)} + ${$(r.other_fees)} = ${$(r.annual_trade_spend)}`],
       ],
       traderate: [
         ['Trade rate', `${$(r.annual_trade_spend)} trade spend ÷ ${$(r.annual_gross_sales)} gross sales = ${(r.trade_rate*100).toFixed(1)}%`],
@@ -25996,7 +26017,7 @@ render();
         ['Net sales', `${$(r.annual_gross_sales)} gross − ${$(r.annual_trade_spend)} trade spend = ${$(r.net_sales)}`],
       ],
     };
-    const titles = { margin:'Retailer margin', units:'Annual units', gross:'Annual gross sales', scan:'Scan $', distfees:'Distributor fees', trade:'Annual trade spend', traderate:'Trade rate', net:'Net sales' };
+    const titles = { margin:'Retailer margin', units:'Annual total units', baseunits:'Annual base units', promounits:'Annual units on promo', gross:'Annual gross sales', scan:'Scan $', distfees:'Distributor fees', adfees:'Ad fees', otherfees:'Other fees', edlp:'EDLP spend', trade:'Total trade spend', traderate:'Trade rate', net:'Net sales' };
     const rows = steps[key] || [];
     let modal = document.getElementById('hl-promo-audit-modal');
     if (modal) modal.remove();
@@ -26156,14 +26177,22 @@ render();
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('Distributor fee % (scan)')}${pctInp('hl-pc-distfee', v('distributor_fee_pct', 0.10), '10')}</div>
+          <div>${lbl('Ad fees ($/yr)')}${inp('hl-pc-adfees', v('ad_fees', 0), '0')}</div>
+          <div>${lbl('Other fees ($/yr)')}${inp('hl-pc-otherfees', v('other_fees', 0), '0')}</div>
           <div>${lbl('First event start date')}<input id="hl-pc-startdate" type="date" value="${esc(v('start_date'))}" style="width:100%;box-sizing:border-box;padding:6px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" /></div>
         </div>
 
-        <div class="hl-docs-label" style="margin-bottom:8px;">Event schedule <span style="color:var(--ink-3);font-weight:normal;font-family:var(--serif);font-style:italic;text-transform:none;letter-spacing:0;">— computed from start date, # events, weeks/event</span></div>
-        <div id="hl-pc-schedule" style="background:var(--bone-2);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--mono);font-size:11px;color:var(--ink-2);">Enter a start date to see the schedule.</div>
+        <div style="margin-bottom:18px;border:1px solid var(--rule-soft);border-radius:6px;overflow:hidden;">
+          <button id="hl-pc-dates-toggle" style="width:100%;text-align:left;background:var(--bone-2);border:none;padding:11px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;">
+            <span class="hl-docs-label" style="margin:0;">Promo dates <span style="color:var(--ink-3);font-weight:normal;font-family:var(--serif);font-style:italic;text-transform:none;letter-spacing:0;">— one range per event, pre-filled from the schedule, editable. Tracked for forecasting; does not affect the calc.</span></span>
+            <span id="hl-pc-dates-caret" style="font-family:var(--mono);color:var(--ink-3);">▾</span>
+          </button>
+          <div id="hl-pc-dates-body" style="padding:12px 14px;background:var(--paper);"></div>
+        </div>
 
         <div class="hl-docs-label" style="margin-bottom:8px;">Calculated</div>
-        <div id="hl-pc-calc" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px;"></div>
+        <div id="hl-pc-calc-row1" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;"></div>
+        <div id="hl-pc-calc-row2" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px;"></div>
 
         <div style="display:flex;justify-content:space-between;gap:10px;padding-top:14px;border-top:1px solid var(--rule-soft);">
           <div>${promoId ? `<button id="hl-pc-delete" style="background:transparent;border:1px solid var(--lost);color:var(--lost);border-radius:6px;padding:9px 16px;font-family:var(--sans);font-size:13px;cursor:pointer;">Delete</button>` : ''}</div>
@@ -26322,34 +26351,86 @@ render();
       p1_wks_per_event: parseFloat(document.getElementById('hl-pc-wks').value) || 0,
       scan_bb_unit: parseFloat(document.getElementById('hl-pc-scan').value) || 0,
       distributor_fee_pct: document.getElementById('hl-pc-distfee').value === '' ? 0.10 : (parseFloat(document.getElementById('hl-pc-distfee').value) / 100),
+      ad_fees: parseFloat(document.getElementById('hl-pc-adfees').value) || 0,
+      other_fees: parseFloat(document.getElementById('hl-pc-otherfees').value) || 0,
       start_date: document.getElementById('hl-pc-startdate').value || null,
     });
+
+    // Promo dates state: array of {start,end}. Synced to # events; blanks filled
+    // from the computed schedule. Edits preserved unless event count changes.
+    let promoDates = Array.isArray(e.event_dates) ? e.event_dates.slice() : [];
+
+    const renderPromoDates = () => {
+      const body = document.getElementById('hl-pc-dates-body');
+      if (!body) return;
+      const inputs = getInputs();
+      const events = Math.max(0, Math.round(inputs.p1_events) || 0);
+      const computed = computePromoEventDates(inputs.start_date, inputs.p1_events, inputs.p1_wks_per_event);
+      // resize promoDates to match events; fill new slots from computed schedule
+      const next = [];
+      for (let i = 0; i < events; i++) {
+        const existing = promoDates[i];
+        const comp = computed[i] || { start: '', end: '' };
+        next.push({ start: (existing && existing.start) || comp.start || '', end: (existing && existing.end) || comp.end || '' });
+      }
+      promoDates = next;
+      if (events === 0) { body.innerHTML = '<div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);">Set # events to enter promo dates.</div>'; return; }
+      body.innerHTML = `
+        <div style="display:flex;justify-content:flex-end;margin-bottom:8px;"><button id="hl-pc-dates-refill" style="background:transparent;border:1px solid var(--rule-soft);border-radius:4px;font-family:var(--mono);font-size:9px;padding:4px 10px;cursor:pointer;text-transform:uppercase;">↻ Refill from schedule</button></div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          ${promoDates.map((d, i) => `
+            <div style="display:grid;grid-template-columns:70px 1fr 1fr;gap:8px;align-items:center;">
+              <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Event ${i+1}</span>
+              <input type="date" class="hl-pc-evdate" data-i="${i}" data-k="start" value="${esc(d.start||'')}" style="padding:5px 8px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" />
+              <input type="date" class="hl-pc-evdate" data-i="${i}" data-k="end" value="${esc(d.end||'')}" style="padding:5px 8px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" />
+            </div>`).join('')}
+        </div>`;
+      body.querySelectorAll('.hl-pc-evdate').forEach(el => el.addEventListener('input', (ev) => {
+        ev.stopPropagation();  // dates don't affect the calc; don't trigger recalc/re-render
+        const i = Number(el.dataset.i), k = el.dataset.k;
+        if (promoDates[i]) promoDates[i][k] = el.value;
+      }));
+      const refill = document.getElementById('hl-pc-dates-refill');
+      if (refill) refill.addEventListener('click', () => { promoDates = []; renderPromoDates(); });
+    };
 
     const recalc = () => {
       if (step2El.style.display === 'none') return;
       const inputs = getInputs();
       const r = computePromoLine(inputs);
-      document.getElementById('hl-pc-calc').innerHTML =
+      document.getElementById('hl-pc-calc-row1').innerHTML =
         calcCell('Retailer margin', pctf(r.retailer_margin), 'margin') +
-        calcCell('Annual units', numf(r.annual_units), 'units') +
+        calcCell('Annual base units', numf(r.annual_base_units), 'baseunits') +
+        calcCell('Annual units on promo', numf(r.total_units_promo), 'promounits') +
+        calcCell('Annual total units', numf(r.annual_units), 'units');
+      document.getElementById('hl-pc-calc-row2').innerHTML =
+        calcCell('EDLP spend', money(r.annual_edlp_spend), 'edlp') +
+        calcCell('Scan $ cost', money(r.scan_dollars), 'scan') +
+        calcCell('Distributor fee', money(r.distributor_fees), 'distfees') +
+        calcCell('Ad fees', money(r.ad_fees), 'adfees') +
+        calcCell('Other fees', money(r.other_fees), 'otherfees') +
         calcCell('Annual gross sales', money(r.annual_gross_sales), 'gross') +
-        calcCell('Annual trade spend', money(r.annual_trade_spend), 'trade') +
-        calcCell('Trade rate', pctf(r.trade_rate), 'traderate') +
-        calcCell('Scan $', money(r.scan_dollars), 'scan') +
-        calcCell('Distributor fees', money(r.distributor_fees), 'distfees') +
-        calcCell('Net sales', money(r.net_sales), 'net');
+        calcCell('Total trade spend', money(r.annual_trade_spend), 'trade') +
+        calcCell('Net sales', money(r.net_sales), 'net') +
+        calcCell('Trade rate', pctf(r.trade_rate), 'traderate');
       document.querySelectorAll('.hl-pc-calccell[data-audit]').forEach(cell => {
         if (!cell.dataset.audit) return;
         cell.addEventListener('click', () => openPromoAudit(cell.dataset.audit, inputs, r));
       });
-      const dates = computePromoEventDates(inputs.start_date, inputs.p1_events, inputs.p1_wks_per_event);
-      const sched = document.getElementById('hl-pc-schedule');
-      if (!dates.length) sched.textContent = 'Enter a start date (and events / weeks) to see the schedule.';
-      else sched.innerHTML = dates.map((d, i) => `<div style="display:flex;justify-content:space-between;padding:2px 0;"><span>Event ${i+1}</span><span>${d.start} → ${d.end}</span></div>`).join('');
+      renderPromoDates();
     };
 
     // wire recalc to all step-2 inputs (delegated, since step2 always in DOM)
     step2El.addEventListener('input', recalc);
+    // collapse toggle for promo dates
+    const datesToggle = document.getElementById('hl-pc-dates-toggle');
+    if (datesToggle) datesToggle.addEventListener('click', () => {
+      const body = document.getElementById('hl-pc-dates-body');
+      const caret = document.getElementById('hl-pc-dates-caret');
+      const open = body.style.display !== 'none';
+      body.style.display = open ? 'none' : '';
+      if (caret) caret.textContent = open ? '▸' : '▾';
+    });
 
     // Save
     document.getElementById('hl-pc-save').addEventListener('click', async () => {
@@ -26357,7 +26438,7 @@ render();
       if (!inputs.retailer_id) { alert('Please select a retailer.'); return; }
       if (!inputs.promoted_group) { alert('Please select a promo group.'); return; }
       const computed = computePromoLine(inputs);
-      const eventDates = computePromoEventDates(inputs.start_date, inputs.p1_events, inputs.p1_wks_per_event);
+      const eventDates = promoDates;  // use the (possibly edited) tracked dates
       // persist any manual items into retailer_items so they're known carried items
       for (const m of manualItems) {
         try {
