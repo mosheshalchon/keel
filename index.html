@@ -5233,6 +5233,13 @@ HL.autoCreateSubmissions = async function() {
     inserted += chunk.length;
   }
   console.log(`autoCreate: inserted ${inserted} submissions`);
+  // New submissions may have stages already active (e.g. "Upcoming" at −60 days) —
+  // run the stage notification check so reminders/to-dos fire right away.
+  if (inserted > 0 && typeof window.checkTimelineStageNotifications === 'function') {
+    window.checkTimelineStageNotifications()
+      .then(() => window.refreshNotificationBell && window.refreshNotificationBell())
+      .catch(() => {});
+  }
 };
 
 </script>
@@ -7015,10 +7022,14 @@ window.SpinsConverter = (function() {
   // action (notify / notify_and_upload) has become active and hasn't fired yet,
   // create an in-app notification (and thus a to-do) for each person on that
   // submission (the retailer's 4 contacts). Deduped via stage_notifications_sent.
-  let _stageNotifChecked = false;
+  // Runs on app load AND after submissions are created/changed. Safe to call
+  // repeatedly — the stage_notifications_sent table dedupes, so re-running only
+  // creates notifications for newly-active stages. We just guard against two
+  // overlapping runs at once.
+  let _stageNotifRunning = false;
   async function checkTimelineStageNotifications() {
-    if (_stageNotifChecked) return;          // once per app load
-    _stageNotifChecked = true;
+    if (_stageNotifRunning) return;
+    _stageNotifRunning = true;
     try {
       const sb = window.Auth.getClient();
       const session = window.BrandLibrary.getSession();
@@ -7079,8 +7090,8 @@ window.SpinsConverter = (function() {
               brand_id: brandId,
               submission_id: sub.id,
               kind: 'stage_reminder',
-              title: `${sd.stage_name || sd.stage_key}: ${sub.retailer}${itemLabel}`,
-              body: `${sd.action_description || 'Stage active'}${dueLabel}`,
+              title: `${sd.label || sd.stage_key}: ${sub.retailer}${itemLabel}`,
+              body: `${sd.action_label || 'Stage active'}${dueLabel}`,
               link_hash: `#submission-docs?id=${sub.id}`,
             });
           }
@@ -7099,6 +7110,8 @@ window.SpinsConverter = (function() {
       }
     } catch (err) {
       console.warn('checkTimelineStageNotifications failed (non-fatal):', err);
+    } finally {
+      _stageNotifRunning = false;
     }
   }
   window.checkTimelineStageNotifications = checkTimelineStageNotifications;
