@@ -25026,15 +25026,17 @@ render();
       }
     }
 
-    // FINAL — start + actuals + inputs + decisions + unforecasted actuals.
-    const finalTotal = startVal + actualsNet + inputsDelta + decisionsNet + unforecastedActual;
+    // FINAL — start + actuals (Step 1) + inputs + decisions. The actuals replacement
+    // for locked months IS Step 1 (actual − forecast over forecasted items). We do NOT
+    // add unforecasted-item actuals on top — that would double-count and overshoot the
+    // true reforecast total (which ties to the Summary page).
+    const finalTotal = startVal + actualsNet + inputsDelta + decisionsNet;
 
     // Build the waterfall steps in the order the analyst works:
-    // Start → Step 1 (lock actuals) → unforecasted actuals → Step 2 (inputs) → decisions → Final.
+    // Start → Step 1 (lock actuals) → Step 2 (inputs) → decisions → Final.
     const steps = [
       { label: parentName ? `Original — ${parentName}` : 'Original forecast', val: startVal, kind: 'start' },
       { label: lockThrough ? `Step 1 · Update Actuals (through ${lockThrough.slice(0,7)})` : 'Step 1 · Update Actuals (none locked)', val: actualsNet, kind: 'delta' },
-      ...(unforecastedActual ? [{ label: 'Actuals · non-forecasted items', val: unforecastedActual, kind: 'delta' }] : []),
       { label: 'Step 2 · Update Inputs', val: inputsDelta, kind: 'delta' },
       { label: 'Distribution decisions', val: decisionsNet, kind: 'delta' },
       { label: 'Final reforecast', val: finalTotal, kind: 'end' },
