@@ -17985,6 +17985,17 @@ render();
     function renderFvaSummary() {
       const summaryHost = document.getElementById('hl-fva-summary-host');
       const mk = currentHeadlineMonthKey;
+      // Open (forecast) months remaining in the year = 12 − locked/actual months.
+      // Used to annualize the monthly $ impact. Computed locally since the parent
+      // scope's value isn't visible in this nested function.
+      let _lockedMo = 0;
+      const _lk = scenario && scenario.actuals_locked_through;
+      if (_lk) {
+        const _sy = new Date((scenario.start_date || '2026-01-01') + 'T00:00:00').getFullYear();
+        const _lm = new Date(_lk + 'T00:00:00');
+        _lockedMo = Math.max(0, Math.min(12, (_lm.getFullYear() - _sy) * 12 + (_lm.getMonth() + 1)));
+      }
+      const openMonths = Math.max(0, 12 - _lockedMo);
       if (!mk) {
         summaryHost.innerHTML = `<div style="background:var(--bone-2);padding:14px;border-radius:6px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">No months with data in this range.</div>`;
         return;
