@@ -7005,10 +7005,103 @@ window.SpinsConverter = (function() {
     });
 
     // Initial render + start polling
-    refreshNotificationBell();
+    checkTimelineStageNotifications().then(() => refreshNotificationBell());
     if (_notifPollTimer) clearInterval(_notifPollTimer);
     _notifPollTimer = setInterval(refreshNotificationBell, 30000);  // every 30s
   }
+
+  // ─── Timeline stage notifications + to-dos ───
+  // On app load, evaluate every submission's stages. When a stage with a notify
+  // action (notify / notify_and_upload) has become active and hasn't fired yet,
+  // create an in-app notification (and thus a to-do) for each person on that
+  // submission (the retailer's 4 contacts). Deduped via stage_notifications_sent.
+  let _stageNotifChecked = false;
+  async function checkTimelineStageNotifications() {
+    if (_stageNotifChecked) return;          // once per app load
+    _stageNotifChecked = true;
+    try {
+      const sb = window.Auth.getClient();
+      const session = window.BrandLibrary.getSession();
+      if (!session) return;
+      const brandId = session.brandId;
+
+      // Stage definitions (with anchor/offset/action), submissions, retailers, contacts.
+      const [defsRes, subsRes, retsRes, contactsRes, sentRes] = await Promise.all([
+        sb.from('stage_definitions').select('*').order('sequence', { ascending: true }),
+        sb.from('timeline_entries').select('*').eq('brand_id', brandId),
+        sb.from('retailers').select('*').eq('brand_id', brandId),
+        sb.from('brand_contacts').select('id, email, name').eq('brand_id', brandId),
+        sb.from('stage_notifications_sent').select('submission_id, stage_key').eq('brand_id', brandId),
+      ]);
+      const defs = defsRes.data || [];
+      const subs = subsRes.data || [];
+      const retByName = new Map((retsRes.data || []).map(r => [r.name, r]));
+      const contactById = new Map((contactsRes.data || []).map(c => [c.id, c]));
+      const sentSet = new Set((sentRes.data || []).map(s => `${s.submission_id}|${s.stage_key}`));
+
+      const NOTIFY_ACTIONS = new Set(['notify', 'notify_and_upload']);
+      const today = new Date(); today.setHours(0,0,0,0);
+
+      const toInsertNotifs = [];
+      const toInsertSent = [];
+
+      for (const sub of subs) {
+        const overrides = sub.stage_overrides || {};
+        const fieldVal = (k) => {
+          const v = sub[k] || (k === 'submission_due' ? sub.submission_date : null);
+          return v ? new Date(v) : null;
+        };
+        // Resolve this submission's people (retailer's 4 contacts).
+        const ret = retByName.get(sub.retailer);
+        const contactIds = ret ? [ret.sales_ops_contact_id, ret.sales_manager_contact_id, ret.sales_director_contact_id, ret.head_of_sales_contact_id] : [];
+        const emails = [...new Set(contactIds.map(id => contactById.get(id)?.email).filter(Boolean).map(e => e.toLowerCase()))];
+        if (!emails.length) continue;   // no one to notify
+
+        for (const sd of defs) {
+          if (!NOTIFY_ACTIONS.has(sd.action_type)) continue;     // only notify-type stages
+          const key = `${sub.id}|${sd.stage_key}`;
+          if (sentSet.has(key)) continue;                        // already fired
+          const ov = overrides[sd.stage_key] || {};
+          const anchor = ov.anchor_field || sd.anchor_field;
+          const offset = ov.offset_days != null ? ov.offset_days : sd.offset_days;
+          if (!anchor || offset == null) continue;
+          const base = fieldVal(anchor);
+          if (!base) continue;
+          const trigger = new Date(base); trigger.setDate(trigger.getDate() + offset); trigger.setHours(0,0,0,0);
+          if (trigger > today) continue;                         // stage not active yet
+
+          // Stage is active and not yet notified → queue a notification per person.
+          const itemLabel = sub.item_description ? ` — ${sub.item_description}` : '';
+          const dueLabel = sub.submission_due ? ` (due ${new Date(sub.submission_due).toLocaleDateString()})` : '';
+          for (const email of emails) {
+            toInsertNotifs.push({
+              recipient_email: email,
+              brand_id: brandId,
+              submission_id: sub.id,
+              kind: 'stage_reminder',
+              title: `${sd.stage_name || sd.stage_key}: ${sub.retailer}${itemLabel}`,
+              body: `${sd.action_description || 'Stage active'}${dueLabel}`,
+              link_hash: `#submission-docs?id=${sub.id}`,
+            });
+          }
+          toInsertSent.push({ brand_id: brandId, submission_id: sub.id, stage_key: sd.stage_key });
+          sentSet.add(key);
+        }
+      }
+
+      if (toInsertNotifs.length) {
+        // Insert the dedupe markers FIRST so a race can't double-send; markers are
+        // unique on (submission_id, stage_key) so a duplicate insert is rejected.
+        const { error: sentErr } = await sb.from('stage_notifications_sent').insert(toInsertSent);
+        if (sentErr) { console.warn('stage_notifications_sent insert failed; skipping notifications to avoid dupes:', sentErr); return; }
+        const { error: nErr } = await sb.from('notifications').insert(toInsertNotifs);
+        if (nErr) console.warn('stage notification insert failed:', nErr);
+      }
+    } catch (err) {
+      console.warn('checkTimelineStageNotifications failed (non-fatal):', err);
+    }
+  }
+  window.checkTimelineStageNotifications = checkTimelineStageNotifications;
 
   window.refreshNotificationBell = refreshNotificationBell;
 
@@ -7074,6 +7167,7 @@ window.SpinsConverter = (function() {
       if (kind === 'fully_approved') return '✓';
       if (kind === 'rejected') return '✗';
       if (kind === 'sent_to_retailer') return '→';
+      if (kind === 'stage_reminder') return '◷';
       return '·';
     };
     const colorFor = (kind) => {
@@ -7081,6 +7175,7 @@ window.SpinsConverter = (function() {
       if (kind === 'fully_approved') return 'var(--won)';
       if (kind === 'rejected') return 'var(--lost)';
       if (kind === 'sent_to_retailer') return 'var(--ink)';
+      if (kind === 'stage_reminder') return '#5b7c9d';
       return 'var(--ink-3)';
     };
     list.innerHTML = notifs.map(n => {
@@ -7477,7 +7572,20 @@ function renderDashboardPage() {
       }
       const approachingDeadline = [...deadlineMap.values()];
 
-      _liveTodos = { awaitingMe, needsRework, approachingDeadline };
+      // 4. Stage reminders — unread timeline-stage notifications addressed to me.
+      let stageReminders = [];
+      try {
+        const { data: sr } = await sb.from('notifications')
+          .select('*')
+          .eq('recipient_email', userEmail)
+          .eq('kind', 'stage_reminder')
+          .is('read_at', null)
+          .order('created_at', { ascending: false })
+          .limit(20);
+        stageReminders = sr || [];
+      } catch (e) { /* non-fatal */ }
+
+      _liveTodos = { awaitingMe, needsRework, approachingDeadline, stageReminders };
       doRender();
     } catch (err) {
       console.warn('To-do load failed:', err);
@@ -7559,8 +7667,8 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
         </section>
       `;
     }
-    const { awaitingMe, needsRework, approachingDeadline } = liveTodos;
-    const totalCount = awaitingMe.length + needsRework.length + approachingDeadline.length;
+    const { awaitingMe, needsRework, approachingDeadline, stageReminders = [] } = liveTodos;
+    const totalCount = awaitingMe.length + needsRework.length + approachingDeadline.length + stageReminders.length;
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const daysUntil = (iso) => {
       const d = new Date(iso); d.setHours(0,0,0,0);
@@ -7574,7 +7682,7 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
           <div class="section-head">
             <div>
               <h2 class="section-title">To-Do</h2>
-              <p class="section-desc">Items that need your attention right now, pulled directly from the approval flow.</p>
+              <p class="section-desc">Items that need your attention right now, pulled from the approval flow and timeline stages.</p>
             </div>
           </div>
           <div style="padding:32px;text-align:center;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
@@ -7600,7 +7708,7 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
         <div class="section-head">
           <div>
             <h2 class="section-title">To-Do <span style="font-family:var(--mono);font-size:13px;letter-spacing:0.04em;color:var(--ink-3);font-weight:normal;">${totalCount} item${totalCount === 1 ? '' : 's'}</span></h2>
-            <p class="section-desc">Items that need your attention right now, pulled directly from the approval flow.</p>
+            <p class="section-desc">Items that need your attention right now, pulled from the approval flow and timeline stages.</p>
           </div>
         </div>
         <div style="display:flex;flex-direction:column;gap:18px;">
@@ -7651,6 +7759,15 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
             const detail = days === 0 ? 'Due today' : (days === 1 ? 'Due tomorrow' : `Due in ${days} days`);
             return itemRow('var(--ink)', detail, title, `Submission deadline ${esc(e.submission_due)}`, `#submission-docs?id=${e.id}`);
           }).join('')}
+        </div>
+      `;
+    }
+
+    if (stageReminders.length > 0) {
+      html += `
+        <div>
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:8px;">Timeline stages (${stageReminders.length})</div>
+          ${stageReminders.map(n => itemRow('#5b7c9d', 'Stage', esc(n.title || 'Stage active'), esc(n.body || ''), esc(n.link_hash || '#'))).join('')}
         </div>
       `;
     }
