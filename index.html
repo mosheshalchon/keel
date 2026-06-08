@@ -25953,6 +25953,73 @@ render();
 
 
   // ─── Promo card (add / edit one promo line) ───
+  // Audit modal: shows how a given promo metric was calculated, with live numbers.
+  function openPromoAudit(key, inp, r) {
+    const n = (v, dp=2) => (v==null||!isFinite(v)) ? '0' : Number(v).toLocaleString(undefined,{maximumFractionDigits:dp});
+    const $ = (v) => '$' + n(v, 2);
+    const baseCost = inp.atg_gross_price * (1 + inp.dist_markup);
+    const edlpCost = baseCost - inp.edlp;
+    const avgBase = inp.doors * inp.num_items * inp.base_upspw * (1 + inp.edlp_lift_override);
+    const steps = {
+      margin: [
+        ['Estimated retailer base cost', `${$(inp.atg_gross_price)} × (1 + ${(inp.dist_markup*100).toFixed(1)}%) = ${$(baseCost)}`],
+        ['Retailer EDLP cost', `${$(baseCost)} − ${$(inp.edlp)} EDLP = ${$(edlpCost)}`],
+        ['Retailer margin', `(${$(inp.srp)} SRP − ${$(edlpCost)}) ÷ ${$(inp.srp)} = ${(r.retailer_margin*100).toFixed(1)}%`],
+      ],
+      units: [
+        ['Avg weekly base units', `${n(inp.doors,0)} doors × ${n(inp.num_items,0)} items × ${n(inp.base_upspw)} UPSPW × (1 + ${(inp.edlp_lift_override*100).toFixed(0)}% EDLP lift) = ${n(avgBase,0)}`],
+        ['Annual base + EDLP units', `${n(avgBase,0)} × 52 wks = ${n(avgBase*52,0)}`],
+        ['Promo weeks', `${n(inp.p1_events,0)} events × ${n(inp.p1_wks_per_event,0)} wks = ${n(r.promo_weeks,0)}`],
+        ['Incremental units', `(${n(r.wkly_promo_units,0)} promo − ${n(avgBase,0)} base) wkly × ${n(r.promo_weeks,0)} promo wks = ${n(r.annual_units - avgBase*52,0)}`],
+        ['TOTAL annual units', `${n(avgBase*52,0)} base + ${n(r.annual_units - avgBase*52,0)} incremental = ${n(r.annual_units,0)}`],
+      ],
+      gross: [
+        ['Annual gross sales', `${n(r.annual_units,0)} total units × ${$(inp.atg_gross_price)} ATG = ${$(r.annual_gross_sales)}`],
+      ],
+      scan: [
+        ['Total units on promo', `${n(r.wkly_promo_units,0)} wkly promo units × ${n(r.promo_weeks,0)} promo wks = ${n(r.total_units_promo,0)}`],
+        ['Scan $', `${n(r.total_units_promo,0)} × ${$(inp.scan_bb_unit)} scan/unit = ${$(r.scan_dollars)}`],
+      ],
+      distfees: [
+        ['Distributor fees', `${$(r.scan_dollars)} scan × ${(inp.distributor_fee_pct*100).toFixed(1)}% = ${$(r.distributor_fees)}`],
+      ],
+      trade: [
+        ['Scan $', `${$(r.scan_dollars)}`],
+        ['Distributor fees', `${$(r.distributor_fees)}`],
+        ['Annual EDLP spend', `${n(avgBase,0)} base × 52 × ${$(inp.edlp)} EDLP = ${$(r.annual_edlp_spend)}`],
+        ['Annual trade spend', `${$(r.scan_dollars)} + ${$(r.distributor_fees)} + ${$(r.annual_edlp_spend)} = ${$(r.annual_trade_spend)}`],
+      ],
+      traderate: [
+        ['Trade rate', `${$(r.annual_trade_spend)} trade spend ÷ ${$(r.annual_gross_sales)} gross sales = ${(r.trade_rate*100).toFixed(1)}%`],
+      ],
+      net: [
+        ['Net sales', `${$(r.annual_gross_sales)} gross − ${$(r.annual_trade_spend)} trade spend = ${$(r.net_sales)}`],
+      ],
+    };
+    const titles = { margin:'Retailer margin', units:'Annual units', gross:'Annual gross sales', scan:'Scan $', distfees:'Distributor fees', trade:'Annual trade spend', traderate:'Trade rate', net:'Net sales' };
+    const rows = steps[key] || [];
+    let modal = document.getElementById('hl-promo-audit-modal');
+    if (modal) modal.remove();
+    modal = document.createElement('div');
+    modal.id = 'hl-promo-audit-modal';
+    modal.className = 'hl-modal-backdrop';
+    modal.innerHTML = `
+      <div class="hl-modal" style="max-width:560px;">
+        <div class="hl-modal-header"><h2 style="margin:0;">${titles[key] || 'Calculation'}</h2><button class="hl-modal-close" id="hl-audit-close">×</button></div>
+        <div class="hl-modal-body">
+          ${rows.map(([label, expr]) => `
+            <div style="padding:10px 0;border-bottom:1px solid var(--rule-softer);">
+              <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:3px;">${label}</div>
+              <div style="font-family:var(--mono);font-size:13px;color:var(--ink);">${expr}</div>
+            </div>`).join('')}
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const close = () => modal.remove();
+    modal.querySelector('#hl-audit-close').addEventListener('click', close);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+  }
+
   // Small modal to pick Brand Library items (in a promo group) to add to a promo.
   function openPromoItemPicker(candidates, onConfirm) {
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -26012,6 +26079,9 @@ render();
     }
     const e = existing || {};
     const v = (k, d) => (e[k] != null ? e[k] : (d != null ? d : ''));
+    // For NEW promos, seed sensible defaults as REAL values (not placeholders) so the
+    // calc runs immediately. For edits, use the saved value.
+    const dv = (k, def) => (e[k] != null ? e[k] : (promoId ? '' : def));
     // selected item ids for this promo (persisted in event_dates? no — store in promo.item_ids if present)
     let selectedItemIds = new Set(Array.isArray(e.item_ids) ? e.item_ids : []);
     let manualItems = [];  // {name, upc} added manually this session
@@ -26066,7 +26136,7 @@ render();
         <div class="hl-docs-label" style="margin-bottom:8px;">Pricing</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('ATG gross price')}${inp('hl-pc-atg', v('atg_gross_price'), '4.87')}</div>
-          <div>${lbl('Dist markup %')}${pctInp('hl-pc-markup', v('dist_markup'), '13')}</div>
+          <div>${lbl('Dist markup %')}${pctInp('hl-pc-markup', dv('dist_markup', 0.13), '13')}</div>
           <div>${lbl('Cur retail / SRP')}${inp('hl-pc-srp', v('srp'), '8.49')}</div>
           <div>${lbl('EDLP ($ off)')}${inp('hl-pc-edlp', v('edlp', 0), '0.23')}</div>
         </div>
@@ -26076,13 +26146,13 @@ render();
           <div>${lbl('Base UPSPW (velocity)')}${inp('hl-pc-upspw', v('base_upspw'), '1.2')}</div>
           <div>${lbl('# Items (auto from selection)')}${inp('hl-pc-items-count', v('num_items'), '1')}</div>
           <div>${lbl('Doors')}${inp('hl-pc-doors', v('doors'), '845')}</div>
-          <div>${lbl('Lift %')}${pctInp('hl-pc-lift', v('lift'), '35')}</div>
+          <div>${lbl('Lift %')}${pctInp('hl-pc-lift', dv('lift', 0.35), '35')}</div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('EDLP lift override')}${inp('hl-pc-edlplift', v('edlp_lift_override', 0), '0')}</div>
-          <div>${lbl('P1 # Events')}${inp('hl-pc-events', v('p1_events'), '8')}</div>
-          <div>${lbl('Wks per event')}${inp('hl-pc-wks', v('p1_wks_per_event'), '2')}</div>
-          <div>${lbl('Scan / BB unit ($)')}${inp('hl-pc-scan', v('scan_bb_unit'), '1.10')}</div>
+          <div>${lbl('P1 # Events')}${inp('hl-pc-events', dv('p1_events', 8), '8')}</div>
+          <div>${lbl('Wks per event')}${inp('hl-pc-wks', dv('p1_wks_per_event', 2), '2')}</div>
+          <div>${lbl('Scan / BB unit ($)')}${inp('hl-pc-scan', dv('scan_bb_unit', 1.10), '1.10')}</div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('Distributor fee % (scan)')}${pctInp('hl-pc-distfee', v('distributor_fee_pct', 0.10), '10')}</div>
@@ -26126,7 +26196,7 @@ render();
       if (!rid || !group) { itemsEl.innerHTML = '<div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);">Select a retailer and promo group to see carried items.</div>'; step2El.style.display = 'none'; return; }
       itemsEl.innerHTML = '<div class="hl-loading">Loading items…</div>';
       // All Brand Library products, to know which map to this group (for carried match + manual picker)
-      const { data: allProds } = await sb.from('products').select('id, item_description, product_line, unit_upc, wholesale_unit_price').eq('brand_id', brandId);
+      const { data: allProds } = await sb.from('products').select('id, item_description, product_line, unit_upc, wholesale_unit_price, srp').eq('brand_id', brandId);
       groupBrandProducts = (allProds || []).filter(p => promoGroupForLine(p.product_line) === group);
       const prodById = new Map((allProds || []).map(p => [p.id, p]));
       // carried items for retailer
@@ -26151,31 +26221,29 @@ render();
     // and price from Brand Library; pre-fill the fields (user can override).
     const autoPopulateFromData = async (rid, items, prodById) => {
       const pids = items.map(i => i.product_id).filter(Boolean);
-      let velAvg = null, doorsMax = null, srpAvg = null, atgAvg = null;
+      let velAvg = null, doorsMax = null;
       if (pids.length) {
         const { data: fa } = await sb.from('forecast_actuals')
-          .select('product_id, velocity, doors, arp, period_end')
+          .select('product_id, velocity, doors, period_end')
           .eq('brand_id', brandId).eq('retailer_id', rid).in('product_id', pids)
           .order('period_end', { ascending: false });
-        // latest row per product
         const latest = new Map();
         for (const r of (fa || [])) if (!latest.has(r.product_id)) latest.set(r.product_id, r);
         const vels = [...latest.values()].map(r => Number(r.velocity)).filter(v => isFinite(v) && v > 0);
         const doors = [...latest.values()].map(r => Number(r.doors)).filter(v => isFinite(v) && v > 0);
-        const arps = [...latest.values()].map(r => Number(r.arp)).filter(v => isFinite(v) && v > 0);
         if (vels.length) velAvg = vels.reduce((a,b)=>a+b,0) / vels.length;
         if (doors.length) doorsMax = Math.max(...doors);
-        if (arps.length) srpAvg = arps.reduce((a,b)=>a+b,0) / arps.length;
       }
-      // ATG price from Brand Library wholesale price (avg across the group's items)
+      // Price + SRP from Brand Library (avg across the group's items).
       const prices = items.map(i => prodById.get(i.product_id)?.wholesale_unit_price).map(Number).filter(v => isFinite(v) && v > 0);
-      if (prices.length) atgAvg = prices.reduce((a,b)=>a+b,0) / prices.length;
-      // set fields only if we found data
+      const srps = items.map(i => prodById.get(i.product_id)?.srp).map(Number).filter(v => isFinite(v) && v > 0);
+      const atgAvg = prices.length ? prices.reduce((a,b)=>a+b,0) / prices.length : null;
+      const srpAvg = srps.length ? srps.reduce((a,b)=>a+b,0) / srps.length : null;
       const set = (id, val, dp) => { const el = document.getElementById(id); if (el && val != null) el.value = Number(val).toFixed(dp); };
       set('hl-pc-upspw', velAvg, 2);
       set('hl-pc-doors', doorsMax, 0);
-      if (srpAvg) set('hl-pc-srp', srpAvg, 2);
-      if (atgAvg) set('hl-pc-atg', atgAvg, 2);
+      set('hl-pc-srp', srpAvg, 2);
+      set('hl-pc-atg', atgAvg, 2);
     };
 
     const renderItemsList = () => {
@@ -26235,7 +26303,7 @@ render();
     const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
     const pctf = (n) => (n == null || !isFinite(n)) ? '—' : (n * 100).toFixed(1) + '%';
     const numf = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
-    const calcCell = (label, val) => `<div style="background:var(--bone-2);border-radius:6px;padding:9px 11px;"><div style="font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${label}</div><div style="font-family:var(--mono);font-size:15px;font-weight:600;color:var(--ink);margin-top:2px;">${val}</div></div>`;
+    const calcCell = (label, val, key) => `<div class="hl-pc-calccell" data-audit="${key||''}" style="background:var(--bone-2);border-radius:6px;padding:9px 11px;cursor:${key?'pointer':'default'};${key?'':''}" ${key?'title="Click to audit this calculation"':''}><div style="font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${label}${key?' <span style=\'color:var(--ink-3);\'>ⓘ</span>':''}</div><div style="font-family:var(--mono);font-size:15px;font-weight:600;color:var(--ink);margin-top:2px;">${val}</div></div>`;
 
     const getInputs = () => ({
       retailer_id: document.getElementById('hl-pc-retailer').value || null,
@@ -26262,14 +26330,18 @@ render();
       const inputs = getInputs();
       const r = computePromoLine(inputs);
       document.getElementById('hl-pc-calc').innerHTML =
-        calcCell('Retailer margin', pctf(r.retailer_margin)) +
-        calcCell('Annual units', numf(r.annual_units)) +
-        calcCell('Annual gross sales', money(r.annual_gross_sales)) +
-        calcCell('Annual trade spend', money(r.annual_trade_spend)) +
-        calcCell('Trade rate', pctf(r.trade_rate)) +
-        calcCell('Scan $', money(r.scan_dollars)) +
-        calcCell('Distributor fees', money(r.distributor_fees)) +
-        calcCell('Net sales', money(r.net_sales));
+        calcCell('Retailer margin', pctf(r.retailer_margin), 'margin') +
+        calcCell('Annual units', numf(r.annual_units), 'units') +
+        calcCell('Annual gross sales', money(r.annual_gross_sales), 'gross') +
+        calcCell('Annual trade spend', money(r.annual_trade_spend), 'trade') +
+        calcCell('Trade rate', pctf(r.trade_rate), 'traderate') +
+        calcCell('Scan $', money(r.scan_dollars), 'scan') +
+        calcCell('Distributor fees', money(r.distributor_fees), 'distfees') +
+        calcCell('Net sales', money(r.net_sales), 'net');
+      document.querySelectorAll('.hl-pc-calccell[data-audit]').forEach(cell => {
+        if (!cell.dataset.audit) return;
+        cell.addEventListener('click', () => openPromoAudit(cell.dataset.audit, inputs, r));
+      });
       const dates = computePromoEventDates(inputs.start_date, inputs.p1_events, inputs.p1_wks_per_event);
       const sched = document.getElementById('hl-pc-schedule');
       if (!dates.length) sched.textContent = 'Enter a start date (and events / weeks) to see the schedule.';
