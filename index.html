@@ -25953,6 +25953,45 @@ render();
 
 
   // ─── Promo card (add / edit one promo line) ───
+  // Small modal to pick Brand Library items (in a promo group) to add to a promo.
+  function openPromoItemPicker(candidates, onConfirm) {
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    let modal = document.getElementById('hl-promo-pick-modal');
+    if (modal) modal.remove();
+    modal = document.createElement('div');
+    modal.id = 'hl-promo-pick-modal';
+    modal.className = 'hl-modal-backdrop';
+    modal.innerHTML = `
+      <div class="hl-modal" style="max-width:520px;">
+        <div class="hl-modal-header"><h2 style="margin:0;">Add items from Brand Library</h2><button class="hl-modal-close" id="hl-pick-close">×</button></div>
+        <div class="hl-modal-body">
+          <p style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin:0 0 12px;">Brand Library items in this group not already listed. Check the ones this retailer carries.</p>
+          <div style="background:var(--paper);border:1px solid var(--rule-softer);border-radius:4px;overflow:hidden;max-height:300px;overflow-y:auto;">
+            ${candidates.map((p, i) => `
+              <label style="display:flex;align-items:center;gap:10px;padding:7px 12px;border-bottom:1px solid var(--rule-softer);cursor:pointer;font-size:13px;">
+                <input type="checkbox" class="hl-pick-cb" data-i="${i}" />
+                <span style="flex:1;">${esc(p.item_description)}</span>
+                <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(p.unit_upc||'')}</span>
+              </label>`).join('')}
+          </div>
+        </div>
+        <div class="hl-modal-footer" style="display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid var(--rule-soft);">
+          <button id="hl-pick-cancel" class="hl-btn-secondary">Cancel</button>
+          <button id="hl-pick-add" class="hl-btn-primary">Add selected</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    const close = () => modal.remove();
+    modal.querySelector('#hl-pick-close').addEventListener('click', close);
+    modal.querySelector('#hl-pick-cancel').addEventListener('click', close);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+    modal.querySelector('#hl-pick-add').addEventListener('click', () => {
+      const chosen = [...modal.querySelectorAll('.hl-pick-cb')].filter(cb => cb.checked).map(cb => candidates[Number(cb.dataset.i)]);
+      close();
+      if (chosen.length) onConfirm(chosen);
+    });
+  }
+
   // ─── Promo card (inline page; add / edit one promo line) ───
   // Step 1: retailer + promo group → show carried items mapping to that group
   //         (verify/select, add manual). # items defaults to the selection count.
@@ -25978,13 +26017,19 @@ render();
     let manualItems = [];  // {name, upc} added manually this session
 
     const inp = (id, val, ph, step) => `<input id="${id}" type="number" step="${step||'any'}" value="${val===''?'':esc(val)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" />`;
+    // Percent-display input: shows the decimal value ×100 (e.g. 0.35 → 35) with a %
+    // suffix; getInputs converts back to a decimal on read.
+    const pctInp = (id, val, ph) => {
+      const shown = (val === '' || val == null) ? '' : (Number(val) * 100);
+      return `<div style="position:relative;"><input id="${id}" type="number" step="any" value="${shown===''?'':esc(shown)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 22px 7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" /><span style="position:absolute;right:9px;top:50%;transform:translateY(-50%);font-family:var(--mono);font-size:11px;color:var(--ink-3);pointer-events:none;">%</span></div>`;
+    };
     const lbl = (t) => `<label style="display:block;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:3px;">${t}</label>`;
 
     main.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:6px;">
         <button id="hl-pc-back" style="background:transparent;border:none;color:var(--ink-2);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;cursor:pointer;padding:0;">← Back to promos</button>
       </div>
-      <h1 class="page-title">${promoId ? 'Edit promo' : 'New promo'}</h1>
+      <h1 class="page-title" id="hl-pc-title">${promoId ? 'Edit promo' : 'New promo'}</h1>
 
       <!-- Step 1: retailer + promo group + items -->
       <div style="background:var(--bone-2);border-radius:8px;padding:18px;margin-top:14px;">
@@ -26021,7 +26066,7 @@ render();
         <div class="hl-docs-label" style="margin-bottom:8px;">Pricing</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('ATG gross price')}${inp('hl-pc-atg', v('atg_gross_price'), '4.87')}</div>
-          <div>${lbl('Dist markup')}${inp('hl-pc-markup', v('dist_markup'), '0.13')}</div>
+          <div>${lbl('Dist markup %')}${pctInp('hl-pc-markup', v('dist_markup'), '13')}</div>
           <div>${lbl('Cur retail / SRP')}${inp('hl-pc-srp', v('srp'), '8.49')}</div>
           <div>${lbl('EDLP ($ off)')}${inp('hl-pc-edlp', v('edlp', 0), '0.23')}</div>
         </div>
@@ -26031,7 +26076,7 @@ render();
           <div>${lbl('Base UPSPW (velocity)')}${inp('hl-pc-upspw', v('base_upspw'), '1.2')}</div>
           <div>${lbl('# Items (auto from selection)')}${inp('hl-pc-items-count', v('num_items'), '1')}</div>
           <div>${lbl('Doors')}${inp('hl-pc-doors', v('doors'), '845')}</div>
-          <div>${lbl('Lift')}${inp('hl-pc-lift', v('lift'), '0.35')}</div>
+          <div>${lbl('Lift %')}${pctInp('hl-pc-lift', v('lift'), '35')}</div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('EDLP lift override')}${inp('hl-pc-edlplift', v('edlp_lift_override', 0), '0')}</div>
@@ -26040,7 +26085,7 @@ render();
           <div>${lbl('Scan / BB unit ($)')}${inp('hl-pc-scan', v('scan_bb_unit'), '1.10')}</div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
-          <div>${lbl('Distributor fee % (scan)')}${inp('hl-pc-distfee', v('distributor_fee_pct', 0.10), '0.10')}</div>
+          <div>${lbl('Distributor fee % (scan)')}${pctInp('hl-pc-distfee', v('distributor_fee_pct', 0.10), '10')}</div>
           <div>${lbl('First event start date')}<input id="hl-pc-startdate" type="date" value="${esc(v('start_date'))}" style="width:100%;box-sizing:border-box;padding:6px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" /></div>
         </div>
 
@@ -26068,20 +26113,24 @@ render();
     const itemsEl = document.getElementById('hl-pc-items');
     const step2El = document.getElementById('hl-pc-step2');
 
+    // Brand Library products in the chosen group (for the manual-add picker) and
+    // the latest actuals (velocity/doors) for auto-population.
+    let groupBrandProducts = [];   // [{id, item_description, unit_upc, product_line}]
     const loadCarriedItems = async () => {
       const rid = document.getElementById('hl-pc-retailer').value;
       const group = document.getElementById('hl-pc-group').value;
+      // Title shows retailer name
+      const titleEl = document.getElementById('hl-pc-title');
+      const rName = (retailers || []).find(r => r.id === rid)?.name;
+      if (titleEl) titleEl.textContent = (promoId ? 'Edit promo' : 'New promo') + (rName ? ' — ' + rName : '');
       if (!rid || !group) { itemsEl.innerHTML = '<div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);">Select a retailer and promo group to see carried items.</div>'; step2El.style.display = 'none'; return; }
       itemsEl.innerHTML = '<div class="hl-loading">Loading items…</div>';
+      // All Brand Library products, to know which map to this group (for carried match + manual picker)
+      const { data: allProds } = await sb.from('products').select('id, item_description, product_line, unit_upc, wholesale_unit_price').eq('brand_id', brandId);
+      groupBrandProducts = (allProds || []).filter(p => promoGroupForLine(p.product_line) === group);
+      const prodById = new Map((allProds || []).map(p => [p.id, p]));
       // carried items for retailer
       const { data: ri } = await sb.from('retailer_items').select('id, raw_upc, raw_item_name, product_id').eq('brand_id', brandId).eq('retailer_id', rid);
-      const productIds = [...new Set((ri||[]).map(i => i.product_id).filter(Boolean))];
-      const prodById = new Map();
-      for (let i = 0; i < productIds.length; i += 200) {
-        const { data: ps } = await sb.from('products').select('id, item_description, product_line, unit_upc').in('id', productIds.slice(i, i+200));
-        (ps||[]).forEach(p => prodById.set(p.id, p));
-      }
-      // dedupe by upc, map to group, keep only items whose product_line maps to the chosen group
       const norm = (u) => String(u==null?'':u).replace(/\D/g,'');
       const seen = new Set();
       carriedItems = [];
@@ -26093,7 +26142,40 @@ render();
         if (seen.has(key)) continue; seen.add(key);
         carriedItems.push({ id: it.id, name: (p && p.item_description) || it.raw_item_name || it.raw_upc, upc: (p && p.unit_upc) || it.raw_upc, product_line: line, product_id: it.product_id });
       }
+      // ── Auto-populate velocity / doors / price from data (only on NEW promos) ──
+      if (!promoId) await autoPopulateFromData(rid, carriedItems, prodById);
       renderItemsList();
+    };
+
+    // Pull latest actuals (velocity, doors) for the group's items at this retailer,
+    // and price from Brand Library; pre-fill the fields (user can override).
+    const autoPopulateFromData = async (rid, items, prodById) => {
+      const pids = items.map(i => i.product_id).filter(Boolean);
+      let velAvg = null, doorsMax = null, srpAvg = null, atgAvg = null;
+      if (pids.length) {
+        const { data: fa } = await sb.from('forecast_actuals')
+          .select('product_id, velocity, doors, arp, period_end')
+          .eq('brand_id', brandId).eq('retailer_id', rid).in('product_id', pids)
+          .order('period_end', { ascending: false });
+        // latest row per product
+        const latest = new Map();
+        for (const r of (fa || [])) if (!latest.has(r.product_id)) latest.set(r.product_id, r);
+        const vels = [...latest.values()].map(r => Number(r.velocity)).filter(v => isFinite(v) && v > 0);
+        const doors = [...latest.values()].map(r => Number(r.doors)).filter(v => isFinite(v) && v > 0);
+        const arps = [...latest.values()].map(r => Number(r.arp)).filter(v => isFinite(v) && v > 0);
+        if (vels.length) velAvg = vels.reduce((a,b)=>a+b,0) / vels.length;
+        if (doors.length) doorsMax = Math.max(...doors);
+        if (arps.length) srpAvg = arps.reduce((a,b)=>a+b,0) / arps.length;
+      }
+      // ATG price from Brand Library wholesale price (avg across the group's items)
+      const prices = items.map(i => prodById.get(i.product_id)?.wholesale_unit_price).map(Number).filter(v => isFinite(v) && v > 0);
+      if (prices.length) atgAvg = prices.reduce((a,b)=>a+b,0) / prices.length;
+      // set fields only if we found data
+      const set = (id, val, dp) => { const el = document.getElementById(id); if (el && val != null) el.value = Number(val).toFixed(dp); };
+      set('hl-pc-upspw', velAvg, 2);
+      set('hl-pc-doors', doorsMax, 0);
+      if (srpAvg) set('hl-pc-srp', srpAvg, 2);
+      if (atgAvg) set('hl-pc-atg', atgAvg, 2);
     };
 
     const renderItemsList = () => {
@@ -26126,10 +26208,18 @@ render();
         if (countEl) { countEl.value = selectedItemIds.size; recalc(); }
       }));
       document.getElementById('hl-pc-additem').addEventListener('click', async () => {
-        const name = prompt('Item name:'); if (!name) return;
-        const upc = prompt('UPC (optional):') || '';
-        manualItems.push({ name: name.trim(), upc: upc.trim() });
-        renderItemsList();
+        // Show Brand Library items in THIS group that aren't already listed.
+        const norm = (u) => String(u==null?'':u).replace(/\D/g,'');
+        const shownUpcs = new Set(carriedItems.map(c => norm(c.upc)).concat(manualItems.map(m => norm(m.upc))));
+        const shownPids = new Set(carriedItems.map(c => c.product_id).filter(Boolean));
+        const candidates = groupBrandProducts.filter(p => !shownPids.has(p.id) && !shownUpcs.has(norm(p.unit_upc)));
+        if (!candidates.length) { alert('All Brand Library items in this group are already listed.'); return; }
+        openPromoItemPicker(candidates, (chosen) => {
+          for (const p of chosen) {
+            manualItems.push({ name: p.item_description, upc: p.unit_upc || '', product_id: p.id });
+          }
+          renderItemsList();
+        });
       });
       // show step 2, set # items from selection
       step2El.style.display = '';
@@ -26152,18 +26242,18 @@ render();
       promoted_group: document.getElementById('hl-pc-group').value || null,
       promo_type: document.getElementById('hl-pc-type').value,
       atg_gross_price: parseFloat(document.getElementById('hl-pc-atg').value) || 0,
-      dist_markup: parseFloat(document.getElementById('hl-pc-markup').value) || 0,
+      dist_markup: (parseFloat(document.getElementById('hl-pc-markup').value) || 0) / 100,
       srp: parseFloat(document.getElementById('hl-pc-srp').value) || 0,
       edlp: parseFloat(document.getElementById('hl-pc-edlp').value) || 0,
       base_upspw: parseFloat(document.getElementById('hl-pc-upspw').value) || 0,
       num_items: parseFloat(document.getElementById('hl-pc-items-count').value) || 0,
       doors: parseFloat(document.getElementById('hl-pc-doors').value) || 0,
-      lift: parseFloat(document.getElementById('hl-pc-lift').value) || 0,
+      lift: (parseFloat(document.getElementById('hl-pc-lift').value) || 0) / 100,
       edlp_lift_override: parseFloat(document.getElementById('hl-pc-edlplift').value) || 0,
       p1_events: parseFloat(document.getElementById('hl-pc-events').value) || 0,
       p1_wks_per_event: parseFloat(document.getElementById('hl-pc-wks').value) || 0,
       scan_bb_unit: parseFloat(document.getElementById('hl-pc-scan').value) || 0,
-      distributor_fee_pct: document.getElementById('hl-pc-distfee').value === '' ? 0.10 : parseFloat(document.getElementById('hl-pc-distfee').value),
+      distributor_fee_pct: document.getElementById('hl-pc-distfee').value === '' ? 0.10 : (parseFloat(document.getElementById('hl-pc-distfee').value) / 100),
       start_date: document.getElementById('hl-pc-startdate').value || null,
     });
 
@@ -26199,10 +26289,12 @@ render();
       // persist any manual items into retailer_items so they're known carried items
       for (const m of manualItems) {
         try {
-          await sb.from('retailer_items').insert({ brand_id: brandId, retailer_id: inputs.retailer_id, raw_item_name: m.name, raw_upc: m.upc || null });
+          await sb.from('retailer_items').insert({ brand_id: brandId, retailer_id: inputs.retailer_id, raw_item_name: m.name, raw_upc: m.upc || null, product_id: m.product_id || null });
         } catch (ie) { /* non-fatal */ }
       }
       const itemIds = [...selectedItemIds].filter(id => !String(id).startsWith('manual:'));
+      // add product_ids of any manually-picked Brand Library items
+      for (const m of manualItems) if (m.product_id) itemIds.push(m.product_id);
       const row = {
         brand_id: brandId, ...inputs, event_dates: eventDates, item_ids: itemIds,
         retailer_margin: computed.retailer_margin, annual_units: computed.annual_units,
