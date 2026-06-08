@@ -24964,8 +24964,14 @@ render();
           if (!isLockedMonth(monthKeys[i])) continue;
           const a = lookupItemActual(actuals, it.unitUpc, it.itemName, monthKeys[i], metricKey);
           const fc = it.fcByMonth[i];
-          actualsNet += ((a != null ? a : 0) - fc);
-          if (a != null) matchedActualTotal += a;
+          // If the actual is MISSING for this item/month, we have no basis to replace
+          // the forecast — contribute 0 (keep forecast), not (0 − fc). This matters
+          // most in UNITS mode, where sales_actuals often lacks unit quantities
+          // (dollars are populated but units are null); without this guard the bridge
+          // shows a phantom negative equal to the full forecast.
+          if (a == null) continue;
+          actualsNet += (a - fc);
+          matchedActualTotal += a;
         }
         if (resolvedByUpc) consumedUpcKeys.add(uk); else if (actuals.byName.has(nk)) consumedNameKeys.add(nk);
       }
@@ -25731,7 +25737,7 @@ render();
     'baguettes': 'Bread',
     'pita': 'Bread 2.0',
     'rolls': 'Bread',
-    'garlic rosemary dinner rolls': 'Bread',
+    'garlic rosemary dinner rolls': 'Bread 2.0',
     'pizza pockets': 'Pockets',
     'pizza poppers': 'Poppers',
     '12" pizza': '12" Pizza',
@@ -25899,9 +25905,6 @@ render();
         <select id="hl-pf-group" class="hl-pf" style="padding:7px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
           <option value="">All product groups</option>${fGroups.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('')}
         </select>
-        <select id="hl-pf-item" class="hl-pf" style="padding:7px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);min-width:180px;">
-          <option value="">All items</option>${fItems.map(it => `<option value="${esc(it)}">${esc(it)}</option>`).join('')}
-        </select>
         <select id="hl-pf-type" class="hl-pf" style="padding:7px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
           <option value="">All promo types</option>${fTypes.map(t => `<option value="${esc(t)}">${esc(typeLabel(t))}</option>`).join('')}
         </select>
@@ -25918,14 +25921,12 @@ render();
     const renderSummary = () => {
       const fR = document.getElementById('hl-pf-retailer').value;
       const fG = document.getElementById('hl-pf-group').value;
-      const fI = document.getElementById('hl-pf-item').value;
       const fT = document.getElementById('hl-pf-type').value;
       // filter lines
       const lines = promos.filter(p => {
         if (fR && retById.get(p.retailer_id) !== fR) return false;
         if (fG && p.promoted_group !== fG) return false;
         if (fT && p.promo_type !== fT) return false;
-        if (fI && !lineItemNames(p).includes(fI)) return false;
         return true;
       });
       if (!lines.length) { summaryEl.innerHTML = `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:24px;text-align:center;background:var(--bone-2);border-radius:8px;">No promos match these filters.</div>`; return; }
@@ -25945,9 +25946,11 @@ render();
       }
       rows.sort((a,b)=> b.grossSales - a.grossSales || a.name.localeCompare(b.name));
 
+      const colgroup = `<colgroup><col style="width:24%"><col style="width:11%"><col style="width:8%"><col style="width:8%"><col style="width:12%"><col style="width:13%"><col style="width:13%"><col style="width:8%"><col style="width:3%"></colgroup>`;
       summaryEl.innerHTML = `
         <div class="hl-master-table-wrap">
-          <table class="hl-master-table" style="font-size:12px;">
+          <table class="hl-master-table" style="font-size:12px;table-layout:fixed;width:100%;">
+            ${colgroup}
             <thead><tr>
               ${th('Retailer')}${th('Retailer margin', true)}${th('# Events', true)}${th('Wks/event', true)}${th('Annual units', true)}${th('Annual gross sales', true)}${th('Annual trade spend', true)}${th('Trade rate', true)}${th('')}
             </tr></thead>
@@ -25965,17 +25968,16 @@ render();
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);color:var(--ink-3);"><span class="hl-promo-caret" data-idx="${idx}">▸</span></td>
                 </tr>
                 <tr class="hl-promo-detail" data-idx="${idx}" style="display:none;">
-                  <td colspan="9" style="padding:0 10px 10px;background:var(--bone-2);">
-                    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:4px;">
+                  <td colspan="9" style="padding:0;background:var(--bone-2);">
+                    <table style="width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;">
+                      ${colgroup}
                       <thead><tr>
-                        <th style="width:28px;"></th>${th('Promoted group')}${th('Type')}${th('Margin', true)}${th('Events', true)}${th('Wks', true)}${th('Annual units', true)}${th('Gross sales', true)}${th('Trade spend', true)}${th('Trade rate', true)}${th('')}
+                        ${th('Group · type')}${th('Margin', true)}${th('Events', true)}${th('Wks', true)}${th('Annual units', true)}${th('Gross sales', true)}${th('Trade spend', true)}${th('Trade rate', true)}${th('')}
                       </tr></thead>
                       <tbody>
                         ${row.lines.map(l => `
                           <tr style="border-top:1px solid var(--rule-softer);">
-                            <td style="padding:6px 10px;text-align:center;"><input type="checkbox" class="hl-promo-delcb" data-id="${esc(l.id)}" ${selectedToDelete.has(l.id)?'checked':''} /></td>
-                            <td class="text" style="padding:6px 10px;">${esc(l.promoted_group || '—')}</td>
-                            <td class="text" style="padding:6px 10px;font-family:var(--mono);font-size:10px;">${esc(typeLabel(l.promo_type) || '—')}</td>
+                            <td class="text" style="padding:6px 10px;"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" class="hl-promo-delcb" data-id="${esc(l.id)}" ${selectedToDelete.has(l.id)?'checked':''} /><span>${esc(l.promoted_group || '—')} <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">${esc(typeLabel(l.promo_type) || '')}</span></span></label></td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${pct(l.retailer_margin)}</td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(l.p1_events)}</td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(l.p1_wks_per_event)}</td>
@@ -25983,7 +25985,7 @@ render();
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${money(l.annual_gross_sales)}</td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${money(l.annual_trade_spend)}</td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${pct(l.trade_rate)}</td>
-                            <td style="text-align:right;padding:6px 10px;"><button class="hl-promo-edit" data-id="${esc(l.id)}" style="background:transparent;border:1px solid var(--rule-soft);border-radius:3px;font-family:var(--mono);font-size:9px;padding:3px 8px;cursor:pointer;text-transform:uppercase;">Edit</button></td>
+                            <td style="text-align:right;padding:6px 10px;"><button class="hl-promo-edit" data-id="${esc(l.id)}" style="background:transparent;border:1px solid var(--rule-soft);border-radius:3px;font-family:var(--mono);font-size:9px;padding:3px 6px;cursor:pointer;text-transform:uppercase;">Edit</button></td>
                           </tr>`).join('')}
                       </tbody>
                     </table>
