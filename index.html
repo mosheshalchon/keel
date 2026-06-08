@@ -25790,7 +25790,8 @@ render();
     return {
       retailer_margin: retailerMargin,
       avg_wkly_base_units: avgWklyBaseUnits,
-      annual_base_units: annualBaseEdlpUnits,
+      // Base units = the non-promo portion, defined so base + on-promo = total exactly.
+      annual_base_units: totalUnits - totalUnitsPromo,
       wkly_promo_units: wklyPromoUnits,
       promo_weeks: promoWeeks,
       annual_units: totalUnits,
@@ -25979,8 +25980,8 @@ render();
         ['TOTAL annual units', `${n(avgBase*52,0)} base + ${n(r.annual_units - avgBase*52,0)} incremental = ${n(r.annual_units,0)}`],
       ],
       baseunits: [
-        ['Avg weekly base units', `${n(inp.doors,0)} doors × ${n(inp.num_items,0)} items × ${n(inp.base_upspw)} UPSPW × (1 + ${(inp.edlp_lift_override*100).toFixed(0)}% EDLP lift) = ${n(avgBase,0)}`],
-        ['Annual base units', `${n(avgBase,0)} × 52 wks = ${n(r.annual_base_units,0)}`],
+        ['Annual units on promo', `${n(r.wkly_promo_units,0)} wkly promo × ${n(r.promo_weeks,0)} promo wks = ${n(r.total_units_promo,0)}`],
+        ['Annual base units', `${n(r.annual_units,0)} total units − ${n(r.total_units_promo,0)} on promo = ${n(r.annual_base_units,0)}`],
       ],
       promounits: [
         ['Weekly promo units', `${n(avgBase,0)} base × (1 + ${(inp.lift*100).toFixed(0)}% lift) = ${n(r.wkly_promo_units,0)}`],
@@ -26388,7 +26389,20 @@ render();
       body.querySelectorAll('.hl-pc-evdate').forEach(el => el.addEventListener('input', (ev) => {
         ev.stopPropagation();  // dates don't affect the calc; don't trigger recalc/re-render
         const i = Number(el.dataset.i), k = el.dataset.k;
-        if (promoDates[i]) promoDates[i][k] = el.value;
+        if (!promoDates[i]) return;
+        promoDates[i][k] = el.value;
+        // When a START date changes, auto-fill that event's END = start + (wks×7 − 1) days.
+        if (k === 'start' && el.value) {
+          const wks = Math.max(1, Math.round(getInputs().p1_wks_per_event || 0));
+          const s = new Date(el.value + 'T00:00:00');
+          if (!isNaN(s.getTime())) {
+            const endD = new Date(s.getTime()); endD.setDate(endD.getDate() + wks * 7 - 1);
+            const endISO = endD.toISOString().slice(0, 10);
+            promoDates[i].end = endISO;
+            const endInput = body.querySelector(`.hl-pc-evdate[data-i="${i}"][data-k="end"]`);
+            if (endInput) endInput.value = endISO;
+          }
+        }
       }));
       const refill = document.getElementById('hl-pc-dates-refill');
       if (refill) refill.addEventListener('click', () => { promoDates = []; renderPromoDates(); });
