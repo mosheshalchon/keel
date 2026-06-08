@@ -24749,6 +24749,13 @@ render();
     });
     const otherTotal = otherByIdx.reduce((s, v) => s + (v || 0), 0);
     const hasOther = otherByIdx.some(v => v != null && v !== 0);
+    if (window._otherDebug) {
+      console.log('[otherDebug] metric=', metric, 'lockThrough=', lockThrough);
+      console.log('[otherDebug] monthKeys=', monthKeys);
+      console.log('[otherDebug] lockedKeys=', monthKeys.filter(mk => isLockedMonth(mk)));
+      console.log('[otherDebug] spByMonth=', spByMonth);
+      console.log('[otherDebug] otherByIdx=', otherByIdx, 'hasOther=', hasOther, 'otherTotal=', otherTotal);
+    }
 
     const monthOptions = monthKeys.map((mk, i) => mk ? `<option value="${mk}" ${lockThrough === mk ? 'selected' : ''}>${esc(monthLabels[i])}</option>` : '').join('');
     const blendLabel = lockThrough
