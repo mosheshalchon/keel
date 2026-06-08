@@ -23355,7 +23355,7 @@ render();
       (rs || []).forEach(r => retailersById.set(r.id, r));
     }
     if (productIds.length) {
-      const { data: ps } = await sb.from('products').select('id, item_description, category, product_line, unit_upc').in('id', productIds);
+      const { data: ps } = await sb.from('products').select('id, item_description, category, product_line, unit_upc, case_pack, units_per_case').in('id', productIds);
       (ps || []).forEach(p => productsById.set(p.id, p));
     }
 
@@ -23433,11 +23433,13 @@ render();
       const itemName = product ? product.item_description : '(unknown)';
       const category = product ? product.category : null;
       // Units-per-case for eaches→cases conversion. The forecast's velocity/price are
-      // per-EACH (dollars = eaches × each-price). We report UNITS in CASES to match the
-      // cases-based actuals, so cases = eaches ÷ units_per_case. Dollars are unchanged
-      // (they stay eaches × each-price). If units_per_case is missing/invalid, we leave
-      // units as eaches (divide by 1) rather than produce NaN/Infinity.
-      const casePack = product && Number(product.units_per_case) > 0 ? Number(product.units_per_case) : 1;
+      // per SELLING-UNIT (the unit priced at wholesale_unit_price); case_pack is how
+      // many selling-units go in a case (case_price ÷ each_price = case_pack). So
+      // cases = forecast-units ÷ case_pack. NOTE: this is case_pack, NOT units_per_case
+      // (which counts individual pieces, a finer granularity than the priced unit).
+      // Dollars are unchanged (they stay units × each-price). Falls back to 1 if missing.
+      const casePack = product && Number(product.case_pack) > 0 ? Number(product.case_pack) : 1;
+      if (window._fcDebug) console.log('[fcDebug]', (product&&product.item_description||'?').slice(0,24), 'case_pack=', product&&product.case_pack, '→ casePack used=', casePack);
 
       const monthly = new Array(numMonths).fill(0);
       const monthlyUnits = new Array(numMonths).fill(0);  // forecast UNITS per month (for $/units toggle)
