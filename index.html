@@ -7083,7 +7083,24 @@ window.SpinsConverter = (function() {
 
           // Stage is active and not yet notified → queue a notification per person.
           const itemLabel = sub.item_description ? ` — ${sub.item_description}` : '';
-          const dueLabel = sub.submission_due ? ` (due ${new Date(sub.submission_due).toLocaleDateString()})` : '';
+          // Countdown body based on the stage's anchor date vs today. The anchor is
+          // what the stage counts toward (submission_due or reset_date), so phrase it
+          // accordingly. Computed at fire time (stored on the row).
+          const anchorDate = fieldVal(anchor);
+          const anchorNoun = anchor === 'reset_date' ? 'Reset date' : 'Submission';
+          const anchorVerb = anchor === 'reset_date' ? 'is' : 'is due';
+          let countdownBody;
+          if (anchorDate) {
+            const ad = new Date(anchorDate); ad.setHours(0,0,0,0);
+            const days = Math.round((ad - today) / 86400000);
+            const dstr = ad.toLocaleDateString();
+            if (days > 1) countdownBody = `${anchorNoun} ${anchorVerb} in ${days} days (${dstr})`;
+            else if (days === 1) countdownBody = `${anchorNoun} ${anchorVerb} tomorrow (${dstr})`;
+            else if (days === 0) countdownBody = `${anchorNoun} ${anchorVerb} today (${dstr})`;
+            else countdownBody = `${anchorNoun} ${anchor === 'reset_date' ? 'was' : 'was due'} ${Math.abs(days)} day${Math.abs(days)===1?'':'s'} ago (${dstr})`;
+          } else {
+            countdownBody = sd.action_label || 'Stage active';
+          }
           for (const email of emails) {
             toInsertNotifs.push({
               recipient_email: email,
@@ -7091,7 +7108,7 @@ window.SpinsConverter = (function() {
               submission_id: sub.id,
               kind: 'stage_reminder',
               title: `${sd.label || sd.stage_key}: ${sub.retailer}${itemLabel}`,
-              body: `${sd.action_label || 'Stage active'}${dueLabel}`,
+              body: countdownBody,
               link_hash: `#submission-docs?id=${sub.id}`,
             });
           }
