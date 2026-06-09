@@ -9851,10 +9851,10 @@ function renderTimelinePage() {
               // Live values from the rendered prize row inputs, fallback to saved map.
               const liveRow = body.querySelector(`[data-prize-row][data-product-id="${p.id}"]`);
               const sp = prizeByProductId.get(p.id) || {};
-              const d = liveRow ? (Number(liveRow.querySelector('[data-prize-field="doors"]').value) || 0) : (Number(sp.doors) || 0);
-              const vel = liveRow ? (Number(liveRow.querySelector('[data-prize-field="velocity"]').value) || 0) : (Number(sp.velocity) || 0);
-              const pw = liveRow ? (Number(liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0) : (Number(sp.promo_weeks_per_year) || 0);
-              const lp = liveRow ? (Number(liveRow.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0) : (Number(sp.promo_lift_pct) || 0);
+              const d = ((liveRow && liveRow.querySelector('[data-prize-field="doors"]')) ? (Number(liveRow.querySelector('[data-prize-field="doors"]').value) || 0) : (Number(sp.doors) || 0));
+              const vel = ((liveRow && liveRow.querySelector('[data-prize-field="velocity"]')) ? (Number(liveRow.querySelector('[data-prize-field="velocity"]').value) || 0) : (Number(sp.velocity) || 0));
+              const pw = ((liveRow && liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]')) ? (Number(liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0) : (Number(sp.promo_weeks_per_year) || 0));
+              const lp = ((liveRow && liveRow.querySelector('[data-prize-field="promo_lift_pct"]')) ? (Number(liveRow.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0) : (Number(sp.promo_lift_pct) || 0));
               const promoUnitsYr = d * vel * (1 + lp/100) * pw;
               let cost = 0;
               let detail = '';
@@ -10332,7 +10332,17 @@ function renderTimelinePage() {
         const numVal = val === '' || val == null ? null : Number(val);
         const { error } = await sb.from('timeline_entries').update({ slotting_cases_per_door: numVal }).eq('id', submissionId);
         if (error) { alert('Slotting save failed: ' + error.message); return; }
-        await loadDocsPanel(submissionId);
+        // Keep the local submission object in sync so the slotting total recomputes
+        // without needing a full reload.
+        try { submission.slotting_cases_per_door = numVal; } catch (e) {}
+        // Re-render the panel to reflect the new total. Guard it: if the re-render
+        // throws (missing element, etc.) it must not bubble to the app error
+        // boundary, which would kick the user out to the summary page.
+        try {
+          await loadDocsPanel(submissionId);
+        } catch (e) {
+          console.warn('[Slotting] panel refresh failed (non-fatal):', e);
+        }
       };
       slottingDropdown.addEventListener('change', async (e) => {
         const v = e.target.value;
@@ -10369,7 +10379,8 @@ function renderTimelinePage() {
       const rows = selectedProducts.map(p => {
         const sp = prizeByProductId.get(p.id) || {};
         const liveRow = body.querySelector(`[data-prize-row][data-product-id="${p.id}"]`);
-        const doors = liveRow ? (Number(liveRow.querySelector('[data-prize-field="doors"]').value) || 0) : (Number(sp.doors) || 0);
+        const _dEl = liveRow ? liveRow.querySelector('[data-prize-field="doors"]') : null;
+        const doors = _dEl ? (Number(_dEl.value) || 0) : (Number(sp.doors) || 0);
         const casePrice = casePriceByProductId.get(p.id);
         const cost = doors * cpd * (casePrice || 0);
         return { name: p.item_description || '—', doors, casePrice, cost };
@@ -10525,10 +10536,10 @@ function renderTimelinePage() {
       const liveVars = (productId) => {
         const liveRow = body.querySelector(`[data-prize-row][data-product-id="${productId}"]`);
         const sp = prizeByProductId.get(productId) || {};
-        const d = liveRow ? (Number(liveRow.querySelector('[data-prize-field="doors"]').value) || 0) : (Number(sp.doors) || 0);
-        const vel = liveRow ? (Number(liveRow.querySelector('[data-prize-field="velocity"]').value) || 0) : (Number(sp.velocity) || 0);
-        const pw = liveRow ? (Number(liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0) : (Number(sp.promo_weeks_per_year) || 0);
-        const lp = liveRow ? (Number(liveRow.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0) : (Number(sp.promo_lift_pct) || 0);
+        const d = ((liveRow && liveRow.querySelector('[data-prize-field="doors"]')) ? (Number(liveRow.querySelector('[data-prize-field="doors"]').value) || 0) : (Number(sp.doors) || 0));
+        const vel = ((liveRow && liveRow.querySelector('[data-prize-field="velocity"]')) ? (Number(liveRow.querySelector('[data-prize-field="velocity"]').value) || 0) : (Number(sp.velocity) || 0));
+        const pw = ((liveRow && liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]')) ? (Number(liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0) : (Number(sp.promo_weeks_per_year) || 0));
+        const lp = ((liveRow && liveRow.querySelector('[data-prize-field="promo_lift_pct"]')) ? (Number(liveRow.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0) : (Number(sp.promo_lift_pct) || 0));
         return { d, vel, pw, lp, promoUnitsYr: d * vel * (1 + lp / 100) * pw };
       };
       const costForLine = (line) => {
@@ -10645,10 +10656,10 @@ function renderTimelinePage() {
         // Pull live values from the row inputs if rendered, fallback to DB
         const liveRow = body.querySelector(`[data-prize-row][data-product-id="${p.id}"]`);
         const sp = prizeByProductId.get(p.id) || {};
-        const d = liveRow ? (Number(liveRow.querySelector('[data-prize-field="doors"]').value) || 0) : (Number(sp.doors) || 0);
-        const v = liveRow ? (Number(liveRow.querySelector('[data-prize-field="velocity"]').value) || 0) : (Number(sp.velocity) || 0);
-        const pw = liveRow ? (Number(liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0) : (Number(sp.promo_weeks_per_year) || 0);
-        const lp = liveRow ? (Number(liveRow.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0) : (Number(sp.promo_lift_pct) || 0);
+        const d = ((liveRow && liveRow.querySelector('[data-prize-field="doors"]')) ? (Number(liveRow.querySelector('[data-prize-field="doors"]').value) || 0) : (Number(sp.doors) || 0));
+        const v = ((liveRow && liveRow.querySelector('[data-prize-field="velocity"]')) ? (Number(liveRow.querySelector('[data-prize-field="velocity"]').value) || 0) : (Number(sp.velocity) || 0));
+        const pw = ((liveRow && liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]')) ? (Number(liveRow.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0) : (Number(sp.promo_weeks_per_year) || 0));
+        const lp = ((liveRow && liveRow.querySelector('[data-prize-field="promo_lift_pct"]')) ? (Number(liveRow.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0) : (Number(sp.promo_lift_pct) || 0));
         const price = priceByProductId.get(p.id) || 0;
         const baseWeeks = Math.max(0, 52 - pw);
         const baseUnitsYr = d * v * baseWeeks;
