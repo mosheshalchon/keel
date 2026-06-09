@@ -18151,6 +18151,13 @@ render();
     function renderFvaTable() {
       const tbody = document.getElementById('hl-fva-tbody');
       const mk = currentHeadlineMonthKey;
+      if (window._fvaDebug) {
+        console.log('[fvaDebug] headline mk=', mk);
+        console.log('[fvaDebug] currentFvaRows.length=', currentFvaRows.length);
+        console.log('[fvaDebug] rows with entry for mk=', currentFvaRows.filter(r => r.monthBreakdown.find(x => x.monthKey === mk)).length);
+        console.log('[fvaDebug] sample row monthKeys=', currentFvaRows[0] ? currentFvaRows[0].monthBreakdown.map(m => m.monthKey) : 'no rows');
+        console.log('[fvaDebug] tbody element found=', !!tbody);
+      }
       if (!mk) { tbody.innerHTML = ''; return; }
 
       // Sort: rows with biggest absolute $ impact first, then by retailer name
