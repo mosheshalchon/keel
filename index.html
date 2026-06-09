@@ -4639,6 +4639,17 @@ window.Auth = (function() {
     return !!(_cachedSession && _cachedSession.roleLabel === 'admin');
   }
 
+  // Can the current user create/edit/upload? True for admins and editors; false for
+  // viewers. Uses accessRole (from user_brand_access) which holds admin/editor/viewer.
+  // Falls back to permissive when accessRole is unset (legacy users predate the role
+  // column) so existing internal users aren't suddenly locked out.
+  function canEdit() {
+    if (!_cachedSession) return false;
+    const r = _cachedSession.accessRole;
+    if (r == null || r === '') return true;      // legacy/unset → allow (trusted internal)
+    return r === 'admin' || r === 'editor';
+  }
+
   // Force-refresh the cached session (e.g. after the user updates their profile)
   async function refreshSession() {
     const c = client();
@@ -4648,7 +4659,7 @@ window.Auth = (function() {
   }
 
   return {
-    boot, getSession, getBootError, getClient, isAdmin, refreshSession,
+    boot, getSession, getBootError, getClient, isAdmin, canEdit, refreshSession,
     getAuthLinkError: () => _authLinkError,
     signIn, signUp, signOut, resetPassword,
   };
@@ -9554,6 +9565,42 @@ function renderTimelinePage() {
       .select('*')
       .eq('submission_id', submissionId)
       .order('position', { ascending: true });
+
+    // Load P&L + brand settings so the Opportunity Analytics contribution margin can
+    // default to each item's actual P&L contribution margin (revenue-weighted across
+    // the submission's items) instead of a flat 25%. Mirrors Finance's computePnl.
+    let pnlContribPctByProductId = new Map();
+    try {
+      const { data: pnlRows } = await sb.from('product_pnl').select('*').eq('brand_id', brandId);
+      const { data: bsRows } = await sb.from('brand_settings').select('*').eq('brand_id', brandId).maybeSingle();
+      const _set = bsRows || {};
+      const pnlByProd = new Map();
+      for (const r of (pnlRows || [])) pnlByProd.set(r.product_id, r);
+      const _allProducts = (products || []);
+      const _prodById = new Map(_allProducts.map(p => [p.id, p]));
+      const _contribPct = (product, pnl) => {
+        if (!pnl) return null;
+        const gross = pnl.gross_sales != null ? Number(pnl.gross_sales) : (product && product.case_pricing != null ? Number(product.case_pricing) : 0);
+        const tradeRaw = pnl.trade_amount != null ? Number(pnl.trade_amount) : 0;
+        const trade = _set.trade_mode === 'pct' ? (gross * tradeRaw / 100) : tradeRaw;
+        const spoilsRaw = pnl.spoils_amount != null ? Number(pnl.spoils_amount) : 0;
+        const spoils = _set.spoils_mode === 'pct' ? (gross * spoilsRaw / 100) : spoilsRaw;
+        const netSales = gross - trade - spoils;
+        const direct = pnl.direct_costs_total != null ? Number(pnl.direct_costs_total) : 0;
+        const indirect = pnl.indirect_costs_total != null ? Number(pnl.indirect_costs_total) : 0;
+        const logistics = pnl.logistics != null ? Number(pnl.logistics) : 0;
+        const grossProfit = (pnl.net_profit_actual != null) ? Number(pnl.net_profit_actual) : (netSales - direct - indirect - logistics);
+        const brokerPct = pnl.broker_pct != null ? Number(pnl.broker_pct) : 0;
+        const broker = netSales * (brokerPct / 100);
+        const contribution = grossProfit - broker;
+        return netSales > 0 ? (contribution / netSales * 100) : null;
+      };
+      for (const [pid, pnl] of pnlByProd) {
+        const pct = _contribPct(_prodById.get(pid), pnl);
+        if (pct != null && isFinite(pct)) pnlContribPctByProductId.set(pid, pct);
+      }
+    } catch (e) { console.warn('[OA] P&L margin load failed (non-fatal):', e); }
+
     const { data: generatedDocs } = await sb
       .from('generated_documents').select('*')
       .eq('submission_id', submissionId)
@@ -9966,6 +10013,7 @@ function renderTimelinePage() {
 
           // 1. Revenue: per-item annual revenue using submission_products values + wholesale price
           let revenue = 0;
+          const revByProductId = new Map();
           for (const p of selectedProducts) {
             const sp = prizeByProductId.get(p.id) || {};
             const d = Number(sp.doors) || 0;
@@ -9976,7 +10024,9 @@ function renderTimelinePage() {
             const baseWeeks = Math.max(0, 52 - pw);
             const baseUnits = d * v * baseWeeks;
             const promoUnits = d * v * (1 + lp/100) * pw;
-            revenue += (baseUnits + promoUnits) * price;
+            const itemRev = (baseUnits + promoUnits) * price;
+            revByProductId.set(p.id, itemRev);
+            revenue += itemRev;
           }
 
           // 2. Slotting
@@ -10027,7 +10077,22 @@ function renderTimelinePage() {
           const ongoingTradeRate = revenue > 0 ? (tradePlanTotal / revenue) : 0;
 
           // 5. Contribution + payback
-          const contribPct = submission.contribution_margin_pct != null ? Number(submission.contribution_margin_pct) : 25;
+          // Contribution margin: revenue-weighted blend of each item's P&L
+          // contribution margin (from Finance). Items without P&L data are excluded
+          // from the weighting. Falls back to 25% only if NO item has P&L data.
+          let _wSum = 0, _wPctSum = 0;
+          for (const p of selectedProducts) {
+            const pct = pnlContribPctByProductId.get(p.id);
+            if (pct == null) continue;
+            const w = Math.max(0, Number(revByProductId.get(p.id)) || 0);
+            // If an item has P&L but zero modeled revenue, still give it a minimal
+            // weight so its margin isn't ignored entirely.
+            const weight = w > 0 ? w : 1;
+            _wSum += weight;
+            _wPctSum += weight * pct;
+          }
+          const itemBlendedPct = _wSum > 0 ? (_wPctSum / _wSum) : null;
+          const contribPct = itemBlendedPct != null ? itemBlendedPct : 25;
           const contribDollars = (revenue - tradePlanTotal) * (contribPct / 100);
           // Payback PERIOD: slotting ÷ annual contribution = years to recoup the
           // upfront slotting. Shorter is better. (Inverse of the old "ratio" view.)
@@ -10077,11 +10142,11 @@ function renderTimelinePage() {
                 <div style="background:var(--paper);border:1px solid var(--rule-softer);border-radius:5px;padding:12px 14px;">
                   <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;font-weight:600;">Contribution $</div>
                   <div style="font-family:var(--mono);font-size:18px;font-weight:600;color:${contribDollars >= 0 ? 'var(--ink)' : 'var(--lost)'};">${fmt$(contribDollars)}</div>
-                  <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:4px;">(${fmt$(revenue)} − ${fmt$(tradePlanTotal)}) × ${contribPct}%</div>
+                  <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:4px;">(${fmt$(revenue)} − ${fmt$(tradePlanTotal)}) × ${contribPct.toFixed(1)}%</div>
                   <div style="display:flex;align-items:center;gap:6px;margin-top:6px;">
                     <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Margin:</span>
-                    <input type="number" id="hl-oa-contrib-pct" min="0" max="100" step="0.5" value="${contribPct}" style="width:55px;padding:3px 6px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:3px;background:var(--paper);text-align:right;" />
-                    <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">%</span>
+                    <span style="font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-2);">${contribPct.toFixed(1)}%</span>
+                    <span style="font-family:var(--serif);font-style:italic;font-size:10px;color:var(--ink-3);">${itemBlendedPct != null ? 'from item P&amp;L' : 'default (no P&amp;L)'}</span>
                   </div>
                 </div>
                 <div style="background:var(--paper);border:1px solid var(--rule-softer);border-radius:5px;padding:12px 14px;">
@@ -35730,7 +35795,7 @@ render();
       <div class="hl-settings-section" id="settings-spins" style="margin-top:48px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
           <h2 style="margin:0;">SPINs Items Upload</h2>
-          ${window.Auth.isAdmin() ? `
+          ${window.Auth.canEdit() ? `
             <div>
               <input type="file" id="hl-spins-bulk-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
               <button class="hl-btn-primary" id="hl-spins-bulk-upload-btn">+ Upload SPINs items</button>
@@ -35963,7 +36028,7 @@ render();
       <div class="hl-settings-section">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
           <h2 style="margin:0;">Items carried <span style="font-family:var(--mono);font-size:13px;letter-spacing:0.04em;color:var(--ink-3);font-weight:normal;">${items.length}</span></h2>
-          ${window.Auth.isAdmin() ? `
+          ${window.Auth.canEdit() ? `
             <div>
               <input type="file" id="hl-items-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
               <button class="hl-btn-primary" id="hl-upload-items-btn">+ Upload items</button>
@@ -35974,7 +36039,7 @@ render();
         <span class="hl-status-msg" id="hl-items-status"></span>
         ${items.length === 0 ? `
           <div style="text-align:center;padding:32px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;margin-top:14px;">
-            No items recorded for ${esc(retailer.name)} yet.${window.Auth.isAdmin() ? ' Upload a SPINs export or items list to populate.' : ''}
+            No items recorded for ${esc(retailer.name)} yet.${window.Auth.canEdit() ? ' Upload a SPINs export or items list to populate.' : ''}
           </div>
         ` : `
           <table class="hl-master-table" style="margin-top:14px;">
@@ -42041,11 +42106,23 @@ render();
   function buildSubItemsBlock(itemData, parentType, subByPnl, pnlByProduct, esc) {
     // Collect all unique labels across selected items for this parent_type
     const labelMap = new Map();  // label → array of {productId, sub} or null per column
+    // Collect all unique labels across selected items for this parent_type.
+    // Skip malformed sub-items whose label is blank or purely numeric — those are
+    // upload-parser artifacts (a value column misread as a label, or an index that
+    // leaked in as the name) and render as junk "2", "3", "4" rows. Real cost lines
+    // always have a text label (Dough, Topping, Labor, etc.).
+    const isJunkLabel = (lbl) => {
+      const t = (lbl || '').trim();
+      if (t === '') return true;                 // blank
+      if (/^\d+(\.\d+)?$/.test(t)) return true;  // purely numeric ("2", "41.78")
+      return false;
+    };
     for (const d of itemData) {
       if (!d.pnl) continue;
       const subs = (subByPnl.get(d.pnl.id) || []).filter(s => s.parent_type === parentType);
       for (const s of subs) {
         const key = (s.label || '').trim();
+        if (isJunkLabel(key)) continue;          // drop parser-artifact rows
         if (!labelMap.has(key)) labelMap.set(key, new Map());
         labelMap.get(key).set(d.product.id, s);
       }
