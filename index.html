@@ -18151,13 +18151,16 @@ render();
     function renderFvaTable() {
       const tbody = document.getElementById('hl-fva-tbody');
       const mk = currentHeadlineMonthKey;
-      if (window._fvaDebug) {
-        console.log('[fvaDebug] headline mk=', mk);
-        console.log('[fvaDebug] currentFvaRows.length=', currentFvaRows.length);
-        console.log('[fvaDebug] rows with entry for mk=', currentFvaRows.filter(r => r.monthBreakdown.find(x => x.monthKey === mk)).length);
-        console.log('[fvaDebug] sample row monthKeys=', currentFvaRows[0] ? currentFvaRows[0].monthBreakdown.map(m => m.monthKey) : 'no rows');
-        console.log('[fvaDebug] tbody element found=', !!tbody);
+      // Open (forecast) months remaining = 12 − locked months. Used to annualize the
+      // per-row $ impact. Defined locally — the parent scope's copy isn't visible here.
+      let _lockedMoT = 0;
+      const _lkT = scenario && scenario.actuals_locked_through;
+      if (_lkT) {
+        const _syT = new Date((scenario.start_date || '2026-01-01') + 'T00:00:00').getFullYear();
+        const _lmT = new Date(_lkT + 'T00:00:00');
+        _lockedMoT = Math.max(0, Math.min(12, (_lmT.getFullYear() - _syT) * 12 + (_lmT.getMonth() + 1)));
       }
+      const openMonths = Math.max(0, 12 - _lockedMoT);
       if (!mk) { tbody.innerHTML = ''; return; }
 
       // Sort: rows with biggest absolute $ impact first, then by retailer name
