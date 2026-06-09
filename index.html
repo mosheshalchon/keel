@@ -10239,10 +10239,11 @@ function renderTimelinePage() {
     // to be felt as "instant" but slow enough to coalesce typing into one write.
     const prizeSaveTimers = new Map(); // subProdId → setTimeout handle
     const recalcRow = (row) => {
-      const doors = Number(row.querySelector('[data-prize-field="doors"]').value) || 0;
-      const vel = Number(row.querySelector('[data-prize-field="velocity"]').value) || 0;
-      const pw = Number(row.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0;
-      const lp = Number(row.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0;
+      const _pf = (n) => { const el = row.querySelector(`[data-prize-field="${n}"]`); return el ? (Number(el.value) || 0) : 0; };
+      const doors = _pf('doors');
+      const vel = _pf('velocity');
+      const pw = _pf('promo_weeks_per_year');
+      const lp = _pf('promo_lift_pct');
       const productId = row.dataset.productId;
       const price = priceByProductId.get(productId) || 0;
       const baseWeeks = Math.max(0, 52 - pw);
@@ -10278,12 +10279,21 @@ function renderTimelinePage() {
         const key = subProdId || ('product:' + productId);
         if (prizeSaveTimers.has(key)) clearTimeout(prizeSaveTimers.get(key));
         prizeSaveTimers.set(key, setTimeout(async () => {
-          const payload = {
-            doors: row.querySelector('[data-prize-field="doors"]').value === '' ? null : Number(row.querySelector('[data-prize-field="doors"]').value),
-            velocity: row.querySelector('[data-prize-field="velocity"]').value === '' ? null : Number(row.querySelector('[data-prize-field="velocity"]').value),
-            promo_weeks_per_year: row.querySelector('[data-prize-field="promo_weeks_per_year"]').value === '' ? null : Number(row.querySelector('[data-prize-field="promo_weeks_per_year"]').value),
-            promo_lift_pct: row.querySelector('[data-prize-field="promo_lift_pct"]').value === '' ? null : Number(row.querySelector('[data-prize-field="promo_lift_pct"]').value),
+          // Read each field defensively — the element may be gone by the time this
+          // debounced save fires (row re-rendered, or a brand-new submission whose
+          // inputs aren't all present yet). A null querySelector would throw and
+          // trip the app's error boundary (reload), so guard every read.
+          const fieldVal = (name) => {
+            const el = row.querySelector(`[data-prize-field="${name}"]`);
+            if (!el) return undefined;            // element absent → don't include in payload
+            return el.value === '' ? null : Number(el.value);
           };
+          const payload = {};
+          const _d = fieldVal('doors');                 if (_d !== undefined) payload.doors = _d;
+          const _v = fieldVal('velocity');              if (_v !== undefined) payload.velocity = _v;
+          const _w = fieldVal('promo_weeks_per_year');  if (_w !== undefined) payload.promo_weeks_per_year = _w;
+          const _l = fieldVal('promo_lift_pct');        if (_l !== undefined) payload.promo_lift_pct = _l;
+          if (Object.keys(payload).length === 0) return;  // nothing to save
           try {
             if (subProdId) {
               const { error } = await sb.from('submission_products').update(payload).eq('id', subProdId);
@@ -10709,10 +10719,11 @@ function renderTimelinePage() {
     // always reflects the current state (no stale data).
     function openPrizeAuditModal(row) {
       const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-      const doors = Number(row.querySelector('[data-prize-field="doors"]').value) || 0;
-      const vel   = Number(row.querySelector('[data-prize-field="velocity"]').value) || 0;
-      const pw    = Number(row.querySelector('[data-prize-field="promo_weeks_per_year"]').value) || 0;
-      const lp    = Number(row.querySelector('[data-prize-field="promo_lift_pct"]').value) || 0;
+      const _pf = (n) => { const el = row.querySelector(`[data-prize-field="${n}"]`); return el ? (Number(el.value) || 0) : 0; };
+      const doors = _pf('doors');
+      const vel   = _pf('velocity');
+      const pw    = _pf('promo_weeks_per_year');
+      const lp    = _pf('promo_lift_pct');
       const priceStr = row.dataset.price;
       const price = priceStr ? Number(priceStr) : null;
       const baseWeeks = Math.max(0, 52 - pw);
