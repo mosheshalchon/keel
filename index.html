@@ -41526,6 +41526,56 @@ render();
       .eq('brand_id', brandId).order('item_description');
     const candidates = existingProducts || [];
 
+    // ── UPC-based matching (primary) ──
+    // The P&L file may include a "UPC" row listing each item's UPC. UPC is an
+    // exact identifier, so when present it's far more reliable than fuzzy-matching
+    // the nickname (CP12, etc.). Find that row anywhere in the sheet (its label
+    // column cell reads "UPC"), read each item column's UPC, and build a lookup
+    // against products.unit_upc. Normalize both sides (strip non-digits, drop a
+    // trailing check digit / leading zeros) so formatting differences don't block.
+    const normUpc = (raw) => {
+      let d = String(raw == null ? '' : raw).replace(/[^0-9]/g, '');
+      return d.replace(/^0+/, '');  // drop leading zeros for tolerant compare
+    };
+    const upcCandidateKeys = (raw) => {
+      const d = String(raw == null ? '' : raw).replace(/[^0-9]/g, '');
+      const keys = new Set();
+      if (!d) return keys;
+      const variants = [d, d.replace(/^0+/, '')];
+      // also try without a trailing check digit and zero-padded forms
+      if (d.length > 1) variants.push(d.slice(0, -1));
+      for (const v of variants) { if (v) { keys.add(v); keys.add(v.replace(/^0+/, '')); } }
+      return keys;
+    };
+    // Index products by all UPC key variants.
+    const productByUpcKey = new Map();
+    for (const p of candidates) {
+      for (const k of upcCandidateKeys(p.unit_upc)) {
+        if (k && !productByUpcKey.has(k)) productByUpcKey.set(k, p);
+      }
+    }
+    // Find the UPC row and map colIdx → UPC string.
+    const upcByCol = {};
+    for (let r = 0; r < aoa.length; r++) {
+      const lbl = String(((aoa[r] || [])[labelCol]) ?? '').trim().toLowerCase();
+      if (lbl === 'upc' || lbl === 'upc code' || lbl === 'upc codes') {
+        const row = aoa[r] || [];
+        for (const { colIdx } of itemHeaders) {
+          const u = String(row[colIdx] == null ? '' : row[colIdx]).trim();
+          if (u) upcByCol[colIdx] = u;
+        }
+        break;
+      }
+    }
+    const matchByUpc = (colIdx) => {
+      const u = upcByCol[colIdx];
+      if (!u) return null;
+      for (const k of upcCandidateKeys(u)) {
+        if (productByUpcKey.has(k)) return productByUpcKey.get(k);
+      }
+      return null;
+    };
+
     const itemPayloads = itemHeaders.map(({ colIdx, raw }) => {
       const totals = {};  // gross_sales, trade, spoils, direct_costs_total, indirect_costs_total, logistics, broker_pct
       const directSubs = [];
@@ -41550,6 +41600,11 @@ render();
           else if (i >= indirectStartIdx && i < indirectEndIdx) indirectSubs.push({ label: l.label, amount: Math.abs(v) });
         }
       }
+      // Match priority: exact UPC (from the file's UPC row) → fuzzy on nickname.
+      const upcMatch = matchByUpc(colIdx);
+      if (upcMatch) {
+        return { raw, colIdx, totals, directSubs, indirectSubs, suggestedProductId: upcMatch.id, suggestedScore: 100, matchedVia: 'upc', fileUpc: upcByCol[colIdx] || null };
+      }
       // Fuzzy-match the raw header to a Brand Library product
       let bestMatch = null;
       let bestScore = 0;
@@ -41560,7 +41615,7 @@ render();
         );
         if (s > bestScore) { bestScore = s; bestMatch = p; }
       }
-      return { raw, colIdx, totals, directSubs, indirectSubs, suggestedProductId: bestScore >= 40 ? bestMatch.id : null, suggestedScore: bestScore };
+      return { raw, colIdx, totals, directSubs, indirectSubs, suggestedProductId: bestScore >= 40 ? bestMatch.id : null, suggestedScore: bestScore, matchedVia: bestScore >= 40 ? 'fuzzy' : 'none', fileUpc: upcByCol[colIdx] || null };
     });
 
     // Open the preview/confirm modal
@@ -41588,7 +41643,7 @@ render();
               <option value="">— Skip this item —</option>
               ${candidates.map(c => `<option value="${esc(c.id)}" ${chosenIds[idx] === c.id ? 'selected' : ''}>${esc(payload.raw)} → ${esc(c.item_description || c.unit_upc || c.id)}</option>`).join('')}
             </select>
-            ${payload.suggestedScore >= 70 ? `<span style="font-family:var(--mono);font-size:9px;color:var(--won, #3a7a3a);letter-spacing:0.04em;text-transform:uppercase;">match ${Math.round(payload.suggestedScore)}</span>` : payload.suggestedScore >= 40 ? `<span style="font-family:var(--mono);font-size:9px;color:#7a5a1a;letter-spacing:0.04em;text-transform:uppercase;">maybe ${Math.round(payload.suggestedScore)}</span>` : `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);letter-spacing:0.04em;text-transform:uppercase;">no auto-match</span>`}
+            ${payload.matchedVia === 'upc' ? `<span style="font-family:var(--mono);font-size:9px;color:var(--won, #3a7a3a);letter-spacing:0.04em;text-transform:uppercase;" title="Matched by UPC ${esc(payload.fileUpc || '')}">UPC match</span>` : payload.suggestedScore >= 70 ? `<span style="font-family:var(--mono);font-size:9px;color:var(--won, #3a7a3a);letter-spacing:0.04em;text-transform:uppercase;">match ${Math.round(payload.suggestedScore)}</span>` : payload.suggestedScore >= 40 ? `<span style="font-family:var(--mono);font-size:9px;color:#7a5a1a;letter-spacing:0.04em;text-transform:uppercase;">maybe ${Math.round(payload.suggestedScore)}</span>` : `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);letter-spacing:0.04em;text-transform:uppercase;">no auto-match</span>`}
           </div>
           <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);letter-spacing:0.04em;display:flex;gap:14px;flex-wrap:wrap;">
             ${totalCount > 0 ? `<span>${totalCount} totals</span>` : ''}
