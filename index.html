@@ -45610,6 +45610,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
         <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
+        <button id="hl-mrp-sync" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:8px 14px;cursor:pointer;border-radius:6px;color:var(--ink-3);white-space:nowrap;">↻ Sync on-hand</button>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · demand from ${srcLabel}</div>
       </div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;min-width:1100px;">
@@ -45724,6 +45725,26 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     for (const k of out.keys()) out.set(k, out.get(k) / n);
     return out;
   }
+  async function _mrpSyncOnHand(btn) {
+    const old = btn ? btn.textContent : '';
+    if (btn) { btn.textContent = '↻ Syncing…'; btn.disabled = true; }
+    try {
+      const sb = window.Auth.getClient();
+      const { data, error } = await sb.functions.invoke('sync-mrp-onhand');
+      if (error) throw error;
+      const msg = data && data.ok
+        ? `On-hand synced from ${data.snapshot || 'Dropbox'}.\nUpdated ${data.updated} ingredients.` + (data.unmatched_count ? `\n${data.unmatched_count} items in the file didn't match an ingredient` + (data.unmatched && data.unmatched.length ? ':\n• ' + data.unmatched.slice(0, 20).join('\n• ') : '.') : '')
+        : 'Sync ran but returned: ' + JSON.stringify(data);
+      alert(msg);
+      _mrpLoaded = false; _mrpFcKey = null;
+      await _mrpLoad();
+    } catch (err) {
+      alert('Sync failed: ' + (err && err.message ? err.message : String(err)) + '\n\nIf the function isn\'t deployed yet, deploy sync-mrp-onhand first.');
+    } finally {
+      if (btn) { btn.textContent = old; btn.disabled = false; }
+    }
+  }
+
   async function _mrpSaveIngField(ingredient, field, value) {
     const v = (value === '' || value == null) ? null : Number(value);
     const row = _mrpIngs.find(i => i.ingredient === ingredient);
@@ -45816,14 +45837,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const f = (n, d) => _mrpFmt(n, d == null ? 1 : d);
     const weeks = _mrpLastWeeks;
     let orderByTxt = '—';
-    if (r.firstBreach >= 0 && r.lead != null) { const idx = r.firstBreach - r.lead; orderByTxt = idx <= 0 ? 'now' : _mrpWeekLabel(weeks[Math.min(idx, weeks.length - 1)]); }
+    if (rec.reorderWeek >= 0) orderByTxt = rec.reorderWeek === 0 ? 'now' : _mrpWeekLabel(weeks[rec.reorderWeek]);
     const line = (label, val, opts) => `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:7px 4px;font-family:var(--serif);font-size:13px;${opts&&opts.strong?'font-weight:600;':''}${opts&&opts.dim?'color:var(--ink-3);':''}">${label}</td><td style="padding:7px 4px;text-align:right;font-family:var(--mono);font-size:13px;${opts&&opts.strong?'font-weight:700;':''}${opts&&opts.color?'color:'+opts.color+';':''}">${val}</td></tr>`;
     const shelfNote = rec.cappedByShelf ? ` <span style="color:#7b4397;">(capped at shelf life ${f(rec.shelf,0)}w)</span>` : '';
+    const atReorderLabel = rec.reorderWeek <= 0 ? 'On hand + on order now' : 'Projected on hand at ' + _mrpWeekLabel(weeks[rec.reorderWeek]);
     const rows = [
       line('Weekly demand', f(rec.weekly) + ' ' + uom + '/wk', {dim:true}),
       line('Target cover = lead ' + f(rec.lead,0) + 'w + target hold ' + f(rec.target,0) + 'w', f(rec.lead+rec.target,0) + ' wks' + shelfNote, {dim:true}),
       line('Order-up-to level (weekly × ' + f(rec.desiredWeeks,0) + 'w)', f(rec.desiredQty,0) + ' ' + uom, {}),
-      line('Now on hand + on order', '− ' + f(rec.total,0) + ' ' + uom, {dim:true}),
+      line(atReorderLabel, '− ' + f(rec.ohAtReorder,0) + ' ' + uom, {dim:true}),
       line('Shortfall to cover', (rec.need>0?f(rec.need,0):'0') + ' ' + uom, {}),
       rec.moqApplied ? line('Below MOQ — raised to minimum order', f(rec.moq,0) + ' ' + uom, {color:'#b8860b'}) : '',
       line('Recommended order', f(rec.qty,0) + ' ' + uom, {strong:true, color: rec.qty>0?'var(--ink)':'var(--ink-3)'}),
@@ -46019,13 +46041,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     let desiredWeeks = lead + target;                       // order up to lead + target hold
     const cappedByShelf = (shelf != null && shelf < desiredWeeks);
     if (shelf != null) desiredWeeks = Math.min(desiredWeeks, shelf);  // never aim past shelf life
-    const desiredQty = wk * desiredWeeks;
-    const need = desiredQty - r.startOnHand;
+    const desiredQty = wk * desiredWeeks;                   // order-up-to level S
+    // no reorder due within the horizon → nothing to order yet
+    if (r.firstBreach < 0) return { qty: 0, conflict: false, need: 0, desiredWeeks, desiredQty, lead, target, shelf, moq, weekly: wk, cappedByShelf, moqApplied: false, ohAtReorder: r.startOnHand, reorderWeek: -1 };
+    // on-hand entering the week you hit the reorder point (when you'd place the order)
+    const ohAtReorder = r.firstBreach === 0 ? r.startOnHand : r.eoh[r.firstBreach - 1];
+    const need = desiredQty - ohAtReorder;
     let qty = need > 0 ? need : 0;
     let moqApplied = false;
     if (need > 0 && moq != null && qty < moq) { qty = moq; moqApplied = true; }
     const conflict = (shelf != null && moq != null && moq > wk * shelf); // one order > shelf life
-    return { qty, conflict, need, desiredWeeks, desiredQty, lead, target, shelf, moq, weekly: wk, cappedByShelf, moqApplied, total: r.startOnHand };
+    return { qty, conflict, need, desiredWeeks, desiredQty, lead, target, shelf, moq, weekly: wk, cappedByShelf, moqApplied, ohAtReorder, reorderWeek: r.firstBreach };
   }
   function _mrpGridSetupHtml() {
     const opts = _mrpScenarios.map(s => `<option value="${_mrpEsc(s.id)}" ${s.id===_mrpScenarioId?'selected':''}>${_mrpEsc(s.name)}</option>`).join('');
@@ -46089,13 +46115,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         : r.firstBreach >= 0
         ? `<span style="background:#b8860b;color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;">Reorder</span>`
         : `<span style="background:#3d7a4e;color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;">OK</span>`;
-      // order-by week = first breach − lead time
+      // order-by week = the week on-hand hits the reorder point (lead-time demand already baked in)
       let orderBy = '';
-      if (r.firstBreach >= 0 && r.lead != null) {
-        const idx = r.firstBreach - r.lead;
-        orderBy = idx <= 0 ? 'now' : _mrpWeekLabel(weeks[Math.min(idx, weeks.length-1)]);
-      } else if (r.firstBreach >= 0) {
-        orderBy = '—';
+      if (r.firstBreach >= 0) {
+        orderBy = r.firstBreach === 0 ? 'now' : _mrpWeekLabel(weeks[r.firstBreach]);
       }
       const cells = r.eoh.map((v,w) => {
         const breach = v < r.targetQty, neg = v < 0;
@@ -46104,8 +46127,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}" style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${bg}${col}">${cellVal(r, v)}</td>`;
       }).join('');
       const rec = _mrpRecOrder(r);
+      const recVal = (rec && rec.qty > 0) ? (dollars ? (r.avgCost ? '$' + _mrpFmt(rec.qty * r.avgCost, 0) : '—') : _mrpFmt(rec.qty, 0)) : '—';
       const recHtml = (rec && rec.qty > 0)
-        ? `${_mrpFmt(rec.qty, 0)}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
+        ? `${recVal}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
         : '—';
       const targetWks = r.lead != null ? (r.lead + (r.targetHold != null ? r.targetHold : 0)) : null;
       const ohWks = r.avgWk > 0 ? _mrpFmt(r.startOnHand / r.avgWk, 1) : '—';
@@ -46208,6 +46232,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (srcBtn) { _mrpDemandSource = srcBtn.dataset.mrpsrc; _mrpGridStart = null; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-mapbtn') { _mrpShowMap = !_mrpShowMap; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-automap') { _mrpAutoMapAll(); }
+      if (e.target.id === 'hl-mrp-sync') { _mrpSyncOnHand(e.target); }
       const cell = e.target.closest('[data-cellweek]');
       if (cell) { _mrpShowCell(cell.dataset.celling, Number(cell.dataset.cellweek)); }
       const ordC = e.target.closest('[data-ordercalc]');
