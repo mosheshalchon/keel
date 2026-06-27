@@ -45397,6 +45397,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _mrpFc = null;                      // { monthly: Map(code -> Map('Y-M' -> cases)), scenarioName }
   let _mrpFcLoading = false, _mrpFcErr = null, _mrpFcKey = null;
   let _mrpShowMap = false;
+  let _mrpLastWeeks = [], _mrpRowByIng = new Map();
   let _mrpLinesByCode = new Map(), _mrpSupByIng = new Map();
   let _mrpExpanded = new Set();           // expanded BOM codes
   let _mrpIngSearch = '';
@@ -45655,7 +45656,86 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const p = _mrpMatchProduct(b.name || b.code);
       if (p) await _mrpSaveSkuMap(b.code, p.id);
     }
+    _mrpShowMap = false;   // collapse the editor once populated
     _mrpRenderBody();
+  }
+
+  function _mrpCasesFor(code, dateISO) {
+    if (_mrpDemandSource === 'forecast') return _mrpForecastCases(code, dateISO);
+    const prodHas = _mrpDemand.some(d => d.source === 'prod' && d.week_start === dateISO);
+    const want = prodHas ? 'prod' : 'plan';
+    const row = _mrpDemand.find(d => d.sku_code === code && d.week_start === dateISO && d.source === want);
+    return row ? (Number(row.cases) || 0) : 0;
+  }
+  function _mrpCloseCell() { const el = document.getElementById('hl-mrp-cell-modal'); if (el) el.remove(); }
+  function _mrpShowCell(normIng, weekIdx) {
+    const row = _mrpRowByIng.get(normIng);
+    const weekISO = _mrpLastWeeks[weekIdx];
+    if (!row || !weekISO) return;
+    const tn = _mrpNorm(row.srcIng || row.ing);
+    const contrib = [];
+    for (const b of _mrpBoms) {
+      let per = 0;
+      for (const l of (_mrpLinesByCode.get(b.code) || [])) if (_mrpNorm(l.ingredient) === tn) per += _mrpLbsPerCase(l, b.dough_yield);
+      if (per <= 0) continue;
+      const cases = _mrpCasesFor(b.code, weekISO);
+      if (cases <= 0) continue;
+      contrib.push({ code: b.code, name: b.name, cases, per, qty: cases * per });
+    }
+    contrib.sort((a,b) => b.qty - a.qty);
+    const totalDem = contrib.reduce((s,c) => s + c.qty, 0);
+    const startOH = weekIdx === 0 ? row.startOnHand : row.eoh[weekIdx-1];
+    const eoh = row.eoh[weekIdx];
+    const uom = row.uom || 'lbs';
+    const d = new Date(weekISO + 'T00:00:00');
+    const monthName = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()] + ' ' + d.getFullYear();
+    const f = (n) => _mrpFmt(n, 1);
+    const srcNote = _mrpDemandSource === 'forecast'
+      ? `Cases per SKU come from forecast "${_mrpEsc(_mrpFc ? _mrpFc.scenarioName : '')}" — that SKU's ${_mrpEsc(monthName)} monthly cases divided by ${_mrpMondaysInMonth(d.getFullYear(), d.getMonth())} weeks in the month.`
+      : `Cases per SKU come from the seeded plan for the week of ${_mrpWeekLabel(weekISO)}.`;
+    const rowsHtml = contrib.map(c => `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:6px 10px;font-family:var(--mono);font-size:12px;">${_mrpEsc(c.code)}</td>
+        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(c.name || '')}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${f(c.cases)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_mrpFmt(c.per,4)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${f(c.qty)}</td>
+      </tr>`).join('') || `<tr><td colspan="5" style="padding:14px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No demand this week.</td></tr>`;
+    const html = `<div id="hl-mrp-cell-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:720px;width:100%;max-height:86vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+        <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:20px;">${_mrpEsc(row.ing)}</div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px;">Week of ${_mrpWeekLabel(weekISO)} · ${_mrpEsc(monthName)}</div>
+          </div>
+          <button data-mrpcellclose style="background:transparent;border:none;font-size:22px;line-height:1;cursor:pointer;color:var(--ink-3);">×</button>
+        </div>
+        <div style="padding:18px 22px;">
+          <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:16px;">
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Start on hand</div><div style="font-family:var(--mono);font-size:18px;">${f(startOH)} <span style="font-size:11px;color:var(--ink-3);">${_mrpEsc(uom)}</span></div></div>
+            <div style="align-self:center;font-size:18px;color:var(--ink-3);">−</div>
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Demand</div><div style="font-family:var(--mono);font-size:18px;">${f(totalDem)}</div></div>
+            <div style="align-self:center;font-size:18px;color:var(--ink-3);">=</div>
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">End on hand</div><div style="font-family:var(--mono);font-size:18px;${eoh<0?'color:#a8381f;':''}">${f(eoh)}</div></div>
+          </div>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr style="background:#efe9dd;">
+              ${['SKU','Recipe','Cases',''+uom+'/case','Total '+uom].map((h,i)=>`<th style="padding:7px 10px;text-align:${i<2?'left':'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${_mrpEsc(h)}</th>`).join('')}
+            </tr></thead>
+            <tbody>${rowsHtml}</tbody>
+            <tfoot><tr style="border-top:2px solid var(--ink);"><td colspan="4" style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">Total demand</td><td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;">${f(totalDem)}</td></tr></tfoot>
+          </table>
+          <div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">${srcNote} Each SKU's ${_mrpEsc(uom)} = cases × ${_mrpEsc(uom)}/case (from the recipe, yield applied). End on hand = start − demand.</div>
+        </div>
+      </div></div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const modal = document.getElementById('hl-mrp-cell-modal');
+    if (modal) {
+      modal.addEventListener('click', (ev) => {
+        if (ev.target === modal || ev.target.closest('[data-mrpcellclose]')) _mrpCloseCell();
+      });
+      const onKey = (ev) => { if (ev.key === 'Escape') { _mrpCloseCell(); document.removeEventListener('keydown', onKey); } };
+      document.addEventListener('keydown', onKey);
+    }
   }
 
   // ─── Planning grid: demand explosion → netting → reorder flags ───────
@@ -45709,10 +45789,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         }
       }
     }
-    const ingByName = new Map(_mrpIngs.map(i => [i.ingredient, i]));
-    const rows = [];
+    const ingByNorm = new Map(_mrpIngs.map(i => [_mrpNorm(i.ingredient), i]));
+    const rows = []; const unmatched = [];
     for (const [ing, dem] of demand) {
-      const info = ingByName.get(ing) || {};
+      const info = ingByNorm.get(_mrpNorm(ing)) || {};
+      if (!info.ingredient) unmatched.push(ing);
       const sup = _mrpSupByIng.get(_mrpNorm(ing));
       let boh = Number(info.on_hand) || 0;
       const eoh = [];
@@ -45727,8 +45808,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (firstBreach < 0 && eoh[w] < targetQty) firstBreach = w;
       }
       const lead = sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null;
-      rows.push({ ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, startOnHand: Number(info.on_hand) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
+      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, startOnHand: Number(info.on_hand) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
     }
+    if (unmatched.length) console.warn('[MRP] ingredients with no master match (on-hand shows 0):', unmatched);
     rows.sort((a,b) => {
       const ax = a.firstStockout >= 0 ? a.firstStockout : (a.firstBreach >= 0 ? 1000 + a.firstBreach : 99999);
       const bx = b.firstStockout >= 0 ? b.firstStockout : (b.firstBreach >= 0 ? 1000 + b.firstBreach : 99999);
@@ -45794,6 +45876,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
 
     const { weeks, rows } = _mrpComputeGrid();
+    _mrpLastWeeks = weeks;
+    _mrpRowByIng = new Map(rows.map(r => [_mrpNorm(r.ing), r]));
     const cellVal = (r, v) => dollars ? (r.avgCost ? '$' + _mrpFmt(v * r.avgCost, 0) : '—') : _mrpFmt(v, 0);
     const counts = { stockout: rows.filter(r => r.firstStockout >= 0).length, reorder: rows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length };
     const headWeeks = weeks.map(w => `<th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${_mrpWeekLabel(w)}</th>`).join('');
@@ -45815,7 +45899,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const breach = v < r.targetQty, neg = v < 0;
         const bg = neg ? 'background:#f6e3de;' : breach ? 'background:#faf0d7;' : '';
         const col = neg ? 'color:#a8381f;font-weight:600;' : '';
-        return `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;${bg}${col}">${cellVal(r, v)}</td>`;
+        return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}" style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${bg}${col}">${cellVal(r, v)}</td>`;
       }).join('');
       return `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:190px;">${_mrpEsc(r.ing)}</td>
@@ -45906,6 +45990,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (srcBtn) { _mrpDemandSource = srcBtn.dataset.mrpsrc; _mrpGridStart = null; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-mapbtn') { _mrpShowMap = !_mrpShowMap; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-automap') { _mrpAutoMapAll(); }
+      const cell = e.target.closest('[data-cellweek]');
+      if (cell) { _mrpShowCell(cell.dataset.celling, Number(cell.dataset.cellweek)); }
     });
     body.addEventListener('change', (e) => {
       const yi = e.target.closest('[data-yield-code]');
