@@ -45383,6 +45383,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   //  Demand-explosion + netting grid lands in the next increment.
   // ════════════════════════════════════════════════════════════════════
   const _mrpEsc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const _mrpNorm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
   let _mrpSubTab = 'recipes';            // 'recipes' | 'ingredients'
   let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
@@ -45431,7 +45432,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         arr.push(l); _mrpLinesByCode.set(l.bom_code, arr);
       }
       _mrpSupByIng = new Map();
-      for (const s of _mrpSuppliers) if (s.ingredient && !_mrpSupByIng.has(s.ingredient)) _mrpSupByIng.set(s.ingredient, s);
+      for (const s of _mrpSuppliers) {
+        const k = _mrpNorm(s.ingredient);
+        if (k && !_mrpSupByIng.has(k)) _mrpSupByIng.set(k, s);
+      }
       _mrpLoaded = true;
     } catch (e) {
       _mrpErr = e;
@@ -45509,30 +45513,47 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _mrpIngredientsHtml() {
     const q = _mrpIngSearch.trim().toLowerCase();
     let list = _mrpIngs;
-    if (q) list = list.filter(i => (i.ingredient || '').toLowerCase().includes(q) || (_mrpSupByIng.get(i.ingredient)?.supplier || '').toLowerCase().includes(q));
+    if (q) list = list.filter(i => (i.ingredient || '').toLowerCase().includes(q) || (_mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '').toLowerCase().includes(q));
+    const td = (v, opts) => {
+      const o = opts || {};
+      const align = o.right ? 'right' : 'left';
+      const mono = o.mono ? 'var(--mono)' : 'var(--serif)';
+      const sz = o.mono ? '11px' : '13px';
+      const col = o.dim ? 'color:var(--ink-3);' : '';
+      const wrap = o.wrap ? 'white-space:pre-line;min-width:130px;' : '';
+      return `<td style="padding:7px 10px;text-align:${align};font-family:${mono};font-size:${sz};${col}${wrap}">${v}</td>`;
+    };
     const rows = list.map(i => {
-      const sup = _mrpSupByIng.get(i.ingredient);
+      const sup = _mrpSupByIng.get(_mrpNorm(i.ingredient));
       const val = (Number(i.on_hand) || 0) * (Number(i.avg_cost) || 0);
       return `<tr style="border-top:1px solid var(--rule-soft);">
-        <td style="padding:7px 10px;font-family:var(--serif);font-size:14px;">${_mrpEsc(i.ingredient)}</td>
-        <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_mrpEsc(i.uom || '')}</td>
-        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_mrpFmt(i.on_hand, 0)}</td>
-        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${i.avg_cost!=null?'$'+_mrpFmt(i.avg_cost,2):'—'}</td>
-        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${val?'$'+_mrpFmt(val,0):'—'}</td>
-        <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(sup?.supplier || '')}</td>
-        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${sup?.moq!=null?_mrpFmt(sup.moq,0):'—'}</td>
-        <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_mrpEsc(sup?.lead_time || '')}</td>
+        ${td(_mrpEsc(i.ingredient), {})}
+        ${td(_mrpEsc(i.uom || ''), {mono:true, dim:true})}
+        ${td(_mrpFmt(i.on_hand, 0), {right:true, mono:true})}
+        ${td(i.avg_cost!=null?'$'+_mrpFmt(i.avg_cost,2):'—', {right:true, mono:true})}
+        ${td(val?'$'+_mrpFmt(val,0):'—', {right:true, mono:true, dim:true})}
+        ${td(_mrpEsc(sup?.supplier || ''), {})}
+        ${td(_mrpEsc(sup?.lead_time || ''), {mono:true, dim:true})}
+        ${td(_mrpEsc(sup?.order_cadence || ''), {mono:true, dim:true})}
+        ${td(_mrpEsc(sup?.delivery_dates || ''), {mono:true, dim:true})}
+        ${td(_mrpEsc(sup?.order_qty || ''), {mono:true, dim:true, wrap:true})}
+        ${td(_mrpEsc(sup?.order_multiples || ''), {mono:true, dim:true, wrap:true})}
+        ${td(_mrpEsc(sup?.supply_levels || ''), {mono:true, dim:true, wrap:true})}
+        ${td(_mrpEsc(sup?.notes || ''), {mono:true, dim:true, wrap:true})}
       </tr>`;
     }).join('');
     const totalVal = _mrpIngs.reduce((s,i)=>s+(Number(i.on_hand)||0)*(Number(i.avg_cost)||0),0);
+    const heads = ['Ingredient','UOM','On hand','Avg cost','Value','Supplier','Lead time','Order cadence','Delivery dates','Order QTY','Order multiples','Supply levels','Notes'];
+    const rightCols = new Set([2,3,4]);
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
         <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · on-hand value $${_mrpFmt(totalVal,0)}</div>
       </div>
-      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
-        <thead><tr>${['Ingredient','UOM','On hand','Avg cost','Value','Supplier','MOQ','Lead'].map((h,i)=>`<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;text-align:${i>=2&&i<=4||i===6?'right':'left'};">${h}</th>`).join('')}</tr></thead>
-        <tbody>${rows || `<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No matches.</td></tr>`}</tbody>
-      </table></div>`;
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;min-width:1100px;">
+        <thead><tr>${heads.map((h,i)=>`<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;text-align:${rightCols.has(i)?'right':'left'};white-space:nowrap;">${h}</th>`).join('')}</tr></thead>
+        <tbody>${rows || `<tr><td colspan="${heads.length}" style="padding:24px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No matches.</td></tr>`}</tbody>
+      </table></div>
+      <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;">Supplier columns are pulled from the Supplier Info tab. Blank rows have no supplier record yet.</div>`;
   }
 
   async function _mrpSaveYield(code, value) {
