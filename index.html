@@ -45385,9 +45385,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   const _mrpEsc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const _mrpNorm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
-  let _mrpSubTab = 'recipes';            // 'recipes' | 'ingredients'
+  let _mrpSubTab = 'recipes';            // 'recipes' | 'ingredients' | 'planning'
   let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
-  let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [];
+  let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [];
+  let _mrpGridUnit = 'units';             // 'units' | 'dollars'
+  let _mrpGridHorizon = 13;               // weeks shown
+  let _mrpGridStart = null;               // ISO week_start of first column
   let _mrpLinesByCode = new Map(), _mrpSupByIng = new Map();
   let _mrpExpanded = new Set();           // expanded BOM codes
   let _mrpIngSearch = '';
@@ -45412,12 +45415,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const sb = window.Auth.getClient();
     const brandId = BrandLibrary.getSession().brandId;
     try {
-      const [setR, bomR, lineR, ingR, supR] = await Promise.all([
+      const [setR, bomR, lineR, ingR, supR, demR] = await Promise.all([
         sb.from('mrp_settings').select('*').eq('brand_id', brandId).maybeSingle(),
         sb.from('mrp_boms').select('*').eq('brand_id', brandId).order('sort', { ascending: true }),
         sb.from('mrp_bom_lines').select('*').eq('brand_id', brandId).order('sort', { ascending: true }),
         sb.from('mrp_ingredients').select('*').eq('brand_id', brandId).order('ingredient', { ascending: true }),
         sb.from('mrp_suppliers').select('*').eq('brand_id', brandId),
+        sb.from('mrp_demand_plan').select('*').eq('brand_id', brandId),
       ]);
       const firstErr = [bomR, lineR, ingR, supR].map(r => r.error).find(Boolean);
       if (firstErr) throw firstErr;
@@ -45426,6 +45430,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       _mrpLines = lineR.data || [];
       _mrpIngs = ingR.data || [];
       _mrpSuppliers = supR.data || [];
+      _mrpDemand = demR.data || [];
       _mrpLinesByCode = new Map();
       for (const l of _mrpLines) {
         const arr = _mrpLinesByCode.get(l.bom_code) || [];
@@ -45459,7 +45464,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return;
     }
     if (!_mrpLoaded) { body.innerHTML = `<div class="hl-loading">Loading…</div>`; return; }
-    body.innerHTML = _mrpSubTab === 'ingredients' ? _mrpIngredientsHtml() : _mrpRecipesHtml();
+    body.innerHTML = _mrpSubTab === 'ingredients' ? _mrpIngredientsHtml()
+                   : _mrpSubTab === 'planning'    ? _mrpGridHtml()
+                   : _mrpRecipesHtml();
   }
 
   function _mrpRecipesHtml() {
@@ -45556,6 +45563,151 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;">Supplier columns are pulled from the Supplier Info tab. Blank rows have no supplier record yet.</div>`;
   }
 
+  // ─── Planning grid: demand explosion → netting → reorder flags ───────
+  function _mrpSkuIngLbs() {
+    const m = new Map();
+    for (const b of _mrpBoms) {
+      const im = new Map();
+      for (const l of (_mrpLinesByCode.get(b.code) || [])) {
+        const per = _mrpLbsPerCase(l, b.dough_yield);   // lbs (weighed) or eaches (packaging) per case
+        if (l.ingredient) im.set(l.ingredient, (im.get(l.ingredient) || 0) + per);
+      }
+      m.set(b.code, im);
+    }
+    return m;
+  }
+  function _mrpGridWeeks() {
+    const all = [...new Set(_mrpDemand.map(d => d.week_start))].sort();
+    if (!all.length) return [];
+    if (!_mrpGridStart) {
+      const today = new Date(); today.setHours(0,0,0,0);
+      const cutoff = today.getTime() - 7*864e5;
+      _mrpGridStart = all.find(d => new Date(d + 'T00:00:00').getTime() >= cutoff) || all[0];
+    }
+    const out = []; let d = new Date(_mrpGridStart + 'T00:00:00');
+    for (let i = 0; i < _mrpGridHorizon; i++) { out.push(d.toISOString().slice(0,10)); d = new Date(d.getTime() + 7*864e5); }
+    return out;
+  }
+  function _mrpComputeGrid() {
+    const weeks = _mrpGridWeeks();
+    const prodWeeks = new Set(_mrpDemand.filter(d => d.source === 'prod').map(d => d.week_start));
+    const mapOf = (src) => { const m = new Map(); for (const d of _mrpDemand) if (d.source === src) m.set(d.sku_code + '|' + d.week_start, Number(d.cases) || 0); return m; };
+    const planMap = mapOf('plan'), prodMap = mapOf('prod');
+    const casesFor = (sku, date) => prodWeeks.has(date) ? (prodMap.get(sku + '|' + date) || 0) : (planMap.get(sku + '|' + date) || 0);
+    const skuIng = _mrpSkuIngLbs();
+    const demand = new Map();
+    for (const [sku, im] of skuIng) {
+      for (let w = 0; w < weeks.length; w++) {
+        const cs = casesFor(sku, weeks[w]);
+        if (!cs) continue;
+        for (const [ing, per] of im) {
+          if (!demand.has(ing)) demand.set(ing, new Array(weeks.length).fill(0));
+          demand.get(ing)[w] += cs * per;
+        }
+      }
+    }
+    const ingByName = new Map(_mrpIngs.map(i => [i.ingredient, i]));
+    const rows = [];
+    for (const [ing, dem] of demand) {
+      const info = ingByName.get(ing) || {};
+      const sup = _mrpSupByIng.get(_mrpNorm(ing));
+      let boh = Number(info.on_hand) || 0;
+      const eoh = [];
+      for (let w = 0; w < weeks.length; w++) { boh = boh - dem[w]; eoh.push(boh); }
+      const totalDem = dem.reduce((a,b) => a + b, 0);
+      const avgWk = totalDem / weeks.length;
+      const target = (info.target_months != null ? Number(info.target_months) : Number(_mrpSettings.target_months)) || 2;
+      const targetQty = avgWk * 4.33 * target;
+      let firstBreach = -1, firstStockout = -1;
+      for (let w = 0; w < weeks.length; w++) {
+        if (firstStockout < 0 && eoh[w] < 0) firstStockout = w;
+        if (firstBreach < 0 && eoh[w] < targetQty) firstBreach = w;
+      }
+      const lead = sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null;
+      rows.push({ ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, startOnHand: Number(info.on_hand) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
+    }
+    rows.sort((a,b) => {
+      const ax = a.firstStockout >= 0 ? a.firstStockout : (a.firstBreach >= 0 ? 1000 + a.firstBreach : 99999);
+      const bx = b.firstStockout >= 0 ? b.firstStockout : (b.firstBreach >= 0 ? 1000 + b.firstBreach : 99999);
+      return ax - bx || a.ing.localeCompare(b.ing);
+    });
+    return { weeks, rows };
+  }
+  function _mrpWeekLabel(iso) {
+    const d = new Date(iso + 'T00:00:00');
+    return (d.getMonth()+1) + '/' + d.getDate();
+  }
+  function _mrpGridHtml() {
+    if (!_mrpDemand.length) return `<div class="hl-loading">No demand plan loaded. Run the mrp_demand_plan block, then reload.</div>`;
+    const { weeks, rows } = _mrpComputeGrid();
+    const dollars = _mrpGridUnit === 'dollars';
+    const allWeeks = [...new Set(_mrpDemand.map(d => d.week_start))].sort();
+    const cellVal = (r, v) => dollars ? (r.avgCost ? '$' + _mrpFmt(v * r.avgCost, 0) : '—') : _mrpFmt(v, 0);
+    const counts = { stockout: rows.filter(r => r.firstStockout >= 0).length, reorder: rows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length };
+
+    const headWeeks = weeks.map(w => `<th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${_mrpWeekLabel(w)}</th>`).join('');
+    const body = rows.map(r => {
+      const status = r.firstStockout >= 0
+        ? `<span style="background:#a8381f;color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;">Stockout</span>`
+        : r.firstBreach >= 0
+        ? `<span style="background:#b8860b;color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;">Reorder</span>`
+        : `<span style="background:#3d7a4e;color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;">OK</span>`;
+      // order-by week = first breach − lead time
+      let orderBy = '';
+      if (r.firstBreach >= 0 && r.lead != null) {
+        const idx = r.firstBreach - r.lead;
+        orderBy = idx <= 0 ? 'now' : _mrpWeekLabel(weeks[Math.min(idx, weeks.length-1)]);
+      } else if (r.firstBreach >= 0) {
+        orderBy = '—';
+      }
+      const cells = r.eoh.map((v,w) => {
+        const breach = v < r.targetQty, neg = v < 0;
+        const bg = neg ? 'background:#f6e3de;' : breach ? 'background:#faf0d7;' : '';
+        const col = neg ? 'color:#a8381f;font-weight:600;' : '';
+        return `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;${bg}${col}">${cellVal(r, v)}</td>`;
+      }).join('');
+      return `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:190px;">${_mrpEsc(r.ing)}</td>
+        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(r.uom)}</td>
+        <td style="padding:6px 8px;">${status}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.lead != null ? r.lead + 'w' : '—'}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${cellVal(r, r.startOnHand)}</td>
+        ${cells}
+      </tr>`;
+    }).join('');
+
+    const unitBtn = (id, label) => `<button data-mrpunit="${id}" style="background:${_mrpGridUnit===id?'var(--ink)':'transparent'};color:${_mrpGridUnit===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
+    const startOpts = allWeeks.map(w => `<option value="${w}" ${w===_mrpGridStart?'selected':''}>${_mrpWeekLabel(w)}/${new Date(w+'T00:00:00').getFullYear()}</option>`).join('');
+
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          ${unitBtn('units','Units')}${unitBtn('dollars','Dollars')}
+          <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Start</label>
+          <select id="hl-mrp-grid-start" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;">${startOpts}</select>
+          <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Weeks</label>
+          <select id="hl-mrp-grid-horizon" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;">
+            ${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}
+          </select>
+        </div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${rows.length} ingredients · <span style="color:#a8381f;">${counts.stockout} stockout</span> · <span style="color:#b8860b;">${counts.reorder} reorder</span></div>
+      </div>
+      <div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;"><table style="border-collapse:collapse;min-width:100%;">
+        <thead><tr style="background:#efe9dd;">
+          <th style="padding:7px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;position:sticky;left:0;background:#efe9dd;">Ingredient</th>
+          <th style="padding:7px 8px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">UOM</th>
+          <th style="padding:7px 8px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Status</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Lead</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order by</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">On hand</th>
+          ${headWeeks}
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table></div>
+      <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
+        Each cell is projected end-of-week on-hand (BOH − demand). Demand = production plan for weeks it covers, demand plan after. Amber = below your ${_mrpSettings.target_months}-month target; red = stockout. "Order by" = first shortfall week minus lead time. Incoming POs aren't time-phased yet, so this assumes no future receipts.</div>`;
+  }
+
   async function _mrpSaveYield(code, value) {
     const sb = window.Auth.getClient();
     const brandId = BrandLibrary.getSession().brandId;
@@ -45581,7 +45733,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         </div>
       </div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:18px 0 0;">
-        ${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}
+        ${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}${tab('planning','Planning')}
       </div>
       <div id="hl-mrp-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
     `;
@@ -45598,10 +45750,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (_mrpExpanded.has(code)) _mrpExpanded.delete(code); else _mrpExpanded.add(code);
         _mrpRenderBody();
       }
+      const unitBtn = e.target.closest('[data-mrpunit]');
+      if (unitBtn) { _mrpGridUnit = unitBtn.dataset.mrpunit; _mrpRenderBody(); }
     });
     body.addEventListener('change', (e) => {
       const yi = e.target.closest('[data-yield-code]');
       if (yi) _mrpSaveYield(yi.dataset.yieldCode, yi.value);
+      if (e.target.id === 'hl-mrp-grid-start')   { _mrpGridStart = e.target.value; _mrpRenderBody(); }
+      if (e.target.id === 'hl-mrp-grid-horizon') { _mrpGridHorizon = Number(e.target.value); _mrpRenderBody(); }
     });
     body.addEventListener('input', (e) => {
       if (e.target.id === 'hl-mrp-ing-search') {
