@@ -45429,7 +45429,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         sb.from('mrp_suppliers').select('*').eq('brand_id', brandId),
         sb.from('mrp_demand_plan').select('*').eq('brand_id', brandId),
         sb.from('products').select('id, item_description, unit_upc, case_pack').eq('brand_id', brandId).order('item_description'),
-        sb.from('forecast_scenarios').select('id, name, start_date, weeks, updated_at, is_reforecast').eq('brand_id', brandId).order('updated_at', { ascending: false }),
+        sb.from('forecast_scenarios').select('id, name, status, start_date, weeks').eq('brand_id', brandId).order('updated_at', { ascending: false }),
         sb.from('mrp_sku_map').select('*').eq('brand_id', brandId),
       ]);
       const firstErr = [bomR, lineR, ingR, supR].map(r => r.error).find(Boolean);
@@ -45441,7 +45441,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       _mrpSuppliers = supR.data || [];
       _mrpDemand = demR.data || [];
       _mrpProducts = prodR.data || [];
-      _mrpScenarios = (scenR.data || []).filter(s => !s.is_reforecast);
+      _mrpScenarios = scenR.data || [];
       if (!_mrpScenarioId && _mrpScenarios.length) _mrpScenarioId = _mrpScenarios[0].id;
       _mrpSkuMap = new Map();
       for (const m of (mapR.data || [])) _mrpSkuMap.set(m.code, m);
