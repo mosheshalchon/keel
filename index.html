@@ -45391,6 +45391,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _mrpGridUnit = 'units';             // 'units' | 'dollars'
   let _mrpGridHorizon = 13;               // weeks shown
   let _mrpGridStart = null;               // ISO week_start of first column
+  let _mrpDemandSource = 'forecast';      // 'forecast' | 'plan'
+  let _mrpScenarioId = null;
+  let _mrpProducts = [], _mrpScenarios = [], _mrpSkuMap = new Map();  // code -> {product_id, product_name, unit_upc}
+  let _mrpFc = null;                      // { monthly: Map(code -> Map('Y-M' -> cases)), scenarioName }
+  let _mrpFcLoading = false, _mrpFcErr = null, _mrpFcKey = null;
+  let _mrpShowMap = false;
   let _mrpLinesByCode = new Map(), _mrpSupByIng = new Map();
   let _mrpExpanded = new Set();           // expanded BOM codes
   let _mrpIngSearch = '';
@@ -45415,13 +45421,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const sb = window.Auth.getClient();
     const brandId = BrandLibrary.getSession().brandId;
     try {
-      const [setR, bomR, lineR, ingR, supR, demR] = await Promise.all([
+      const [setR, bomR, lineR, ingR, supR, demR, prodR, scenR, mapR] = await Promise.all([
         sb.from('mrp_settings').select('*').eq('brand_id', brandId).maybeSingle(),
         sb.from('mrp_boms').select('*').eq('brand_id', brandId).order('sort', { ascending: true }),
         sb.from('mrp_bom_lines').select('*').eq('brand_id', brandId).order('sort', { ascending: true }),
         sb.from('mrp_ingredients').select('*').eq('brand_id', brandId).order('ingredient', { ascending: true }),
         sb.from('mrp_suppliers').select('*').eq('brand_id', brandId),
         sb.from('mrp_demand_plan').select('*').eq('brand_id', brandId),
+        sb.from('products').select('id, item_description, unit_upc, case_pack').eq('brand_id', brandId).order('item_description'),
+        sb.from('forecast_scenarios').select('id, name, start_date, weeks, updated_at, is_reforecast').eq('brand_id', brandId).order('updated_at', { ascending: false }),
+        sb.from('mrp_sku_map').select('*').eq('brand_id', brandId),
       ]);
       const firstErr = [bomR, lineR, ingR, supR].map(r => r.error).find(Boolean);
       if (firstErr) throw firstErr;
@@ -45431,6 +45440,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       _mrpIngs = ingR.data || [];
       _mrpSuppliers = supR.data || [];
       _mrpDemand = demR.data || [];
+      _mrpProducts = prodR.data || [];
+      _mrpScenarios = (scenR.data || []).filter(s => !s.is_reforecast);
+      if (!_mrpScenarioId && _mrpScenarios.length) _mrpScenarioId = _mrpScenarios[0].id;
+      _mrpSkuMap = new Map();
+      for (const m of (mapR.data || [])) _mrpSkuMap.set(m.code, m);
       _mrpLinesByCode = new Map();
       for (const l of _mrpLines) {
         const arr = _mrpLinesByCode.get(l.bom_code) || [];
@@ -45563,6 +45577,87 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;">Supplier columns are pulled from the Supplier Info tab. Blank rows have no supplier record yet.</div>`;
   }
 
+  // ─── Forecast hookup + SKU map ───────────────────────────────────────
+  function _mrpMatchProduct(bomName) {
+    const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const a = norm(bomName);
+    if (!a) return null;
+    let best = null, bestScore = 0;
+    for (const p of _mrpProducts) {
+      const b = norm(p.item_description); if (!b) continue;
+      let s;
+      if (a === b) s = 100;
+      else if (b.includes(a) || a.includes(b)) s = 80;
+      else { const ta = new Set(a.split(' ')), tb = new Set(b.split(' ')); let o = 0; for (const t of ta) if (tb.has(t)) o++; s = (o / Math.max(ta.size, tb.size)) * 60; }
+      if (s > bestScore) { bestScore = s; best = p; }
+    }
+    return bestScore >= 30 ? best : null;
+  }
+  function _mrpMondaysInMonth(y, m) {
+    let c = 0, d = new Date(y, m, 1);
+    while (d.getMonth() === m) { if (d.getDay() === 1) c++; d = new Date(d.getTime() + 864e5); }
+    return c || 4;
+  }
+  function _mrpForecastCases(code, weekISO) {
+    if (!_mrpFc) return 0;
+    const cm = _mrpFc.monthly.get(code); if (!cm) return 0;
+    const d = new Date(weekISO + 'T00:00:00');
+    const cases = cm.get(d.getFullYear() + '-' + d.getMonth()) || 0;
+    return cases / _mrpMondaysInMonth(d.getFullYear(), d.getMonth());
+  }
+  async function _mrpComputeForecast() {
+    const sc = _mrpScenarios.find(s => s.id === _mrpScenarioId);
+    const key = sc ? sc.id : null;
+    if (!sc) { _mrpFc = null; _mrpFcKey = null; return; }
+    if (_mrpFcKey === key && _mrpFc) return;      // cached
+    if (_mrpFcLoading) return;
+    _mrpFcLoading = true; _mrpFcErr = null; _mrpRenderBody();
+    try {
+      const res = await computeForecast(sc);
+      const codeByProduct = new Map();
+      for (const [code, m] of _mrpSkuMap) if (m.product_id) codeByProduct.set(m.product_id, code);
+      const MON = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+      const ymOf = (label) => { const parts = String(label).split(' '); return parts[1] + '-' + MON[parts[0]]; };
+      const monthly = new Map();
+      for (const row of (res.rows || [])) {
+        const code = codeByProduct.get(row.productId);
+        if (!code) continue;
+        const mu = row.monthlyUnits || [];
+        for (let i = 0; i < res.numMonths; i++) {
+          const ym = ymOf(res.monthLabels[i]);
+          if (!monthly.has(code)) monthly.set(code, new Map());
+          const cm = monthly.get(code);
+          cm.set(ym, (cm.get(ym) || 0) + (Number(mu[i]) || 0));
+        }
+      }
+      _mrpFc = { monthly, scenarioName: sc.name };
+      _mrpFcKey = key;
+    } catch (e) { _mrpFcErr = e; console.error('[MRP] forecast compute failed:', e); }
+    finally { _mrpFcLoading = false; _mrpRenderBody(); }
+  }
+  function _mrpMappedCount() {
+    let n = 0; for (const b of _mrpBoms) { const m = _mrpSkuMap.get(b.code); if (m && m.product_id) n++; } return n;
+  }
+  async function _mrpSaveSkuMap(code, productId) {
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    const p = _mrpProducts.find(x => x.id === productId);
+    const row = { brand_id: brandId, code, product_id: productId || null, product_name: p ? p.item_description : null, unit_upc: p ? p.unit_upc : null };
+    if (productId) _mrpSkuMap.set(code, row); else _mrpSkuMap.delete(code);
+    _mrpFcKey = null;            // force forecast recompute next render
+    _mrpRenderBody();
+    const { error } = await sb.from('mrp_sku_map').upsert(row, { onConflict: 'brand_id,code' });
+    if (error) alert('Map save failed: ' + error.message);
+  }
+  async function _mrpAutoMapAll() {
+    for (const b of _mrpBoms) {
+      if (_mrpSkuMap.get(b.code)?.product_id) continue;
+      const p = _mrpMatchProduct(b.name || b.code);
+      if (p) await _mrpSaveSkuMap(b.code, p.id);
+    }
+    _mrpRenderBody();
+  }
+
   // ─── Planning grid: demand explosion → netting → reorder flags ───────
   function _mrpSkuIngLbs() {
     const m = new Map();
@@ -45577,12 +45672,18 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return m;
   }
   function _mrpGridWeeks() {
-    const all = [...new Set(_mrpDemand.map(d => d.week_start))].sort();
-    if (!all.length) return [];
     if (!_mrpGridStart) {
-      const today = new Date(); today.setHours(0,0,0,0);
-      const cutoff = today.getTime() - 7*864e5;
-      _mrpGridStart = all.find(d => new Date(d + 'T00:00:00').getTime() >= cutoff) || all[0];
+      if (_mrpDemandSource === 'forecast') {
+        let d = new Date(); d.setHours(0,0,0,0);
+        while (d.getDay() !== 1) d = new Date(d.getTime() + 864e5);   // next Monday
+        _mrpGridStart = d.toISOString().slice(0,10);
+      } else {
+        const all = [...new Set(_mrpDemand.map(x => x.week_start))].sort();
+        if (!all.length) return [];
+        const today = new Date(); today.setHours(0,0,0,0);
+        const cutoff = today.getTime() - 7*864e5;
+        _mrpGridStart = all.find(x => new Date(x + 'T00:00:00').getTime() >= cutoff) || all[0];
+      }
     }
     const out = []; let d = new Date(_mrpGridStart + 'T00:00:00');
     for (let i = 0; i < _mrpGridHorizon; i++) { out.push(d.toISOString().slice(0,10)); d = new Date(d.getTime() + 7*864e5); }
@@ -45593,7 +45694,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const prodWeeks = new Set(_mrpDemand.filter(d => d.source === 'prod').map(d => d.week_start));
     const mapOf = (src) => { const m = new Map(); for (const d of _mrpDemand) if (d.source === src) m.set(d.sku_code + '|' + d.week_start, Number(d.cases) || 0); return m; };
     const planMap = mapOf('plan'), prodMap = mapOf('prod');
-    const casesFor = (sku, date) => prodWeeks.has(date) ? (prodMap.get(sku + '|' + date) || 0) : (planMap.get(sku + '|' + date) || 0);
+    const casesFor = _mrpDemandSource === 'forecast'
+      ? (sku, date) => _mrpForecastCases(sku, date)
+      : (sku, date) => prodWeeks.has(date) ? (prodMap.get(sku + '|' + date) || 0) : (planMap.get(sku + '|' + date) || 0);
     const skuIng = _mrpSkuIngLbs();
     const demand = new Map();
     for (const [sku, im] of skuIng) {
@@ -45637,14 +45740,62 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const d = new Date(iso + 'T00:00:00');
     return (d.getMonth()+1) + '/' + d.getDate();
   }
+  function _mrpGridSetupHtml() {
+    // Demand-source toggle + (forecast) scenario picker + SKU map editor
+    const srcBtn = (id, label) => `<button data-mrpsrc="${id}" style="background:${_mrpDemandSource===id?'var(--ink)':'transparent'};color:${_mrpDemandSource===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
+    let fc = '';
+    if (_mrpDemandSource === 'forecast') {
+      const opts = _mrpScenarios.map(s => `<option value="${_mrpEsc(s.id)}" ${s.id===_mrpScenarioId?'selected':''}>${_mrpEsc(s.name)}</option>`).join('');
+      const mapped = _mrpMappedCount();
+      fc = `<label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Forecast</label>
+        <select id="hl-mrp-scenario" style="font-family:var(--serif);font-size:13px;padding:4px 8px;border:1px solid var(--rule-soft);border-radius:4px;max-width:280px;">${opts || '<option>No scenarios</option>'}</select>
+        <button id="hl-mrp-mapbtn" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;color:${mapped<_mrpBoms.length?'#a8381f':'var(--ink-3)'};">SKU map ${mapped}/${_mrpBoms.length}</button>`;
+    }
+    return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${srcBtn('forecast','Forecast')}${srcBtn('plan','Plan')}${fc}</div>`;
+  }
+  function _mrpMapEditorHtml() {
+    const rows = _mrpBoms.map(b => {
+      const cur = _mrpSkuMap.get(b.code);
+      const suggested = cur?.product_id || (_mrpMatchProduct(b.name || b.code)?.id || '');
+      const opts = ['<option value="">— unmapped —</option>'].concat(
+        _mrpProducts.map(p => `<option value="${_mrpEsc(p.id)}" ${p.id===suggested?'selected':''}>${_mrpEsc(p.item_description)}${p.unit_upc?' · '+_mrpEsc(p.unit_upc):''}</option>`)
+      ).join('');
+      return `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:6px 10px;font-family:var(--mono);font-size:12px;">${_mrpEsc(b.code)}</td>
+        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(b.name || '')}</td>
+        <td style="padding:6px 10px;">${cur?.product_id ? '<span style="color:#3d7a4e;font-family:var(--mono);font-size:10px;">✓ saved</span>' : '<span style="color:#a8381f;font-family:var(--mono);font-size:10px;">unsaved</span>'}</td>
+        <td style="padding:6px 10px;"><select data-mapcode="${_mrpEsc(b.code)}" style="font-family:var(--serif);font-size:13px;padding:4px 8px;border:1px solid var(--rule-soft);border-radius:4px;min-width:280px;">${opts}</select></td>
+      </tr>`;
+    }).join('');
+    return `<div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px;margin-bottom:14px;background:#faf6ef;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+        <div style="font-family:var(--serif);font-size:15px;">Map each recipe SKU to its Brand Library product. The forecast is keyed by product; this links it to the BOM codes.</div>
+        <button id="hl-mrp-automap" class="hl-btn-primary">Auto-match all</button>
+      </div>
+      <div style="overflow-x:auto;max-height:380px;overflow-y:auto;"><table style="width:100%;border-collapse:collapse;">
+        <thead><tr>${['SKU','Recipe','State','Brand Library product'].map(h=>`<th style="padding:7px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${h}</th>`).join('')}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`;
+  }
   function _mrpGridHtml() {
-    if (!_mrpDemand.length) return `<div class="hl-loading">No demand plan loaded. Run the mrp_demand_plan block, then reload.</div>`;
-    const { weeks, rows } = _mrpComputeGrid();
     const dollars = _mrpGridUnit === 'dollars';
-    const allWeeks = [...new Set(_mrpDemand.map(d => d.week_start))].sort();
+    const setup = _mrpGridSetupHtml();
+    const wrap = (inner) => `<div style="margin-bottom:14px;">${setup}</div>${_mrpShowMap ? _mrpMapEditorHtml() : ''}${inner}`;
+
+    if (_mrpDemandSource === 'forecast') {
+      if (!_mrpScenarios.length) return wrap(`<div class="hl-loading">No forecast scenarios found.</div>`);
+      _mrpComputeForecast();   // async; re-renders when ready (cached after first)
+      if (_mrpFcErr) return wrap(`<div style="padding:18px;color:#a8381f;font-family:var(--serif);">Forecast compute failed: ${_mrpEsc(_mrpFcErr.message || String(_mrpFcErr))}</div>`);
+      if (_mrpFcLoading || !_mrpFc) return wrap(`<div class="hl-loading">Computing forecast…</div>`);
+      if (_mrpMappedCount() === 0) return wrap(`<div style="padding:18px;font-family:var(--serif);color:var(--ink-3);">No SKUs mapped yet — open <b>SKU map</b> above and Auto-match, then the grid fills in.</div>`);
+    } else {
+      if (!_mrpDemand.length) return wrap(`<div class="hl-loading">No demand plan loaded.</div>`);
+    }
+
+    const { weeks, rows } = _mrpComputeGrid();
     const cellVal = (r, v) => dollars ? (r.avgCost ? '$' + _mrpFmt(v * r.avgCost, 0) : '—') : _mrpFmt(v, 0);
     const counts = { stockout: rows.filter(r => r.firstStockout >= 0).length, reorder: rows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length };
-
     const headWeeks = weeks.map(w => `<th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${_mrpWeekLabel(w)}</th>`).join('');
     const body = rows.map(r => {
       const status = r.firstStockout >= 0
@@ -45678,13 +45829,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }).join('');
 
     const unitBtn = (id, label) => `<button data-mrpunit="${id}" style="background:${_mrpGridUnit===id?'var(--ink)':'transparent'};color:${_mrpGridUnit===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
-    const startOpts = allWeeks.map(w => `<option value="${w}" ${w===_mrpGridStart?'selected':''}>${_mrpWeekLabel(w)}/${new Date(w+'T00:00:00').getFullYear()}</option>`).join('');
 
-    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
+    return wrap(`<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           ${unitBtn('units','Units')}${unitBtn('dollars','Dollars')}
           <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Start</label>
-          <select id="hl-mrp-grid-start" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;">${startOpts}</select>
+          <input type="date" id="hl-mrp-grid-start" value="${_mrpGridStart || ''}" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;" />
           <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Weeks</label>
           <select id="hl-mrp-grid-horizon" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;">
             ${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}
@@ -45705,7 +45855,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <tbody>${body}</tbody>
       </table></div>
       <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
-        Each cell is projected end-of-week on-hand (BOH − demand). Demand = production plan for weeks it covers, demand plan after. Amber = below your ${_mrpSettings.target_months}-month target; red = stockout. "Order by" = first shortfall week minus lead time. Incoming POs aren't time-phased yet, so this assumes no future receipts.</div>`;
+        Each cell is projected end-of-week on-hand (BOH − demand). ${_mrpDemandSource==='forecast' ? 'Demand = forecast "'+_mrpEsc(_mrpFc?_mrpFc.scenarioName:'')+'", monthly cases spread evenly across the weeks in each calendar month.' : 'Demand = production plan for weeks it covers, demand plan after.'} Amber = below your ${_mrpSettings.target_months}-month target; red = stockout. "Order by" = first shortfall week minus lead time. Incoming POs aren't time-phased yet, so this assumes no future receipts.</div>`);
   }
 
   async function _mrpSaveYield(code, value) {
@@ -45752,12 +45902,19 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       }
       const unitBtn = e.target.closest('[data-mrpunit]');
       if (unitBtn) { _mrpGridUnit = unitBtn.dataset.mrpunit; _mrpRenderBody(); }
+      const srcBtn = e.target.closest('[data-mrpsrc]');
+      if (srcBtn) { _mrpDemandSource = srcBtn.dataset.mrpsrc; _mrpGridStart = null; _mrpRenderBody(); }
+      if (e.target.id === 'hl-mrp-mapbtn') { _mrpShowMap = !_mrpShowMap; _mrpRenderBody(); }
+      if (e.target.id === 'hl-mrp-automap') { _mrpAutoMapAll(); }
     });
     body.addEventListener('change', (e) => {
       const yi = e.target.closest('[data-yield-code]');
       if (yi) _mrpSaveYield(yi.dataset.yieldCode, yi.value);
-      if (e.target.id === 'hl-mrp-grid-start')   { _mrpGridStart = e.target.value; _mrpRenderBody(); }
+      if (e.target.id === 'hl-mrp-grid-start')   { _mrpGridStart = e.target.value || null; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-grid-horizon') { _mrpGridHorizon = Number(e.target.value); _mrpRenderBody(); }
+      if (e.target.id === 'hl-mrp-scenario')     { _mrpScenarioId = e.target.value; _mrpFcKey = null; _mrpRenderBody(); }
+      const mapSel = e.target.closest('[data-mapcode]');
+      if (mapSel) _mrpSaveSkuMap(mapSel.dataset.mapcode, mapSel.value);
     });
     body.addEventListener('input', (e) => {
       if (e.target.id === 'hl-mrp-ing-search') {
