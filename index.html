@@ -45552,11 +45552,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const sup = _mrpSupByIng.get(norm);
       const wk = weekly.get(norm) || 0;
       const oh = Number(i.on_hand) || 0;
+      const onOrder = Number(i.on_order) || 0;
+      const total = oh + onOrder;
       const lead = i.lead_time_weeks != null ? Number(i.lead_time_weeks) : (sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null);
       const shelf = i.shelf_life_weeks != null ? Number(i.shelf_life_weeks) : null;
       const target = i.target_hold_weeks != null ? Number(i.target_hold_weeks) : null;
       const moqBase = i.moq_base != null ? Number(i.moq_base) : null;
-      const ohWeeks = wk > 0 ? oh / wk : null;
+      const ohWeeks = wk > 0 ? total / wk : null;
       const moqWeeks = (wk > 0 && moqBase != null) ? moqBase / wk : null;
       const tgtForFlag = target != null ? target : fallbackTarget;
       const targetOrder = lead != null ? lead + tgtForFlag : null;   // lead + target hold
@@ -45576,6 +45578,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;"><span data-ingexp="${_mrpEsc(norm)}" style="cursor:pointer;color:var(--ink-3);margin-right:6px;">${expanded ? '▾' : '▸'}</span>${_mrpEsc(i.ingredient)}</td>
         <td style="padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(i.uom || '')}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${num(oh, 0)}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${onOrder ? num(onOrder, 0) : '—'}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;">${num(total, 0)}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${wk > 0 ? num(wk, 1) : '—'}</td>
         <td data-ingcalc="oh" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${ohWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}${ohWeeks != null && lead != null && ohWeeks <= lead ? 'color:#a8381f;font-weight:600;' : ''}">${ohWeeks != null ? num(ohWeeks, 1) : '—'}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'shelf_life_weeks', shelf)}</td>
@@ -45586,7 +45590,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td data-ingcalc="moq" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${moqWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}">${moqWeeks != null ? num(moqWeeks, 1) : '—'}</td>
         <td style="padding:7px 8px;white-space:nowrap;">${flag}${conflict ? ' ' + conflict : ''}</td>
       </tr>`;
-      const detail = expanded ? `<tr style="background:#faf6ef;"><td colspan="11" style="padding:10px 16px 14px 32px;">
+      const detail = expanded ? `<tr style="background:#faf6ef;"><td colspan="14" style="padding:10px 16px 14px 32px;">
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px 24px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">
           <div><span style="text-transform:uppercase;font-size:9px;">Supplier</span><br><span style="font-family:var(--serif);font-size:13px;color:var(--ink);">${_mrpEsc(sup?.supplier || '—')}</span></div>
           <div><span style="text-transform:uppercase;font-size:9px;">Lead time (text)</span><br>${_mrpEsc(sup?.lead_time || '—')}</div>
@@ -45601,8 +45605,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return main + detail;
     }).join('');
 
-    const heads = ['Ingredient', 'UOM', 'On hand', 'Wkly demand', 'On hand (wks)', 'Shelf (wks)', 'Lead (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)', 'Flag'];
-    const rightCols = new Set([2,3,4,5,6,7,8,9,10]);
+    const heads = ['Ingredient', 'UOM', 'On hand', 'On order', 'Total', 'Wkly demand', 'OH+OR (wks)', 'Shelf (wks)', 'Lead (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)', 'Flag'];
+    const rightCols = new Set([2,3,4,5,6,7,8,9,10,11,12]);
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
         <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
@@ -45753,13 +45757,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const weekly = contrib.reduce((s,c) => s + c.qty, 0);
     const uom = i.uom || 'units';
     const oh = Number(i.on_hand) || 0;
+    const onOrder = Number(i.on_order) || 0;
+    const total = oh + onOrder;
     const moqBase = i.moq_base != null ? Number(i.moq_base) : null;
     const f = (n,d) => _mrpFmt(n, d == null ? 1 : d);
     const isOh = type === 'oh';
-    const numer = isOh ? oh : (moqBase || 0);
-    const numerLabel = isOh ? 'On hand' : 'MOQ (units)';
+    const numer = isOh ? total : (moqBase || 0);
+    const numerLabel = isOh ? 'On hand + on order' : 'MOQ (units)';
     const result = weekly > 0 ? numer / weekly : 0;
-    const resultLabel = isOh ? 'On hand (weeks)' : 'MOQ (weeks)';
+    const resultLabel = isOh ? 'OH+OR (weeks)' : 'MOQ (weeks)';
     const rowsHtml = contrib.map(c => `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:6px 10px;font-family:var(--mono);font-size:12px;">${_mrpEsc(c.code)}</td>
         <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(c.name || '')}</td>
@@ -45846,7 +45852,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         </div>
         <div style="padding:18px 22px;">
           <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:16px;">
-            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Start on hand</div><div style="font-family:var(--mono);font-size:18px;">${f(startOH)} <span style="font-size:11px;color:var(--ink-3);">${_mrpEsc(uom)}</span></div></div>
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${weekIdx === 0 ? 'Start (OH+OR)' : 'Start on hand'}</div><div style="font-family:var(--mono);font-size:18px;">${f(startOH)} <span style="font-size:11px;color:var(--ink-3);">${_mrpEsc(uom)}</span></div></div>
             <div style="align-self:center;font-size:18px;color:var(--ink-3);">−</div>
             <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Demand</div><div style="font-family:var(--mono);font-size:18px;">${f(totalDem)}</div></div>
             <div style="align-self:center;font-size:18px;color:var(--ink-3);">=</div>
@@ -45931,7 +45937,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (!info.ingredient) { unmatched.push(ing); continue; }       // not in ingredient master
       if (info.on_hand == null) continue;                            // tracked elsewhere but not inventoried (e.g. Water)
       const sup = _mrpSupByIng.get(_mrpNorm(ing));
-      let boh = Number(info.on_hand) || 0;
+      const totalOH = (Number(info.on_hand) || 0) + (Number(info.on_order) || 0);
+      let boh = totalOH;
       const eoh = [];
       for (let w = 0; w < weeks.length; w++) { boh = boh - dem[w]; eoh.push(boh); }
       const totalDem = dem.reduce((a,b) => a + b, 0);
@@ -45945,7 +45952,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (firstStockout < 0 && eoh[w] < 0) firstStockout = w;
         if (firstBreach < 0 && eoh[w] < targetQty) firstBreach = w;
       }
-      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, targetHold, startOnHand: Number(info.on_hand) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
+      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, targetHold, startOnHand: totalOH, onHand: Number(info.on_hand) || 0, onOrder: Number(info.on_order) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
     }
     if (unmatched.length) console.warn('[MRP] ingredients with no master match (on-hand shows 0):', unmatched);
     rows.sort((a,b) => {
@@ -46094,7 +46101,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Target</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order by</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order qty</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">On hand</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">OH+OR</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">OH wks</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Wkly dem</th>
           ${headWeeks}
