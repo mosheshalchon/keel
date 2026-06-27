@@ -4999,6 +4999,7 @@ HL.NAV_ITEMS = [
   { id: 'insights',        label: 'Insights',        href: './insights.html' },
   { id: 'sales-tools',     label: 'Sales Tools',     href: './sales-tools.html' },
   { id: 'distribution',    label: 'Distributors',    href: './distribution.html' },
+  { id: 'mrp',             label: 'Inventory MRP',   href: './mrp.html' },
   { id: 'finance',         label: 'Finance',         href: './finance.html' },
   { id: 'settings',        label: 'Settings',        href: './settings.html' },
 ];
@@ -5012,7 +5013,7 @@ HL.NAV_GROUPS = [
   { type: 'item',  id: 'ask-keel' },
   { type: 'item',  id: 'brand-library' },
   { type: 'group', label: 'Sales',      children: ['retailer-library', 'timeline', 'submission-docs', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
-  { type: 'group', label: 'Operations', children: ['distribution'] },
+  { type: 'group', label: 'Operations', children: ['distribution', 'mrp'] },
   { type: 'item',  id: 'finance' },
   { type: 'item',  id: 'settings' },
 ];
@@ -45375,6 +45376,226 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
 
   // ─── Hash router ───
+  // ════════════════════════════════════════════════════════════════════
+  //  INVENTORY MRP  (Operations · below Distributors)
+  //  Phase 1a — foundation: Recipes (BOM) + Ingredients master.
+  //  Reads mrp_* tables (run mrp_schema.sql + mrp_seed.sql once).
+  //  Demand-explosion + netting grid lands in the next increment.
+  // ════════════════════════════════════════════════════════════════════
+  let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
+  let _mrpSubTab = 'recipes';            // 'recipes' | 'ingredients'
+  let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
+  let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [];
+  let _mrpLinesByCode = new Map(), _mrpSupByIng = new Map();
+  let _mrpExpanded = new Set();           // expanded BOM codes
+  let _mrpIngSearch = '';
+
+  function _mrpLbsPerCase(line, doughYield) {
+    const g = Number(line.grams) || 0;
+    if (line.component === 'Packaging') return g;            // eaches/case, no conversion
+    const y = (line.component === 'Dough') ? (Number(doughYield) || 1) : 1;
+    return (g * (Number(_mrpSettings.g_to_lb) || 0.00220462)) / y;
+  }
+  function _mrpLineUom(line) {
+    return (line.component === 'Packaging') ? 'ea' : 'lbs';
+  }
+  function _mrpFmt(n, dp) {
+    if (n == null || isNaN(n)) return '—';
+    return Number(n).toLocaleString('en-US', { minimumFractionDigits: dp ?? 0, maximumFractionDigits: dp ?? 0 });
+  }
+
+  async function _mrpLoad() {
+    if (_mrpLoading) return;
+    _mrpLoading = true; _mrpErr = null;
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    try {
+      const [setR, bomR, lineR, ingR, supR] = await Promise.all([
+        sb.from('mrp_settings').select('*').eq('brand_id', brandId).maybeSingle(),
+        sb.from('mrp_boms').select('*').eq('brand_id', brandId).order('sort', { ascending: true }),
+        sb.from('mrp_bom_lines').select('*').eq('brand_id', brandId).order('sort', { ascending: true }),
+        sb.from('mrp_ingredients').select('*').eq('brand_id', brandId).order('ingredient', { ascending: true }),
+        sb.from('mrp_suppliers').select('*').eq('brand_id', brandId),
+      ]);
+      const firstErr = [bomR, lineR, ingR, supR].map(r => r.error).find(Boolean);
+      if (firstErr) throw firstErr;
+      if (setR.data) _mrpSettings = setR.data;
+      _mrpBoms = bomR.data || [];
+      _mrpLines = lineR.data || [];
+      _mrpIngs = ingR.data || [];
+      _mrpSuppliers = supR.data || [];
+      _mrpLinesByCode = new Map();
+      for (const l of _mrpLines) {
+        const arr = _mrpLinesByCode.get(l.bom_code) || [];
+        arr.push(l); _mrpLinesByCode.set(l.bom_code, arr);
+      }
+      _mrpSupByIng = new Map();
+      for (const s of _mrpSuppliers) if (s.ingredient && !_mrpSupByIng.has(s.ingredient)) _mrpSupByIng.set(s.ingredient, s);
+      _mrpLoaded = true;
+    } catch (e) {
+      _mrpErr = e;
+      console.error('[MRP] load failed:', e.message || e);
+    } finally {
+      _mrpLoading = false;
+    }
+    _mrpRenderBody();
+  }
+
+  function _mrpRenderBody() {
+    const body = document.getElementById('hl-mrp-body');
+    if (!body) return;
+    if (_mrpErr) {
+      const needsMigration = /relation .* does not exist|could not find the table|schema cache/i.test(_mrpErr.message || '');
+      body.innerHTML = `<div style="padding:24px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;">
+        <div style="font-family:var(--serif);font-size:18px;margin-bottom:6px;">Couldn't load MRP data.</div>
+        <div style="font-family:var(--serif);color:var(--ink-3);font-size:15px;">${needsMigration
+          ? 'The mrp_* tables are not there yet — run <b>mrp_schema.sql</b> then <b>mrp_seed.sql</b> in Supabase, then reload.'
+          : esc(_mrpErr.message || String(_mrpErr))}</div></div>`;
+      return;
+    }
+    if (!_mrpLoaded) { body.innerHTML = `<div class="hl-loading">Loading…</div>`; return; }
+    body.innerHTML = _mrpSubTab === 'ingredients' ? _mrpIngredientsHtml() : _mrpRecipesHtml();
+  }
+
+  function _mrpRecipesHtml() {
+    if (!_mrpBoms.length) return `<div class="hl-loading">No recipes yet. Run mrp_seed.sql to load BOMs.</div>`;
+    const canEdit = window.Auth.canEdit();
+    const rows = _mrpBoms.map(b => {
+      const lines = _mrpLinesByCode.get(b.code) || [];
+      const comps = [...new Set(lines.map(l => l.component))];
+      const open = _mrpExpanded.has(b.code);
+      const totalLbs = lines.filter(l => l.component !== 'Packaging')
+        .reduce((s, l) => s + _mrpLbsPerCase(l, b.dough_yield), 0);
+      const head = `<tr class="hl-mrp-bomrow" data-code="${esc(b.code)}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
+        <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;color:var(--ink);">${open ? '▾' : '▸'} ${esc(b.code)}</td>
+        <td style="padding:9px 10px;font-family:var(--serif);font-size:14px;">${esc(b.name || '')}</td>
+        <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${lines.length} lines</td>
+        <td style="padding:9px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${comps.map(esc).join(' · ')}</td>
+        <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_mrpFmt(totalLbs, 1)} lbs/cs</td>
+        <td style="padding:9px 10px;text-align:right;" onclick="event.stopPropagation()">
+          ${canEdit
+            ? `<input type="number" step="0.01" min="0" max="1" value="${b.dough_yield != null ? b.dough_yield : ''}" data-yield-code="${esc(b.code)}" style="width:62px;text-align:right;font-family:var(--mono);font-size:12px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;" />`
+            : `<span style="font-family:var(--mono);font-size:12px;">${(Number(b.dough_yield)*100).toFixed(0)}%</span>`}
+        </td></tr>`;
+      let detail = '';
+      if (open) {
+        const lineRows = lines.map(l => {
+          const per = _mrpLbsPerCase(l, b.dough_yield);
+          const isDough = l.component === 'Dough';
+          return `<tr style="border-top:1px solid var(--rule-soft);background:#faf6ef;">
+            <td style="padding:5px 10px 5px 28px;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${esc(l.component || '')}</td>
+            <td colspan="2" style="padding:5px 10px;font-family:var(--serif);font-size:13px;">${esc(l.ingredient || '')}</td>
+            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${l.component === 'Packaging' ? _mrpFmt(l.grams,0)+' ea' : _mrpFmt(l.grams,1)+' g'}</td>
+            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:12px;${isDough?'color:#7a5c1e;':''}">${_mrpFmt(per, 3)} ${_mrpLineUom(l)}/cs</td>
+            <td></td></tr>`;
+        }).join('');
+        detail = lineRows;
+      }
+      return head + detail;
+    }).join('');
+    return `<div style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="text-align:left;">
+          ${['SKU','Recipe','','Components','Σ weighed','Dough yield'].map((h,i)=>`<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;${i>=2?'text-align:right;':''}${i===3?'text-align:left;':''}">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;">
+        Per-case = grams × ${_mrpSettings.g_to_lb} ÷ yield (Dough only). Packaging rows are eaches/case, no conversion. Edit a yield to recompute that recipe.</div>
+    </div>`;
+  }
+
+  function _mrpIngredientsHtml() {
+    const q = _mrpIngSearch.trim().toLowerCase();
+    let list = _mrpIngs;
+    if (q) list = list.filter(i => (i.ingredient || '').toLowerCase().includes(q) || (_mrpSupByIng.get(i.ingredient)?.supplier || '').toLowerCase().includes(q));
+    const rows = list.map(i => {
+      const sup = _mrpSupByIng.get(i.ingredient);
+      const val = (Number(i.on_hand) || 0) * (Number(i.avg_cost) || 0);
+      return `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:7px 10px;font-family:var(--serif);font-size:14px;">${esc(i.ingredient)}</td>
+        <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${esc(i.uom || '')}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_mrpFmt(i.on_hand, 0)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${i.avg_cost!=null?'$'+_mrpFmt(i.avg_cost,2):'—'}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${val?'$'+_mrpFmt(val,0):'—'}</td>
+        <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${esc(sup?.supplier || '')}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${sup?.moq!=null?_mrpFmt(sup.moq,0):'—'}</td>
+        <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${esc(sup?.lead_time || '')}</td>
+      </tr>`;
+    }).join('');
+    const totalVal = _mrpIngs.reduce((s,i)=>s+(Number(i.on_hand)||0)*(Number(i.avg_cost)||0),0);
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
+        <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${esc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · on-hand value $${_mrpFmt(totalVal,0)}</div>
+      </div>
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
+        <thead><tr>${['Ingredient','UOM','On hand','Avg cost','Value','Supplier','MOQ','Lead'].map((h,i)=>`<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;text-align:${i>=2&&i<=4||i===6?'right':'left'};">${h}</th>`).join('')}</tr></thead>
+        <tbody>${rows || `<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No matches.</td></tr>`}</tbody>
+      </table></div>`;
+  }
+
+  async function _mrpSaveYield(code, value) {
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    const y = Math.max(0.01, Math.min(1, Number(value)));
+    const bom = _mrpBoms.find(b => b.code === code);
+    if (bom) bom.dough_yield = y;
+    _mrpRenderBody();
+    const { error } = await sb.from('mrp_boms').update({ dough_yield: y, updated_at: new Date().toISOString() }).eq('brand_id', brandId).eq('code', code);
+    if (error) { alert('Yield save failed: ' + error.message); }
+  }
+
+  function renderMrpPage() {
+    const session = HL.mountPage('mrp');
+    if (!session) return;
+    const main = document.getElementById('main-content');
+    const tab = (id, label) => `<button class="hl-mrp-tab${_mrpSubTab===id?' active':''}" data-mrpsubtab="${id}" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;color:${_mrpSubTab===id?'var(--ink)':'var(--ink-3)'};text-transform:uppercase;padding:10px 16px;cursor:pointer;${_mrpSubTab===id?'border-bottom:2px solid var(--ink);font-weight:600;':'font-weight:400;'}">${label}</button>`;
+    main.innerHTML = `
+      <div class="eyebrow">— Operations</div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;">
+        <div>
+          <h1 class="page-title">Inventory MRP.</h1>
+          <p class="page-meta">Recipes, ingredient on-hand, and (next) the weekly material-requirements grid: demand → on-hand → reorder.</p>
+        </div>
+      </div>
+      <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:18px 0 0;">
+        ${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}
+      </div>
+      <div id="hl-mrp-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
+    `;
+    // sub-tab switch
+    main.querySelectorAll('.hl-mrp-tab').forEach(btn => btn.addEventListener('click', () => {
+      _mrpSubTab = btn.dataset.mrpsubtab; renderMrpPage();
+    }));
+    // delegated events on body
+    const body = document.getElementById('hl-mrp-body');
+    body.addEventListener('click', (e) => {
+      const bomRow = e.target.closest('.hl-mrp-bomrow');
+      if (bomRow) {
+        const code = bomRow.dataset.code;
+        if (_mrpExpanded.has(code)) _mrpExpanded.delete(code); else _mrpExpanded.add(code);
+        _mrpRenderBody();
+      }
+    });
+    body.addEventListener('change', (e) => {
+      const yi = e.target.closest('[data-yield-code]');
+      if (yi) _mrpSaveYield(yi.dataset.yieldCode, yi.value);
+    });
+    body.addEventListener('input', (e) => {
+      if (e.target.id === 'hl-mrp-ing-search') {
+        _mrpIngSearch = e.target.value;
+        const body2 = document.getElementById('hl-mrp-body');
+        // re-render only the table region by full body re-render (cheap)
+        const pos = e.target.selectionStart;
+        _mrpRenderBody();
+        const again = document.getElementById('hl-mrp-ing-search');
+        if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch(_){} }
+      }
+    });
+    if (_mrpLoaded || _mrpErr) _mrpRenderBody(); else _mrpLoad();
+  }
+
+
   const ROUTES = {
     'login':           renderLoginPage,
     'dashboard':       renderDashboardPage,
@@ -45389,6 +45610,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     'promos':          renderPromosPage,
     'sales-pacing':    renderSalesPacingPage,
     'distribution':    renderDistributionPage,
+    'mrp':             renderMrpPage,
     'finance':         renderFinancePage,
     'insights':        renderInsightsPage,
     'sales-tools':     renderSalesToolsPage,
