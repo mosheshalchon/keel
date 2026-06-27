@@ -45558,6 +45558,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const ohWeeks = wk > 0 ? oh / wk : null;
       const moqWeeks = (wk > 0 && moqBase != null) ? moqBase / wk : null;
       const tgtForFlag = target != null ? target : fallbackTarget;
+      const targetOrder = lead != null ? lead + tgtForFlag : null;   // lead + target hold
       // flags
       let flag = '';
       if (wk > 0 && ohWeeks != null && lead != null) {
@@ -45575,12 +45576,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(i.uom || '')}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${num(oh, 0)}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${wk > 0 ? num(wk, 1) : '—'}</td>
-        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${ohWeeks != null && lead != null && ohWeeks <= lead ? 'color:#a8381f;font-weight:600;' : ''}">${ohWeeks != null ? num(ohWeeks, 1) : '—'}</td>
+        <td data-ingcalc="oh" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${ohWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}${ohWeeks != null && lead != null && ohWeeks <= lead ? 'color:#a8381f;font-weight:600;' : ''}">${ohWeeks != null ? num(ohWeeks, 1) : '—'}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'lead_time_weeks', lead)}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'shelf_life_weeks', shelf)}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'target_hold_weeks', target)}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${targetOrder != null ? num(targetOrder, 1) : '—'}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'moq_base', moqBase)}</td>
-        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${moqWeeks != null ? num(moqWeeks, 1) : '—'}</td>
+        <td data-ingcalc="moq" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${moqWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}">${moqWeeks != null ? num(moqWeeks, 1) : '—'}</td>
         <td style="padding:7px 8px;white-space:nowrap;">${flag}${conflict ? ' ' + conflict : ''}</td>
       </tr>`;
       const detail = expanded ? `<tr style="background:#faf6ef;"><td colspan="11" style="padding:10px 16px 14px 32px;">
@@ -45598,8 +45600,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return main + detail;
     }).join('');
 
-    const heads = ['Ingredient', 'UOM', 'On hand', 'Wkly demand', 'On hand (wks)', 'Lead (wks)', 'Shelf (wks)', 'Target hold (wks)', 'MOQ (base)', 'MOQ (wks)', 'Flag'];
-    const rightCols = new Set([2,3,4,5,6,7,8,9]);
+    const heads = ['Ingredient', 'UOM', 'On hand', 'Wkly demand', 'On hand (wks)', 'Lead (wks)', 'Shelf (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)', 'Flag'];
+    const rightCols = new Set([2,3,4,5,6,7,8,9,10]);
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
         <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
@@ -45610,7 +45612,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <tbody>${rows || `<tr><td colspan="${heads.length}" style="padding:24px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No matches.</td></tr>`}</tbody>
       </table></div>
       <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
-        Weekly demand is averaged over the current Planning horizon. On-hand weeks = on hand ÷ weekly demand. MOQ weeks = one minimum order ÷ weekly demand. <b>Order now</b> = cover ≤ lead time; <b>Reorder</b> = cover ≤ lead + target hold; <b>Conflict</b> = one minimum order (or your target hold) exceeds shelf life. Lead time seeds from the supplier; click ▸ to see full supplier terms. Set shelf life, target hold, and MOQ base to drive the flags.</div>`;
+        Weekly demand is averaged over the current Planning horizon. On-hand weeks and MOQ weeks are clickable — they show the weekly-demand build-up. Target order = lead + target hold (the cover you're buying up to). <b>Order now</b> = cover ≤ lead time; <b>Reorder</b> = cover ≤ lead + target hold; <b>Conflict</b> = one minimum order (or your target hold) exceeds shelf life. Lead seeds from the supplier, MOQ units from supply levels; click ▸ to see full supplier terms.</div>`;
   }
 
   // ─── Forecast hookup + SKU map ───────────────────────────────────────
@@ -45729,6 +45731,77 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
 
   function _mrpCloseCell() { const el = document.getElementById('hl-mrp-cell-modal'); if (el) el.remove(); }
+  function _mrpShowIngCalc(norm, type) {
+    const i = _mrpIngs.find(x => _mrpNorm(x.ingredient) === norm);
+    if (!i) return;
+    const weeks = _mrpGridWeeks();
+    const nW = weeks.length || 1;
+    // avg weekly contribution per SKU for this ingredient
+    const contrib = [];
+    for (const b of _mrpBoms) {
+      let per = 0;
+      for (const l of (_mrpLinesByCode.get(b.code) || [])) if (_mrpNorm(l.ingredient) === norm) per += _mrpLbsPerCase(l, b.dough_yield);
+      if (per <= 0) continue;
+      let totCases = 0;
+      for (const wk of weeks) totCases += _mrpCasesFor(b.code, wk);
+      const avgCases = totCases / nW;
+      if (avgCases <= 0) continue;
+      contrib.push({ code: b.code, name: b.name, avgCases, per, qty: avgCases * per });
+    }
+    contrib.sort((a,b) => b.qty - a.qty);
+    const weekly = contrib.reduce((s,c) => s + c.qty, 0);
+    const uom = i.uom || 'units';
+    const oh = Number(i.on_hand) || 0;
+    const moqBase = i.moq_base != null ? Number(i.moq_base) : null;
+    const f = (n,d) => _mrpFmt(n, d == null ? 1 : d);
+    const isOh = type === 'oh';
+    const numer = isOh ? oh : (moqBase || 0);
+    const numerLabel = isOh ? 'On hand' : 'MOQ (units)';
+    const result = weekly > 0 ? numer / weekly : 0;
+    const resultLabel = isOh ? 'On hand (weeks)' : 'MOQ (weeks)';
+    const rowsHtml = contrib.map(c => `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:6px 10px;font-family:var(--mono);font-size:12px;">${_mrpEsc(c.code)}</td>
+        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(c.name || '')}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${f(c.avgCases)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_mrpFmt(c.per,4)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${f(c.qty)}</td>
+      </tr>`).join('') || `<tr><td colspan="5" style="padding:14px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No demand from mapped SKUs.</td></tr>`;
+    const html = `<div id="hl-mrp-cell-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:720px;width:100%;max-height:86vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+        <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:20px;">${_mrpEsc(i.ingredient)}</div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px;">${_mrpEsc(resultLabel)} · demand averaged over ${nW} weeks</div>
+          </div>
+          <button data-mrpcellclose style="background:transparent;border:none;font-size:22px;line-height:1;cursor:pointer;color:var(--ink-3);">×</button>
+        </div>
+        <div style="padding:18px 22px;">
+          <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:16px;align-items:flex-end;">
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${_mrpEsc(numerLabel)}</div><div style="font-family:var(--mono);font-size:18px;">${f(numer,0)} <span style="font-size:11px;color:var(--ink-3);">${_mrpEsc(uom)}</span></div></div>
+            <div style="align-self:center;font-size:18px;color:var(--ink-3);">÷</div>
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Weekly demand</div><div style="font-family:var(--mono);font-size:18px;">${f(weekly)} <span style="font-size:11px;color:var(--ink-3);">${_mrpEsc(uom)}/wk</span></div></div>
+            <div style="align-self:center;font-size:18px;color:var(--ink-3);">=</div>
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${_mrpEsc(resultLabel)}</div><div style="font-family:var(--mono);font-size:18px;">${weekly>0?f(result):'—'} <span style="font-size:11px;color:var(--ink-3);">wks</span></div></div>
+          </div>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr style="background:#efe9dd;">
+              ${['SKU','Recipe','Avg wkly cases',''+uom+'/case','Avg wkly '+uom].map((h,idx)=>`<th style="padding:7px 10px;text-align:${idx<2?'left':'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${_mrpEsc(h)}</th>`).join('')}
+            </tr></thead>
+            <tbody>${rowsHtml}</tbody>
+            <tfoot><tr style="border-top:2px solid var(--ink);"><td colspan="4" style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">Weekly demand</td><td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;">${f(weekly)}</td></tr></tfoot>
+          </table>
+          <div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">Weekly demand = sum over every SKU of (average weekly cases × ${_mrpEsc(uom)}/case from the recipe). ${_mrpEsc(resultLabel)} = ${_mrpEsc(numerLabel.toLowerCase())} ÷ weekly demand — how many weeks ${isOh ? 'current stock covers' : 'one minimum order covers'}.</div>
+        </div>
+      </div></div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const modal = document.getElementById('hl-mrp-cell-modal');
+    if (modal) {
+      modal.addEventListener('click', (ev) => { if (ev.target === modal || ev.target.closest('[data-mrpcellclose]')) _mrpCloseCell(); });
+      const onKey = (ev) => { if (ev.key === 'Escape') { _mrpCloseCell(); document.removeEventListener('keydown', onKey); } };
+      document.addEventListener('keydown', onKey);
+    }
+  }
+
   function _mrpShowCell(normIng, weekIdx) {
     const row = _mrpRowByIng.get(normIng);
     const weekISO = _mrpLastWeeks[weekIdx];
@@ -46061,6 +46134,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (cell) { _mrpShowCell(cell.dataset.celling, Number(cell.dataset.cellweek)); }
       const ingExp = e.target.closest('[data-ingexp]');
       if (ingExp) { const k = ingExp.dataset.ingexp; if (_mrpIngExpanded.has(k)) _mrpIngExpanded.delete(k); else _mrpIngExpanded.add(k); _mrpRenderBody(); }
+      const ingCalc = e.target.closest('[data-ingcalc]');
+      if (ingCalc) { _mrpShowIngCalc(ingCalc.dataset.ingnorm, ingCalc.dataset.ingcalc); }
     });
     body.addEventListener('change', (e) => {
       const yi = e.target.closest('[data-yield-code]');
