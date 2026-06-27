@@ -45958,18 +45958,29 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const d = new Date(iso + 'T00:00:00');
     return (d.getMonth()+1) + '/' + d.getDate();
   }
+  function _mrpRecOrder(r) {
+    const wk = r.avgWk; if (!(wk > 0)) return null;
+    const lead = r.lead != null ? r.lead : 0;
+    const fb = (Number(_mrpSettings.target_months) || 2) * 4.33;
+    const target = r.targetHold != null ? r.targetHold : fb;
+    const shelf = r.info && r.info.shelf_life_weeks != null ? Number(r.info.shelf_life_weeks) : null;
+    const moq = r.info && r.info.moq_base != null ? Number(r.info.moq_base) : null;
+    let desiredWeeks = lead + target;                       // order up to lead + target hold
+    if (shelf != null) desiredWeeks = Math.min(desiredWeeks, shelf);  // never aim past shelf life
+    const need = wk * desiredWeeks - r.startOnHand;
+    if (need <= 0) return { qty: 0 };
+    let qty = need;
+    if (moq != null && qty < moq) qty = moq;                // honor minimum order
+    const conflict = (shelf != null && moq != null && moq > wk * shelf); // one order > shelf life
+    return { qty, conflict };
+  }
   function _mrpGridSetupHtml() {
-    // Demand-source toggle + (forecast) scenario picker + SKU map editor
-    const srcBtn = (id, label) => `<button data-mrpsrc="${id}" style="background:${_mrpDemandSource===id?'var(--ink)':'transparent'};color:${_mrpDemandSource===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
-    let fc = '';
-    if (_mrpDemandSource === 'forecast') {
-      const opts = _mrpScenarios.map(s => `<option value="${_mrpEsc(s.id)}" ${s.id===_mrpScenarioId?'selected':''}>${_mrpEsc(s.name)}</option>`).join('');
-      const mapped = _mrpMappedCount();
-      fc = `<label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Forecast</label>
+    const opts = _mrpScenarios.map(s => `<option value="${_mrpEsc(s.id)}" ${s.id===_mrpScenarioId?'selected':''}>${_mrpEsc(s.name)}</option>`).join('');
+    const mapped = _mrpMappedCount();
+    const fc = `<label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Forecast</label>
         <select id="hl-mrp-scenario" style="font-family:var(--serif);font-size:13px;padding:4px 8px;border:1px solid var(--rule-soft);border-radius:4px;max-width:280px;">${opts || '<option>No scenarios</option>'}</select>
         <button id="hl-mrp-mapbtn" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;color:${mapped<_mrpBoms.length?'#a8381f':'var(--ink-3)'};">SKU map ${mapped}/${_mrpBoms.length}</button>`;
-    }
-    return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${srcBtn('forecast','Forecast')}${srcBtn('plan','Plan')}${fc}</div>`;
+    return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${fc}</div>`;
   }
   function _mrpMapEditorHtml() {
     const rows = _mrpBoms.map(b => {
@@ -46037,15 +46048,22 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const col = neg ? 'color:#a8381f;font-weight:600;' : '';
         return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}" style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${bg}${col}">${cellVal(r, v)}</td>`;
       }).join('');
+      const rec = _mrpRecOrder(r);
+      const recHtml = (rec && rec.qty > 0)
+        ? `${_mrpFmt(rec.qty, 0)}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
+        : '—';
+      const targetWks = r.lead != null ? (r.lead + (r.targetHold != null ? r.targetHold : (Number(_mrpSettings.target_months) || 2) * 4.33)) : null;
       return `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:190px;">${_mrpEsc(r.ing)}</td>
         <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(r.uom)}</td>
         <td style="padding:6px 8px;">${status}</td>
         <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.lead != null ? r.lead + 'w' : '—'}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${targetWks != null ? _mrpFmt(targetWks, 0) + 'w' : '—'}</td>
         <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;color:${rec && rec.qty > 0 ? 'var(--ink)' : 'var(--ink-3)'};">${recHtml}</td>
         <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${cellVal(r, r.startOnHand)}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? cellVal(r, r.avgWk) : '—'}</td>
         <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? _mrpFmt(r.startOnHand / r.avgWk, 1) : '—'}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? cellVal(r, r.avgWk) : '—'}</td>
         ${cells}
       </tr>`;
     }).join('');
@@ -46070,16 +46088,18 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <th style="padding:7px 8px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">UOM</th>
           <th style="padding:7px 8px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Status</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Lead</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Target</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order by</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order qty</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">On hand</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Wkly dem</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">OH wks</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Wkly dem</th>
           ${headWeeks}
         </tr></thead>
         <tbody>${body}</tbody>
       </table></div>
       <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
-        Each cell is projected end-of-week on-hand (BOH − demand). ${_mrpDemandSource==='forecast' ? 'Demand = forecast "'+_mrpEsc(_mrpFc?_mrpFc.scenarioName:'')+'", monthly cases spread evenly across the weeks in each calendar month.' : 'Demand = production plan for weeks it covers, demand plan after.'} Amber = below your ${_mrpSettings.target_months}-month target; red = stockout. "Order by" = first shortfall week minus lead time. Incoming POs aren't time-phased yet, so this assumes no future receipts.</div>`);
+        Each cell is projected end-of-week on-hand (BOH − demand). Demand = forecast "${_mrpEsc(_mrpFc?_mrpFc.scenarioName:'')}", monthly cases spread evenly across the weeks in each calendar month. Amber = below lead-time cover; red = stockout. "Order by" = first shortfall week minus lead time. "Order qty" brings you up to lead + target hold weeks of demand, floored to MOQ and capped at shelf life (⚠ = one minimum order exceeds shelf life). Incoming POs aren't time-phased yet, so this assumes no future receipts.</div>`);
   }
 
   async function _mrpSaveYield(code, value) {
