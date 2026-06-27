@@ -45854,7 +45854,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const rows = []; const unmatched = [];
     for (const [ing, dem] of demand) {
       const info = ingByNorm.get(_mrpNorm(ing)) || {};
-      if (!info.ingredient) unmatched.push(ing);
+      if (!info.ingredient) { unmatched.push(ing); continue; }       // not in ingredient master
+      if (info.on_hand == null) continue;                            // tracked elsewhere but not inventoried (e.g. Water)
       const sup = _mrpSupByIng.get(_mrpNorm(ing));
       let boh = Number(info.on_hand) || 0;
       const eoh = [];
@@ -45970,6 +45971,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.lead != null ? r.lead + 'w' : '—'}</td>
         <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
         <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${cellVal(r, r.startOnHand)}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? cellVal(r, r.avgWk) : '—'}</td>
+        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? _mrpFmt(r.startOnHand / r.avgWk, 1) : '—'}</td>
         ${cells}
       </tr>`;
     }).join('');
@@ -45996,6 +45999,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Lead</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order by</th>
           <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">On hand</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Wkly dem</th>
+          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">OH wks</th>
           ${headWeeks}
         </tr></thead>
         <tbody>${body}</tbody>
