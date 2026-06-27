@@ -45398,6 +45398,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _mrpFcLoading = false, _mrpFcErr = null, _mrpFcKey = null;
   let _mrpShowMap = false;
   let _mrpLastWeeks = [], _mrpRowByIng = new Map();
+  let _mrpIngExpanded = new Set();
   let _mrpLinesByCode = new Map(), _mrpSupByIng = new Map();
   let _mrpExpanded = new Set();           // expanded BOM codes
   let _mrpIngSearch = '';
@@ -45536,46 +45537,80 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const q = _mrpIngSearch.trim().toLowerCase();
     let list = _mrpIngs;
     if (q) list = list.filter(i => (i.ingredient || '').toLowerCase().includes(q) || (_mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '').toLowerCase().includes(q));
-    const td = (v, opts) => {
-      const o = opts || {};
-      const align = o.right ? 'right' : 'left';
-      const mono = o.mono ? 'var(--mono)' : 'var(--serif)';
-      const sz = o.mono ? '11px' : '13px';
-      const col = o.dim ? 'color:var(--ink-3);' : '';
-      const wrap = o.wrap ? 'white-space:pre-line;min-width:130px;' : '';
-      return `<td style="padding:7px 10px;text-align:${align};font-family:${mono};font-size:${sz};${col}${wrap}">${v}</td>`;
-    };
+    // weekly demand from current source/scenario/horizon
+    if (_mrpDemandSource === 'forecast') _mrpComputeForecast();
+    const weekly = _mrpWeeklyDemandMap();
+    const fallbackTarget = (Number(_mrpSettings.target_months) || 2) * 4.33;
+
+    const inp = (ing, field, v) => `<input type="number" step="any" min="0" data-ing="${_mrpEsc(ing)}" data-ingfield="${field}" value="${v != null ? v : ''}" style="width:54px;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;text-align:right;" />`;
+    const badge = (t, bg) => `<span style="background:${bg};color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;white-space:nowrap;">${t}</span>`;
+    const num = (v, d) => v == null ? '—' : _mrpFmt(v, d);
+
     const rows = list.map(i => {
-      const sup = _mrpSupByIng.get(_mrpNorm(i.ingredient));
-      const val = (Number(i.on_hand) || 0) * (Number(i.avg_cost) || 0);
-      return `<tr style="border-top:1px solid var(--rule-soft);">
-        ${td(_mrpEsc(i.ingredient), {})}
-        ${td(_mrpEsc(i.uom || ''), {mono:true, dim:true})}
-        ${td(_mrpFmt(i.on_hand, 0), {right:true, mono:true})}
-        ${td(i.avg_cost!=null?'$'+_mrpFmt(i.avg_cost,2):'—', {right:true, mono:true})}
-        ${td(val?'$'+_mrpFmt(val,0):'—', {right:true, mono:true, dim:true})}
-        ${td(_mrpEsc(sup?.supplier || ''), {})}
-        ${td(_mrpEsc(sup?.lead_time || ''), {mono:true, dim:true})}
-        ${td(_mrpEsc(sup?.order_cadence || ''), {mono:true, dim:true})}
-        ${td(_mrpEsc(sup?.delivery_dates || ''), {mono:true, dim:true})}
-        ${td(_mrpEsc(sup?.order_qty || ''), {mono:true, dim:true, wrap:true})}
-        ${td(_mrpEsc(sup?.order_multiples || ''), {mono:true, dim:true, wrap:true})}
-        ${td(_mrpEsc(sup?.supply_levels || ''), {mono:true, dim:true, wrap:true})}
-        ${td(_mrpEsc(sup?.notes || ''), {mono:true, dim:true, wrap:true})}
+      const norm = _mrpNorm(i.ingredient);
+      const sup = _mrpSupByIng.get(norm);
+      const wk = weekly.get(norm) || 0;
+      const oh = Number(i.on_hand) || 0;
+      const lead = i.lead_time_weeks != null ? Number(i.lead_time_weeks) : (sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null);
+      const shelf = i.shelf_life_weeks != null ? Number(i.shelf_life_weeks) : null;
+      const target = i.target_hold_weeks != null ? Number(i.target_hold_weeks) : null;
+      const moqBase = i.moq_base != null ? Number(i.moq_base) : null;
+      const ohWeeks = wk > 0 ? oh / wk : null;
+      const moqWeeks = (wk > 0 && moqBase != null) ? moqBase / wk : null;
+      const tgtForFlag = target != null ? target : fallbackTarget;
+      // flags
+      let flag = '';
+      if (wk > 0 && ohWeeks != null && lead != null) {
+        if (ohWeeks <= lead) flag = badge('Order now', '#a8381f');
+        else if (ohWeeks <= lead + tgtForFlag) flag = badge('Reorder', '#b8860b');
+        else flag = badge('OK', '#3d7a4e');
+      }
+      let conflict = '';
+      if (shelf != null && ((moqWeeks != null && moqWeeks > shelf) || (target != null && target > shelf))) conflict = badge('Conflict', '#7b4397');
+      const expanded = _mrpIngExpanded.has(norm);
+      const moqRef = sup ? (sup.order_qty || sup.supply_levels || '') : '';
+
+      const main = `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;"><span data-ingexp="${_mrpEsc(norm)}" style="cursor:pointer;color:var(--ink-3);margin-right:6px;">${expanded ? '▾' : '▸'}</span>${_mrpEsc(i.ingredient)}</td>
+        <td style="padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(i.uom || '')}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${num(oh, 0)}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${wk > 0 ? num(wk, 1) : '—'}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${ohWeeks != null && lead != null && ohWeeks <= lead ? 'color:#a8381f;font-weight:600;' : ''}">${ohWeeks != null ? num(ohWeeks, 1) : '—'}</td>
+        <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'lead_time_weeks', lead)}</td>
+        <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'shelf_life_weeks', shelf)}</td>
+        <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'target_hold_weeks', target)}</td>
+        <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'moq_base', moqBase)}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${moqWeeks != null ? num(moqWeeks, 1) : '—'}</td>
+        <td style="padding:7px 8px;white-space:nowrap;">${flag}${conflict ? ' ' + conflict : ''}</td>
       </tr>`;
+      const detail = expanded ? `<tr style="background:#faf6ef;"><td colspan="11" style="padding:10px 16px 14px 32px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px 24px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">
+          <div><span style="text-transform:uppercase;font-size:9px;">Supplier</span><br><span style="font-family:var(--serif);font-size:13px;color:var(--ink);">${_mrpEsc(sup?.supplier || '—')}</span></div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Lead time (text)</span><br>${_mrpEsc(sup?.lead_time || '—')}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Order cadence</span><br>${_mrpEsc(sup?.order_cadence || '—')}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Delivery dates</span><br>${_mrpEsc(sup?.delivery_dates || '—')}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">MOQ / order qty</span><br>${_mrpEsc(moqRef || '—')}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Order multiples</span><br>${_mrpEsc(sup?.order_multiples || '—')}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Supply levels</span><br>${_mrpEsc(sup?.supply_levels || '—')}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Avg cost</span><br>${i.avg_cost != null ? '$' + _mrpFmt(i.avg_cost, 2) : '—'}</div>
+          <div style="grid-column:1/-1;"><span style="text-transform:uppercase;font-size:9px;">Notes</span><br>${_mrpEsc(sup?.notes || '—')}</div>
+        </div></td></tr>` : '';
+      return main + detail;
     }).join('');
-    const totalVal = _mrpIngs.reduce((s,i)=>s+(Number(i.on_hand)||0)*(Number(i.avg_cost)||0),0);
-    const heads = ['Ingredient','UOM','On hand','Avg cost','Value','Supplier','Lead time','Order cadence','Delivery dates','Order QTY','Order multiples','Supply levels','Notes'];
-    const rightCols = new Set([2,3,4]);
+
+    const heads = ['Ingredient', 'UOM', 'On hand', 'Wkly demand', 'On hand (wks)', 'Lead (wks)', 'Shelf (wks)', 'Target hold (wks)', 'MOQ (base)', 'MOQ (wks)', 'Flag'];
+    const rightCols = new Set([2,3,4,5,6,7,8,9]);
+    const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
         <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
-        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · on-hand value $${_mrpFmt(totalVal,0)}</div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · demand from ${srcLabel}</div>
       </div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;min-width:1100px;">
-        <thead><tr>${heads.map((h,i)=>`<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;text-align:${rightCols.has(i)?'right':'left'};white-space:nowrap;">${h}</th>`).join('')}</tr></thead>
+        <thead><tr>${heads.map((h,idx)=>`<th style="padding:8px 8px;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;text-align:${rightCols.has(idx)?'right':'left'};white-space:nowrap;">${h}</th>`).join('')}</tr></thead>
         <tbody>${rows || `<tr><td colspan="${heads.length}" style="padding:24px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No matches.</td></tr>`}</tbody>
       </table></div>
-      <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;">Supplier columns are pulled from the Supplier Info tab. Blank rows have no supplier record yet.</div>`;
+      <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
+        Weekly demand is averaged over the current Planning horizon. On-hand weeks = on hand ÷ weekly demand. MOQ weeks = one minimum order ÷ weekly demand. <b>Order now</b> = cover ≤ lead time; <b>Reorder</b> = cover ≤ lead + target hold; <b>Conflict</b> = one minimum order (or your target hold) exceeds shelf life. Lead time seeds from the supplier; click ▸ to see full supplier terms. Set shelf life, target hold, and MOQ base to drive the flags.</div>`;
   }
 
   // ─── Forecast hookup + SKU map ───────────────────────────────────────
@@ -45667,6 +45702,32 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const row = _mrpDemand.find(d => d.sku_code === code && d.week_start === dateISO && d.source === want);
     return row ? (Number(row.cases) || 0) : 0;
   }
+  function _mrpWeeklyDemandMap() {
+    const weeks = _mrpGridWeeks();
+    const skuIng = _mrpSkuIngLbs();
+    const out = new Map();
+    for (const [sku, im] of skuIng) {
+      for (let w = 0; w < weeks.length; w++) {
+        const cs = _mrpCasesFor(sku, weeks[w]);
+        if (!cs) continue;
+        for (const [ing, per] of im) { const k = _mrpNorm(ing); out.set(k, (out.get(k) || 0) + cs * per); }
+      }
+    }
+    const n = weeks.length || 1;
+    for (const k of out.keys()) out.set(k, out.get(k) / n);
+    return out;
+  }
+  async function _mrpSaveIngField(ingredient, field, value) {
+    const v = (value === '' || value == null) ? null : Number(value);
+    const row = _mrpIngs.find(i => i.ingredient === ingredient);
+    if (row) row[field] = v;
+    _mrpRenderBody();
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    const { error } = await sb.from('mrp_ingredients').update({ [field]: v }).eq('brand_id', brandId).eq('ingredient', ingredient);
+    if (error) alert('Save failed: ' + error.message);
+  }
+
   function _mrpCloseCell() { const el = document.getElementById('hl-mrp-cell-modal'); if (el) el.remove(); }
   function _mrpShowCell(normIng, weekIdx) {
     const row = _mrpRowByIng.get(normIng);
@@ -45800,15 +45861,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       for (let w = 0; w < weeks.length; w++) { boh = boh - dem[w]; eoh.push(boh); }
       const totalDem = dem.reduce((a,b) => a + b, 0);
       const avgWk = totalDem / weeks.length;
-      const target = (info.target_months != null ? Number(info.target_months) : Number(_mrpSettings.target_months)) || 2;
-      const targetQty = avgWk * 4.33 * target;
+      const lead = info.lead_time_weeks != null ? Number(info.lead_time_weeks) : (sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null);
+      const targetHold = info.target_hold_weeks != null ? Number(info.target_hold_weeks) : null;
+      const reorderWeeks = lead != null ? lead : ((Number(_mrpSettings.target_months) || 2) * 4.33);
+      const targetQty = avgWk * reorderWeeks;   // reorder point = lead-time worth of demand
       let firstBreach = -1, firstStockout = -1;
       for (let w = 0; w < weeks.length; w++) {
         if (firstStockout < 0 && eoh[w] < 0) firstStockout = w;
         if (firstBreach < 0 && eoh[w] < targetQty) firstBreach = w;
       }
-      const lead = sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null;
-      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, startOnHand: Number(info.on_hand) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
+      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, targetHold, startOnHand: Number(info.on_hand) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
     }
     if (unmatched.length) console.warn('[MRP] ingredients with no master match (on-hand shows 0):', unmatched);
     rows.sort((a,b) => {
@@ -45992,6 +46054,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (e.target.id === 'hl-mrp-automap') { _mrpAutoMapAll(); }
       const cell = e.target.closest('[data-cellweek]');
       if (cell) { _mrpShowCell(cell.dataset.celling, Number(cell.dataset.cellweek)); }
+      const ingExp = e.target.closest('[data-ingexp]');
+      if (ingExp) { const k = ingExp.dataset.ingexp; if (_mrpIngExpanded.has(k)) _mrpIngExpanded.delete(k); else _mrpIngExpanded.add(k); _mrpRenderBody(); }
     });
     body.addEventListener('change', (e) => {
       const yi = e.target.closest('[data-yield-code]');
@@ -46001,6 +46065,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (e.target.id === 'hl-mrp-scenario')     { _mrpScenarioId = e.target.value; _mrpFcKey = null; _mrpRenderBody(); }
       const mapSel = e.target.closest('[data-mapcode]');
       if (mapSel) _mrpSaveSkuMap(mapSel.dataset.mapcode, mapSel.value);
+      const ingF = e.target.closest('[data-ingfield]');
+      if (ingF) _mrpSaveIngField(ingF.dataset.ing, ingF.dataset.ingfield, ingF.value);
     });
     body.addEventListener('input', (e) => {
       if (e.target.id === 'hl-mrp-ing-search') {
