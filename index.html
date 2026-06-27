@@ -45809,6 +45809,50 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
   }
 
+  function _mrpShowOrderCalc(norm) {
+    const r = _mrpRowByIng.get(norm); if (!r) return;
+    const rec = _mrpRecOrder(r); if (!rec) return;
+    const uom = r.uom || 'units';
+    const f = (n, d) => _mrpFmt(n, d == null ? 1 : d);
+    const weeks = _mrpLastWeeks;
+    let orderByTxt = '—';
+    if (r.firstBreach >= 0 && r.lead != null) { const idx = r.firstBreach - r.lead; orderByTxt = idx <= 0 ? 'now' : _mrpWeekLabel(weeks[Math.min(idx, weeks.length - 1)]); }
+    const line = (label, val, opts) => `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:7px 4px;font-family:var(--serif);font-size:13px;${opts&&opts.strong?'font-weight:600;':''}${opts&&opts.dim?'color:var(--ink-3);':''}">${label}</td><td style="padding:7px 4px;text-align:right;font-family:var(--mono);font-size:13px;${opts&&opts.strong?'font-weight:700;':''}${opts&&opts.color?'color:'+opts.color+';':''}">${val}</td></tr>`;
+    const shelfNote = rec.cappedByShelf ? ` <span style="color:#7b4397;">(capped at shelf life ${f(rec.shelf,0)}w)</span>` : '';
+    const rows = [
+      line('Weekly demand', f(rec.weekly) + ' ' + uom + '/wk', {dim:true}),
+      line('Target cover = lead ' + f(rec.lead,0) + 'w + target hold ' + f(rec.target,0) + 'w', f(rec.lead+rec.target,0) + ' wks' + shelfNote, {dim:true}),
+      line('Order-up-to level (weekly × ' + f(rec.desiredWeeks,0) + 'w)', f(rec.desiredQty,0) + ' ' + uom, {}),
+      line('Now on hand + on order', '− ' + f(rec.total,0) + ' ' + uom, {dim:true}),
+      line('Shortfall to cover', (rec.need>0?f(rec.need,0):'0') + ' ' + uom, {}),
+      rec.moqApplied ? line('Below MOQ — raised to minimum order', f(rec.moq,0) + ' ' + uom, {color:'#b8860b'}) : '',
+      line('Recommended order', f(rec.qty,0) + ' ' + uom, {strong:true, color: rec.qty>0?'var(--ink)':'var(--ink-3)'}),
+    ].join('');
+    const conflictBanner = rec.conflict ? `<div style="margin-top:12px;padding:10px 12px;background:#f3ecf6;border-left:3px solid #7b4397;font-family:var(--serif);font-size:12px;color:#5a2f6e;">Conflict: one minimum order (${f(rec.moq,0)} ${uom}) is more than shelf life allows you to hold (${f(rec.weekly*rec.shelf,0)} ${uom} over ${f(rec.shelf,0)} weeks). You'll either over-buy past spoilage or need a smaller minimum from the supplier.</div>` : '';
+    const html = `<div id="hl-mrp-cell-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:560px;width:100%;max-height:86vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+        <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:20px;">${_mrpEsc(r.ing)}</div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px;">Recommended order · place by ${_mrpEsc(orderByTxt)}</div>
+          </div>
+          <button data-mrpcellclose style="background:transparent;border:none;font-size:22px;line-height:1;cursor:pointer;color:var(--ink-3);">×</button>
+        </div>
+        <div style="padding:14px 22px 20px;">
+          <table style="width:100%;border-collapse:collapse;">${rows}</table>
+          ${conflictBanner}
+          <div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">We top up to lead + target hold weeks of demand, subtract what's on hand and on order, then round the shortfall up to the supplier minimum. Shelf life caps the target so you don't buy more than you can use before it spoils.</div>
+        </div>
+      </div></div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const modal = document.getElementById('hl-mrp-cell-modal');
+    if (modal) {
+      modal.addEventListener('click', (ev) => { if (ev.target === modal || ev.target.closest('[data-mrpcellclose]')) _mrpCloseCell(); });
+      const onKey = (ev) => { if (ev.key === 'Escape') { _mrpCloseCell(); document.removeEventListener('keydown', onKey); } };
+      document.addEventListener('keydown', onKey);
+    }
+  }
+
   function _mrpShowCell(normIng, weekIdx) {
     const row = _mrpRowByIng.get(normIng);
     const weekISO = _mrpLastWeeks[weekIdx];
@@ -45973,13 +46017,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const shelf = r.info && r.info.shelf_life_weeks != null ? Number(r.info.shelf_life_weeks) : null;
     const moq = r.info && r.info.moq_base != null ? Number(r.info.moq_base) : null;
     let desiredWeeks = lead + target;                       // order up to lead + target hold
+    const cappedByShelf = (shelf != null && shelf < desiredWeeks);
     if (shelf != null) desiredWeeks = Math.min(desiredWeeks, shelf);  // never aim past shelf life
-    const need = wk * desiredWeeks - r.startOnHand;
-    if (need <= 0) return { qty: 0 };
-    let qty = need;
-    if (moq != null && qty < moq) qty = moq;                // honor minimum order
+    const desiredQty = wk * desiredWeeks;
+    const need = desiredQty - r.startOnHand;
+    let qty = need > 0 ? need : 0;
+    let moqApplied = false;
+    if (need > 0 && moq != null && qty < moq) { qty = moq; moqApplied = true; }
     const conflict = (shelf != null && moq != null && moq > wk * shelf); // one order > shelf life
-    return { qty, conflict };
+    return { qty, conflict, need, desiredWeeks, desiredQty, lead, target, shelf, moq, weekly: wk, cappedByShelf, moqApplied, total: r.startOnHand };
   }
   function _mrpGridSetupHtml() {
     const opts = _mrpScenarios.map(s => `<option value="${_mrpEsc(s.id)}" ${s.id===_mrpScenarioId?'selected':''}>${_mrpEsc(s.name)}</option>`).join('');
@@ -46062,17 +46108,20 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         ? `${_mrpFmt(rec.qty, 0)}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
         : '—';
       const targetWks = r.lead != null ? (r.lead + (r.targetHold != null ? r.targetHold : 0)) : null;
+      const ohWks = r.avgWk > 0 ? _mrpFmt(r.startOnHand / r.avgWk, 1) : '—';
+      const orderQtyCell = (rec && rec.qty > 0)
+        ? `<td data-ordercalc="${_mrpEsc(_mrpNorm(r.ing))}" style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;color:var(--ink);cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;">${recHtml}</td>`
+        : `<td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">—</td>`;
       return `<tr style="border-top:1px solid var(--rule-soft);">
-        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:190px;">${_mrpEsc(r.ing)}</td>
-        <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(r.uom)}</td>
-        <td style="padding:6px 8px;">${status}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.lead != null ? r.lead + 'w' : '—'}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${targetWks != null ? _mrpFmt(targetWks, 0) + 'w' : '—'}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;color:${rec && rec.qty > 0 ? 'var(--ink)' : 'var(--ink-3)'};">${recHtml}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${cellVal(r, r.startOnHand)}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? _mrpFmt(r.startOnHand / r.avgWk, 1) : '—'}</td>
-        <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? cellVal(r, r.avgWk) : '—'}</td>
+        <td style="padding:8px 12px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:200px;">${_mrpEsc(r.ing)}</td>
+        <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${cellVal(r, r.startOnHand)}</td>
+        <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? cellVal(r, r.avgWk) : '—'}</td>
+        <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${ohWks}</td>
+        <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${targetWks != null ? _mrpFmt(targetWks, 0) + 'w' : '—'}</td>
+        <td style="padding:8px 10px;">${status}</td>
+        <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
+        ${orderQtyCell}
+        <td style="padding:0;width:10px;border-left:1px solid var(--rule-soft);"></td>
         ${cells}
       </tr>`;
     }).join('');
@@ -46094,16 +46143,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div>
       <div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;"><table style="border-collapse:collapse;min-width:100%;">
         <thead><tr style="background:#efe9dd;">
-          <th style="padding:7px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;position:sticky;left:0;background:#efe9dd;">Ingredient</th>
-          <th style="padding:7px 8px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">UOM</th>
-          <th style="padding:7px 8px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Status</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Lead</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Target</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order by</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Order qty</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">OH+OR</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">OH wks</th>
-          <th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Wkly dem</th>
+          <th style="padding:9px 12px;text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;position:sticky;left:0;background:#efe9dd;">Ingredient</th>
+          <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">OH+OR<br><span style="font-size:8px;opacity:0.7;">qty</span></th>
+          <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Wkly dem<br><span style="font-size:8px;opacity:0.7;">qty</span></th>
+          <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">OH+OR<br><span style="font-size:8px;opacity:0.7;">wks</span></th>
+          <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Target<br><span style="font-size:8px;opacity:0.7;">wks</span></th>
+          <th style="padding:9px 10px;text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Status</th>
+          <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order by</th>
+          <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order qty</th>
+          <th style="padding:0;width:10px;border-left:1px solid var(--rule-soft);background:#efe9dd;"></th>
           ${headWeeks}
         </tr></thead>
         <tbody>${body}</tbody>
@@ -46162,6 +46210,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (e.target.id === 'hl-mrp-automap') { _mrpAutoMapAll(); }
       const cell = e.target.closest('[data-cellweek]');
       if (cell) { _mrpShowCell(cell.dataset.celling, Number(cell.dataset.cellweek)); }
+      const ordC = e.target.closest('[data-ordercalc]');
+      if (ordC) { _mrpShowOrderCalc(ordC.dataset.ordercalc); }
       const ingExp = e.target.closest('[data-ingexp]');
       if (ingExp) { const k = ingExp.dataset.ingexp; if (_mrpIngExpanded.has(k)) _mrpIngExpanded.delete(k); else _mrpIngExpanded.add(k); _mrpRenderBody(); }
       const ingCalc = e.target.closest('[data-ingcalc]');
