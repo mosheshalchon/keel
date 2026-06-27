@@ -45397,6 +45397,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _mrpFc = null;                      // { monthly: Map(code -> Map('Y-M' -> cases)), scenarioName }
   let _mrpFcLoading = false, _mrpFcErr = null, _mrpFcKey = null;
   let _mrpShowMap = false;
+  let _mrpGridSearch = '';
   let _mrpLastWeeks = [], _mrpRowByIng = new Map();
   let _mrpIngExpanded = new Set();
   let _mrpLinesByCode = new Map(), _mrpSupByIng = new Map();
@@ -45540,7 +45541,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     // weekly demand from current source/scenario/horizon
     if (_mrpDemandSource === 'forecast') _mrpComputeForecast();
     const weekly = _mrpWeeklyDemandMap();
-    const fallbackTarget = (Number(_mrpSettings.target_months) || 2) * 4.33;
+    const fallbackTarget = 0;   // blank target hold counts as 0 weeks (not the 2-month default)
 
     const inp = (ing, field, v) => `<input type="number" step="any" min="0" data-ing="${_mrpEsc(ing)}" data-ingfield="${field}" value="${v != null ? v : ''}" style="width:54px;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;text-align:right;" />`;
     const badge = (t, bg) => `<span style="background:${bg};color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;white-space:nowrap;">${t}</span>`;
@@ -45577,8 +45578,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${num(oh, 0)}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${wk > 0 ? num(wk, 1) : '—'}</td>
         <td data-ingcalc="oh" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${ohWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}${ohWeeks != null && lead != null && ohWeeks <= lead ? 'color:#a8381f;font-weight:600;' : ''}">${ohWeeks != null ? num(ohWeeks, 1) : '—'}</td>
-        <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'lead_time_weeks', lead)}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'shelf_life_weeks', shelf)}</td>
+        <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'lead_time_weeks', lead)}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'target_hold_weeks', target)}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${targetOrder != null ? num(targetOrder, 1) : '—'}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'moq_base', moqBase)}</td>
@@ -45600,7 +45601,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return main + detail;
     }).join('');
 
-    const heads = ['Ingredient', 'UOM', 'On hand', 'Wkly demand', 'On hand (wks)', 'Lead (wks)', 'Shelf (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)', 'Flag'];
+    const heads = ['Ingredient', 'UOM', 'On hand', 'Wkly demand', 'On hand (wks)', 'Shelf (wks)', 'Lead (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)', 'Flag'];
     const rightCols = new Set([2,3,4,5,6,7,8,9,10]);
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
@@ -45961,8 +45962,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _mrpRecOrder(r) {
     const wk = r.avgWk; if (!(wk > 0)) return null;
     const lead = r.lead != null ? r.lead : 0;
-    const fb = (Number(_mrpSettings.target_months) || 2) * 4.33;
-    const target = r.targetHold != null ? r.targetHold : fb;
+    const target = r.targetHold != null ? r.targetHold : 0;
     const shelf = r.info && r.info.shelf_life_weeks != null ? Number(r.info.shelf_life_weeks) : null;
     const moq = r.info && r.info.moq_base != null ? Number(r.info.moq_base) : null;
     let desiredWeeks = lead + target;                       // order up to lead + target hold
@@ -46022,11 +46022,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (!_mrpDemand.length) return wrap(`<div class="hl-loading">No demand plan loaded.</div>`);
     }
 
-    const { weeks, rows } = _mrpComputeGrid();
+    const { weeks, rows: allRows } = _mrpComputeGrid();
     _mrpLastWeeks = weeks;
-    _mrpRowByIng = new Map(rows.map(r => [_mrpNorm(r.ing), r]));
+    _mrpRowByIng = new Map(allRows.map(r => [_mrpNorm(r.ing), r]));
+    const gq = _mrpGridSearch.trim().toLowerCase();
+    const rows = gq ? allRows.filter(r => (r.ing || '').toLowerCase().includes(gq)) : allRows;
     const cellVal = (r, v) => dollars ? (r.avgCost ? '$' + _mrpFmt(v * r.avgCost, 0) : '—') : _mrpFmt(v, 0);
-    const counts = { stockout: rows.filter(r => r.firstStockout >= 0).length, reorder: rows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length };
+    const counts = { stockout: allRows.filter(r => r.firstStockout >= 0).length, reorder: allRows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length };
     const headWeeks = weeks.map(w => `<th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${_mrpWeekLabel(w)}</th>`).join('');
     const body = rows.map(r => {
       const status = r.firstStockout >= 0
@@ -46052,7 +46054,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const recHtml = (rec && rec.qty > 0)
         ? `${_mrpFmt(rec.qty, 0)}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
         : '—';
-      const targetWks = r.lead != null ? (r.lead + (r.targetHold != null ? r.targetHold : (Number(_mrpSettings.target_months) || 2) * 4.33)) : null;
+      const targetWks = r.lead != null ? (r.lead + (r.targetHold != null ? r.targetHold : 0)) : null;
       return `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:190px;">${_mrpEsc(r.ing)}</td>
         <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(r.uom)}</td>
@@ -46079,8 +46081,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <select id="hl-mrp-grid-horizon" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;">
             ${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}
           </select>
+          <input id="hl-mrp-grid-search" placeholder="Search ingredient…" value="${_mrpEsc(_mrpGridSearch)}" style="margin-left:6px;font-family:var(--serif);font-size:13px;padding:5px 10px;border:1px solid var(--rule-soft);border-radius:6px;min-width:170px;" />
         </div>
-        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${rows.length} ingredients · <span style="color:#a8381f;">${counts.stockout} stockout</span> · <span style="color:#b8860b;">${counts.reorder} reorder</span></div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${gq ? rows.length + ' of ' + allRows.length : allRows.length} ingredients · <span style="color:#a8381f;">${counts.stockout} stockout</span> · <span style="color:#b8860b;">${counts.reorder} reorder</span></div>
       </div>
       <div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;"><table style="border-collapse:collapse;min-width:100%;">
         <thead><tr style="background:#efe9dd;">
@@ -46171,11 +46174,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     body.addEventListener('input', (e) => {
       if (e.target.id === 'hl-mrp-ing-search') {
         _mrpIngSearch = e.target.value;
-        const body2 = document.getElementById('hl-mrp-body');
-        // re-render only the table region by full body re-render (cheap)
         const pos = e.target.selectionStart;
         _mrpRenderBody();
         const again = document.getElementById('hl-mrp-ing-search');
+        if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch(_){} }
+      }
+      if (e.target.id === 'hl-mrp-grid-search') {
+        _mrpGridSearch = e.target.value;
+        const pos = e.target.selectionStart;
+        _mrpRenderBody();
+        const again = document.getElementById('hl-mrp-grid-search');
         if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch(_){} }
       }
     });
