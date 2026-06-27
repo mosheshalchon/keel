@@ -45471,7 +45471,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;color:var(--ink);">${open ? '▾' : '▸'} ${_mrpEsc(b.code)}</td>
         <td style="padding:9px 10px;font-family:var(--serif);font-size:14px;">${_mrpEsc(b.name || '')}</td>
         <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${lines.length} lines</td>
-        <td style="padding:9px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${comps.map(esc).join(' · ')}</td>
+        <td style="padding:9px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${comps.map(_mrpEsc).join(' · ')}</td>
         <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_mrpFmt(totalLbs, 1)} lbs/cs</td>
         <td style="padding:9px 10px;text-align:right;" onclick="event.stopPropagation()">
           ${canEdit
