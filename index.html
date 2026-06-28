@@ -46595,9 +46595,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const sb = window.Auth.getClient();
       const { data, error } = await sb.functions.invoke('sync-fg-onhand');
       if (error) throw error;
-      const msg = data && data.ok
-        ? `FG inventory synced from ${data.snapshot || 'Dropbox'}.\nUpdated ${data.updated} items.`
-        : 'Sync ran but returned: ' + JSON.stringify(data);
+      let msg;
+      if (data && data.ok) {
+        const parts = [`FG inventory synced from ${data.snapshot || 'Dropbox'}.`, `Updated ${data.updated} rows.`];
+        if (data.matched != null) parts.push(`Matched ${data.matched} items to the forecast.`);
+        if (data.skipped_non_atg != null) parts.push(`Skipped ${data.skipped_non_atg} non-ATG rows.`);
+        if (data.unmatched_count != null) parts.push(`${data.unmatched_count} unmatched` + (data.unmatched && data.unmatched.length ? ':\n• ' + data.unmatched.slice(0, 30).join('\n• ') : '.'));
+        if (data.matched == null) parts.push('(No match info returned — the matching version of sync-fg-onhand may not be deployed yet.)');
+        msg = parts.join('\n');
+      } else {
+        msg = 'Sync ran but returned: ' + JSON.stringify(data);
+      }
       alert(msg);
       _prodLoaded = false;
       await _prodLoad();
