@@ -46292,6 +46292,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   // ═══════════════════════ PRODUCTION (finished-goods supply) ═══════════════════════
   let _prodLoaded = false, _prodLoading = false, _prodErr = null;
   let _prodFg = [], _prodFc = null, _prodFcKey = null, _prodFcLoading = false;
+  let _prodProductById = new Map();
   let _prodTargetWeeks = 8, _prodView = 'units', _prodSearch = '';
   let _prodLocFilter = 'all', _prodLineFilter = 'all';
   const _prodEsc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
@@ -46312,6 +46313,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (fgR.error) throw fgR.error;
       _prodFg = fgR.data || [];
       if ((prodR.data || []).length) _mrpProducts = prodR.data;   // shared with the matcher
+      _prodProductById = new Map((_mrpProducts || []).map(p => [p.id, p]));
       _mrpScenarios = scenR.data || _mrpScenarios;
       if (!_mrpScenarioId && _mrpScenarios.length) _mrpScenarioId = _mrpScenarios[0].id;
       _prodLoaded = true;
@@ -46355,14 +46357,23 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _prodRow(g) {
     const onHand = g.onHand;
     const price = g.price;
-    const prod = _mrpMatchProduct(g.item);
-    const monthly = prod ? _prodMonthlyDemand(prod.id) : null;
+    let prodId = g.product_id || null;
+    let prod = prodId ? _prodProductById.get(prodId) : null;
+    if (!prod) { prod = _mrpMatchProduct(g.item); if (prod) prodId = prod.id; }  // fallback before re-sync persists the match
+    const monthly = prodId ? _prodMonthlyDemand(prodId) : null;
     const weekly = (monthly != null) ? monthly / WK_PER_MONTH : null;
     const weeksSupply = (weekly && weekly > 0) ? onHand / weekly : null;
     const mosSupply = (monthly && monthly > 0) ? onHand / monthly : null;
     const produce = (weekly && weekly > 0) ? Math.max(0, weekly * _prodTargetWeeks - onHand) : 0;
     const line = (prod && prod.product_line) ? prod.product_line : '';
-    return { item: g.item, onHand, price, value: onHand * price, locations: [...g.locations], prod, line, monthly, weekly, weeksSupply, mosSupply, produce, snapshot: g.snapshot };
+    return { item: g.item, onHand, price, value: onHand * price, locations: [...g.locations], prod, prodId, line, monthly, weekly, weeksSupply, mosSupply, produce, snapshot: g.snapshot };
+  }
+
+  // on-hand-weighted average weeks of supply for a set of rows
+  function _prodWtdWeeks(rows) {
+    let num = 0, den = 0;
+    for (const r of rows) if (r.weekly != null && r.onHand > 0) { num += r.weeksSupply * r.onHand; den += r.onHand; }
+    return den > 0 ? num / den : null;
   }
 
   function _prodStatus(r) {
@@ -46396,12 +46407,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     for (const f of _prodFg) {
       const loc = (f.location || '').trim();
       if (_prodLocFilter !== 'all' && loc !== _prodLocFilter) continue;
-      const g = groups.get(f.item) || { item: f.item, onHand: 0, price: 0, locations: new Set(), snapshot: f.snapshot_date };
+      const g = groups.get(f.item) || { item: f.item, onHand: 0, price: 0, locations: new Set(), snapshot: f.snapshot_date, product_id: null };
       const oh = Number(f.on_hand_cases) || 0;
       g.onHand += oh;
       const p = Number(f.unit_price) || 0;
       if (p > 0 && (g.price === 0 || p < g.price)) g.price = p;
       if (oh !== 0 && loc) g.locations.add(loc);
+      if (f.product_id) g.product_id = f.product_id;
       if (f.snapshot_date) g.snapshot = f.snapshot_date;
       groups.set(f.item, g);
     }
@@ -46443,6 +46455,60 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </tr>`;
     }).join('');
 
+    // grand totals (weeks = on-hand-weighted average)
+    const gOH = rows.reduce((s, r) => s + r.onHand, 0);
+    const gVal = rows.reduce((s, r) => s + r.value, 0);
+    const gProd = rows.reduce((s, r) => s + r.produce, 0);
+    const gWeeks = _prodWtdWeeks(rows);
+    const totRow = `<tr style="border-top:2px solid var(--ink);background:#efe9dd;">
+      <td style="padding:9px 12px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;position:sticky;left:0;background:#efe9dd;">Total (all)</td>
+      <td></td>
+      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:700;">${dollars ? '$' + _prodFmt(gVal, 0) : _prodFmt(gOH, 0)}</td>
+      <td></td><td></td>
+      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:700;">${gWeeks == null ? '—' : _prodFmt(gWeeks, 1)}</td>
+      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${gWeeks == null ? '—' : _prodFmt(gWeeks / WK_PER_MONTH, 1)}</td>
+      <td></td><td></td>
+      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:700;">${dollars ? '$' + _prodFmt(rows.reduce((s, r) => s + r.produce * r.price, 0), 0) : _prodFmt(gProd, 0)}</td>
+    </tr>`;
+
+    // summaries: by product line, by location (on-hand-weighted weeks)
+    const byLine = new Map();
+    for (const r of rows) {
+      const k = r.line || '(no line)';
+      const o = byLine.get(k) || { rows: [], oh: 0, val: 0, prod: 0 };
+      o.rows.push(r); o.oh += r.onHand; o.val += r.value; o.prod += r.produce; byLine.set(k, o);
+    }
+    const byLoc = new Map();
+    for (const f of _prodFg) {
+      const loc = (f.location || '').trim() || '(none)';
+      if (_prodLocFilter !== 'all' && loc !== _prodLocFilter) continue;
+      const o = byLoc.get(loc) || { oh: 0, val: 0 };
+      const oh = Number(f.on_hand_cases) || 0, pr = Number(f.unit_price) || 0;
+      o.oh += oh; o.val += oh * pr; byLoc.set(loc, o);
+    }
+    const sumTable = (title, headCols, bodyRows) => `<div style="flex:1;min-width:300px;">
+      <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin:0 0 6px 2px;">${title}</div>
+      <table style="width:100%;border-collapse:collapse;border:1px solid var(--rule-soft);border-radius:8px;overflow:hidden;">
+        <thead><tr style="background:#efe9dd;">${headCols.map((h, i) => `<th style="padding:7px 10px;text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:9px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">${_prodEsc(h)}</th>`).join('')}</tr></thead>
+        <tbody>${bodyRows}</tbody>
+      </table></div>`;
+    const lineBody = [...byLine.entries()].sort((a, b) => b[1].val - a[1].val).map(([k, o]) => {
+      const w = _prodWtdWeeks(o.rows);
+      return `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:7px 10px;font-family:var(--serif);font-size:12px;">${_prodEsc(k)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${_prodFmt(o.oh, 0)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">$${_prodFmt(o.val, 0)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;${w != null && w < _prodTargetWeeks ? 'color:#a8381f;font-weight:600;' : 'color:var(--ink-3);'}">${w == null ? '—' : _prodFmt(w, 1)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${_prodFmt(o.prod, 0)}</td>
+      </tr>`;
+    }).join('');
+    const locBody = [...byLoc.entries()].sort((a, b) => b[1].oh - a[1].oh).map(([k, o]) => `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:7px 10px;font-family:var(--serif);font-size:12px;">${_prodEsc(k)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${_prodFmt(o.oh, 0)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">$${_prodFmt(o.val, 0)}</td>
+        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${gOH > 0 ? _prodFmt(100 * o.oh / gOH, 0) + '%' : '—'}</td>
+      </tr>`).join('');
+
     host.innerHTML = `${_prodControls(false, { snapshot, count: rows.length, flagged, totalVal, allLocs, allLines })}
       <div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;">
         <table style="width:100%;border-collapse:collapse;min-width:1020px;">
@@ -46450,10 +46516,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             ${head.map((h, i) => `<th style="padding:9px 12px;text-align:${leftCols.has(i) ? 'left' : 'right'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;${i === 0 ? 'position:sticky;left:0;background:#efe9dd;' : ''}">${_prodEsc(h)}</th>`).join('')}
           </tr></thead>
           <tbody>${body}</tbody>
+          <tfoot>${totRow}</tfoot>
         </table>
       </div>
-      <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
-        On-hand is summed across the selected ATG locations from the latest snapshot${snapshot ? ' (' + _prodEsc(snapshot) + ')' : ''}. Weeks of supply = on-hand ÷ weekly demand (forecast "${_prodEsc(_prodFc ? _prodFc.scenarioName : '')}" monthly cases ÷ ${_prodFmt(WK_PER_MONTH, 2)}). "Produce" = cases to reach the ${_prodTargetWeeks}-week target. Base price is the lowest non-zero per-case price in the file. Bliss Unlimited is excluded.</div>`;
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:18px;">
+        ${sumTable('Totals by product line', ['Product line', 'On hand', '$ value', 'Wks', 'Produce'], lineBody)}
+        ${sumTable('Totals by location', ['Location', 'On hand', '$ value', '% of OH'], locBody)}
+      </div>
+      <div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
+        On-hand is summed across the selected ATG locations from the latest snapshot${snapshot ? ' (' + _prodEsc(snapshot) + ')' : ''}. Weeks of supply = on-hand ÷ weekly demand (forecast "${_prodEsc(_prodFc ? _prodFc.scenarioName : '')}" monthly cases ÷ ${_prodFmt(WK_PER_MONTH, 2)}); totals use an on-hand-weighted average. "Produce" = cases to reach the ${_prodTargetWeeks}-week target. Base price is the lowest non-zero per-case price in the file. Bliss Unlimited is excluded.</div>`;
     _prodWire();
   }
 
