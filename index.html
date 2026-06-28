@@ -46443,7 +46443,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const onHandCell = (r) => dollars ? (r.price ? '$' + _prodFmt(r.value, 0) : '—') : _prodFmt(r.onHand, 0);
     const produceCell = (r) => r.produce > 0 ? (dollars ? (r.price ? '$' + _prodFmt(r.produce * r.price, 0) : '—') : _prodFmt(r.produce, 0)) : '—';
 
-    const head = ['Finished good', 'Location', dollars ? 'On hand $' : 'On hand', 'Base price', 'Wkly demand', 'Wks supply', 'Mos supply', 'Target', 'Status', dollars ? 'Produce $' : 'Produce'];
+    const head = ['Finished good', 'Location', dollars ? 'On hand $' : 'On hand', 'Base price', 'Wkly demand', 'Wks supply', 'Mos supply', 'Target (wks)', 'Status', dollars ? 'Produce $' : 'Produce'];
     const leftCols = new Set([0, 1, 8]);
     const body = rows.map(r => {
       const st = _prodStatus(r);
@@ -46460,7 +46460,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.weekly == null ? '—' : _prodFmt(r.weekly, 1)}</td>
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;${r.weeksSupply != null && r.weeksSupply < r.target ? 'color:#a8381f;font-weight:600;' : ''}">${supplyTxt}</td>
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${mosTxt}</td>
-        <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_prodFmt(r.target, 0)}w</td>
+        <td style="padding:5px 8px;text-align:right;"><input data-linetarget="${_prodEsc(r.line)}" type="number" min="1" max="52" value="${_prodFmt(r.target, 0)}" title="Target for the ${_prodEsc(r.line || 'no line')} line — applies to every item in it" style="width:54px;font-family:var(--mono);font-size:11px;padding:4px 6px;text-align:right;border:1px solid var(--rule-soft);border-radius:5px;" /></td>
         <td style="padding:8px 10px;"><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;text-transform:uppercase;background:${st.bg};color:${st.fg};">${st.label}</span></td>
         <td ${produceClickable ? `data-prodcalc="${_prodEsc(r.item)}" style="cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;` : 'style="'}padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">${produceCell(r)}</td>
       </tr>`;
@@ -46489,8 +46489,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const o = byLine.get(k) || { rows: [], oh: 0, val: 0, prod: 0 };
       o.rows.push(r); o.oh += r.onHand; o.val += r.value; o.prod += r.produce; byLine.set(k, o);
     }
+    const shownItems = new Set(rows.map(r => r.item));   // respects line + search + location filters
     const byLoc = new Map();
     for (const f of _prodFg) {
+      if (!shownItems.has(f.item)) continue;
       const loc = (f.location || '').trim() || '(none)';
       if (_prodLocFilter !== 'all' && loc !== _prodLocFilter) continue;
       const o = byLoc.get(loc) || { oh: 0, val: 0 };
@@ -46509,7 +46511,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const tgt = _prodTargetFor(k);
       return `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:7px 10px;font-family:var(--serif);font-size:12px;">${_prodEsc(k)}</td>
-        <td style="padding:5px 8px;text-align:right;"><input data-linetarget="${_prodEsc(k)}" type="number" min="1" max="52" value="${_prodFmt(tgt, 0)}" style="width:52px;font-family:var(--mono);font-size:11px;padding:4px 6px;text-align:right;border:1px solid var(--rule-soft);border-radius:5px;" /></td>
         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${_prodFmt(o.oh, 0)}</td>
         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">$${_prodFmt(o.val, 0)}</td>
         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;${w != null && w < tgt ? 'color:#a8381f;font-weight:600;' : 'color:var(--ink-3);'}">${w == null ? '—' : _prodFmt(w, 1)}</td>
@@ -46517,7 +46518,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </tr>`;
     }).join('') + `<tr style="border-top:2px solid var(--ink);background:#efe9dd;">
         <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;">Total</td>
-        <td></td>
         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${_prodFmt(gOH, 0)}</td>
         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">$${_prodFmt(gVal, 0)}</td>
         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;${gWeeks != null && gWeeks < _prodTargetWeeks ? 'color:#a8381f;' : ''}">${gWeeks == null ? '—' : _prodFmt(gWeeks, 1)}</td>
@@ -46548,7 +46548,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         </table>
       </div>
       <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:18px;">
-        ${sumTable('Totals by product line', ['Product line', 'Target', 'On hand', '$ value', 'Wks', 'Produce'], lineBody)}
+        ${sumTable('Totals by product line', ['Product line', 'On hand', '$ value', 'Wks', 'Produce'], lineBody)}
         ${sumTable('Totals by location', ['Location', 'On hand', '$ value', '% of OH'], locBody)}
       </div>
       <div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">
@@ -46575,10 +46575,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       <div style="display:flex;flex-direction:column;gap:2px;">
         <label style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Location</label>
         <select id="hl-prod-loc" style="font-family:var(--serif);font-size:13px;padding:6px 10px;border:1px solid var(--rule-soft);border-radius:6px;background:var(--paper,#f4efe6);">${locOpts}</select>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:2px;">
-        <label style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Default tgt (wks)</label>
-        <input id="hl-prod-target" type="number" min="1" max="52" value="${_prodTargetWeeks}" style="width:70px;font-family:var(--mono);font-size:13px;padding:6px 10px;border:1px solid var(--rule-soft);border-radius:6px;" />
       </div>
       <div style="display:flex;border:1px solid var(--rule-soft);border-radius:6px;overflow:hidden;">
         <button data-prodview="units" style="background:${_prodView === 'units' ? 'var(--ink)' : 'transparent'};color:${_prodView === 'units' ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:8px 14px;cursor:pointer;">Units</button>
