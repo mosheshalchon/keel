@@ -46416,16 +46416,20 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     for (const f of _prodFg) {
       const loc = (f.location || '').trim();
       if (_prodLocFilter !== 'all' && loc !== _prodLocFilter) continue;
-      const g = groups.get(f.item) || { item: f.item, onHand: 0, price: 0, locations: new Set(), snapshot: f.snapshot_date, product_id: null };
+      const g = groups.get(f.item) || { item: f.item, onHand: 0, priceWtNum: 0, priceWtDen: 0, priceMin: 0, locations: new Set(), snapshot: f.snapshot_date, product_id: null };
       const oh = Number(f.on_hand_cases) || 0;
       g.onHand += oh;
       const p = Number(f.unit_price) || 0;
-      if (p > 0 && (g.price === 0 || p < g.price)) g.price = p;
+      if (p > 0) {
+        if (oh > 0) { g.priceWtNum += p * oh; g.priceWtDen += oh; }   // qty-weighted avg
+        if (g.priceMin === 0 || p < g.priceMin) g.priceMin = p;        // fallback when no qty
+      }
       if (oh !== 0 && loc) g.locations.add(loc);
       if (f.product_id) g.product_id = f.product_id;
       if (f.snapshot_date) g.snapshot = f.snapshot_date;
       groups.set(f.item, g);
     }
+    for (const g of groups.values()) g.price = g.priceWtDen > 0 ? g.priceWtNum / g.priceWtDen : g.priceMin;
     let rows = [...groups.values()].map(_prodRow);
 
     // product-line options (from matched products), then filter
@@ -46490,13 +46494,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       o.rows.push(r); o.oh += r.onHand; o.val += r.value; o.prod += r.produce; byLine.set(k, o);
     }
     const shownItems = new Set(rows.map(r => r.item));   // respects line + search + location filters
+    const priceByItem = new Map(rows.map(r => [r.item, r.price]));
     const byLoc = new Map();
     for (const f of _prodFg) {
       if (!shownItems.has(f.item)) continue;
       const loc = (f.location || '').trim() || '(none)';
       if (_prodLocFilter !== 'all' && loc !== _prodLocFilter) continue;
       const o = byLoc.get(loc) || { oh: 0, val: 0 };
-      const oh = Number(f.on_hand_cases) || 0, pr = Number(f.unit_price) || 0;
+      const oh = Number(f.on_hand_cases) || 0, pr = priceByItem.get(f.item) || 0;
       o.oh += oh; o.val += oh * pr; byLoc.set(loc, o);
     }
     const sumTable = (title, headCols, bodyRows) => `<div style="flex:1;min-width:300px;">
