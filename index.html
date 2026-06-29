@@ -4344,6 +4344,40 @@ window.Auth = (function() {
     return _client;
   }
 
+  // ---- KeelCache: persistent in-memory data cache -------------------------
+  // Lives above the page-render functions, so cached table loads survive
+  // navigation between tabs (the render fns re-declare their own state on every
+  // mount, which is why pages re-fetched everything on each visit). Each entry
+  // has a freshness window (ttl); writes/realtime call set() or invalidate() so
+  // data is never served stale past a real change. Cleared on logout/brand switch.
+  // Designed to be lifted into a standalone data-store module later (rewrite-safe).
+  const KeelCache = (function () {
+    const store = new Map(); // key -> { ts, data, promise }
+    const DEFAULT_TTL = 90 * 1000;
+    async function get(key, fetchFn, ttl) {
+      ttl = (ttl == null ? DEFAULT_TTL : ttl);
+      const now = Date.now();
+      const hit = store.get(key);
+      if (hit && hit.data !== undefined && (now - hit.ts) < ttl) return hit.data; // fresh hit
+      if (hit && hit.promise) return hit.promise;                                  // de-dupe in-flight
+      const promise = Promise.resolve().then(fetchFn).then((data) => {
+        store.set(key, { ts: Date.now(), data, promise: null });
+        return data;
+      }).catch((e) => { store.delete(key); throw e; });
+      store.set(key, { ts: now, data: hit ? hit.data : undefined, promise });
+      return promise;
+    }
+    function set(key, data) { store.set(key, { ts: Date.now(), data, promise: null }); }
+    function invalidate(key) {
+      if (key == null) return;
+      if (key instanceof RegExp) { for (const k of [...store.keys()]) if (key.test(k)) store.delete(k); }
+      else store.delete(key);
+    }
+    function clear() { store.clear(); }
+    return { get, set, invalidate, clear };
+  })();
+  window.KeelCache = KeelCache;
+
   // Look up the user's brand_id from the user_profiles table.
   // We need this for every signed-in session because RLS keys off it.
   async function fetchProfile(userId) {
@@ -4920,6 +4954,7 @@ window.BrandLibrary = (function() {
   // Async sign-out helper — most call sites still call it without awaiting,
   // which is fine because Auth.signOut handles the redirect itself.
   function logout() {
+    try { if (window.KeelCache) window.KeelCache.clear(); } catch (e) {}
     if (window.Auth) window.Auth.signOut();
     else { window.location.hash = '#login'; window.location.reload(); }
   }
@@ -8940,12 +8975,19 @@ function renderTimelinePage() {
   async function loadEntries() {
     _loadState = 'loading';
     render();
-    const { data, error } = await sb
-      .from('timeline_entries')
-      .select('*')
-      .or('archived.is.null,archived.eq.false')
-      .order('submission_due', { ascending: false, nullsFirst: false })
-      .order('created_at', { ascending: false });
+    let data, error;
+    try {
+      data = await window.KeelCache.get('te:' + session.brandId, async () => {
+        const res = await sb
+          .from('timeline_entries')
+          .select('*')
+          .or('archived.is.null,archived.eq.false')
+          .order('submission_due', { ascending: false, nullsFirst: false })
+          .order('created_at', { ascending: false });
+        if (res.error) throw res.error;
+        return res.data || [];
+      });
+    } catch (e) { error = e; }
     if (error) {
       _loadState = 'error';
       _loadError = error.message || String(error);
@@ -8969,11 +9011,15 @@ function renderTimelinePage() {
   }
 
   async function loadStageDefs() {
-    const { data, error } = await sb
-      .from('stage_definitions')
-      .select('*')
-      .order('sequence', { ascending: true });
-    if (!error && data) {
+    let data;
+    try {
+      data = await window.KeelCache.get('sd:' + session.brandId, async () => {
+        const res = await sb.from('stage_definitions').select('*').order('sequence', { ascending: true });
+        if (res.error) throw res.error;
+        return res.data || [];
+      }, 10 * 60 * 1000);
+    } catch (e) { return; }
+    if (data) {
       _stageDefs = data;
       // If timeline already rendered, re-render to pick up the strips
       if (_loadState === 'ready') render();
@@ -8983,12 +9029,14 @@ function renderTimelinePage() {
   async function loadComments() {
     // Load all comments for this brand once. They're keyed by submission_id
     // for fast lookup when rendering rows.
-    const { data, error } = await sb
-      .from('submission_comments')
-      .select('*')
-      .is('deleted_at', null)
-      .order('created_at', { ascending: true });
-    if (error) {
+    let data;
+    try {
+      data = await window.KeelCache.get('cm:' + session.brandId, async () => {
+        const res = await sb.from('submission_comments').select('*').is('deleted_at', null).order('created_at', { ascending: true });
+        if (res.error) throw res.error;
+        return res.data || [];
+      });
+    } catch (error) {
       // Table may not exist yet (migration not run) — fail gracefully
       console.warn('Comments load failed (run v3 migration?):', error.message);
       return;
@@ -11564,6 +11612,7 @@ function renderTimelinePage() {
     const arr = _commentsBySubmission.get(submissionId) || [];
     arr.push(data);
     _commentsBySubmission.set(submissionId, arr);
+    try { window.KeelCache.invalidate('cm:' + session.brandId); } catch (e) {}
     render();
   }
 
@@ -11789,6 +11838,7 @@ function renderTimelinePage() {
             } else if (t === 'DELETE' && oldRow) {
               _entries = _entries.filter(e => e.id !== oldRow.id);
             }
+            try { window.KeelCache.set('te:' + session.brandId, _entries); } catch (e) {}
             render();
           })
       .subscribe();
