@@ -4368,13 +4368,19 @@ window.Auth = (function() {
       return promise;
     }
     function set(key, data) { store.set(key, { ts: Date.now(), data, promise: null }); }
+    function peek(key, ttl) {
+      ttl = (ttl == null ? DEFAULT_TTL : ttl);
+      const hit = store.get(key);
+      if (hit && hit.data !== undefined && (Date.now() - hit.ts) < ttl) return hit.data;
+      return undefined;
+    }
     function invalidate(key) {
       if (key == null) return;
       if (key instanceof RegExp) { for (const k of [...store.keys()]) if (key.test(k)) store.delete(k); }
       else store.delete(key);
     }
     function clear() { store.clear(); }
-    return { get, set, invalidate, clear };
+    return { get, set, peek, invalidate, clear };
   })();
   window.KeelCache = KeelCache;
 
@@ -8973,29 +8979,36 @@ function renderTimelinePage() {
   const sb = window.Auth.getClient();
 
   async function loadEntries() {
-    _loadState = 'loading';
-    render();
-    let data, error;
-    try {
-      data = await window.KeelCache.get('te:' + session.brandId, async () => {
-        const res = await sb
-          .from('timeline_entries')
-          .select('*')
-          .or('archived.is.null,archived.eq.false')
-          .order('submission_due', { ascending: false, nullsFirst: false })
-          .order('created_at', { ascending: false });
-        if (res.error) throw res.error;
-        return res.data || [];
-      });
-    } catch (e) { error = e; }
-    if (error) {
-      _loadState = 'error';
-      _loadError = error.message || String(error);
+    const key = 'te:' + session.brandId;
+    const cached = window.KeelCache.peek(key);
+    if (cached !== undefined) {
+      _entries = cached;
+      _loadState = 'ready';
+    } else {
+      _loadState = 'loading';
       render();
-      return;
+      let data, error;
+      try {
+        data = await window.KeelCache.get(key, async () => {
+          const res = await sb
+            .from('timeline_entries')
+            .select('*')
+            .or('archived.is.null,archived.eq.false')
+            .order('submission_due', { ascending: false, nullsFirst: false })
+            .order('created_at', { ascending: false });
+          if (res.error) throw res.error;
+          return res.data || [];
+        });
+      } catch (e) { error = e; }
+      if (error) {
+        _loadState = 'error';
+        _loadError = error.message || String(error);
+        render();
+        return;
+      }
+      _entries = data || [];
+      _loadState = 'ready';
     }
-    _entries = data || [];
-    _loadState = 'ready';
     // If we landed here from "+ New submission" on the Submissions page,
     // auto-open the new-submission form.
     try {
@@ -9033,12 +9046,15 @@ function renderTimelinePage() {
     try {
       data = await window.KeelCache.get('cm:' + session.brandId, async () => {
         const res = await sb.from('submission_comments').select('*').is('deleted_at', null).order('created_at', { ascending: true });
-        if (res.error) throw res.error;
+        if (res.error) {
+          // Table may not exist yet (migration not run). Return [] so the result
+          // is cached and we stop re-hitting a 404 on every load this session.
+          console.warn('Comments load failed (run v3 migration?):', res.error.message);
+          return [];
+        }
         return res.data || [];
-      });
+      }, 10 * 60 * 1000);
     } catch (error) {
-      // Table may not exist yet (migration not run) — fail gracefully
-      console.warn('Comments load failed (run v3 migration?):', error.message);
       return;
     }
     _commentsBySubmission = new Map();
