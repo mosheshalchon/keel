@@ -4981,8 +4981,8 @@ window.BrandLibrary = (function() {
   // cached set; brand-scoped key; 5-min freshness. Writes call invalidate*.
   async function cachedProducts() {
     const bid = (getSession() && getSession().brandId) || 'nobrand';
-    return KeelCache.get('products:all:' + bid, async () => {
-      const { data, error } = await client()
+    return window.KeelCache.get('products:all:' + bid, async () => {
+      const { data, error } = await window.Auth.getClient()
         .from('products').select('*')
         .order('category', { ascending: true })
         .order('item_description', { ascending: true });
@@ -4992,14 +4992,14 @@ window.BrandLibrary = (function() {
   }
   async function cachedRetailers() {
     const bid = (getSession() && getSession().brandId) || 'nobrand';
-    return KeelCache.get('retailers:all:' + bid, async () => {
-      const { data, error } = await client().from('retailers').select('*');
+    return window.KeelCache.get('retailers:all:' + bid, async () => {
+      const { data, error } = await window.Auth.getClient().from('retailers').select('*');
       if (error) throw error;
       return data || [];
     }, 5 * 60 * 1000);
   }
-  function invalidateProducts() { try { KeelCache.invalidate(/^products:/); } catch (e) {} }
-  function invalidateRetailers() { try { KeelCache.invalidate(/^retailers:/); } catch (e) {} }
+  function invalidateProducts() { try { window.KeelCache.invalidate(/^products:/); } catch (e) {} }
+  function invalidateRetailers() { try { window.KeelCache.invalidate(/^retailers:/); } catch (e) {} }
 
   return {
     logout, getSession, requireAuth,
