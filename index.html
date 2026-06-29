@@ -40142,6 +40142,11 @@ render();
   function spNormalizeUpc(raw) {
     if (raw == null) return '';
     const s = String(raw).replace(/[^0-9]/g, '');
+    // Reject implausibly short values. Real UPCs are 11–13 digits; some exports
+    // stamp a constant short value (e.g. the company GS1 prefix "89245311") on
+    // every row. Treat anything shorter than a real UPC as no-UPC, so name-based
+    // resolution (SP_NAME_UPC_ALIASES) is used instead of a garbage code.
+    if (s.length < 11) return '';
     return s;
   }
 
