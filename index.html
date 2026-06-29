@@ -24068,11 +24068,17 @@ render();
     'THINPEPPERONIPIZZA10': '892453001266',
     'THINPESTOPIZZA10': '892453001280',
   };
-  // Resolve a UPC for a sales entity: prefer the row's own UPC, else the alias map.
+  // Resolve a UPC for a sales entity: prefer the row's own UPC (only if it's a
+  // plausible full-length UPC), else the alias map, else whatever we have.
+  // The length guard defends against truncated/garbage UPCs in the feed (e.g. a
+  // constant short value like "89245311" stamped on every row), which would
+  // otherwise short-circuit the name→UPC alias map and break actuals matching.
   function spResolveUpc(rowUpc, entityName) {
     const own = spUpcKey(rowUpc);
-    if (own) return own;
-    return SP_NAME_UPC_ALIASES[spNormName(entityName)] || '';
+    if (own && own.length >= 11) return own;
+    const alias = SP_NAME_UPC_ALIASES[spNormName(entityName)];
+    if (alias) return alias;
+    return own || '';
   }
 
   // Convert a forecast month label ("Mar 2026") to a sales_actuals month key ("2026-03-01").
