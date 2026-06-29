@@ -9586,27 +9586,21 @@ function renderTimelinePage() {
     }
     const retailer = retailers[0];
 
-    // 3–5b. Load templates, products (cached), selected products, and current
-    // wholesale prices in parallel — these are independent of each other, so
-    // running them together cuts the page's load time vs the old sequential chain.
-    const brandId = window.BrandLibrary?.getSession()?.brandId || submission.brand_id;
-    const today = new Date().toISOString().slice(0, 10);
-    const [templatesRes, products, subProductsRes, wholesaleRes] = await Promise.all([
-      sb.from('retailer_templates').select('*').eq('retailer_id', retailer.id),
-      window.BrandLibrary.cachedProducts(),
-      sb.from('submission_products').select('*').eq('submission_id', submissionId).order('position', { ascending: true }),
-      sb.from('wholesale_prices')
-        .select('product_id, wholesale_price, effective_date')
-        .eq('brand_id', brandId)
-        .eq('retailer_id', retailer.id)
-        .lte('effective_date', today)
-        .or(`end_date.is.null,end_date.gte.${today}`)
-        .order('effective_date', { ascending: false }),
-    ]);
-    const templates = templatesRes.data;
+    // 3. Load templates for this retailer
+    const { data: templates } = await sb
+      .from('retailer_templates').select('*').eq('retailer_id', retailer.id);
     const hasTemplates = templates && templates.length > 0;
-    const subProducts = subProductsRes.data;
-    const wholesaleRows = wholesaleRes.data;
+    // Templates are optional — submission detail page should work regardless.
+    // The "Generate documents" section at the bottom shows a placeholder if none exist.
+
+    // 4. Load all products for the brand (to pick from)
+    const { data: products } = await sb
+      .from('products').select('*').order('category', { ascending: true }).order('item_description', { ascending: true });
+
+    // 5. Load currently-selected products for this submission
+    const brandId = window.BrandLibrary?.getSession()?.brandId || submission.brand_id;
+    const { data: subProducts } = await sb
+      .from('submission_products').select('*').eq('submission_id', submissionId).order('position', { ascending: true });
     const selectedSet = new Set((subProducts || []).map(sp => sp.product_id));
     // Build a quick lookup for per-item prize data (doors, velocity, promo)
     const prizeBySubProdId = new Map();
@@ -9617,6 +9611,19 @@ function renderTimelinePage() {
     for (const sp of (subProducts || [])) {
       prizeByProductId.set(sp.product_id, sp);
     }
+
+    // 5b. Load current wholesale prices for this retailer (for Size of Prize calc).
+    // wholesale_prices is keyed by (brand, retailer, product, effective_date range).
+    // Pull the latest current price per product.
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: wholesaleRows } = await sb
+      .from('wholesale_prices')
+      .select('product_id, wholesale_price, effective_date')
+      .eq('brand_id', brandId)
+      .eq('retailer_id', retailer.id)
+      .lte('effective_date', today)
+      .or(`end_date.is.null,end_date.gte.${today}`)
+      .order('effective_date', { ascending: false });
     // Get the most recent price per product (since query is ordered desc, first wins).
     // priceSource is tracked so the UI can show whether the price came from a
     // retailer-specific override or fell back to the Brand Library default.
