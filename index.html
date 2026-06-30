@@ -40802,6 +40802,103 @@ render();
     return { total: rows.length, matched, unmatched, period_start, period_end };
   }
 
+  // ---- UNFI Customer detail view (Phase 2a: L52 totals) ----
+  let _cdState = { products: null, cat: '', line: '', item: '', search: '', offset: 0, limit: 25, rows: [], fullCount: 0, brandId: null, sb: null };
+  function _cdSelStyle() { return 'padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;background:var(--paper);'; }
+  function _cdMoney(n) { return '$' + Math.round(Number(n) || 0).toLocaleString(); }
+  function _cdNum(n) { return (Number(n) || 0).toLocaleString(); }
+
+  async function renderCustomerDetailView(brandId, sb) {
+    const body = document.getElementById('hl-sp-body');
+    if (!body) return;
+    _cdState.brandId = brandId; _cdState.sb = sb;
+    body.innerHTML = `<div class="hl-loading">Loading customer detail…</div>`;
+    if (!_cdState.products) {
+      const { data: ps, error } = await sb.from('products')
+        .select('id, item_description, product_line, category').eq('brand_id', brandId);
+      if (error) { body.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Could not load products: ${escapeHtml(error.message)}</div>`; return; }
+      _cdState.products = ps || [];
+    }
+    _cdState.cat = ''; _cdState.line = ''; _cdState.item = ''; _cdState.search = ''; _cdState.offset = 0; _cdState.rows = []; _cdState.fullCount = 0;
+    const cats = [...new Set(_cdState.products.map(p => p.category).filter(Boolean))].sort();
+
+    body.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+        <div style="font-family:var(--serif);font-size:18px;color:var(--ink);">UNFI · Customer detail <span style="color:var(--ink-3);font-size:13px;">(L52 totals)</span></div>
+        <button id="hl-cd-back" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">← Back to pacing</button>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;">
+        <input id="hl-cd-search" placeholder="Search retailer…" style="padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;min-width:200px;" />
+        <select id="hl-cd-cat" style="${_cdSelStyle()}"><option value="">All categories</option>${cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}</select>
+        <select id="hl-cd-line" style="${_cdSelStyle()}"><option value="">All product lines</option></select>
+        <select id="hl-cd-item" style="${_cdSelStyle()}"><option value="">All items</option></select>
+      </div>
+      <div id="hl-cd-results"></div>`;
+
+    const catSel = document.getElementById('hl-cd-cat'), lineSel = document.getElementById('hl-cd-line'), itemSel = document.getElementById('hl-cd-item'), search = document.getElementById('hl-cd-search');
+    document.getElementById('hl-cd-back').addEventListener('click', () => loadAndRenderSalesPacing(brandId, sb));
+
+    const refillLines = () => {
+      const lines = [...new Set(_cdState.products.filter(p => !_cdState.cat || p.category === _cdState.cat).map(p => p.product_line).filter(Boolean))].sort();
+      lineSel.innerHTML = `<option value="">All product lines</option>` + lines.map(l => `<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join('');
+    };
+    const refillItems = () => {
+      const items = _cdState.products.filter(p => (!_cdState.cat || p.category === _cdState.cat) && (!_cdState.line || p.product_line === _cdState.line)).sort((a, b) => (a.item_description || '').localeCompare(b.item_description || ''));
+      itemSel.innerHTML = `<option value="">All items</option>` + items.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.item_description || '(unnamed)')}</option>`).join('');
+    };
+    refillLines(); refillItems();
+
+    catSel.addEventListener('change', () => { _cdState.cat = catSel.value; _cdState.line = ''; _cdState.item = ''; refillLines(); refillItems(); _cdReload(); });
+    lineSel.addEventListener('change', () => { _cdState.line = lineSel.value; _cdState.item = ''; refillItems(); _cdReload(); });
+    itemSel.addEventListener('change', () => { _cdState.item = itemSel.value; _cdReload(); });
+    let t = null; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { _cdState.search = search.value.trim(); _cdReload(); }, 300); });
+
+    await _cdReload();
+  }
+
+  async function _cdReload() { _cdState.offset = 0; _cdState.rows = []; await _cdLoad(); }
+
+  async function _cdLoad() {
+    const res = document.getElementById('hl-cd-results');
+    if (res && _cdState.offset === 0) res.innerHTML = `<div class="hl-loading">Loading…</div>`;
+    const { data, error } = await _cdState.sb.rpc('dcs_customer_rollup', {
+      p_brand: _cdState.brandId, p_distributor: 'UNFI', p_report_type: 'total',
+      p_category: _cdState.cat || null, p_product_line: _cdState.line || null,
+      p_product_id: _cdState.item || null, p_search: _cdState.search || null,
+      p_limit: _cdState.limit, p_offset: _cdState.offset,
+    });
+    if (error) { if (res) res.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Query failed: ${escapeHtml(error.message)}</div>`; return; }
+    const rows = data || [];
+    if (_cdState.offset === 0) _cdState.fullCount = rows.length ? Number(rows[0].full_count) : 0;
+    _cdState.rows = _cdState.rows.concat(rows);
+    _cdRenderRows();
+  }
+
+  function _cdRenderRows() {
+    const res = document.getElementById('hl-cd-results');
+    if (!res) return;
+    const rows = _cdState.rows;
+    if (rows.length === 0) { res.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No matching customers.</div>`; return; }
+    const head = ['Region', 'Chain Name', 'Description', 'Category', 'Sales', 'Quantity'];
+    const tbody = rows.map(r => `<tr style="border-top:1px solid var(--rule-soft);">
+      <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${escapeHtml(r.region || '')}</td>
+      <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${escapeHtml(r.chain_name || '')}</td>
+      <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${escapeHtml(r.item_description || '')}</td>
+      <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(r.category || '')}</td>
+      <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_cdMoney(r.sales)}</td>
+      <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_cdNum(r.quantity)}</td></tr>`).join('');
+    const more = _cdState.rows.length < _cdState.fullCount;
+    res.innerHTML = `
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${rows.length.toLocaleString()} of ${Number(_cdState.fullCount).toLocaleString()} · region × chain × item, by sales</div>
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="text-align:left;">${head.map((h, i) => `<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;${i >= 4 ? 'text-align:right;' : ''}">${h}</th>`).join('')}</tr></thead>
+        <tbody>${tbody}</tbody>
+      </table></div>
+      ${more ? `<div style="text-align:center;margin-top:14px;"><button id="hl-cd-more" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load 25 more</button></div>` : ''}`;
+    const mb = document.getElementById('hl-cd-more');
+    if (mb) mb.addEventListener('click', () => { _cdState.offset += _cdState.limit; _cdLoad(); });
+  }
+
   async function renderSalesPacingPage() {
     const session = HL.mountPage('sales-pacing');
     if (!session) return;
@@ -40819,6 +40916,7 @@ render();
         <div style="display:flex;gap:8px;align-items:center;margin-top:24px;flex-wrap:wrap;">
           <input type="file" id="hl-sp-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <input type="file" id="hl-cd-upload" accept=".xlsx,.xls" style="display:none;" />
+          <button class="hl-btn-primary" id="hl-cd-view-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Customer detail ▸</button>
           <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI customer detail</button>
           <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
         </div>
@@ -40828,6 +40926,7 @@ render();
 
     const uploadInput = document.getElementById('hl-sp-upload');
     document.getElementById('hl-sp-upload-btn').addEventListener('click', () => uploadInput.click());
+    document.getElementById('hl-cd-view-btn').addEventListener('click', () => renderCustomerDetailView(brandId, sb));
 
     const cdInput = document.getElementById('hl-cd-upload');
     document.getElementById('hl-cd-upload-btn').addEventListener('click', () => cdInput.click());
