@@ -45520,6 +45520,37 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _mrpLineUom(line) {
     return (line.component === 'Packaging') ? 'ea' : 'lbs';
   }
+  // Recipe costing: per-case ingredient quantity × that ingredient's avg cost,
+  // mirroring the planning grid's convention (lbs/eaches per case × $/unit).
+  // Lines whose ingredient has no cost on file are skipped and flagged (partial).
+  function _mrpCostByName() {
+    const m = new Map();
+    for (const i of _mrpIngs) {
+      const k = _mrpNorm(i.ingredient);
+      if (k && i.avg_cost != null && i.avg_cost !== '') {
+        // Normalize to a per-base-unit cost: avg_cost covers `cost_pack_size`
+        // base units (lbs/eaches). e.g. a 42-lb cheese case price ÷ 42 = $/lb.
+        const pack = Number(i.cost_pack_size) || 1;
+        m.set(k, (Number(i.avg_cost) || 0) / (pack > 0 ? pack : 1));
+      }
+    }
+    return m;
+  }
+  function _mrpLineCost(line, doughYield, costByName) {
+    const c = costByName.get(_mrpNorm(line.ingredient));
+    if (c == null) return null;
+    return _mrpLbsPerCase(line, doughYield) * c;
+  }
+  function _mrpRecipeCost(bom, costByName) {
+    const lines = _mrpLinesByCode.get(bom.code) || [];
+    let cost = 0, missing = 0, priced = 0;
+    for (const l of lines) {
+      const lc = _mrpLineCost(l, bom.dough_yield, costByName);
+      if (lc == null) { if (_mrpLbsPerCase(l, bom.dough_yield) > 0) missing++; continue; }
+      cost += lc; priced++;
+    }
+    return { cost, missing, priced, lines: lines.length };
+  }
   function _mrpFmt(n, dp) {
     if (n == null || isNaN(n)) return '—';
     return Number(n).toLocaleString('en-US', { minimumFractionDigits: dp ?? 0, maximumFractionDigits: dp ?? 0 });
@@ -45596,12 +45627,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _mrpRecipesHtml() {
     if (!_mrpBoms.length) return `<div class="hl-loading">No recipes yet. Run mrp_seed.sql to load BOMs.</div>`;
     const canEdit = window.Auth.canEdit();
+    const costByName = _mrpCostByName();
     const rows = _mrpBoms.map(b => {
       const lines = _mrpLinesByCode.get(b.code) || [];
       const comps = [...new Set(lines.map(l => l.component))];
       const open = _mrpExpanded.has(b.code);
       const totalLbs = lines.filter(l => l.component !== 'Packaging')
         .reduce((s, l) => s + _mrpLbsPerCase(l, b.dough_yield), 0);
+      const rc = _mrpRecipeCost(b, costByName);
       const head = `<tr class="hl-mrp-bomrow" data-code="${_mrpEsc(b.code)}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
         <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;color:var(--ink);">${open ? '▾' : '▸'} ${_mrpEsc(b.code)}</td>
         <td style="padding:9px 10px;font-family:var(--serif);font-size:14px;">${_mrpEsc(b.name || '')}</td>
@@ -45612,7 +45645,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${canEdit
             ? `<input type="number" step="0.01" min="0" max="1" value="${b.dough_yield != null ? b.dough_yield : ''}" data-yield-code="${_mrpEsc(b.code)}" style="width:62px;text-align:right;font-family:var(--mono);font-size:12px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;" />`
             : `<span style="font-family:var(--mono);font-size:12px;">${(Number(b.dough_yield)*100).toFixed(0)}%</span>`}
-        </td></tr>`;
+        </td>
+        <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${rc.priced ? '$' + _mrpFmt(rc.cost, 2) : '—'}${rc.missing ? `<span title="${rc.missing} ingredient(s) have no cost on file — cost is partial" style="color:#a8381f;cursor:help;">*</span>` : ''}</td></tr>`;
       let detail = '';
       if (open) {
         const lineRows = lines.map(l => {
@@ -45623,7 +45657,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             <td colspan="2" style="padding:5px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(l.ingredient || '')}</td>
             <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${l.component === 'Packaging' ? _mrpFmt(l.grams,0)+' ea' : _mrpFmt(l.grams,1)+' g'}</td>
             <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:12px;${isDough?'color:#7a5c1e;':''}">${_mrpFmt(per, 3)} ${_mrpLineUom(l)}/cs</td>
-            <td></td></tr>`;
+            <td></td>
+            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${(() => { const lc = _mrpLineCost(l, b.dough_yield, costByName); return lc == null ? '—' : '$' + _mrpFmt(lc, 2); })()}</td></tr>`;
         }).join('');
         detail = lineRows;
       }
@@ -45632,12 +45667,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return `<div style="overflow-x:auto;">
       <table style="width:100%;border-collapse:collapse;">
         <thead><tr style="text-align:left;">
-          ${['SKU','Recipe','','Components','Σ weighed','Dough yield'].map((h,i)=>`<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;${i>=2?'text-align:right;':''}${i===3?'text-align:left;':''}">${h}</th>`).join('')}
+          ${['SKU','Recipe','','Components','Σ weighed','Dough yield','Cost / case'].map((h,i)=>`<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;${i>=2?'text-align:right;':''}${i===3?'text-align:left;':''}">${h}</th>`).join('')}
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
       <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;">
-        Per-case = grams × ${_mrpSettings.g_to_lb} ÷ yield (Dough only). Packaging rows are eaches/case, no conversion. Edit a yield to recompute that recipe.</div>
+        Per-case = grams × ${_mrpSettings.g_to_lb} ÷ yield (Dough only). Packaging rows are eaches/case, no conversion. Cost / case = Σ (per-case quantity × ingredient avg cost) from the Ingredients tab; a <span style="color:#a8381f;">*</span> means one or more ingredients have no cost on file, so the shown cost is partial. Edit a yield to recompute that recipe.</div>
     </div>`;
   }
 
@@ -45706,7 +45741,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <div><span style="text-transform:uppercase;font-size:9px;">MOQ / order qty</span><br>${_mrpEsc(moqRef || '—')}</div>
           <div><span style="text-transform:uppercase;font-size:9px;">Order multiples</span><br>${_mrpEsc(sup?.order_multiples || '—')}</div>
           <div><span style="text-transform:uppercase;font-size:9px;">Supply levels</span><br>${_mrpEsc(sup?.supply_levels || '—')}</div>
-          <div><span style="text-transform:uppercase;font-size:9px;">Avg cost</span><br>${i.avg_cost != null ? '$' + _mrpFmt(i.avg_cost, 2) : '—'}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Avg cost</span><br>${i.avg_cost != null ? '$' + _mrpFmt(i.avg_cost, 2) : '—'}${i.cost_pack_size ? ` <span style="color:var(--ink-3);">/ ${_mrpFmt(i.cost_pack_size, 0)}</span>` : ''}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;" title="Units (lbs or eaches) the Avg cost covers. e.g. a 42 lb cheese case = 42. Blank = cost is already per unit.">Cost pack size</span><br>${inp(i.ingredient, 'cost_pack_size', i.cost_pack_size)}</div>
+          <div><span style="text-transform:uppercase;font-size:9px;">Cost / unit</span><br>${i.avg_cost != null ? '$' + _mrpFmt((Number(i.avg_cost) || 0) / (Number(i.cost_pack_size) || 1), 4) : '—'}</div>
           <div style="grid-column:1/-1;"><span style="text-transform:uppercase;font-size:9px;">Notes</span><br>${_mrpEsc(sup?.notes || '—')}</div>
         </div></td></tr>` : '';
       return main + detail;
