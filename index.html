@@ -40699,18 +40699,16 @@ render();
     askKeelRenderSavedList();
   }
 
-  // Build the set of UPC lookup keys for a raw code, tolerant of leading zeros
-  // and 11/12/13-digit variants, so the file's UPC matches a product's unit_upc.
+  // Build UPC lookup keys. UNFI reports the 11 data digits (leading-zero padded,
+  // no check digit); your products store the full 12-digit UPC (data + check).
+  // So the shared key is the FIRST 11 digits after stripping leading zeros.
   function _dcsUpcKeys(raw) {
-    const d = String(raw == null ? '' : raw).replace(/\D/g, '');
+    const d = String(raw == null ? '' : raw).replace(/\D/g, '').replace(/^0+/, '');
     if (!d) return [];
-    const noLead = d.replace(/^0+/, '');
-    const ks = new Set([d, noLead]);
-    if (d.length >= 11) ks.add(d.slice(-11));
-    if (d.length >= 12) ks.add(d.slice(-12));
-    if (noLead.length >= 11) ks.add(noLead.slice(-11));
-    if (noLead.length >= 12) ks.add(noLead.slice(-12));
-    return [...ks].filter(k => k && k.length >= 6);
+    const ks = new Set();
+    if (d.length >= 11) ks.add(d.slice(0, 11));   // 11 data digits — the match key
+    ks.add(d);                                      // exact stripped value (fallback)
+    return [...ks];
   }
 
   // Phase 1: parse the UNFI "MVP Sales by Customer" report, match each row's UPC
