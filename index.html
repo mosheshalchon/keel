@@ -40699,6 +40699,111 @@ render();
     askKeelRenderSavedList();
   }
 
+  // Build the set of UPC lookup keys for a raw code, tolerant of leading zeros
+  // and 11/12/13-digit variants, so the file's UPC matches a product's unit_upc.
+  function _dcsUpcKeys(raw) {
+    const d = String(raw == null ? '' : raw).replace(/\D/g, '');
+    if (!d) return [];
+    const noLead = d.replace(/^0+/, '');
+    const ks = new Set([d, noLead]);
+    if (d.length >= 11) ks.add(d.slice(-11));
+    if (d.length >= 12) ks.add(d.slice(-12));
+    if (noLead.length >= 11) ks.add(noLead.slice(-11));
+    if (noLead.length >= 12) ks.add(noLead.slice(-12));
+    return [...ks].filter(k => k && k.length >= 6);
+  }
+
+  // Phase 1: parse the UNFI "MVP Sales by Customer" report, match each row's UPC
+  // to a product (stamping product_id + your item/line/category), and replace the
+  // prior UNFI snapshot. Reads from distributor_customer_sales in Phase 2.
+  async function handleCustomerDetailUpload(file, brandId, sb, onProgress) {
+    const distributor = 'UNFI';
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+    // Locate the real header row (junk/title rows sit above it).
+    let hi = -1;
+    for (let i = 0; i < Math.min(aoa.length, 50); i++) {
+      const low = (aoa[i] || []).map(c => String(c).trim().toLowerCase());
+      if (low.includes('cust #') && low.includes('chain name') && low.includes('sales')) { hi = i; break; }
+    }
+    if (hi < 0) throw new Error('Could not find the header row (need "Cust #", "Chain Name", "Sales"). Is this the UNFI MVP Sales by Customer report?');
+    const hdr = (aoa[hi] || []).map(c => String(c).trim().toLowerCase());
+    const C = (name) => hdr.indexOf(name);
+    const ci = {
+      region: C('reg'), cust: C('cust #'), chainCode: C('chain'), chainName: C('chain name'),
+      salesrep: C('salesrep'), store: C('name'), city: C('city'), state: C('st'), zip: C('zip'),
+      channel: C('channel number'), whs: C('whs'), upc: C('upc'), pack: C('pack'), size: C('size'),
+      brand: C('brand'), desc: C('description'), cat: C('category'), sales: C('sales'), qty: C('quantity'),
+    };
+    if (ci.sales < 0 || ci.chainName < 0) throw new Error('The report header is missing expected columns (Sales / Chain Name).');
+
+    // Optional reporting period from a "For Period: m/d/yyyy - m/d/yyyy" line above.
+    let period_start = null, period_end = null;
+    for (let i = 0; i < hi; i++) {
+      const cell = String((aoa[i] || [])[0] || '');
+      const m = cell.match(/(\d{1,2}\/\d{1,2}\/\d{4})\s*[-–]\s*(\d{1,2}\/\d{1,2}\/\d{4})/);
+      if (m) {
+        const d1 = new Date(m[1]), d2 = new Date(m[2]);
+        if (!isNaN(d1)) period_start = d1.toISOString().slice(0, 10);
+        if (!isNaN(d2)) period_end = d2.toISOString().slice(0, 10);
+        break;
+      }
+    }
+
+    // Products → UPC map (multi-key) for matching.
+    const { data: prods, error: perr } = await sb.from('products')
+      .select('id, item_description, unit_upc, category, product_line').eq('brand_id', brandId);
+    if (perr) throw new Error('Could not load products for UPC matching: ' + perr.message);
+    const upcMap = new Map();
+    for (const p of (prods || [])) for (const k of _dcsUpcKeys(p.unit_upc)) if (!upcMap.has(k)) upcMap.set(k, p);
+    const matchProduct = (raw) => { for (const k of _dcsUpcKeys(raw)) { const p = upcMap.get(k); if (p) return p; } return null; };
+
+    const upload_id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : (String(Date.now()) + Math.random());
+    const str = (v) => { const s = String(v == null ? '' : v).trim(); return s === '' ? null : s; };
+    const rows = [];
+    let matched = 0, unmatched = 0;
+    for (let i = hi + 1; i < aoa.length; i++) {
+      const r = aoa[i]; if (!r) continue;
+      const cust = str(r[ci.cust]);
+      const salesV = Number(r[ci.sales]);
+      if (!isFinite(salesV)) continue;            // skip subtotal/junk rows with no sales number
+      if (cust == null && str(r[ci.chainName]) == null) continue;
+      const p = matchProduct(r[ci.upc]);
+      if (p) matched++; else unmatched++;
+      rows.push({
+        brand_id: brandId, distributor, upload_id, period_start, period_end,
+        region: str(r[ci.region]), cust_num: cust, chain_code: str(r[ci.chainCode]),
+        chain_name: str(r[ci.chainName]), salesrep: str(r[ci.salesrep]), store_name: str(r[ci.store]),
+        city: str(r[ci.city]), state: str(r[ci.state]), zip: str(r[ci.zip]),
+        channel_number: str(r[ci.channel]), whs: str(r[ci.whs]), upc: str(r[ci.upc]),
+        product_id: p ? p.id : null,
+        item_description: p ? p.item_description : str(r[ci.desc]),
+        product_line: p ? p.product_line : null,
+        category: p ? p.category : str(r[ci.cat]),
+        pack: str(r[ci.pack]), size: str(r[ci.size]), file_brand: str(r[ci.brand]),
+        file_description: str(r[ci.desc]), file_category: str(r[ci.cat]),
+        sales: salesV, quantity: Number(r[ci.qty]) || 0,
+      });
+    }
+    if (rows.length === 0) throw new Error('No data rows found under the header.');
+
+    // Replace the prior UNFI snapshot, then chunked insert.
+    const { error: delErr } = await sb.from('distributor_customer_sales')
+      .delete().eq('brand_id', brandId).eq('distributor', distributor);
+    if (delErr) throw new Error('Could not clear the prior UNFI snapshot: ' + delErr.message);
+
+    const CHUNK = 500;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const { error } = await sb.from('distributor_customer_sales').insert(rows.slice(i, i + CHUNK));
+      if (error) throw new Error(`Insert failed near row ${i}: ${error.message}`);
+      if (onProgress) onProgress(Math.min(i + CHUNK, rows.length), rows.length);
+    }
+    return { total: rows.length, matched, unmatched, period_start, period_end };
+  }
+
   async function renderSalesPacingPage() {
     const session = HL.mountPage('sales-pacing');
     if (!session) return;
@@ -40715,6 +40820,8 @@ render();
         </div>
         <div style="display:flex;gap:8px;align-items:center;margin-top:24px;flex-wrap:wrap;">
           <input type="file" id="hl-sp-upload" accept=".xlsx,.xls" multiple style="display:none;" />
+          <input type="file" id="hl-cd-upload" accept=".xlsx,.xls" style="display:none;" />
+          <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI customer detail</button>
           <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
         </div>
       </div>
@@ -40723,6 +40830,31 @@ render();
 
     const uploadInput = document.getElementById('hl-sp-upload');
     document.getElementById('hl-sp-upload-btn').addEventListener('click', () => uploadInput.click());
+
+    const cdInput = document.getElementById('hl-cd-upload');
+    document.getElementById('hl-cd-upload-btn').addEventListener('click', () => cdInput.click());
+    cdInput.addEventListener('change', async (e) => {
+      const file = (e.target.files || [])[0];
+      if (!file) return;
+      const body = document.getElementById('hl-sp-body');
+      body.innerHTML = `<div class="hl-loading">Parsing “${escapeHtml(file.name)}” and matching UPCs…</div>`;
+      try {
+        const res = await handleCustomerDetailUpload(file, brandId, sb, (done, total) => {
+          body.innerHTML = `<div class="hl-loading">Saving customer detail… ${done.toLocaleString()} / ${total.toLocaleString()} rows</div>`;
+        });
+        const pct = res.total ? Math.round(100 * res.matched / res.total) : 0;
+        const per = (res.period_start && res.period_end) ? `<br><span style="color:var(--ink-3);font-size:12px;">Period ${res.period_start} → ${res.period_end}</span>` : '';
+        body.innerHTML = `<div class="hl-empty" style="padding:28px;text-align:center;">
+          <div style="font-family:var(--serif);font-size:16px;color:var(--ink);">UNFI customer detail uploaded.</div>
+          <div style="margin-top:8px;font-family:var(--mono);font-size:13px;">${res.total.toLocaleString()} rows · ${res.matched.toLocaleString()} matched to products (${pct}%) · ${res.unmatched.toLocaleString()} unmatched</div>${per}
+          <div style="margin-top:10px;color:var(--ink-3);font-size:12px;font-style:italic;">The customer-detail view (top 25, search, dropdowns) is the next step. Reload Sales Pacing to return to the pacing table.</div></div>`;
+        console.log('[CustomerDetail]', res);
+      } catch (err) {
+        console.error('[CustomerDetail upload]', err);
+        body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Upload failed: ${escapeHtml(err.message || 'unknown error')}</div>`;
+      }
+      cdInput.value = '';
+    });
     uploadInput.addEventListener('change', async (e) => {
       const files = Array.from(e.target.files || []);
       if (files.length === 0) return;
