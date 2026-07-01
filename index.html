@@ -40854,27 +40854,39 @@ render();
     await _cdReload();
   }
 
-  async function _cdReload() { _cdState.offset = 0; _cdState.rows = []; await _cdLoad(); }
-
-  async function _cdLoad() {
+  async function _cdReload() {
+    _cdState.offset = 0; _cdState.rows = []; _cdState.total = null; _cdState.error = null;
     const res = document.getElementById('hl-cd-results');
-    if (res && _cdState.offset === 0) res.innerHTML = `<div class="hl-loading">Loading…</div>`;
-    const { data, error } = await _cdState.sb.rpc('dcs_customer_rollup', {
+    if (res) res.innerHTML = `<div class="hl-loading">Loading…</div>`;
+    await Promise.all([_cdFetchPage(), _cdFetchTotal()]);
+    _cdRenderRows();
+  }
+
+  function _cdFilters() {
+    return {
       p_brand: _cdState.brandId, p_distributor: 'UNFI', p_report_type: 'total',
       p_category: _cdState.cat || null, p_product_line: _cdState.line || null,
       p_product_id: _cdState.item || null, p_search: _cdState.search || null,
-      p_limit: _cdState.limit, p_offset: _cdState.offset,
-    });
-    if (error) { if (res) res.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Query failed: ${escapeHtml(error.message)}</div>`; return; }
+    };
+  }
+
+  async function _cdFetchPage() {
+    const { data, error } = await _cdState.sb.rpc('dcs_customer_rollup', Object.assign(_cdFilters(), { p_limit: _cdState.limit, p_offset: _cdState.offset }));
+    if (error) { _cdState.error = error.message; return; }
     const rows = data || [];
     if (_cdState.offset === 0) _cdState.fullCount = rows.length ? Number(rows[0].full_count) : 0;
     _cdState.rows = _cdState.rows.concat(rows);
-    _cdRenderRows();
+  }
+
+  async function _cdFetchTotal() {
+    const { data, error } = await _cdState.sb.rpc('dcs_customer_total', _cdFilters());
+    if (!error && data && data[0]) _cdState.total = data[0];
   }
 
   function _cdRenderRows() {
     const res = document.getElementById('hl-cd-results');
     if (!res) return;
+    if (_cdState.error) { res.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Query failed: ${escapeHtml(_cdState.error)}</div>`; return; }
     const rows = _cdState.rows;
     if (rows.length === 0) { res.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No matching customers.</div>`; return; }
     const head = ['Region', 'Chain Name', 'Description', 'Category', 'Sales', 'Quantity'];
@@ -40885,16 +40897,22 @@ render();
       <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(r.category || '')}</td>
       <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_cdMoney(r.sales)}</td>
       <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_cdNum(r.quantity)}</td></tr>`).join('');
+    const t = _cdState.total;
+    const totalRow = t ? `<tr style="border-top:2px solid var(--ink);background:var(--wash,rgba(0,0,0,0.02));">
+      <td colspan="4" style="padding:9px 10px;font-family:var(--mono);font-size:11px;letter-spacing:0.04em;text-transform:uppercase;color:var(--ink);">Total · all ${Number(t.group_count || 0).toLocaleString()} rows for this filter</td>
+      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;">${_cdMoney(t.total_sales)}</td>
+      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;">${_cdNum(t.total_quantity)}</td></tr>` : '';
     const more = _cdState.rows.length < _cdState.fullCount;
     res.innerHTML = `
       <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${rows.length.toLocaleString()} of ${Number(_cdState.fullCount).toLocaleString()} · region × chain × item, by sales</div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="text-align:left;">${head.map((h, i) => `<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;${i >= 4 ? 'text-align:right;' : ''}">${h}</th>`).join('')}</tr></thead>
         <tbody>${tbody}</tbody>
+        <tfoot>${totalRow}</tfoot>
       </table></div>
       ${more ? `<div style="text-align:center;margin-top:14px;"><button id="hl-cd-more" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load 25 more</button></div>` : ''}`;
     const mb = document.getElementById('hl-cd-more');
-    if (mb) mb.addEventListener('click', () => { _cdState.offset += _cdState.limit; _cdLoad(); });
+    if (mb) mb.addEventListener('click', async () => { _cdState.offset += _cdState.limit; await _cdFetchPage(); _cdRenderRows(); });
   }
 
   async function renderSalesPacingPage() {
