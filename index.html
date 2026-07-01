@@ -40809,7 +40809,7 @@ render();
   function _cdNum(n) { return (Number(n) || 0).toLocaleString(); }
 
   async function renderCustomerDetailView(brandId, sb) {
-    const body = document.getElementById('hl-sp-body');
+    const body = document.getElementById('hl-cd-section');
     if (!body) return;
     _cdState.brandId = brandId; _cdState.sb = sb;
     body.innerHTML = `<div class="hl-loading">Loading customer detail…</div>`;
@@ -40825,7 +40825,6 @@ render();
     body.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
         <div style="font-family:var(--serif);font-size:18px;color:var(--ink);">UNFI · Customer detail <span style="color:var(--ink-3);font-size:13px;">(L52 totals)</span></div>
-        <button id="hl-cd-back" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">← Back to pacing</button>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;">
         <input id="hl-cd-search" placeholder="Search retailer…" style="padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;min-width:200px;" />
@@ -40836,7 +40835,6 @@ render();
       <div id="hl-cd-results"></div>`;
 
     const catSel = document.getElementById('hl-cd-cat'), lineSel = document.getElementById('hl-cd-line'), itemSel = document.getElementById('hl-cd-item'), search = document.getElementById('hl-cd-search');
-    document.getElementById('hl-cd-back').addEventListener('click', () => loadAndRenderSalesPacing(brandId, sb));
 
     const refillLines = () => {
       const lines = [...new Set(_cdState.products.filter(p => !_cdState.cat || p.category === _cdState.cat).map(p => p.product_line).filter(Boolean))].sort();
@@ -40916,36 +40914,32 @@ render();
         <div style="display:flex;gap:8px;align-items:center;margin-top:24px;flex-wrap:wrap;">
           <input type="file" id="hl-sp-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <input type="file" id="hl-cd-upload" accept=".xlsx,.xls" style="display:none;" />
-          <button class="hl-btn-primary" id="hl-cd-view-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Customer detail ▸</button>
           <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI customer detail</button>
           <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
         </div>
       </div>
       <div id="hl-sp-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
+      <div id="hl-cd-section" style="margin-top:48px;padding-top:36px;border-top:1px solid var(--rule-soft);"><div class="hl-loading">Loading customer detail…</div></div>
     `;
 
     const uploadInput = document.getElementById('hl-sp-upload');
     document.getElementById('hl-sp-upload-btn').addEventListener('click', () => uploadInput.click());
-    document.getElementById('hl-cd-view-btn').addEventListener('click', () => renderCustomerDetailView(brandId, sb));
 
     const cdInput = document.getElementById('hl-cd-upload');
     document.getElementById('hl-cd-upload-btn').addEventListener('click', () => cdInput.click());
     cdInput.addEventListener('change', async (e) => {
       const file = (e.target.files || [])[0];
       if (!file) return;
-      const body = document.getElementById('hl-sp-body');
+      const body = document.getElementById('hl-cd-section');
       body.innerHTML = `<div class="hl-loading">Parsing “${escapeHtml(file.name)}” and matching UPCs…</div>`;
       try {
         const res = await handleCustomerDetailUpload(file, brandId, sb, (done, total) => {
           body.innerHTML = `<div class="hl-loading">Saving customer detail… ${done.toLocaleString()} / ${total.toLocaleString()} rows</div>`;
         });
         const pct = res.total ? Math.round(100 * res.matched / res.total) : 0;
-        const per = (res.period_start && res.period_end) ? `<br><span style="color:var(--ink-3);font-size:12px;">Period ${res.period_start} → ${res.period_end}</span>` : '';
-        body.innerHTML = `<div class="hl-empty" style="padding:28px;text-align:center;">
-          <div style="font-family:var(--serif);font-size:16px;color:var(--ink);">UNFI customer detail uploaded.</div>
-          <div style="margin-top:8px;font-family:var(--mono);font-size:13px;">${res.total.toLocaleString()} rows · ${res.matched.toLocaleString()} matched to products (${pct}%) · ${res.unmatched.toLocaleString()} unmatched</div>${per}
-          <div style="margin-top:10px;color:var(--ink-3);font-size:12px;font-style:italic;">The customer-detail view (top 25, search, dropdowns) is the next step. Reload Sales Pacing to return to the pacing table.</div></div>`;
         console.log('[CustomerDetail]', res);
+        body.innerHTML = `<div class="hl-loading">Uploaded ${res.total.toLocaleString()} rows · ${res.matched.toLocaleString()} matched (${pct}%). Refreshing…</div>`;
+        await renderCustomerDetailView(brandId, sb);
       } catch (err) {
         console.error('[CustomerDetail upload]', err);
         body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Upload failed: ${escapeHtml(err.message || 'unknown error')}</div>`;
@@ -40973,6 +40967,7 @@ render();
     });
 
     await loadAndRenderSalesPacing(brandId, sb);
+    renderCustomerDetailView(brandId, sb);
   }
 
   // Fetch ALL rows for a query, paging past Supabase's default 1,000-row cap.
