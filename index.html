@@ -40802,6 +40802,97 @@ render();
     return { total: rows.length, matched, unmatched, period_start, period_end };
   }
 
+  // ---- UNFI weekly customer upload (SBO Velocity Report) ----
+  async function handleWeeklyCustomerUpload(file, brandId, sb, onProgress) {
+    const distributor = 'UNFI';
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+    let hi = -1;
+    for (let i = 0; i < Math.min(aoa.length, 40); i++) {
+      const low = (aoa[i] || []).map(c => String(c).trim().toLowerCase());
+      if (low.includes('cust #') && low.includes('sales') && (low.includes('units') || low.includes('quantity'))) { hi = i; break; }
+    }
+    if (hi < 0) throw new Error('Could not find the weekly header row (need "Cust #", "Sales", "Units"). Is this the SBO Velocity Report?');
+    const hdr = (aoa[hi] || []).map(c => String(c).trim().toLowerCase());
+    const C = (name) => hdr.indexOf(name);
+    const ci = {
+      region: C('region'), channel: C('channel'), chainCode: C('chain'), chainName: C('chain name'),
+      cust: C('cust #'), store: C('customer name'), city: C('city'), state: C('state'), zip: C('zip code'),
+      whs: C('warehouse'), upc: C('upc'), brand: C('brand'), desc: C('description'), pack: C('pack'), size: C('size'),
+      sales: C('sales'), qty: (C('units') >= 0 ? C('units') : C('quantity')), fileCat: C('cm category'),
+    };
+    if (ci.sales < 0) throw new Error('Missing "Sales" column in the weekly report.');
+
+    // Week from the "For Date Range (m/d/yyyy - m/d/yyyy)" line above the header.
+    let week_starting = null, week_end = null;
+    for (let i = 0; i < hi; i++) {
+      const cell = String((aoa[i] || [])[0] || '');
+      const m = cell.match(/(\d{1,2}\/\d{1,2}\/\d{4})\s*[-–]\s*(\d{1,2}\/\d{1,2}\/\d{4})/);
+      if (m) {
+        const d1 = new Date(m[1]), d2 = new Date(m[2]);
+        if (!isNaN(d1)) week_starting = d1.toISOString().slice(0, 10);
+        if (!isNaN(d2)) week_end = d2.toISOString().slice(0, 10);
+        break;
+      }
+    }
+    if (!week_starting) throw new Error('Could not read the week from the top of the file (expected "For Date Range (m/d/yyyy - m/d/yyyy)").');
+
+    const { data: prods, error: perr } = await sb.from('products')
+      .select('id, item_description, unit_upc, category, product_line').eq('brand_id', brandId);
+    if (perr) throw new Error('Could not load products for UPC matching: ' + perr.message);
+    const upcMap = new Map();
+    for (const p of (prods || [])) for (const k of _dcsUpcKeys(p.unit_upc)) if (!upcMap.has(k)) upcMap.set(k, p);
+    const matchProduct = (raw) => { for (const k of _dcsUpcKeys(raw)) { const p = upcMap.get(k); if (p) return p; } return null; };
+
+    const upload_id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : (String(Date.now()) + Math.random());
+    const str = (v) => { const s = String(v == null ? '' : v).trim(); return s === '' ? null : s; };
+    const rows = [];
+    let matched = 0, unmatched = 0;
+    for (let i = hi + 1; i < aoa.length; i++) {
+      const r = aoa[i]; if (!r) continue;
+      const salesV = Number(r[ci.sales]); if (!isFinite(salesV)) continue;
+      const cust = str(r[ci.cust]);
+      if (cust == null && str(r[ci.chainName]) == null && str(r[ci.store]) == null) continue;
+      const p = matchProduct(r[ci.upc]);
+      if (p) matched++; else unmatched++;
+      rows.push({
+        brand_id: brandId, distributor, upload_id, report_type: 'weekly',
+        week_starting, period_start: week_starting, period_end: week_end,
+        region: str(r[ci.region]), cust_num: cust, chain_code: str(r[ci.chainCode]), chain_name: str(r[ci.chainName]),
+        store_name: str(r[ci.store]), city: str(r[ci.city]), state: str(r[ci.state]), zip: str(r[ci.zip]),
+        channel_number: str(r[ci.channel]), whs: str(r[ci.whs]), upc: str(r[ci.upc]),
+        product_id: p ? p.id : null, item_description: p ? p.item_description : str(r[ci.desc]),
+        product_line: p ? p.product_line : null, category: p ? p.category : str(r[ci.fileCat]),
+        pack: str(r[ci.pack]), size: str(r[ci.size]), file_brand: str(r[ci.brand]),
+        file_description: str(r[ci.desc]), file_category: str(r[ci.fileCat]),
+        sales: salesV, quantity: Number(r[ci.qty]) || 0,
+      });
+    }
+    if (rows.length === 0) throw new Error('No weekly data rows found under the header.');
+
+    // Replace this same week (idempotent re-upload), then insert.
+    const { error: delErr } = await sb.from('distributor_customer_sales').delete()
+      .eq('brand_id', brandId).eq('distributor', distributor).eq('report_type', 'weekly').eq('week_starting', week_starting);
+    if (delErr) throw new Error('Could not clear the prior rows for this week: ' + delErr.message);
+
+    const CHUNK = 500;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const { error } = await sb.from('distributor_customer_sales').insert(rows.slice(i, i + CHUNK));
+      if (error) throw new Error(`Insert failed near row ${i}: ${error.message}`);
+      if (onProgress) onProgress(Math.min(i + CHUNK, rows.length), rows.length);
+    }
+
+    // Rolling 52-week trim (in the database).
+    let trimmed = 0;
+    const { data: td } = await sb.rpc('dcs_trim_weekly', { p_brand: brandId, p_distributor: distributor, p_keep: 52 });
+    if (typeof td === 'number') trimmed = td;
+
+    return { total: rows.length, matched, unmatched, week_starting, week_end, trimmed };
+  }
+
   // ---- UNFI Customer detail view (Phase 2a: L52 totals) ----
   let _cdState = { products: null, cat: '', line: '', item: '', search: '', offset: 0, limit: 25, rows: [], fullCount: 0, brandId: null, sb: null };
   function _cdSelStyle() { return 'padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;background:var(--paper);'; }
@@ -40932,7 +41023,9 @@ render();
         <div style="display:flex;gap:8px;align-items:center;margin-top:24px;flex-wrap:wrap;">
           <input type="file" id="hl-sp-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <input type="file" id="hl-cd-upload" accept=".xlsx,.xls" style="display:none;" />
-          <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI customer detail</button>
+          <input type="file" id="hl-cw-upload" accept=".xlsx,.xls" style="display:none;" />
+          <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI L52 total</button>
+          <button class="hl-btn-primary" id="hl-cw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI weekly</button>
           <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
         </div>
       </div>
@@ -40963,6 +41056,28 @@ render();
         body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Upload failed: ${escapeHtml(err.message || 'unknown error')}</div>`;
       }
       cdInput.value = '';
+    });
+
+    const cwInput = document.getElementById('hl-cw-upload');
+    document.getElementById('hl-cw-upload-btn').addEventListener('click', () => cwInput.click());
+    cwInput.addEventListener('change', async (e) => {
+      const file = (e.target.files || [])[0];
+      if (!file) return;
+      const body = document.getElementById('hl-cd-section');
+      body.innerHTML = `<div class="hl-loading">Parsing weekly “${escapeHtml(file.name)}” and matching UPCs…</div>`;
+      try {
+        const res = await handleWeeklyCustomerUpload(file, brandId, sb, (done, total) => {
+          body.innerHTML = `<div class="hl-loading">Saving weekly rows… ${done.toLocaleString()} / ${total.toLocaleString()}</div>`;
+        });
+        const pct = res.total ? Math.round(100 * res.matched / res.total) : 0;
+        console.log('[WeeklyCustomer]', res);
+        body.innerHTML = `<div class="hl-loading">Week ${res.week_starting} → ${res.week_end}: ${res.total.toLocaleString()} rows · ${res.matched.toLocaleString()} matched (${pct}%)${res.trimmed ? ` · trimmed ${res.trimmed.toLocaleString()} old rows` : ''}. Refreshing…</div>`;
+        await renderCustomerDetailView(brandId, sb);
+      } catch (err) {
+        console.error('[WeeklyCustomer upload]', err);
+        body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Weekly upload failed: ${escapeHtml(err.message || 'unknown error')}</div>`;
+      }
+      cwInput.value = '';
     });
     uploadInput.addEventListener('change', async (e) => {
       const files = Array.from(e.target.files || []);
