@@ -41002,24 +41002,33 @@ render();
     const sorted = [...groups.values()].sort((a, b) => b.ts - a.ts);
     if (sorted.length === 0) { res.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No matching customers.</div>`; return; }
     const shown = sorted.slice(0, _cdState.offset + _cdState.limit);
+
+    // per-week (column) totals + grand total across the full filtered set
+    let gs = 0, gu = 0; const weekTot = {}; keys.forEach(k => weekTot[k] = { s: 0, u: 0 });
+    for (const r of f) { const pk = pkey(r); if (weekTot[pk]) { const s = Number(r.sales) || 0, u = Number(r.quantity) || 0; weekTot[pk].s += s; weekTot[pk].u += u; gs += s; gu += u; } }
+
     const label = k => _cdState.grain === 'month' ? k : k.slice(5);
-    const head = ['Region', 'Chain Name', 'Description', 'Category', ...keys.map(label), 'Total'];
-    const cell = (g, k) => { const p = g.per[k]; return `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;white-space:nowrap;">${p ? `${_cdMoney(p.s)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(p.u)}</span>` : '<span style="color:var(--ink-3);">&middot;</span>'}</td>`; };
+    const th = (h, i) => `<th style="padding:6px 6px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.03em;color:var(--ink);text-transform:uppercase;border-bottom:2px solid var(--rule-soft);${i >= 4 ? 'text-align:right;white-space:nowrap;' : 'text-align:left;'}">${escapeHtml(h)}</th>`;
+    const head = ['Region', 'Chain', 'Description', 'Cat', ...keys.map(label), 'Total'];
+    const metric = (s, u, big) => `${_cdMoney(s)}<br><span style="color:var(--ink-3);font-size:9px;">${_cdNum(u)}</span>`;
+    const cell = (g, k) => { const p = g.per[k]; return `<td style="padding:5px 6px;text-align:right;font-family:var(--mono);font-size:11px;white-space:nowrap;">${p ? metric(p.s, p.u) : '<span style="color:var(--ink-3);">&middot;</span>'}</td>`; };
+    const trunc = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
     const tbody = shown.map(g => `<tr style="border-top:1px solid var(--rule-soft);">
-      <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${escapeHtml(g.region)}</td>
-      <td style="padding:6px 8px;font-family:var(--serif);font-size:12px;white-space:nowrap;">${escapeHtml(g.chain)}</td>
-      <td style="padding:6px 8px;font-family:var(--serif);font-size:12px;white-space:nowrap;">${escapeHtml(g.item)}</td>
-      <td style="padding:6px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(g.category)}</td>
+      <td style="padding:5px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${escapeHtml(g.region)}</td>
+      <td style="padding:5px 6px;font-family:var(--serif);font-size:12px;max-width:120px;${trunc}" title="${escapeHtml(g.chain)}">${escapeHtml(g.chain)}</td>
+      <td style="padding:5px 6px;font-family:var(--serif);font-size:12px;max-width:150px;${trunc}" title="${escapeHtml(g.item)}">${escapeHtml(g.item)}</td>
+      <td style="padding:5px 6px;font-family:var(--mono);font-size:9px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(g.category)}</td>
       ${keys.map(k => cell(g, k)).join('')}
-      <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;white-space:nowrap;">${_cdMoney(g.ts)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(g.tu)}</span></td></tr>`).join('');
-    let gs = 0, gu = 0; for (const r of f) { if (keep.has(pkey(r))) { gs += Number(r.sales) || 0; gu += Number(r.quantity) || 0; } }
-    const totalRow = `<tr style="border-top:2px solid var(--ink);"><td colspan="${4 + keys.length}" style="padding:9px 8px;font-family:var(--mono);font-size:11px;text-transform:uppercase;color:var(--ink);">Total &middot; all ${sorted.length.toLocaleString()} rows for this filter</td>
-      <td style="padding:9px 8px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;white-space:nowrap;">${_cdMoney(gs)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(gu)}</span></td></tr>`;
+      <td style="padding:5px 6px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;white-space:nowrap;">${metric(g.ts, g.tu)}</td></tr>`).join('');
+    const totalRow = `<tr style="border-top:2px solid var(--ink);background:rgba(0,0,0,0.02);">
+      <td colspan="4" style="padding:7px 6px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink);">Total &middot; ${sorted.length.toLocaleString()} rows</td>
+      ${keys.map(k => `<td style="padding:7px 6px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;white-space:nowrap;">${metric(weekTot[k].s, weekTot[k].u)}</td>`).join('')}
+      <td style="padding:7px 6px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:700;white-space:nowrap;">${metric(gs, gu)}</td></tr>`;
     const more = shown.length < sorted.length;
     res.innerHTML = `
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${shown.length.toLocaleString()} of ${sorted.length.toLocaleString()} &middot; ${_cdState.grain === 'month' ? 'monthly' : 'weekly'} &middot; each cell: $ sales over units &middot; ${keys.length} of ${allP.length} ${_cdState.grain === 'month' ? 'months' : 'weeks'}</div>
-      <div style="overflow-x:auto;"><table style="border-collapse:collapse;min-width:100%;">
-        <thead><tr style="text-align:left;">${head.map((h, i) => `<th style="padding:7px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;${i >= 4 ? 'text-align:right;white-space:nowrap;' : ''}">${escapeHtml(h)}</th>`).join('')}</tr></thead>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${shown.length.toLocaleString()} of ${sorted.length.toLocaleString()} &middot; ${_cdState.grain === 'month' ? 'monthly' : 'weekly'} &middot; each cell: $ over units &middot; ${keys.length} of ${allP.length} ${_cdState.grain === 'month' ? 'months' : 'weeks'}</div>
+      <div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;table-layout:auto;font-variant-numeric:tabular-nums;">
+        <thead><tr>${head.map((h, i) => th(h, i)).join('')}</tr></thead>
         <tbody>${tbody}</tbody><tfoot>${totalRow}</tfoot>
       </table></div>
       <div style="display:flex;gap:10px;justify-content:center;margin-top:14px;">
