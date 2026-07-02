@@ -40903,34 +40903,41 @@ render();
     const body = document.getElementById('hl-cd-section');
     if (!body) return;
     _cdState.brandId = brandId; _cdState.sb = sb;
-    body.innerHTML = `<div class="hl-loading">Loading customer detail…</div>`;
-    if (!_cdState.products) {
-      const { data: ps, error } = await sb.from('products')
-        .select('id, item_description, product_line, category').eq('brand_id', brandId);
-      if (error) { body.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Could not load products: ${escapeHtml(error.message)}</div>`; return; }
-      _cdState.products = ps || [];
+    body.innerHTML = `<div class="hl-loading">Loading weekly customer data…</div>`;
+    try {
+      if (!_cdState.products) {
+        const { data: ps, error: pe } = await sb.from('products').select('id,item_description,product_line,category').eq('brand_id', brandId);
+        if (pe) throw new Error('products: ' + pe.message);
+        _cdState.products = ps || [];
+      }
+      _cdState.rows = await _cwFetchWeekly(sb, brandId);
+    } catch (err) {
+      body.innerHTML = `<div class="hl-empty" style="padding:28px;text-align:center;color:var(--lost);">Could not load weekly data: ${escapeHtml(err.message || 'error')}</div>`;
+      return;
     }
-    _cdState.cat = ''; _cdState.line = ''; _cdState.item = ''; _cdState.search = ''; _cdState.offset = 0; _cdState.rows = []; _cdState.trendRows = []; _cdState.fullCount = 0; _cdState.mode = 'totals'; _cdState.grain = 'week'; _cdState.periods = 8;
-    const cats = [...new Set(_cdState.products.map(p => p.category).filter(Boolean))].sort();
+    _cdState.cat = ''; _cdState.line = ''; _cdState.item = ''; _cdState.search = ''; _cdState.grain = 'week'; _cdState.periods = 8; _cdState.offset = 0;
 
+    if (!_cdState.rows.length) {
+      body.innerHTML = `<div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:8px;">UNFI &middot; Weekly customer detail</div>
+        <div class="hl-empty" style="padding:28px;text-align:center;color:var(--ink-3);">No weekly data yet. Upload weekly SBO files with &ldquo;+ Upload UNFI weekly&rdquo;.</div>`;
+      return;
+    }
+
+    const cats = [...new Set(_cdState.products.map(p => p.category).filter(Boolean))].sort();
     body.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
-        <div style="font-family:var(--serif);font-size:18px;color:var(--ink);">UNFI · Customer detail</div>
-        <div style="display:flex;border:1px solid var(--rule-soft);border-radius:6px;overflow:hidden;">
-          <button id="hl-cd-mode-totals"></button><button id="hl-cd-mode-trend"></button>
-        </div>
+        <div style="font-family:var(--serif);font-size:18px;color:var(--ink);">UNFI &middot; Weekly customer detail</div>
+        <span style="display:inline-flex;gap:6px;align-items:center;"><button id="hl-cw-week"></button><button id="hl-cw-month"></button></span>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;">
-        <input id="hl-cd-search" placeholder="Search retailer…" style="padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;min-width:200px;" />
-        <select id="hl-cd-cat" style="${_cdSelStyle()}"><option value="">All categories</option>${cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}</select>
-        <select id="hl-cd-line" style="${_cdSelStyle()}"><option value="">All product lines</option></select>
-        <select id="hl-cd-item" style="${_cdSelStyle()}"><option value="">All items</option></select>
-        <span id="hl-cd-grain-wrap" style="display:none;gap:6px;align-items:center;"><button id="hl-cd-grain-week"></button><button id="hl-cd-grain-month"></button></span>
+        <input id="hl-cw-search" placeholder="Search retailer…" style="padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;min-width:200px;" />
+        <select id="hl-cw-cat" style="${_cdSelStyle()}"><option value="">All categories</option>${cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}</select>
+        <select id="hl-cw-line" style="${_cdSelStyle()}"><option value="">All product lines</option></select>
+        <select id="hl-cw-item" style="${_cdSelStyle()}"><option value="">All items</option></select>
       </div>
-      <div id="hl-cd-results"></div>`;
+      <div id="hl-cw-results"></div>`;
 
-    const catSel = document.getElementById('hl-cd-cat'), lineSel = document.getElementById('hl-cd-line'), itemSel = document.getElementById('hl-cd-item'), search = document.getElementById('hl-cd-search');
-
+    const catSel = document.getElementById('hl-cw-cat'), lineSel = document.getElementById('hl-cw-line'), itemSel = document.getElementById('hl-cw-item'), search = document.getElementById('hl-cw-search');
     const refillLines = () => {
       const lines = [...new Set(_cdState.products.filter(p => !_cdState.cat || p.category === _cdState.cat).map(p => p.product_line).filter(Boolean))].sort();
       lineSel.innerHTML = `<option value="">All product lines</option>` + lines.map(l => `<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join('');
@@ -40940,136 +40947,91 @@ render();
       itemSel.innerHTML = `<option value="">All items</option>` + items.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.item_description || '(unnamed)')}</option>`).join('');
     };
     refillLines(); refillItems();
+    catSel.addEventListener('change', () => { _cdState.cat = catSel.value; _cdState.line = ''; _cdState.item = ''; refillLines(); refillItems(); _cdState.offset = 0; _cwRender(); });
+    lineSel.addEventListener('change', () => { _cdState.line = lineSel.value; _cdState.item = ''; refillItems(); _cdState.offset = 0; _cwRender(); });
+    itemSel.addEventListener('change', () => { _cdState.item = itemSel.value; _cdState.offset = 0; _cwRender(); });
+    let t = null; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { _cdState.search = search.value.trim(); _cdState.offset = 0; _cwRender(); }, 250); });
 
-    catSel.addEventListener('change', () => { _cdState.cat = catSel.value; _cdState.line = ''; _cdState.item = ''; refillLines(); refillItems(); _cdReload(); });
-    lineSel.addEventListener('change', () => { _cdState.line = lineSel.value; _cdState.item = ''; refillItems(); _cdReload(); });
-    itemSel.addEventListener('change', () => { _cdState.item = itemSel.value; _cdReload(); });
-    let t = null; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { _cdState.search = search.value.trim(); _cdReload(); }, 300); });
-
-    document.getElementById('hl-cd-mode-totals').addEventListener('click', () => { if (_cdState.mode !== 'totals') { _cdState.mode = 'totals'; _cdSyncToggles(); _cdReload(); } });
-    document.getElementById('hl-cd-mode-trend').addEventListener('click', () => { if (_cdState.mode !== 'trend') { _cdState.mode = 'trend'; _cdState.periods = 8; _cdSyncToggles(); _cdReload(); } });
-    document.getElementById('hl-cd-grain-week').addEventListener('click', () => { if (_cdState.grain !== 'week') { _cdState.grain = 'week'; _cdState.periods = 8; _cdSyncToggles(); _cdReload(); } });
-    document.getElementById('hl-cd-grain-month').addEventListener('click', () => { if (_cdState.grain !== 'month') { _cdState.grain = 'month'; _cdState.periods = 12; _cdSyncToggles(); _cdReload(); } });
-    _cdSyncToggles();
-
-    await _cdReload();
+    const wbtn = document.getElementById('hl-cw-week'), mbtn = document.getElementById('hl-cw-month');
+    const syncGrain = () => {
+      const on = 'background:var(--ink);color:var(--paper);', off = 'background:transparent;color:var(--ink);';
+      const gb = 'padding:6px 12px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--mono);font-size:11px;text-transform:uppercase;cursor:pointer;';
+      wbtn.textContent = 'Weekly'; mbtn.textContent = 'Monthly';
+      wbtn.style.cssText = gb + (_cdState.grain === 'week' ? on : off); mbtn.style.cssText = gb + (_cdState.grain === 'month' ? on : off);
+    };
+    wbtn.addEventListener('click', () => { if (_cdState.grain !== 'week') { _cdState.grain = 'week'; _cdState.periods = 8; _cdState.offset = 0; syncGrain(); _cwRender(); } });
+    mbtn.addEventListener('click', () => { if (_cdState.grain !== 'month') { _cdState.grain = 'month'; _cdState.periods = 12; _cdState.offset = 0; syncGrain(); _cwRender(); } });
+    syncGrain();
+    _cwRender();
   }
 
-  function _cdSyncToggles() {
-    const on = 'background:var(--ink);color:var(--paper);', off = 'background:transparent;color:var(--ink);';
-    const tabBase = 'padding:6px 12px;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.04em;text-transform:uppercase;cursor:pointer;';
-    const gBase = 'padding:6px 12px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--mono);font-size:11px;text-transform:uppercase;cursor:pointer;';
-    const mt = document.getElementById('hl-cd-mode-totals'), mtr = document.getElementById('hl-cd-mode-trend');
-    const gw = document.getElementById('hl-cd-grain-wrap'), gwk = document.getElementById('hl-cd-grain-week'), gmo = document.getElementById('hl-cd-grain-month');
-    if (mt && mtr) { mt.textContent = 'Totals (L52)'; mtr.textContent = 'Trend'; mt.style.cssText = tabBase + (_cdState.mode === 'totals' ? on : off); mtr.style.cssText = tabBase + (_cdState.mode === 'trend' ? on : off); }
-    if (gw) gw.style.display = _cdState.mode === 'trend' ? 'inline-flex' : 'none';
-    if (gwk && gmo) { gwk.textContent = 'Weekly'; gmo.textContent = 'Monthly'; gwk.style.cssText = gBase + (_cdState.grain === 'week' ? on : off); gmo.style.cssText = gBase + (_cdState.grain === 'month' ? on : off); }
+  async function _cwFetchWeekly(sb, brandId) {
+    const PAGE = 1000; let all = [];
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await sb.from('distributor_customer_sales')
+        .select('region,chain_name,item_description,category,product_id,product_line,week_starting,sales,quantity')
+        .eq('brand_id', brandId).eq('distributor', 'UNFI').eq('report_type', 'weekly')
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      all = all.concat(data || []);
+      if (!data || data.length < PAGE) break;
+    }
+    return all;
   }
 
-  async function _cdLoadTrend() {
-    const flt = { p_brand: _cdState.brandId, p_distributor: 'UNFI', p_grain: _cdState.grain, p_category: _cdState.cat || null, p_product_line: _cdState.line || null, p_product_id: _cdState.item || null, p_search: _cdState.search || null };
-    const [pk, rr] = await Promise.all([
-      _cdState.sb.rpc('dcs_periods', { p_brand: _cdState.brandId, p_distributor: 'UNFI', p_grain: _cdState.grain, p_periods: _cdState.periods }),
-      _cdState.sb.rpc('dcs_period_rollup', Object.assign({}, flt, { p_periods: _cdState.periods, p_limit: _cdState.limit, p_offset: _cdState.offset })),
-    ]);
-    if (pk.error || rr.error) { _cdState.error = (pk.error || rr.error).message; return; }
-    _cdState.periodKeys = (pk.data || []).map(r => r.period_key);
-    const rows = rr.data || [];
-    if (_cdState.offset === 0) _cdState.fullCount = rows.length ? Number(rows[0].full_count) : 0;
-    _cdState.trendRows = _cdState.trendRows.concat(rows);
-  }
-
-  function _cdRenderTrend() {
-    const res = document.getElementById('hl-cd-results');
+  function _cwRender() {
+    const res = document.getElementById('hl-cw-results');
     if (!res) return;
-    if (_cdState.error) { res.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Query failed: ${escapeHtml(_cdState.error)}</div>`; return; }
-    const rows = _cdState.trendRows;
-    if (rows.length === 0) { res.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No weekly data yet — upload weekly files to build the trend.</div>`; return; }
-    const keys = [..._cdState.periodKeys].reverse(); // oldest → newest, left to right
-    const label = (k) => _cdState.grain === 'month' ? k : k.slice(5);
+    const cn = r => (r.chain_name && String(r.chain_name).trim()) ? String(r.chain_name).trim() : '(no chain name)';
+    const q = _cdState.search ? _cdState.search.toLowerCase() : '';
+    const f = _cdState.rows.filter(r =>
+      (!_cdState.cat || r.category === _cdState.cat) &&
+      (!_cdState.line || r.product_line === _cdState.line) &&
+      (!_cdState.item || r.product_id === _cdState.item) &&
+      (!q || cn(r).toLowerCase().includes(q)));
+    const pkey = r => _cdState.grain === 'month' ? String(r.week_starting).slice(0, 7) : String(r.week_starting);
+    const allP = [...new Set(f.map(pkey))].sort().reverse();
+    const keys = allP.slice(0, _cdState.periods).reverse();
+    const keep = new Set(keys);
+    const groups = new Map();
+    for (const r of f) {
+      const pk = pkey(r); if (!keep.has(pk)) continue;
+      const gk = (r.region || '') + '|' + cn(r) + '|' + (r.item_description || '');
+      let g = groups.get(gk);
+      if (!g) { g = { region: r.region || '', chain: cn(r), item: r.item_description || '', category: r.category || '', per: {}, ts: 0, tu: 0 }; groups.set(gk, g); }
+      if (!g.per[pk]) g.per[pk] = { s: 0, u: 0 };
+      g.per[pk].s += Number(r.sales) || 0; g.per[pk].u += Number(r.quantity) || 0;
+      g.ts += Number(r.sales) || 0; g.tu += Number(r.quantity) || 0;
+    }
+    const sorted = [...groups.values()].sort((a, b) => b.ts - a.ts);
+    if (sorted.length === 0) { res.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No matching customers.</div>`; return; }
+    const shown = sorted.slice(0, _cdState.offset + _cdState.limit);
+    const label = k => _cdState.grain === 'month' ? k : k.slice(5);
     const head = ['Region', 'Chain Name', 'Description', 'Category', ...keys.map(label), 'Total'];
-    const cell = (r, k) => { const p = r.periods && r.periods[k]; return `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;white-space:nowrap;">${p ? `${_cdMoney(p.s)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(p.u)}</span>` : '<span style="color:var(--ink-3);">·</span>'}</td>`; };
-    const tbody = rows.map(r => `<tr style="border-top:1px solid var(--rule-soft);">
-      <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${escapeHtml(r.region || '')}</td>
-      <td style="padding:6px 8px;font-family:var(--serif);font-size:12px;white-space:nowrap;">${escapeHtml(r.chain_name || '')}</td>
-      <td style="padding:6px 8px;font-family:var(--serif);font-size:12px;white-space:nowrap;">${escapeHtml(r.item_description || '')}</td>
-      <td style="padding:6px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(r.category || '')}</td>
-      ${keys.map(k => cell(r, k)).join('')}
-      <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;white-space:nowrap;">${_cdMoney(r.total_sales)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(r.total_units)}</span></td></tr>`).join('');
-    const more = _cdState.trendRows.length < _cdState.fullCount;
+    const cell = (g, k) => { const p = g.per[k]; return `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;white-space:nowrap;">${p ? `${_cdMoney(p.s)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(p.u)}</span>` : '<span style="color:var(--ink-3);">&middot;</span>'}</td>`; };
+    const tbody = shown.map(g => `<tr style="border-top:1px solid var(--rule-soft);">
+      <td style="padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${escapeHtml(g.region)}</td>
+      <td style="padding:6px 8px;font-family:var(--serif);font-size:12px;white-space:nowrap;">${escapeHtml(g.chain)}</td>
+      <td style="padding:6px 8px;font-family:var(--serif);font-size:12px;white-space:nowrap;">${escapeHtml(g.item)}</td>
+      <td style="padding:6px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(g.category)}</td>
+      ${keys.map(k => cell(g, k)).join('')}
+      <td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;white-space:nowrap;">${_cdMoney(g.ts)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(g.tu)}</span></td></tr>`).join('');
+    let gs = 0, gu = 0; for (const r of f) { if (keep.has(pkey(r))) { gs += Number(r.sales) || 0; gu += Number(r.quantity) || 0; } }
+    const totalRow = `<tr style="border-top:2px solid var(--ink);"><td colspan="${4 + keys.length}" style="padding:9px 8px;font-family:var(--mono);font-size:11px;text-transform:uppercase;color:var(--ink);">Total &middot; all ${sorted.length.toLocaleString()} rows for this filter</td>
+      <td style="padding:9px 8px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;white-space:nowrap;">${_cdMoney(gs)}<br><span style="color:var(--ink-3);font-size:10px;">${_cdNum(gu)}</span></td></tr>`;
+    const more = shown.length < sorted.length;
     res.innerHTML = `
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${rows.length.toLocaleString()} of ${Number(_cdState.fullCount).toLocaleString()} · ${_cdState.grain === 'month' ? 'monthly' : 'weekly'} · each cell: $ sales over units</div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${shown.length.toLocaleString()} of ${sorted.length.toLocaleString()} &middot; ${_cdState.grain === 'month' ? 'monthly' : 'weekly'} &middot; each cell: $ sales over units &middot; ${keys.length} of ${allP.length} ${_cdState.grain === 'month' ? 'months' : 'weeks'}</div>
       <div style="overflow-x:auto;"><table style="border-collapse:collapse;min-width:100%;">
         <thead><tr style="text-align:left;">${head.map((h, i) => `<th style="padding:7px 8px;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;${i >= 4 ? 'text-align:right;white-space:nowrap;' : ''}">${escapeHtml(h)}</th>`).join('')}</tr></thead>
-        <tbody>${tbody}</tbody>
+        <tbody>${tbody}</tbody><tfoot>${totalRow}</tfoot>
       </table></div>
       <div style="display:flex;gap:10px;justify-content:center;margin-top:14px;">
-        ${more ? `<button id="hl-cd-tmore" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load 25 more</button>` : ''}
-        <button id="hl-cd-pmore" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Show more ${_cdState.grain === 'month' ? 'months' : 'weeks'}</button>
+        ${more ? `<button id="hl-cw-more" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load 25 more</button>` : ''}
+        ${allP.length > keys.length ? `<button id="hl-cw-pmore" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Show more ${_cdState.grain === 'month' ? 'months' : 'weeks'}</button>` : ''}
       </div>`;
-    const tm = document.getElementById('hl-cd-tmore'); if (tm) tm.addEventListener('click', async () => { _cdState.offset += _cdState.limit; await _cdLoadTrend(); _cdRenderTrend(); });
-    const pm = document.getElementById('hl-cd-pmore'); if (pm) pm.addEventListener('click', async () => { _cdState.periods += (_cdState.grain === 'month' ? 6 : 8); _cdState.offset = 0; _cdState.trendRows = []; res.innerHTML = `<div class="hl-loading">Loading…</div>`; await _cdLoadTrend(); _cdRenderTrend(); });
-  }
-
-  async function _cdReload() {
-    _cdState.offset = 0; _cdState.rows = []; _cdState.trendRows = []; _cdState.total = null; _cdState.error = null;
-    const res = document.getElementById('hl-cd-results');
-    if (res) res.innerHTML = `<div class="hl-loading">Loading…</div>`;
-    if (_cdState.mode === 'trend') { await _cdLoadTrend(); _cdRenderTrend(); }
-    else { await Promise.all([_cdFetchPage(), _cdFetchTotal()]); _cdRenderRows(); }
-  }
-
-  function _cdFilters() {
-    return {
-      p_brand: _cdState.brandId, p_distributor: 'UNFI', p_report_type: 'total',
-      p_category: _cdState.cat || null, p_product_line: _cdState.line || null,
-      p_product_id: _cdState.item || null, p_search: _cdState.search || null,
-    };
-  }
-
-  async function _cdFetchPage() {
-    const { data, error } = await _cdState.sb.rpc('dcs_customer_rollup', Object.assign(_cdFilters(), { p_limit: _cdState.limit, p_offset: _cdState.offset }));
-    if (error) { _cdState.error = error.message; return; }
-    const rows = data || [];
-    if (_cdState.offset === 0) _cdState.fullCount = rows.length ? Number(rows[0].full_count) : 0;
-    _cdState.rows = _cdState.rows.concat(rows);
-  }
-
-  async function _cdFetchTotal() {
-    const { data, error } = await _cdState.sb.rpc('dcs_customer_total', _cdFilters());
-    if (!error && data && data[0]) _cdState.total = data[0];
-  }
-
-  function _cdRenderRows() {
-    const res = document.getElementById('hl-cd-results');
-    if (!res) return;
-    if (_cdState.error) { res.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Query failed: ${escapeHtml(_cdState.error)}</div>`; return; }
-    const rows = _cdState.rows;
-    if (rows.length === 0) { res.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No matching customers.</div>`; return; }
-    const head = ['Region', 'Chain Name', 'Description', 'Category', 'Sales', 'Quantity'];
-    const tbody = rows.map(r => `<tr style="border-top:1px solid var(--rule-soft);">
-      <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${escapeHtml(r.region || '')}</td>
-      <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${escapeHtml(r.chain_name || '')}</td>
-      <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${escapeHtml(r.item_description || '')}</td>
-      <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(r.category || '')}</td>
-      <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_cdMoney(r.sales)}</td>
-      <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${_cdNum(r.quantity)}</td></tr>`).join('');
-    const t = _cdState.total;
-    const totalRow = t ? `<tr style="border-top:2px solid var(--ink);background:var(--wash,rgba(0,0,0,0.02));">
-      <td colspan="4" style="padding:9px 10px;font-family:var(--mono);font-size:11px;letter-spacing:0.04em;text-transform:uppercase;color:var(--ink);">Total · all ${Number(t.group_count || 0).toLocaleString()} rows for this filter</td>
-      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;">${_cdMoney(t.total_sales)}</td>
-      <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600;">${_cdNum(t.total_quantity)}</td></tr>` : '';
-    const more = _cdState.rows.length < _cdState.fullCount;
-    res.innerHTML = `
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${rows.length.toLocaleString()} of ${Number(_cdState.fullCount).toLocaleString()} · region × chain × item, by sales</div>
-      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
-        <thead><tr style="text-align:left;">${head.map((h, i) => `<th style="padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;${i >= 4 ? 'text-align:right;' : ''}">${h}</th>`).join('')}</tr></thead>
-        <tbody>${tbody}</tbody>
-        <tfoot>${totalRow}</tfoot>
-      </table></div>
-      ${more ? `<div style="text-align:center;margin-top:14px;"><button id="hl-cd-more" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load 25 more</button></div>` : ''}`;
-    const mb = document.getElementById('hl-cd-more');
-    if (mb) mb.addEventListener('click', async () => { _cdState.offset += _cdState.limit; await _cdFetchPage(); _cdRenderRows(); });
+    const m1 = document.getElementById('hl-cw-more'); if (m1) m1.addEventListener('click', () => { _cdState.offset += _cdState.limit; _cwRender(); });
+    const m2 = document.getElementById('hl-cw-pmore'); if (m2) m2.addEventListener('click', () => { _cdState.periods += (_cdState.grain === 'month' ? 6 : 8); _cwRender(); });
   }
 
   async function renderSalesPacingPage() {
