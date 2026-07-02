@@ -40826,19 +40826,15 @@ render();
     };
     if (ci.sales < 0) throw new Error('Missing "Sales" column in the weekly report.');
 
-    // Week from the "For Date Range (m/d/yyyy - m/d/yyyy)" line above the header.
+    // Week period from cell A4 ("For Date Range (m/d/yyyy - m/d/yyyy)").
+    // Parse as plain text (no Date/UTC conversion) so the day never shifts.
     let week_starting = null, week_end = null;
-    for (let i = 0; i < hi; i++) {
-      const cell = String((aoa[i] || [])[0] || '');
-      const m = cell.match(/(\d{1,2}\/\d{1,2}\/\d{4})\s*[-–]\s*(\d{1,2}\/\d{1,2}\/\d{4})/);
-      if (m) {
-        const d1 = new Date(m[1]), d2 = new Date(m[2]);
-        if (!isNaN(d1)) week_starting = d1.toISOString().slice(0, 10);
-        if (!isNaN(d2)) week_end = d2.toISOString().slice(0, 10);
-        break;
-      }
-    }
-    if (!week_starting) throw new Error('Could not read the week from the top of the file (expected "For Date Range (m/d/yyyy - m/d/yyyy)").');
+    const mdyToISO = (s) => { const mm = String(s).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return mm ? `${mm[3]}-${mm[1].padStart(2, '0')}-${mm[2].padStart(2, '0')}` : null; };
+    const rangeRe = /(\d{1,2}\/\d{1,2}\/\d{4})\s*[-–]\s*(\d{1,2}\/\d{1,2}\/\d{4})/;
+    let dm = String((aoa[3] || [])[0] || '').match(rangeRe);   // A4 first
+    if (!dm) { for (let i = 0; i < hi; i++) { const c = String((aoa[i] || [])[0] || '').match(rangeRe); if (c) { dm = c; break; } } }
+    if (dm) { week_starting = mdyToISO(dm[1]); week_end = mdyToISO(dm[2]); }
+    if (!week_starting) throw new Error('Could not read the date period from cell A4 (expected "For Date Range (m/d/yyyy - m/d/yyyy)").');
 
     const { data: prods, error: perr } = await sb.from('products')
       .select('id, item_description, unit_upc, category, product_line').eq('brand_id', brandId);
