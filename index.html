@@ -47308,9 +47308,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           sb.from('freight_3pl').select('*').eq('brand_id', brandId).order('customer')
         ]);
         let rows = custData || [];
-        const dockMap = {}; (dockData || []).forEach(d => { if (d.dc_name) dockMap[String(d.dc_name).trim().toLowerCase()] = d; });
+        const dockMap = {}; (dockData || []).forEach(d => { if (d.dc_name) dockMap[_frDcKey(d.dc_name)] = d; });
         // customer's own dock hours win; otherwise resolve the DC from the Dock Hours tab (KeHE / UNFI)
-        const dockOf = r => { if (r.dock_hours) return r.dock_hours; const d = r.dc_name ? dockMap[String(r.dc_name).trim().toLowerCase()] : null; return d ? _frHoursSummary(d) : null; };
+        const dockOf = r => { if (r.dock_hours) return r.dock_hours; const d = r.dc_name ? dockMap[_frDcKey(r.dc_name)] : null; return d ? _frHoursSummary(d) : null; };
         const showPickup = _frShowPickup;
         const custRows = rows.filter(r => { const s = (r.service_type || '').toLowerCase(); if (s === 'not servicing' || s === '3pl') return false; return showPickup || s.includes('deliver'); });
         const tplRows = (tplData || []).map(r => ({ customer: r.customer, dc_name: r.threepl, address: r.address, service_type: '3PL', dock_hours: null }));
@@ -47339,19 +47339,19 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           sb.from('freight_customers').select('customer,dc_name,service_type,dock_hours').eq('brand_id', brandId).order('customer'),
           sb.from('freight_dock_hours').select('*').eq('brand_id', brandId)
         ]);
-        const dockMap = {}; (dockData || []).forEach(d => { if (d.dc_name) dockMap[String(d.dc_name).trim().toLowerCase()] = d; });
+        const dockMap = {}; (dockData || []).forEach(d => { if (d.dc_name) dockMap[_frDcKey(d.dc_name)] = d; });
         const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
         const fmt = (h, d) => { const o = (h || {})[d]; return o && (o.start || o.end) ? `${o.start || ''}–${o.end || ''}` : null; };
         const seen = new Set(); const list = [];
         (custData || []).forEach(c => {
-          const key = c.dc_name ? String(c.dc_name).trim().toLowerCase() : null;
+          const key = c.dc_name ? _frDcKey(c.dc_name) : null;
           const d = key ? dockMap[key] : null;
           const src = d ? d.source : (c.dock_hours ? 'Customer' : (c.service_type || '—'));
           const summary = c.dock_hours || (d ? _frHoursSummary(d) : null);
           list.push({ dc: c.dc_name, customer: c.customer, source: src, summary, hours: d ? d.hours : null });
           if (key) seen.add(key);
         });
-        (dockData || []).forEach(d => { const key = d.dc_name ? String(d.dc_name).trim().toLowerCase() : null; if (key && !seen.has(key)) list.push({ dc: d.dc_name, customer: '— (no customer match)', source: d.source, summary: _frHoursSummary(d), hours: d.hours }); });
+        (dockData || []).forEach(d => { const key = d.dc_name ? _frDcKey(d.dc_name) : null; if (key && !seen.has(key)) list.push({ dc: d.dc_name, customer: '— (no customer match)', source: d.source, summary: _frHoursSummary(d), hours: d.hours }); });
         if (!list.length) { body.innerHTML = empty('dock hours'); return; }
         const withHours = list.filter(r => r.summary).length;
         const head = ['DC', 'Customer', 'Source', 'Hours', ...days].map((h, i) => th(h, i >= 4)).join('');
@@ -47433,6 +47433,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
   let _frSettingsCache = null;
   function _frDefaults() { return { truck_type: 'Frozen FTL Reefer', max_pallets: 28, max_weight: 40000, cube: null, max_stops: 3, stop_fee: 300, ftl_min_pallets: 15, ltl_max_pallets: 4, date_window_days: 1, unload_hours: 2, stop_transit_days: 1, missed_delivery_fee: 800, late_fee: 300 }; }
+  function _frDcKey(s) { return s ? String(s).trim().toLowerCase().replace(/\s+/g, ' ').replace(/[,.]+$/, '') : ''; }
   function _frHoursSummary(row) {
     if (row && row.notes) return row.notes;
     const h = row && row.hours; if (!h) return null;
