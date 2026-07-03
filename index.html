@@ -47337,51 +47337,39 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.innerHTML = _frSearchBox('hl-fr-search-orders', 'orders', 'Search customer, item, status…') + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
         _frWireSearch(body, 'hl-fr-search-orders', 'orders');
       } else if (_frSubTab === 'output') {
-        const [{ data: orders }, { data: items }, { data: mapRows }] = await Promise.all([
+        const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }] = await Promise.all([
           sb.from('freight_orders').select('*').eq('brand_id', brandId),
           sb.from('freight_items').select('item_description,cases_per_pallet,case_weight').eq('brand_id', brandId),
-          sb.from('freight_item_map').select('order_item,item_description').eq('brand_id', brandId)
+          sb.from('freight_item_map').select('order_item,item_description').eq('brand_id', brandId),
+          sb.from('freight_customers').select('customer,dc_name,address,service_type').eq('brand_id', brandId),
+          sb.from('freight_lanes').select('kind,lane_no,lane_name,states').eq('brand_id', brandId)
         ]);
         const s = await _frLoadSettings(brandId, sb);
         if (!orders || !orders.length) { body.innerHTML = empty('orders — run the daily sync first'); return; }
-        const mapByOrder = {}; (mapRows || []).forEach(m => { mapByOrder[_frNorm(m.order_item)] = m.item_description; });
-        const cfgByDesc = {}; (items || []).forEach(it => { cfgByDesc[_frNorm(it.item_description)] = it; });
-        const cfgFor = sku => { const d = mapByOrder[_frNorm(sku)]; return d ? cfgByDesc[_frNorm(d)] : null; };
-        const ships = new Map(); const unmatched = {};
-        for (const o of orders) {
-          const so = o.so_num || '(no SO)';
-          let sh = ships.get(so);
-          if (!sh) { sh = { so, customer: o.customer, ship: o.projected_ship_date, lines: 0, cases: 0, pallets: 0, weight: 0, missing: 0 }; ships.set(so, sh); }
-          sh.lines++; const cases = Number(o.cases_ordered) || 0; sh.cases += cases;
-          const cfg = cfgFor(o.sku);
-          if (cfg && cfg.cases_per_pallet) { sh.pallets += cases / Number(cfg.cases_per_pallet); sh.weight += cases * (Number(cfg.case_weight) || 0); }
-          else { sh.missing++; unmatched[o.sku] = (unmatched[o.sku] || 0) + 1; }
-          if (o.projected_ship_date && (!sh.ship || o.projected_ship_date < sh.ship)) sh.ship = o.projected_ship_date;
-        }
-        const list = [...ships.values()].map(sh => {
-          const plan = Math.ceil(sh.pallets - 1e-9);
-          let mode = 'Review'; if (plan >= (s.ftl_min_pallets || 15)) mode = 'FTL'; else if (plan <= (s.ltl_max_pallets || 4)) mode = 'LTL';
-          const flags = [];
-          if (sh.missing) flags.push('missing item config');
-          if (plan > (s.max_pallets || 28)) flags.push('over pallet cap');
-          if (sh.weight > (s.max_weight || 40000)) flags.push('over weight');
-          if (/c&s|c and s|target/i.test(sh.customer || '')) flags.push('dedicated (C&S/Target)');
-          return Object.assign({}, sh, { plan, mode, flags });
-        }).sort((a, b) => (a.ship || '9999').localeCompare(b.ship || '9999'));
-        const tot = list.reduce((a, r) => { a.pallets += r.pallets; a.plan += r.plan; a.weight += r.weight; a.cases += r.cases; return a; }, { pallets: 0, plan: 0, weight: 0, cases: 0 });
-        const modeCount = m => list.filter(r => r.mode === m).length;
-        const card = (label, val) => `<div style="border:1px solid var(--rule-soft);border-radius:6px;padding:12px 14px;min-width:118px;"><div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">${label}</div><div style="font-family:var(--serif);font-size:20px;margin-top:2px;">${val}</div></div>`;
+        const P = _frPlan(orders, items, mapRows, s, customers, lanes);
+        const money = n => Math.round(n).toLocaleString();
+        const card = (label, val, sub) => `<div style="border:1px solid var(--rule-soft);border-radius:6px;padding:12px 14px;min-width:112px;"><div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">${label}</div><div style="font-family:var(--serif);font-size:20px;margin-top:2px;">${val}</div>${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}</div>`;
         const badge = m => { const c = m === 'FTL' ? '#2e7d32' : (m === 'LTL' ? 'var(--ink-3)' : '#b8860b'); return `<span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${c};">${m}</span>`; };
-        const missList = Object.entries(unmatched).sort((a, b) => b[1] - a[1]);
-        const head = ['SO #', 'Customer', 'Proj Ship', 'Lines', 'Cases', 'Exact plt', 'Plan plt', 'Weight (lb)', 'Mode', 'Flags'].map((h, i) => th(h, i >= 3 && i <= 7)).join('');
-        const trs = list.map(r => `<tr data-s="${escapeHtml([r.so, r.customer, r.mode].join(' ').toLowerCase())}">${td(r.so)}${td(r.customer)}${td(r.ship)}${td(r.lines, true)}${td(r.cases, true)}${td(r.pallets.toFixed(2), true)}${td(r.plan, true)}${td(Math.round(r.weight).toLocaleString(), true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${badge(r.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(r.flags.join(' · '))}</td></tr>`).join('');
-        const totalRow = `<tr style="border-top:2px solid var(--ink);"><td colspan="3" style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total · ${list.length} shipments</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${tot.cases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${tot.pallets.toFixed(1)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${tot.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${Math.round(tot.weight).toLocaleString()}</td><td colspan="2"></td></tr>`;
+        const laneName = l => l ? `L${l.no} ${l.name}` : '—';
+        const listTable = (rows, cols) => `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${cols}</tr></thead><tbody>${rows}</tbody></table></div>`;
+        const stopStr = t => t.stops.map(x => `${escapeHtml(_frCustShort(x.customer))}${x.dc ? (' · ' + escapeHtml(x.dc)) : ''} (${x.plan})`).join('  →  ');
+        const tHead = ['Truck', 'Lane', 'Route (stops · pallets)', 'States', 'Plan plt', 'Weight (lb)', 'Util', 'Mode', 'Flags'].map((h, i) => th(h, i >= 4 && i <= 6)).join('');
+        const tRows = P.trucks.map((t, i) => `<tr>${td('T' + (i + 1))}${td(laneName(t.lane))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${stopStr(t)}</td>${td([...t.states].join(', '))}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${badge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}</td></tr>`).join('');
+        const ltlRows = P.ltl.map((t, i) => `<tr>${td('L' + (i + 1))}${td(laneName(t.lane))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${stopStr(t)}</td>${td(t.plan, true)}${td(money(t.weight), true)}</tr>`).join('');
+        const dedRows = P.dedicated.map(sh => `<tr>${td(sh.so)}${td(_frCustShort(sh.customer))}${td(sh.dc)}${td(sh.ship)}${td(sh.plan, true)}${td(money(sh.weight), true)}</tr>`).join('');
+        const needRows = P.needsDc.map(sh => `<tr data-s="${escapeHtml((sh.customer || '').toLowerCase())}">${td(sh.so)}${td(_frCustShort(sh.customer))}${td(sh.ship)}${td(sh.plan, true)}${td(money(sh.weight), true)}${td(sh.dedicated ? 'dedicated' : (sh.missing ? 'missing item' : ''))}</tr>`).join('');
+        const missList = Object.entries(P.unmatched).sort((a, b) => b[1] - a[1]);
         body.innerHTML = `
-          <div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:16px;font-family:var(--sans);font-size:12px;color:var(--ink);line-height:1.5;">Shipment math is per sales order — pallets (mixed-pallet formula), weight, and FTL/LTL mode. <b>Lane assignment &amp; truck consolidation need the ship-to DC</b>, which isn't in the current order feed. Add a Customer&nbsp;DC / ship-to column to the NetSuite export and this becomes full truck builds with routes and dock-hour checks.</div>
-          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px;">${card('Shipments', list.length)}${card('Planning pallets', tot.plan)}${card('Total weight', Math.round(tot.weight).toLocaleString() + ' lb')}${card('FTL', modeCount('FTL'))}${card('LTL', modeCount('LTL'))}${card('Review', modeCount('Review'))}</div>
-          ${_frSearchBox('hl-fr-search-output', 'output', 'Search SO, customer, mode…')}
-          <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${trs}</tbody><tfoot>${totalRow}</tfoot></table></div>
-          ${missList.length ? `<div style="margin-top:22px;"><div style="font-family:var(--serif);font-size:15px;margin-bottom:4px;">Missing item config (${missList.length})</div><div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:8px;">Not mapped to a pallet config, so excluded from pallet/weight. Add to the item crosswalk.</div>${missList.map(([k, v]) => `<div style="font-family:var(--sans);font-size:12px;">&bull; ${escapeHtml(k)} <span style="color:var(--ink-3);">(${v} lines)</span></div>`).join('')}</div>` : `<div style="margin-top:14px;font-family:var(--mono);font-size:11px;color:#2e7d32;">All order items matched to a pallet config.</div>`}`;
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
+            ${card('FTL trucks', P.trucks.length)}${card('LTL', P.ltl.length)}${card('Dedicated', P.dedicated.length)}${card('Planning pallets', P.totals.plan)}${card('Total weight', money(P.totals.weight) + ' lb')}${card('Needs DC', P.needsDc.length, 'awaiting ship-to')}
+          </div>
+          ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> The optimizer is fully built — it routes any customer with a resolvable destination (single-DC customers today, everyone once the DC column is in the feed). Multi-DC customers (UNFI, KeHE, C&S, Kroger) sit in the list below until then.</div>` : ''}
+          <div style="font-family:var(--serif);font-size:16px;margin:6px 0 8px;">Truck plan — consolidated FTL${P.trucks.length ? ` (${P.trucks.length})` : ''}</div>
+          ${P.trucks.length ? listTable(tRows, tHead) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">No consolidated trucks yet — needs resolved destinations.</div>`}
+          ${P.ltl.length ? `<div style="font-family:var(--serif);font-size:16px;margin:24px 0 8px;">LTL recommendations (${P.ltl.length})</div>${listTable(ltlRows, ['LTL', 'Lane', 'Route (stops · pallets)', 'Plan plt', 'Weight (lb)'].map((h, i) => th(h, i >= 3)).join(''))}` : ''}
+          ${P.dedicated.length ? `<div style="font-family:var(--serif);font-size:16px;margin:24px 0 8px;">Dedicated — C&amp;S / Target (${P.dedicated.length})</div>${listTable(dedRows, ['SO #', 'Customer', 'DC', 'Proj Ship', 'Plan plt', 'Weight (lb)'].map((h, i) => th(h, i >= 4)).join(''))}` : ''}
+          ${P.needsDc.length ? `<div style="font-family:var(--serif);font-size:16px;margin:24px 0 8px;">Needs ship-to DC (${P.needsDc.length})</div>${_frSearchBox('hl-fr-search-output', 'output', 'Search customer…')}${listTable(needRows, ['SO #', 'Customer', 'Proj Ship', 'Plan plt', 'Weight (lb)', 'Note'].map((h, i) => th(h, i >= 3 && i <= 4)).join(''))}` : ''}
+          ${missList.length ? `<div style="margin-top:22px;"><div style="font-family:var(--serif);font-size:15px;margin-bottom:4px;">Missing item config (${missList.length})</div>${missList.map(([k, v]) => `<div style="font-family:var(--sans);font-size:12px;">&bull; ${escapeHtml(k)} <span style="color:var(--ink-3);">(${v} lines)</span></div>`).join('')}</div>` : ''}`;
         _frWireSearch(body, 'hl-fr-search-output', 'output');
       } else if (_frSubTab === 'dock') {
         const [{ data: custData }, { data: dockData }] = await Promise.all([
@@ -47484,6 +47472,67 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _frDefaults() { return { truck_type: 'Frozen FTL Reefer', max_pallets: 28, max_weight: 40000, cube: null, max_stops: 3, stop_fee: 300, ftl_min_pallets: 15, ltl_max_pallets: 4, date_window_days: 1, unload_hours: 2, stop_transit_days: 1, missed_delivery_fee: 800, late_fee: 300 }; }
   function _frDcKey(s) { return s ? String(s).trim().toLowerCase().replace(/\s+/g, ' ').replace(/[,.]+$/, '') : ''; }
   function _frNorm(s) { return (s == null ? '' : String(s)).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+  function _frStateOf(s) { if (!s) return null; const t = String(s).toUpperCase(); let m = t.match(/\b([A-Z]{2})\s+\d{5}/); if (m) return m[1]; m = t.match(/,\s*([A-Z]{2})\b/); if (m) return m[1]; m = t.match(/\b([A-Z]{2})\s*$/); if (m) return m[1]; return null; }
+  function _frCustShort(c) { return String(c || '').replace(/^CUST\d+\s*/i, '').trim(); }
+  function _frPlan(orders, items, mapRows, settings, customers, lanes) {
+    const S = settings || {};
+    const maxPlt = S.max_pallets || 28, maxWt = S.max_weight || 40000, maxStops = S.max_stops || 3;
+    const ftlMin = S.ftl_min_pallets || 15, ltlMax = S.ltl_max_pallets || 4, windowDays = S.date_window_days || 1;
+    const mapByOrder = {}; (mapRows || []).forEach(m => mapByOrder[_frNorm(m.order_item)] = m.item_description);
+    const cfgByDesc = {}; (items || []).forEach(it => cfgByDesc[_frNorm(it.item_description)] = it);
+    const cfgFor = sku => { const d = mapByOrder[_frNorm(sku)]; return d ? cfgByDesc[_frNorm(d)] : null; };
+    const stateToLane = {}; (lanes || []).filter(l => l.kind === 'lane').forEach(l => String(l.states || '').split(',').forEach(st => { const x = st.trim().toUpperCase(); if (x) stateToLane[x] = { no: l.lane_no, name: l.lane_name }; }));
+    const stAddr = a => { const m = String(a || '').toUpperCase().match(/\b([A-Z]{2})\s+\d{5}/); return m ? m[1] : null; };
+    const dcState = {}, custDcs = {};
+    (customers || []).forEach(c => { const st = stAddr(c.address); if (c.dc_name) dcState[_frDcKey(c.dc_name)] = st; if ((c.service_type || '').toLowerCase().includes('deliver')) { const k = _frNorm(_frCustShort(c.customer)); (custDcs[k] = custDcs[k] || []).push({ dc: c.dc_name, state: st }); } });
+    const resolveDest = sh => { if (sh.customer_dc) { const k = _frDcKey(sh.customer_dc); const st = dcState[k] || _frStateOf(sh.customer_dc); return { dc: sh.customer_dc, state: st || null }; } const list = custDcs[_frNorm(_frCustShort(sh.customer))]; if (list && list.length === 1) return { dc: list[0].dc, state: list[0].state, inferred: true }; return { dc: null, state: null }; };
+    const ships = new Map(), unmatched = {};
+    for (const o of orders) {
+      const so = o.so_num || '(no SO)'; let sh = ships.get(so);
+      if (!sh) { sh = { so, customer: o.customer, customer_dc: o.customer_dc || null, ship: o.projected_ship_date, cases: 0, pallets: 0, weight: 0, lines: 0, missing: 0 }; ships.set(so, sh); }
+      if (o.customer_dc && !sh.customer_dc) sh.customer_dc = o.customer_dc;
+      sh.lines++; const cases = Number(o.cases_ordered) || 0; sh.cases += cases;
+      const cfg = cfgFor(o.sku);
+      if (cfg && cfg.cases_per_pallet) { sh.pallets += cases / Number(cfg.cases_per_pallet); sh.weight += cases * (Number(cfg.case_weight) || 0); }
+      else { sh.missing++; unmatched[o.sku] = (unmatched[o.sku] || 0) + 1; }
+      if (o.projected_ship_date && (!sh.ship || o.projected_ship_date < sh.ship)) sh.ship = o.projected_ship_date;
+    }
+    const shipments = [...ships.values()].map(sh => { const d = resolveDest(sh); sh.dc = d.dc; sh.state = d.state; sh.lane = sh.state ? stateToLane[sh.state] : null; sh.resolved = !!(sh.state && sh.lane); sh.plan = Math.ceil(sh.pallets - 1e-9); sh.dedicated = /c&s|c and s|target/i.test(sh.customer || ''); return sh; });
+    const dedicated = [], needsDc = [], pool = [];
+    for (const sh of shipments) { if (sh.dedicated) { if (sh.resolved) dedicated.push(sh); else needsDc.push(sh); } else if (sh.resolved) pool.push(sh); else needsDc.push(sh); }
+    const avoid = new Set(['FL|WA', 'CA|FL', 'FL|OR', 'AZ|FL', 'CA|TX', 'AZ|TX', 'OR|TX', 'TX|WA']);
+    const pk = (a, b) => [a, b].sort().join('|');
+    const dayDiff = (a, b) => { if (!a || !b) return 0; return Math.abs((new Date(a) - new Date(b)) / 86400000); };
+    const stopKey = sh => _frDcKey(sh.dc || (_frCustShort(sh.customer) + ' ' + (sh.state || '')));
+    const byLane = {}; pool.forEach(sh => { const k = sh.lane.no; (byLane[k] = byLane[k] || []).push(sh); });
+    const trucks = [];
+    Object.values(byLane).forEach(group => {
+      group.sort((a, b) => (a.ship || '9999').localeCompare(b.ship || '9999') || b.plan - a.plan);
+      const open = [];
+      for (const sh of group) {
+        const skey = stopKey(sh); let placed = false;
+        for (const t of open) {
+          if (t.plan + sh.plan > maxPlt) continue;
+          if (t.weight + sh.weight > maxWt) continue;
+          const existing = t.stops.find(st => st.key === skey);
+          if (!existing && t.stops.length >= maxStops) continue;
+          const nMin = (t.minShip && sh.ship) ? (sh.ship < t.minShip ? sh.ship : t.minShip) : (t.minShip || sh.ship);
+          const nMax = (t.maxShip && sh.ship) ? (sh.ship > t.maxShip ? sh.ship : t.maxShip) : (t.maxShip || sh.ship);
+          if (dayDiff(nMin, nMax) > windowDays) continue;
+          let bad = false; if (sh.state) for (const st of t.states) { if (st !== sh.state && avoid.has(pk(st, sh.state))) { bad = true; break; } } if (bad) continue;
+          if (existing) { existing.plan += sh.plan; existing.weight += sh.weight; existing.ships.push(sh.so); }
+          else t.stops.push({ key: skey, dc: sh.dc, customer: sh.customer, state: sh.state, plan: sh.plan, weight: sh.weight, ships: [sh.so] });
+          t.plan += sh.plan; t.weight += sh.weight; t.states.add(sh.state); t.minShip = nMin; t.maxShip = nMax; t._miss = t._miss || !!sh.missing; placed = true; break;
+        }
+        if (!placed) open.push({ lane: sh.lane, plan: sh.plan, weight: sh.weight, stops: [{ key: skey, dc: sh.dc, customer: sh.customer, state: sh.state, plan: sh.plan, weight: sh.weight, ships: [sh.so] }], states: new Set([sh.state]), minShip: sh.ship, maxShip: sh.ship, _miss: !!sh.missing });
+      }
+      open.forEach(t => trucks.push(t));
+    });
+    const ftl = [], ltl = [];
+    trucks.forEach(t => { const flags = []; if (t.plan > maxPlt) flags.push('over pallet cap'); if (t.weight > maxWt) flags.push('over weight'); if (t._miss) flags.push('missing item config'); t.flags = flags; if (t.plan >= ftlMin) t.mode = 'FTL'; else if (t.plan <= ltlMax) t.mode = 'LTL'; else t.mode = 'Review'; if (t.mode === 'LTL') ltl.push(t); else ftl.push(t); });
+    const totals = shipments.reduce((a, sh) => { a.plan += sh.plan; a.weight += sh.weight; return a; }, { plan: 0, weight: 0 });
+    return { trucks: ftl, ltl, dedicated, needsDc, unmatched, totals, shipments };
+  }
   function _frHoursSummary(row) {
     if (row && row.notes) return row.notes;
     const h = row && row.hours; if (!h) return null;
