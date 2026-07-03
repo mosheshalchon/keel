@@ -47262,7 +47262,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div>
       <div class="eyebrow" style="margin-top:20px;color:var(--ink-3);">Inputs</div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:6px 0 0;flex-wrap:wrap;">
-        ${tab('customers', 'Customer/3PL')}${tab('items', 'Items')}${tab('orders', 'Order Data')}${tab('output', 'Output')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('assumptions', 'Assumptions')}
+        ${tab('customers', 'Customer/3PL')}${tab('items', 'Items')}${tab('orders', 'Order Data')}${tab('test', 'Test Orders')}${tab('output', 'Output')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('assumptions', 'Assumptions')}
       </div>
       <div id="hl-fr-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>`;
 
@@ -47336,16 +47336,31 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const trs = data.map(r => `<tr data-s="${escapeHtml([r.customer, r.sku, r.status].filter(Boolean).join(' ').toLowerCase())}">${td(r.po_date)}${td(r.projected_ship_date)}${td(r.customer)}${td(r.sku)}${td(r.status)}${td(r.cases_ordered, true)}${td(money(r.case_price, true), true)}${td(money(r.sales, false), true)}</tr>`).join('');
         body.innerHTML = _frSearchBox('hl-fr-search-orders', 'orders', 'Search customer, item, status…') + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
         _frWireSearch(body, 'hl-fr-search-orders', 'orders');
+      } else if (_frSubTab === 'test') {
+        const { data } = await sb.from('freight_orders_test').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: false }).limit(1000);
+        const rows = data || [];
+        const banner = `<div style="background:rgba(46,125,50,0.07);border:1px solid rgba(46,125,50,0.3);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:var(--sans);font-size:12px;line-height:1.5;">Test data from the workbook's <b>Ordering Data</b> tab — it carries real ship-to DCs (column E), so the optimizer can route it end-to-end. Loaded into a separate table; your live feed and Order Data tab are untouched. Then open <b>Output</b> and switch its source to <b>Test</b>.</div>`;
+        const upBtn = `<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;"><input type="file" id="hl-fr-test-file" accept=".xlsx,.xls" style="display:none;" /><button class="hl-btn-primary" id="hl-fr-test-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load Ordering Data (from logistics workbook)</button><span id="hl-fr-test-msg" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${rows.length ? rows.length + ' pending test orders loaded' : 'no test orders yet'}</span></div>`;
+        const head = ['Customer', 'Customer DC', 'Origin', 'Proj Ship', 'Item', 'Cases', 'Status'].map((h, i) => th(h, i === 5)).join('');
+        const trs = rows.map(r => `<tr data-s="${escapeHtml([r.customer, r.customer_dc, r.sku].filter(Boolean).join(' ').toLowerCase())}">${td(_frCustShort(r.customer))}${td(r.customer_dc)}${td(r.location)}${td(r.projected_ship_date)}${td(r.sku)}${td(r.cases_ordered, true)}${td(r.status)}</tr>`).join('');
+        body.innerHTML = banner + upBtn + (rows.length ? (_frSearchBox('hl-fr-search-test', 'test', 'Search customer, DC, item…') + wrap(head, trs, `${rows.length} rows (Pending Fulfillment, real DCs)`)) : `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No test orders yet — click "Load Ordering Data" and pick the logistics workbook.</div>`);
+        const fi = document.getElementById('hl-fr-test-file'); const btn = document.getElementById('hl-fr-test-btn'); const msg = document.getElementById('hl-fr-test-msg');
+        btn.addEventListener('click', () => fi.click());
+        fi.addEventListener('change', async e => { const f = (e.target.files || [])[0]; if (!f) return; msg.textContent = 'Reading…'; try { const res = await _frUploadTestOrders(f, brandId, sb, m => { msg.textContent = m; }); msg.textContent = res.pending_loaded + ' loaded'; setTimeout(() => _frRenderTab(brandId, sb), 700); } catch (err) { msg.textContent = 'Failed: ' + (err.message || 'error'); } fi.value = ''; });
+        if (rows.length) _frWireSearch(body, 'hl-fr-search-test', 'test');
       } else if (_frSubTab === 'output') {
+        const src = _frSource === 'test' ? 'freight_orders_test' : 'freight_orders';
         const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }] = await Promise.all([
-          sb.from('freight_orders').select('*').eq('brand_id', brandId),
+          sb.from(src).select('*').eq('brand_id', brandId),
           sb.from('freight_items').select('item_description,cases_per_pallet,case_weight').eq('brand_id', brandId),
           sb.from('freight_item_map').select('order_item,item_description').eq('brand_id', brandId),
           sb.from('freight_customers').select('customer,dc_name,address,service_type').eq('brand_id', brandId),
           sb.from('freight_lanes').select('kind,lane_no,lane_name,states').eq('brand_id', brandId)
         ]);
         const s = await _frLoadSettings(brandId, sb);
-        if (!orders || !orders.length) { body.innerHTML = empty('orders — run the daily sync first'); return; }
+        const srcToggle = `<div style="margin-bottom:14px;display:flex;gap:8px;align-items:center;"><span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Source:</span>${['live', 'test'].map(v => `<button class="hl-fr-src" data-src="${v}" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border-radius:4px;cursor:pointer;border:1px solid var(--rule-soft);${_frSource === v ? 'background:var(--ink);color:var(--paper);' : 'background:transparent;color:var(--ink-3);'}">${v === 'live' ? 'Live sync' : 'Test (Ordering Data)'}</button>`).join('')}</div>`;
+        const wireSrc = () => body.querySelectorAll('.hl-fr-src').forEach(b => b.addEventListener('click', () => { _frSource = b.dataset.src; _frRenderTab(brandId, sb); }));
+        if (!orders || !orders.length) { body.innerHTML = srcToggle + `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">${_frSource === 'test' ? 'No test orders — load them in the Test Orders tab.' : 'No orders — run the daily sync first.'}</div>`; wireSrc(); return; }
         const P = _frPlan(orders, items, mapRows, s, customers, lanes);
         const money = n => Math.round(n).toLocaleString();
         const card = (label, val, sub) => `<div style="border:1px solid var(--rule-soft);border-radius:6px;padding:12px 14px;min-width:112px;"><div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">${label}</div><div style="font-family:var(--serif);font-size:20px;margin-top:2px;">${val}</div>${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}</div>`;
@@ -47359,7 +47374,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const dedRows = P.dedicated.map(sh => `<tr>${td(sh.so)}${td(_frCustShort(sh.customer))}${td(sh.dc)}${td(sh.ship)}${td(sh.plan, true)}${td(money(sh.weight), true)}</tr>`).join('');
         const needRows = P.needsDc.map(sh => `<tr data-s="${escapeHtml((sh.customer || '').toLowerCase())}">${td(sh.so)}${td(_frCustShort(sh.customer))}${td(sh.ship)}${td(sh.plan, true)}${td(money(sh.weight), true)}${td(sh.dedicated ? 'dedicated' : (sh.missing ? 'missing item' : ''))}</tr>`).join('');
         const missList = Object.entries(P.unmatched).sort((a, b) => b[1] - a[1]);
-        body.innerHTML = `
+        body.innerHTML = srcToggle + `
           <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
             ${card('FTL trucks', P.trucks.length)}${card('LTL', P.ltl.length)}${card('Dedicated', P.dedicated.length)}${card('Planning pallets', P.totals.plan)}${card('Total weight', money(P.totals.weight) + ' lb')}${card('Needs DC', P.needsDc.length, 'awaiting ship-to')}
           </div>
@@ -47371,6 +47386,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${P.needsDc.length ? `<div style="font-family:var(--serif);font-size:16px;margin:24px 0 8px;">Needs ship-to DC (${P.needsDc.length})</div>${_frSearchBox('hl-fr-search-output', 'output', 'Search customer…')}${listTable(needRows, ['SO #', 'Customer', 'Proj Ship', 'Plan plt', 'Weight (lb)', 'Note'].map((h, i) => th(h, i >= 3 && i <= 4)).join(''))}` : ''}
           ${missList.length ? `<div style="margin-top:22px;"><div style="font-family:var(--serif);font-size:15px;margin-bottom:4px;">Missing item config (${missList.length})</div>${missList.map(([k, v]) => `<div style="font-family:var(--sans);font-size:12px;">&bull; ${escapeHtml(k)} <span style="color:var(--ink-3);">(${v} lines)</span></div>`).join('')}</div>` : ''}`;
         _frWireSearch(body, 'hl-fr-search-output', 'output');
+        wireSrc();
       } else if (_frSubTab === 'dock') {
         const [{ data: custData }, { data: dockData }] = await Promise.all([
           sb.from('freight_customers').select('customer,dc_name,service_type,dock_hours').eq('brand_id', brandId).order('customer'),
@@ -47458,7 +47474,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
   }
   let _frShowPickup = false;
-  let _frSearch = { customers: '', dock: '', items: '', orders: '', output: '' };
+  let _frSearch = { customers: '', dock: '', items: '', orders: '', output: '', test: '' };
+  let _frSource = 'live';
   function _frSearchBox(id, key, placeholder) {
     return `<input type="text" id="${id}" value="${(_frSearch[key] || '').replace(/"/g, '&quot;')}" placeholder="${placeholder}" style="width:100%;max-width:340px;padding:8px 12px;margin-bottom:12px;border:1px solid var(--rule-soft);border-radius:4px;font-family:var(--sans);font-size:13px;background:var(--paper);color:var(--ink);" />`;
   }
@@ -47548,6 +47565,27 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     try { const { data } = await sb.from('freight_settings').select('settings').eq('brand_id', brandId).maybeSingle(); _frSettingsCache = Object.assign({}, _frDefaults(), (data && data.settings) || {}); }
     catch (e) { _frSettingsCache = _frDefaults(); }
     return _frSettingsCache;
+  }
+
+  async function _frUploadTestOrders(file, brandId, sb, onMsg) {
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type: 'array', cellDates: true });
+    const key = wb.SheetNames.find(n => n.trim().toLowerCase() === 'ordering data');
+    if (!key) throw new Error('No "Ordering Data" sheet in this workbook');
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[key], { header: 1, defval: '' });
+    const h = (rows[0] || []).map(x => String(x).trim().toLowerCase());
+    const col = n => h.findIndex(x => x.includes(n));
+    const ci = { so: col('netsuite so'), po: col('customer po'), cust: h.findIndex(x => x === 'customer'), dc: col('customer dc'), pod: col('po order date'), psd: col('projected ship'), sku: col('sku'), cases: col('cases ordered'), uom: col('uom'), sales: col('sales'), loc: col('location'), status: col('status'), qf: col('fulfilled') };
+    const recs = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i]; const status = _frClean(r[ci.status]);
+      if (!status || status.toLowerCase() !== 'pending fulfillment') continue;
+      recs.push({ brand_id: brandId, so_num: _frClean(r[ci.so]), po_num: _frClean(r[ci.po]), customer: _frClean(r[ci.cust]), customer_dc: _frClean(r[ci.dc]), po_date: _frDate(r[ci.pod]), projected_ship_date: _frDate(r[ci.psd]), sku: _frClean(r[ci.sku]), cases_ordered: _frNum(r[ci.cases]), uom: _frClean(r[ci.uom]), sales: _frNum(r[ci.sales]), location: _frClean(r[ci.loc]), status: status, qty_fulfilled: _frNum(r[ci.qf]) });
+    }
+    if (onMsg) onMsg(`Loading ${recs.length} pending test orders…`);
+    const del = await sb.from('freight_orders_test').delete().eq('brand_id', brandId); if (del.error) throw new Error(del.error.message);
+    for (let i = 0; i < recs.length; i += 500) { const { error } = await sb.from('freight_orders_test').insert(recs.slice(i, i + 500)); if (error) throw new Error(error.message); }
+    return { pending_loaded: recs.length };
   }
 
   async function _frUploadWorkbook(file, brandId, sb, onMsg) {
