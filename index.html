@@ -47262,7 +47262,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div>
       <div class="eyebrow" style="margin-top:20px;color:var(--ink-3);">Inputs</div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:6px 0 0;flex-wrap:wrap;">
-        ${tab('customers', 'Customers')}${tab('items', 'Items')}${tab('orders', 'Order Data')}${tab('3pl', '3PL')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('assumptions', 'Assumptions')}
+        ${tab('customers', 'Customer/3PL')}${tab('items', 'Items')}${tab('orders', 'Order Data')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('assumptions', 'Assumptions')}
       </div>
       <div id="hl-fr-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>`;
 
@@ -47302,19 +47302,23 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
     try {
       if (_frSubTab === 'customers') {
-        const [{ data: custData }, { data: dockData }] = await Promise.all([
+        const [{ data: custData }, { data: dockData }, { data: tplData }] = await Promise.all([
           sb.from('freight_customers').select('*').eq('brand_id', brandId).order('customer'),
-          sb.from('freight_dock_hours').select('dc_name,hours,notes,source').eq('brand_id', brandId)
+          sb.from('freight_dock_hours').select('dc_name,hours,notes,source').eq('brand_id', brandId),
+          sb.from('freight_3pl').select('*').eq('brand_id', brandId).order('customer')
         ]);
         let rows = custData || [];
         const dockMap = {}; (dockData || []).forEach(d => { if (d.dc_name) dockMap[String(d.dc_name).trim().toLowerCase()] = d; });
-        const dockOf = r => { const d = r.dc_name ? dockMap[String(r.dc_name).trim().toLowerCase()] : null; return d ? _frHoursSummary(d) : null; };
+        // customer's own dock hours win; otherwise resolve the DC from the Dock Hours tab (KeHE / UNFI)
+        const dockOf = r => { if (r.dock_hours) return r.dock_hours; const d = r.dc_name ? dockMap[String(r.dc_name).trim().toLowerCase()] : null; return d ? _frHoursSummary(d) : null; };
         const showPickup = _frShowPickup;
-        const filtered = rows.filter(r => (r.service_type || '').toLowerCase() !== 'not servicing' && (showPickup || (r.service_type || '').toLowerCase().includes('deliver')));
-        if (!rows.length) { body.innerHTML = empty('customers'); return; }
-        const head = ['Customer', 'DC Name', 'Address', 'Service', 'Dock Hours', 'Transit (days)'].map(h => th(h)).join('');
-        const trs = filtered.map(r => `<tr>${td(r.customer)}${td(r.dc_name)}${td(r.address)}${td(r.service_type)}${td(dockOf(r))}${td(r.transit_times, true)}</tr>`).join('');
-        body.innerHTML = `<div style="margin-bottom:10px;"><label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);cursor:pointer;"><input type="checkbox" id="hl-fr-pickup" ${showPickup ? 'checked' : ''} style="vertical-align:middle;margin-right:6px;">Show pickup customers (calc uses Delivered only)</label></div>` + wrap(head, trs, `${filtered.length} of ${rows.length} customers shown &middot; "Not Servicing" hidden &middot; dock hours resolved from the Dock Hours tab`);
+        const custRows = rows.filter(r => { const s = (r.service_type || '').toLowerCase(); if (s === 'not servicing' || s === '3pl') return false; return showPickup || s.includes('deliver'); });
+        const tplRows = (tplData || []).map(r => ({ customer: r.customer, dc_name: r.threepl, address: r.address, service_type: '3PL', dock_hours: null }));
+        const all = custRows.concat(tplRows);
+        if (!all.length) { body.innerHTML = empty('customers'); return; }
+        const head = ['Customer', 'DC / 3PL', 'Address', 'Service', 'Dock Hours', 'Transit (days)'].map(h => th(h)).join('');
+        const trs = all.map(r => `<tr>${td(r.customer)}${td(r.dc_name)}${td(r.address)}${td(r.service_type)}${td(dockOf(r))}${td(r.transit_times, true)}</tr>`).join('');
+        body.innerHTML = `<div style="margin-bottom:10px;"><label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);cursor:pointer;"><input type="checkbox" id="hl-fr-pickup" ${showPickup ? 'checked' : ''} style="vertical-align:middle;margin-right:6px;">Show pickup customers (calc uses Delivered only)</label></div>` + wrap(head, trs, `${custRows.length} delivered/pickup + ${tplRows.length} 3PL &middot; "Not Servicing" hidden &middot; dock hours from the row's own info or the Dock Hours tab`);
         const cb = document.getElementById('hl-fr-pickup'); if (cb) cb.addEventListener('change', () => { _frShowPickup = cb.checked; _frRenderTab(brandId, sb); });
       } else if (_frSubTab === 'items') {
         const { data } = await sb.from('freight_items').select('*').eq('brand_id', brandId).order('item_description');
@@ -47328,12 +47332,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const head = ['Customer', 'DC', 'PO Date', 'Proj Ship', 'SKU', 'Cases', 'Sales', 'OH', 'Avail', 'Status'].map((h, i) => th(h, i === 5 || i === 6 || i === 7 || i === 8)).join('');
         const trs = data.map(r => `<tr>${td(r.customer)}${td(r.customer_dc)}${td(r.po_date)}${td(r.projected_ship_date)}${td(r.sku)}${td(r.cases_ordered, true)}${td(r.sales != null ? '$' + Math.round(r.sales).toLocaleString() : null, true)}${td(r.on_hand, true)}${td(r.available, true)}${td(r.status)}</tr>`).join('');
         body.innerHTML = wrap(head, trs, `Showing latest ${data.length} order lines (most recent projected ship first)`);
-      } else if (_frSubTab === '3pl') {
-        const { data } = await sb.from('freight_3pl').select('*').eq('brand_id', brandId).order('customer');
-        if (!data || !data.length) { body.innerHTML = empty('3PL locations'); return; }
-        const head = ['Customer', '3PL', 'Address'].map(h => th(h)).join('');
-        const trs = data.map(r => `<tr>${td(r.customer)}${td(r.threepl)}${td(r.address)}</tr>`).join('');
-        body.innerHTML = wrap(head, trs, `${data.length} 3PL locations`);
       } else if (_frSubTab === 'dock') {
         const { data } = await sb.from('freight_dock_hours').select('*').eq('brand_id', brandId).order('source').order('dc_name');
         if (!data || !data.length) { body.innerHTML = empty('dock hours'); return; }
