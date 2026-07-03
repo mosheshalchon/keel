@@ -5068,6 +5068,7 @@ HL.NAV_ITEMS = [
   { id: 'distribution',    label: 'Distributors',    href: './distribution.html' },
   { id: 'mrp',             label: 'Procurement',   href: './mrp.html' },
   { id: 'production',      label: 'Production',   href: './production.html' },
+  { id: 'freight',         label: 'Freight',      href: './freight.html' },
   { id: 'finance',         label: 'Finance',         href: './finance.html' },
   { id: 'settings',        label: 'Settings',        href: './settings.html' },
 ];
@@ -5081,7 +5082,7 @@ HL.NAV_GROUPS = [
   { type: 'item',  id: 'ask-keel' },
   { type: 'item',  id: 'brand-library' },
   { type: 'group', label: 'Sales',      children: ['retailer-library', 'timeline', 'submission-docs', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
-  { type: 'group', label: 'Operations', children: ['distribution', 'mrp', 'production'] },
+  { type: 'group', label: 'Operations', children: ['distribution', 'mrp', 'production', 'freight'] },
   { type: 'item',  id: 'finance' },
   { type: 'item',  id: 'settings' },
 ];
@@ -47234,6 +47235,302 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
   }
 
+  // ===================== FREIGHT TOOL (Phase 1: Inputs) =====================
+  let _frSubTab = 'customers';
+  const _frClean = (v) => { if (v == null) return null; let s = String(v).replace(/_x000D_/g, ' ').replace(/[\r\n]+/g, ' ').replace(/\u00a0/g, ' ').trim(); return s === '' ? null : s; };
+  const _frNum = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : null; };
+  const _frDate = (v) => { if (v == null || v === '') return null; if (v instanceof Date) return v.toISOString().slice(0, 10); const s = String(v); let m = s.match(/(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`; m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`; return null; };
+
+  function renderFreightPage() {
+    const session = HL.mountPage('freight');
+    if (!session) return;
+    const main = document.getElementById('main-content');
+    const brandId = session.brandId || (window.Auth && window.Auth.brandId) || 'humanco';
+    const sb = window.Auth.getClient();
+    const tab = (id, label) => `<button class="hl-fr-tab" data-frsubtab="${id}" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;color:${_frSubTab === id ? 'var(--ink)' : 'var(--ink-3)'};text-transform:uppercase;padding:10px 16px;cursor:pointer;${_frSubTab === id ? 'border-bottom:2px solid var(--ink);font-weight:600;' : 'font-weight:400;'}">${label}</button>`;
+    main.innerHTML = `
+      <div class="eyebrow">— Operations</div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;">
+        <div>
+          <h1 class="page-title">Freight.</h1>
+          <p class="page-meta">Weekly outbound frozen freight from Brattleboro, VT — inputs today; truck-build optimization to follow.</p>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input type="file" id="hl-fr-upload" accept=".xlsx,.xls" style="display:none;" />
+          <button class="hl-btn-primary" id="hl-fr-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload logistics workbook</button>
+        </div>
+      </div>
+      <div class="eyebrow" style="margin-top:20px;color:var(--ink-3);">Inputs</div>
+      <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:6px 0 0;flex-wrap:wrap;">
+        ${tab('customers', 'Customers')}${tab('items', 'Items')}${tab('orders', 'Order Data')}${tab('3pl', '3PL')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('assumptions', 'Assumptions')}
+      </div>
+      <div id="hl-fr-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>`;
+
+    main.querySelectorAll('.hl-fr-tab').forEach(btn => btn.addEventListener('click', () => { _frSubTab = btn.dataset.frsubtab; renderFreightPage(); }));
+
+    const fi = document.getElementById('hl-fr-upload');
+    document.getElementById('hl-fr-upload-btn').addEventListener('click', () => fi.click());
+    fi.addEventListener('change', async (e) => {
+      const file = (e.target.files || [])[0]; if (!file) return;
+      const body = document.getElementById('hl-fr-body');
+      body.innerHTML = `<div class="hl-loading">Reading “${escapeHtml(file.name)}”…</div>`;
+      try {
+        const res = await _frUploadWorkbook(file, brandId, sb, (msg) => { body.innerHTML = `<div class="hl-loading">${escapeHtml(msg)}</div>`; });
+        console.log('[Freight upload]', res);
+        body.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;">
+          <div style="font-family:var(--serif);font-size:16px;">Logistics workbook loaded.</div>
+          <div style="margin-top:8px;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${Object.entries(res).map(([k, v]) => `${k}: ${v}`).join(' &middot; ')}</div></div>`;
+        setTimeout(() => renderFreightPage(), 900);
+      } catch (err) {
+        console.error('[Freight upload]', err);
+        body.innerHTML = `<div class="hl-empty" style="padding:28px;text-align:center;color:var(--lost);">Upload failed: ${escapeHtml(err.message || 'error')}</div>`;
+      }
+      fi.value = '';
+    });
+
+    _frRenderTab(brandId, sb);
+  }
+
+  async function _frRenderTab(brandId, sb) {
+    const body = document.getElementById('hl-fr-body');
+    if (!body) return;
+    body.innerHTML = `<div class="hl-loading">Loading…</div>`;
+    const th = (h, r) => `<th style="padding:7px 9px;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;text-align:${r ? 'right' : 'left'};border-bottom:2px solid var(--rule-soft);white-space:nowrap;">${escapeHtml(h)}</th>`;
+    const td = (v, r) => `<td style="padding:6px 9px;font-family:var(--sans);font-size:12px;text-align:${r ? 'right' : 'left'};border-top:1px solid var(--rule-soft);">${v == null || v === '' ? '<span style="color:var(--ink-3);">—</span>' : escapeHtml(String(v))}</td>`;
+    const wrap = (headHtml, rowsHtml, note) => `${note ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:8px;">${note}</div>` : ''}<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${headHtml}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
+    const empty = (what) => `<div class="hl-empty" style="padding:28px;text-align:center;color:var(--ink-3);">No ${what} yet. Use “+ Upload logistics workbook”.</div>`;
+
+    try {
+      if (_frSubTab === 'customers') {
+        const [{ data: custData }, { data: dockData }] = await Promise.all([
+          sb.from('freight_customers').select('*').eq('brand_id', brandId).order('customer'),
+          sb.from('freight_dock_hours').select('dc_name,hours,notes,source').eq('brand_id', brandId)
+        ]);
+        let rows = custData || [];
+        const dockMap = {}; (dockData || []).forEach(d => { if (d.dc_name) dockMap[String(d.dc_name).trim().toLowerCase()] = d; });
+        const dockOf = r => { const d = r.dc_name ? dockMap[String(r.dc_name).trim().toLowerCase()] : null; return d ? _frHoursSummary(d) : null; };
+        const showPickup = _frShowPickup;
+        const filtered = rows.filter(r => (r.service_type || '').toLowerCase() !== 'not servicing' && (showPickup || (r.service_type || '').toLowerCase().includes('deliver')));
+        if (!rows.length) { body.innerHTML = empty('customers'); return; }
+        const head = ['Customer', 'DC Name', 'Address', 'Service', 'Dock Hours', 'Transit (days)'].map(h => th(h)).join('');
+        const trs = filtered.map(r => `<tr>${td(r.customer)}${td(r.dc_name)}${td(r.address)}${td(r.service_type)}${td(dockOf(r))}${td(r.transit_times, true)}</tr>`).join('');
+        body.innerHTML = `<div style="margin-bottom:10px;"><label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);cursor:pointer;"><input type="checkbox" id="hl-fr-pickup" ${showPickup ? 'checked' : ''} style="vertical-align:middle;margin-right:6px;">Show pickup customers (calc uses Delivered only)</label></div>` + wrap(head, trs, `${filtered.length} of ${rows.length} customers shown &middot; "Not Servicing" hidden &middot; dock hours resolved from the Dock Hours tab`);
+        const cb = document.getElementById('hl-fr-pickup'); if (cb) cb.addEventListener('change', () => { _frShowPickup = cb.checked; _frRenderTab(brandId, sb); });
+      } else if (_frSubTab === 'items') {
+        const { data } = await sb.from('freight_items').select('*').eq('brand_id', brandId).order('item_description');
+        if (!data || !data.length) { body.innerHTML = empty('items'); return; }
+        const head = ['Item', 'UPC', 'Units/Case', 'Case L', 'Case W', 'Case H', 'Case Wt', 'Ti', 'Hi', 'Cases/Pallet'].map((h, i) => th(h, i >= 2)).join('');
+        const trs = data.map(r => `<tr>${td(r.item_description)}${td(r.unit_upc)}${td(r.units_per_case, true)}${td(r.case_length, true)}${td(r.case_width, true)}${td(r.case_height, true)}${td(r.case_weight, true)}${td(r.pallet_ti, true)}${td(r.pallet_hi, true)}${td(r.cases_per_pallet, true)}</tr>`).join('');
+        body.innerHTML = wrap(head, trs, `${data.length} items`);
+      } else if (_frSubTab === 'orders') {
+        const { data } = await sb.from('freight_orders').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: false }).limit(300);
+        if (!data || !data.length) { body.innerHTML = empty('orders'); return; }
+        const head = ['Customer', 'DC', 'PO Date', 'Proj Ship', 'SKU', 'Cases', 'Sales', 'OH', 'Avail', 'Status'].map((h, i) => th(h, i === 5 || i === 6 || i === 7 || i === 8)).join('');
+        const trs = data.map(r => `<tr>${td(r.customer)}${td(r.customer_dc)}${td(r.po_date)}${td(r.projected_ship_date)}${td(r.sku)}${td(r.cases_ordered, true)}${td(r.sales != null ? '$' + Math.round(r.sales).toLocaleString() : null, true)}${td(r.on_hand, true)}${td(r.available, true)}${td(r.status)}</tr>`).join('');
+        body.innerHTML = wrap(head, trs, `Showing latest ${data.length} order lines (most recent projected ship first)`);
+      } else if (_frSubTab === '3pl') {
+        const { data } = await sb.from('freight_3pl').select('*').eq('brand_id', brandId).order('customer');
+        if (!data || !data.length) { body.innerHTML = empty('3PL locations'); return; }
+        const head = ['Customer', '3PL', 'Address'].map(h => th(h)).join('');
+        const trs = data.map(r => `<tr>${td(r.customer)}${td(r.threepl)}${td(r.address)}</tr>`).join('');
+        body.innerHTML = wrap(head, trs, `${data.length} 3PL locations`);
+      } else if (_frSubTab === 'dock') {
+        const { data } = await sb.from('freight_dock_hours').select('*').eq('brand_id', brandId).order('source').order('dc_name');
+        if (!data || !data.length) { body.innerHTML = empty('dock hours'); return; }
+        const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+        const head = ['DC', 'Source', 'Hours', ...days].map((h, i) => th(h, i >= 3)).join('');
+        const fmt = (h, d) => { const o = (h || {})[d]; return o && (o.start || o.end) ? `${o.start || ''}–${o.end || ''}` : null; };
+        const trs = data.map(r => `<tr>${td(r.dc_name)}${td(r.source)}${td(_frHoursSummary(r))}${days.map(d => td(fmt(r.hours, d), true)).join('')}</tr>`).join('');
+        body.innerHTML = wrap(head, trs, `${data.length} DC dock windows — KeHE, UNFI, and customer-direct &middot; per-day start–end shown where available`);
+      } else if (_frSubTab === 'lanes') {
+        const { data } = await sb.from('freight_lanes').select('*').eq('brand_id', brandId).order('kind').order('lane_no');
+        const lanes = (data || []).filter(r => r.kind === 'lane');
+        const routes = (data || []).filter(r => r.kind === 'route_logic');
+        const laneHead = ['#', 'Lane', 'States'].map(h => th(h)).join('');
+        const laneTrs = lanes.map(r => `<tr>${td(r.lane_no)}${td(r.lane_name)}${td(r.states)}</tr>`).join('');
+        const rHead = ['Lane Path', 'Frequency', 'Avg Cost'].map((h, i) => th(h, i >= 1)).join('');
+        const rTrs = routes.map(r => `<tr>${td(r.route_path)}${td(r.frequency, true)}${td(r.avg_cost != null ? '$' + Math.round(r.avg_cost).toLocaleString() : null, true)}</tr>`).join('');
+        body.innerHTML = `<div style="font-family:var(--serif);font-size:15px;margin-bottom:8px;">Freight lanes</div>${wrap(laneHead, laneTrs)}
+          <div style="font-family:var(--serif);font-size:15px;margin:22px 0 8px;">Route logic — top multi-drop lanes (analyst history)</div>${routes.length ? wrap(rHead, rTrs) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">No route-logic rows yet — upload the workbook.</div>`}`;
+      } else if (_frSubTab === 'assumptions') {
+        const s = await _frLoadSettings(brandId, sb);
+        const field = (key, label, val, unit, hint) => `<div style="display:flex;flex-direction:column;gap:4px;">
+          <label style="font-family:var(--mono);font-size:10px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${label}${unit ? ` (${unit})` : ''}</label>
+          <input type="${typeof val === 'number' ? 'number' : 'text'}" data-frset="${key}" value="${val == null ? '' : String(val).replace(/"/g, '&quot;')}" style="padding:8px 10px;border:1px solid var(--rule-soft);border-radius:4px;font-family:var(--sans);font-size:13px;background:var(--paper);color:var(--ink);" />
+          ${hint ? `<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${hint}</span>` : ''}</div>`;
+        body.innerHTML = `
+          <div style="max-width:720px;">
+            <div style="font-family:var(--serif);font-size:15px;margin-bottom:4px;">Truck &amp; planning assumptions</div>
+            <p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:0 0 18px;">Seeded from the logistics file's “Truck / freight constraints” and “Business rules”. Editable here — the optimizer (later phases) reads these as its hard limits, thresholds, and scoring knobs.</p>
+            <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink);margin-bottom:10px;">Truck capacity</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:22px;">
+              ${field('truck_type', 'Truck type', s.truck_type, '', '')}
+              ${field('max_stops', 'Max stops', s.max_stops, 'stops', 'Incl. final drop')}
+              ${field('max_pallets', 'Max pallets', s.max_pallets, 'pallets', 'Hard cap per FTL')}
+              ${field('max_weight', 'Max weight', s.max_weight, 'lbs', 'No overweight allowed')}
+              ${field('cube', 'Cube', s.cube, 'cu ft', 'Optional — leave blank to ignore')}
+            </div>
+            <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink);margin-bottom:10px;">Consolidation &amp; LTL</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:22px;">
+              ${field('ftl_min_pallets', 'FTL crossover', s.ftl_min_pallets, 'pallets', 'FTL cheaper than LTL above ~this')}
+              ${field('ltl_max_pallets', 'LTL threshold', s.ltl_max_pallets, 'pallets', 'Small drops that deviate → LTL')}
+              ${field('date_window_days', 'Delivery-date window', s.date_window_days, 'days', 'Max ship-date spread to combine (~1)')}
+              ${field('unload_hours', 'Unload time per stop', s.unload_hours, 'hours', 'For dock-hour feasibility (2–5)')}
+              ${field('stop_transit_days', 'Added-stop transit', s.stop_transit_days, 'days', 'X, then X+n per extra stop')}
+            </div>
+            <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink);margin-bottom:10px;">Fees &amp; penalties</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:22px;">
+              ${field('stop_fee', 'Stop-off fee', s.stop_fee, '$', 'Per extra stop')}
+              ${field('missed_delivery_fee', 'Missed delivery', s.missed_delivery_fee, '$', '+ reschedule 48h')}
+              ${field('late_fee', 'Late fee', s.late_fee, '$', 'Per late order')}
+            </div>
+            <div style="display:flex;gap:12px;align-items:center;">
+              <button class="hl-btn-primary" id="hl-fr-save-set" style="background:var(--ink);color:var(--paper);border:none;">Save assumptions</button>
+              <button class="hl-btn-primary" id="hl-fr-reset-set" style="background:transparent;color:var(--ink-3);border:1px solid var(--rule-soft);">Reset to defaults</button>
+              <span id="hl-fr-set-msg" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);"></span>
+            </div>
+            <div style="margin-top:22px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.6;">Routing rules from the file become editable in the optimizer phase, where they're applied: always-FTL/dedicated — C&amp;S, Target; always-LTL — Gordon's; avoid-pairings — FL+WA, TX+CA, TX+AZ (off-corridor). No mixed temperature; no splitting orders across trucks; OTIF is a priority for all customers.</div>
+          </div>`;
+        const gather = () => { const o = {}; body.querySelectorAll('[data-frset]').forEach(el => { const k = el.dataset.frset; const v = el.value.trim(); if (v === '') { o[k] = null; return; } o[k] = (el.type === 'number') ? Number(v) : v; }); return o; };
+        const save = document.getElementById('hl-fr-save-set');
+        save.addEventListener('click', async () => {
+          const msg = document.getElementById('hl-fr-set-msg'); msg.textContent = 'Saving…';
+          try { const merged = Object.assign({}, _frDefaults(), gather()); const { error } = await sb.from('freight_settings').upsert({ brand_id: brandId, settings: merged, updated_at: new Date().toISOString() }, { onConflict: 'brand_id' }); if (error) throw error; _frSettingsCache = merged; msg.textContent = 'Saved.'; setTimeout(() => { if (msg) msg.textContent = ''; }, 2500); }
+          catch (err) { msg.textContent = 'Save failed: ' + (err.message || 'error'); }
+        });
+        document.getElementById('hl-fr-reset-set').addEventListener('click', () => { _frSettingsCache = null; const d = _frDefaults(); body.querySelectorAll('[data-frset]').forEach(el => { const v = d[el.dataset.frset]; el.value = v == null ? '' : v; }); });
+      }
+    } catch (err) {
+      body.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Could not load: ${escapeHtml(err.message || 'error')}</div>`;
+    }
+  }
+  let _frShowPickup = false;
+  let _frSettingsCache = null;
+  function _frDefaults() { return { truck_type: 'Frozen FTL Reefer', max_pallets: 28, max_weight: 40000, cube: null, max_stops: 3, stop_fee: 300, ftl_min_pallets: 15, ltl_max_pallets: 4, date_window_days: 1, unload_hours: 2, stop_transit_days: 1, missed_delivery_fee: 800, late_fee: 300 }; }
+  function _frHoursSummary(row) {
+    if (row && row.notes) return row.notes;
+    const h = row && row.hours; if (!h) return null;
+    const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']; const dd = { SUN: 'Sun', MON: 'Mon', TUE: 'Tue', WED: 'Wed', THU: 'Thu', FRI: 'Fri', SAT: 'Sat' };
+    const present = days.filter(d => h[d]); if (!present.length) return null;
+    const first = h[present[0]]; const idx = present.map(d => days.indexOf(d));
+    const contig = idx.every((v, i) => i === 0 || v === idx[i - 1] + 1);
+    const label = (contig && present.length > 1) ? `${dd[present[0]]}–${dd[present[present.length - 1]]}` : present.map(d => dd[d]).join(', ');
+    return `${label} ${first.start || ''}–${first.end || ''}`;
+  }
+  async function _frLoadSettings(brandId, sb) {
+    if (_frSettingsCache) return _frSettingsCache;
+    try { const { data } = await sb.from('freight_settings').select('settings').eq('brand_id', brandId).maybeSingle(); _frSettingsCache = Object.assign({}, _frDefaults(), (data && data.settings) || {}); }
+    catch (e) { _frSettingsCache = _frDefaults(); }
+    return _frSettingsCache;
+  }
+
+  async function _frUploadWorkbook(file, brandId, sb, onMsg) {
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type: 'array' });
+    const sheet = (name) => { const key = wb.SheetNames.find(n => n.trim().toLowerCase() === name.trim().toLowerCase()); return key ? XLSX.utils.sheet_to_json(wb.Sheets[key], { header: 1, defval: '' }) : null; };
+    const hrow = (rows, needles) => { for (let i = 0; i < Math.min(rows.length, 12); i++) { const low = (rows[i] || []).map(c => String(c).trim().toLowerCase()); if (needles.every(n => low.some(c => c.includes(n)))) return i; } return -1; };
+    const col = (hdr, name) => hdr.findIndex(h => String(h).trim().toLowerCase().includes(name));
+    const out = {};
+    const insertAll = async (table, rows) => { const C = 500; for (let i = 0; i < rows.length; i += C) { const { error } = await sb.from(table).insert(rows.slice(i, i + C)); if (error) throw new Error(`${table}: ${error.message}`); } };
+    const wipe = async (table) => { const { error } = await sb.from(table).delete().eq('brand_id', brandId); if (error) throw new Error(`${table} clear: ${error.message}`); };
+
+    // Customer Info
+    let rows = sheet('Customer Info');
+    if (rows) {
+      onMsg('Loading customers…');
+      const hi = hrow(rows, ['customer', 'service type']); const h = rows[hi];
+      const c = { cust: col(h, 'customer'), dc: col(h, 'dc name'), addr: col(h, 'address'), svc: col(h, 'service'), dock: col(h, 'dock'), transit: col(h, 'transit') };
+      const recs = [];
+      for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const cust = _frClean(r[c.cust]); if (!cust) continue; recs.push({ brand_id: brandId, customer: cust, dc_name: _frClean(r[c.dc]), address: _frClean(r[c.addr]), service_type: _frClean(r[c.svc]), dock_hours: _frClean(r[c.dock]), transit_times: _frClean(r[c.transit]) }); }
+      await wipe('freight_customers'); await insertAll('freight_customers', recs); out.customers = recs.length;
+    }
+    // Item Info
+    rows = sheet('Item Info');
+    if (rows) {
+      onMsg('Loading items…');
+      const hi = hrow(rows, ['item description', 'cases per pallet']); const h = rows[hi];
+      const c = { upc: col(h, 'unit upc'), desc: col(h, 'item description'), upc2: col(h, 'units per case'), cl: col(h, 'case length'), cw: col(h, 'case width'), ch: col(h, 'case height'), wt: col(h, 'case gross weight'), ti: col(h, 'pallet ti'), hi2: col(h, 'pallet hi'), cpp: col(h, 'cases per pallet') };
+      const recs = [];
+      for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const d = _frClean(r[c.desc]); if (!d) continue; recs.push({ brand_id: brandId, unit_upc: _frClean(r[c.upc]), item_description: d, units_per_case: _frNum(r[c.upc2]), case_length: _frNum(r[c.cl]), case_width: _frNum(r[c.cw]), case_height: _frNum(r[c.ch]), case_weight: _frNum(r[c.wt]), pallet_ti: _frNum(r[c.ti]), pallet_hi: _frNum(r[c.hi2]), cases_per_pallet: _frNum(r[c.cpp]) }); }
+      await wipe('freight_items'); await insertAll('freight_items', recs); out.items = recs.length;
+    }
+    // 3pl Info
+    rows = sheet('3pl Info');
+    if (rows) {
+      const hi = hrow(rows, ['customer', '3pl']); const h = rows[hi];
+      const c = { cust: col(h, 'customer'), tp: col(h, '3pl'), addr: col(h, 'address') };
+      const recs = [];
+      for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const cust = _frClean(r[c.cust]); if (!cust) continue; recs.push({ brand_id: brandId, customer: cust, threepl: _frClean(r[c.tp]), address: _frClean(r[c.addr]) }); }
+      await wipe('freight_3pl'); await insertAll('freight_3pl', recs); out['3pl'] = recs.length;
+    }
+    // Ship from
+    rows = sheet('Ship from');
+    if (rows) {
+      const hi = hrow(rows, ['name', 'address']); const h = rows[hi];
+      const c = { n: col(h, 'name'), a: col(h, 'address'), sh: col(h, 'shipping hours') };
+      const recs = [];
+      for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const n = _frClean(r[c.n]); if (!n) continue; recs.push({ brand_id: brandId, name: n, address: _frClean(r[c.a]), shipping_hours: _frClean(r[c.sh]) }); }
+      await wipe('freight_ship_from'); await insertAll('freight_ship_from', recs); out.ship_from = recs.length;
+    }
+    // KeHe Dock Hours (day columns)
+    const dockKey = wb.SheetNames.find(n => n.toLowerCase().includes('doc hour') || n.toLowerCase().includes('dock hour'));
+    if (dockKey && dockKey.toLowerCase().includes('kehe')) {
+      onMsg('Loading dock hours…');
+      const dr = XLSX.utils.sheet_to_json(wb.Sheets[dockKey], { header: 1, defval: '' });
+      // find the row that has DC + day names
+      let hi = -1; for (let i = 0; i < Math.min(dr.length, 6); i++) { const low = (dr[i] || []).map(c => String(c).trim().toLowerCase()); if (low.some(c => c === 'mon') || low.some(c => c.includes('dc'))) { hi = i; } if (low.some(c => c === 'mon')) break; }
+      // day header positions from the row containing MON
+      let dayRow = -1; for (let i = 0; i < Math.min(dr.length, 6); i++) { if ((dr[i] || []).map(c => String(c).trim().toUpperCase()).includes('MON')) { dayRow = i; break; } }
+      const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+      const dayCol = {}; if (dayRow >= 0) { const dh = dr[dayRow].map(c => String(c).trim().toUpperCase()); days.forEach(d => { const idx = dh.indexOf(d); if (idx >= 0) dayCol[d] = idx; }); }
+      const recs = [];
+      const startData = dayRow + 2; // start/end sub-header sits under day row
+      for (let i = startData; i < dr.length; i++) {
+        const r = dr[i]; const name = _frClean(r[1]); if (!name) continue;
+        const hours = {};
+        for (const d of days) { const cIdx = dayCol[d]; if (cIdx == null) continue; const s = _frClean(r[cIdx]); const e = _frClean(r[cIdx + 1]); if (s || e) hours[d] = { start: s, end: e }; }
+        recs.push({ brand_id: brandId, source: 'KeHE', dc_name: name, time_zone: _frClean(r[2]), hours });
+      }
+      await wipe('freight_dock_hours'); await insertAll('freight_dock_hours', recs); out.dock_hours = recs.length;
+    }
+    // HMB LTL Rates
+    rows = sheet('HMB Rates');
+    if (rows) {
+      const hi = hrow(rows, ['destination', 'pallet']); const h = rows[hi];
+      const palletCols = []; h.forEach((c, idx) => { const m = String(c).match(/(\d+)\s*pallet/i); if (m) palletCols.push({ n: Number(m[1]), idx }); });
+      const dIdx = col(h, 'destination');
+      const recs = [];
+      for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const dest = _frClean(r[dIdx]); if (!dest) continue; const rates = {}; palletCols.forEach(pc => { const v = _frNum(r[pc.idx]); if (v != null) rates[pc.n] = v; }); recs.push({ brand_id: brandId, destination: dest, rates }); }
+      await wipe('freight_ltl_rates'); await insertAll('freight_ltl_rates', recs); out.ltl_rates = recs.length;
+    }
+    // Route Logic (route rows only; keep the seeded lanes)
+    rows = sheet('Route Logic');
+    if (rows) {
+      const hi = hrow(rows, ['lane path', 'frequency']); if (hi >= 0) { const h = rows[hi]; const c = { p: col(h, 'lane path'), f: col(h, 'frequency'), cst: col(h, 'average cost') };
+        const recs = [];
+        for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const p = _frClean(r[c.p]); if (!p) continue; recs.push({ brand_id: brandId, kind: 'route_logic', route_path: p, frequency: _frNum(r[c.f]), avg_cost: _frNum(r[c.cst]) }); }
+        await sb.from('freight_lanes').delete().eq('brand_id', brandId).eq('kind', 'route_logic');
+        if (recs.length) await insertAll('freight_lanes', recs); out.route_logic = recs.length;
+      }
+    }
+    // Ordering Data (NetSuite) — chunked
+    rows = sheet('Ordering Data');
+    if (rows) {
+      const hi = hrow(rows, ['customer', 'sku', 'cases ordered']); const h = rows[hi];
+      const c = { iid: col(h, 'internal id'), so: col(h, 'netsuite so'), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled') };
+      const cust2 = c.cust; // 'Customer' (not 'Customer DC') — findIndex picks first match; 'customer dc' handled separately
+      const recs = [];
+      for (let i = hi + 1; i < rows.length; i++) {
+        const r = rows[i]; const cust = _frClean(r[cust2]); const sku = _frClean(r[c.sku]); if (!cust && !sku) continue;
+        recs.push({ brand_id: brandId, internal_id: _frClean(r[c.iid]), so_num: _frClean(r[c.so]), po_num: _frClean(r[c.po]), customer: cust, customer_dc: _frClean(r[c.dc]), po_date: _frDate(r[c.pod]), projected_ship_date: _frDate(r[c.psd]), actual_ship_date: _frDate(r[c.asd]), sku: sku, cases_ordered: _frNum(r[c.cases]), uom: _frClean(r[c.uom]), sales: _frNum(r[c.sales]), on_hand: _frNum(r[c.oh]), available: _frNum(r[c.avail]), status: _frClean(r[c.status]), qty_fulfilled: _frNum(r[c.qf]) });
+      }
+      onMsg(`Loading ${recs.length.toLocaleString()} order lines…`);
+      await wipe('freight_orders');
+      const C = 500; for (let i = 0; i < recs.length; i += C) { const { error } = await sb.from('freight_orders').insert(recs.slice(i, i + C)); if (error) throw new Error(`freight_orders: ${error.message}`); onMsg(`Saving orders ${Math.min(i + C, recs.length).toLocaleString()} / ${recs.length.toLocaleString()}…`); }
+      out.orders = recs.length;
+    }
+    return out;
+  }
   function renderProductionPage() {
     const session = HL.mountPage('production');
     if (!session) return;
@@ -47267,6 +47564,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     'distribution':    renderDistributionPage,
     'mrp':             renderMrpPage,
     'production':       renderProductionPage,
+    'freight':          renderFreightPage,
     'finance':         renderFinancePage,
     'insights':        renderInsightsPage,
     'sales-tools':     renderSalesToolsPage,
