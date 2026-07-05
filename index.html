@@ -47378,7 +47378,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const skuName = sku => _mo2[_frNorm(sku)] || sku;
         const skuUpc = sku => { const d = _mo2[_frNorm(sku)]; return d ? (_du[_frNorm(d)] || '') : ''; };
         const linesBySo = {}; orders.forEach(o => { const so = o.so_num || '(no SO)'; (linesBySo[so] = linesBySo[so] || []).push({ sku: o.sku, cases: Number(o.cases_ordered) || 0 }); });
-        const apprSet = new Set((apprv || []).filter(a => a.status === 'approved').map(a => a.signature));
+        const apprMap = {}; (apprv || []).forEach(a => { apprMap[a.signature] = a.status; });
         const sigOf = t => [...new Set(t.stops.flatMap(st => st.ships || []))].sort().join('|');
         const money = n => Math.round(n).toLocaleString();
         const card = (label, val, sub) => `<div style="border:1px solid var(--rule-soft);border-radius:6px;padding:12px 14px;min-width:112px;"><div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">${label}</div><div style="font-family:var(--serif);font-size:20px;margin-top:2px;">${val}</div>${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}</div>`;
@@ -47404,17 +47404,39 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const truckTable = (trucks) => {
           const head = ['#', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan plt', 'Weight (lb)', 'Util', 'Mode', 'Flags', 'Status'].map((h, i) => th(h, i >= 5 && i <= 7)).join('');
           const rows = trucks.map((t, i) => {
-            const id = 'r' + i; const sig = sigOf(t); const approved = apprSet.has(sig);
+            const id = 'r' + i; const sig = sigOf(t); const st8 = apprMap[sig] || '';
             const nLines = t.stops.reduce((a, st) => a + (st.ships || []).reduce((b, so) => b + (linesBySo[so] || []).length, 0), 0);
             const caret = `<button class="fr-exp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:11px;padding:0 5px 0 0;">&#9656; ${t.stops.length > 1 ? t.stops.length + ' stops · ' : ''}${nLines} items</button>`;
-            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><span class="fr-status" style="font-family:var(--mono);font-size:10px;font-weight:700;color:${approved ? '#2e7d32' : '#b8860b'};">${approved ? 'Approved' : 'Pending'}</span> <button class="fr-approve" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:3px;background:transparent;cursor:pointer;color:var(--ink);margin-left:4px;">${approved ? 'Undo' : 'Approve'}</button></td>`;
-            const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(i + 1)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}</td>${statusCell}</tr>`;
+            const stColor = st8 === 'approved' ? '#2e7d32' : st8 === 'rejected' ? 'var(--lost)' : st8 === 'hold' ? '#b8860b' : 'var(--ink-3)';
+            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${[['', 'Pending'], ['approved', 'Approved'], ['hold', 'Hold — consolidate'], ['rejected', 'Rejected'], ['change', 'Needs change']].map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select></td>`;
+            const oppNote = t.opp ? `<div style="color:#7c3aed;">&#9889; combine into #${t.opp.num} (${t.opp.ship}, +${t.opp.days}d) &rarr; ${t.opp.sum} plt · needs buyer date change</div>` : '';
+            const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(i + 1)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}${oppNote}</td>${statusCell}</tr>`;
             const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; return `<tr class="fr-det-${id}" style="display:none;background:rgba(0,0,0,0.02);">${dcell('')}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell('&#8627; ' + escapeHtml(st.dc || '') + ' · ' + escapeHtml(skuName(ln.sku)) + (skuUpc(ln.sku) ? ` <span style="color:var(--ink-3);">${escapeHtml(skuUpc(ln.sku))}</span>` : '') + (ll ? ` <span style="color:var(--ink-3);">· ${ll}</span>` : ''))}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}</tr>`; }))).join('');
             return main + det;
           }).join('');
           return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
         };
         const allTrucks = P.trucks.concat(P.dedicated, P.ltl).sort((a, b) => (a.minShip || '9999').localeCompare(b.minShip || '9999') || b.plan - a.plan);
+        allTrucks.forEach((t, ti) => { t._num = ti + 1; });
+        (() => {
+          const oppWin = Number(s.opp_window_days) || 7, mP = s.max_pallets || 28, mW = s.max_weight || 40000, mS = s.max_stops || 3, autoWin = s.date_window_days || 1;
+          const dd = (a, b) => (!a || !b) ? 999 : Math.abs((new Date(a) - new Date(b)) / 86400000);
+          allTrucks.forEach(t => {
+            if (t.mode === 'Dedicated') return;
+            const myDcs = new Set(t.stops.map(x => _frDcKey(x.dc)).filter(Boolean));
+            let best = null;
+            allTrucks.forEach(u => {
+              if (u === t || u.mode === 'Dedicated' || u.plan < t.plan) return;
+              const uDcs = new Set(u.stops.map(x => _frDcKey(x.dc)).filter(Boolean));
+              if (![...myDcs].some(d => uDcs.has(d))) return;
+              const gap = dd(t.minShip, u.minShip);
+              if (gap <= autoWin || gap > oppWin) return;
+              if (u.plan + t.plan <= mP && u.weight + t.weight <= mW && u.stops.length <= mS) { if (!best || u.plan > best.plan) best = u; }
+            });
+            if (best) t.opp = { num: best._num, ship: best.minShip, days: Math.round(dd(t.minShip, best.minShip)), sum: best.plan + t.plan, dc: [...new Set(t.stops.map(x => x.dc).filter(Boolean))][0] || '' };
+          });
+        })();
+        const oppCount = allTrucks.filter(t => t.opp).length;
         const modesPresent = [...new Set(allTrucks.map(t => t.mode))];
         const allShips = allTrucks.flatMap(t => t.stops).concat(P.manual, P.needsDc);
         const custOpts = [...new Set(allShips.map(x => _frCustShort(x.customer)).filter(Boolean))].sort();
@@ -47447,6 +47469,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             ${card('Pending cases', P.totals.cases.toLocaleString())}${card('FTL trucks', P.trucks.length)}${card('LTL', P.ltl.length)}${card('Dedicated', P.dedicated.length)}${card('Manual', P.manual.length)}${card('Planning pallets', P.totals.plan)}${card('Needs DC', P.needsDc.length, 'awaiting ship-to')}
           </div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;line-height:1.6;">Cases reconciliation — pending <b style="color:var(--ink);">${P.totals.cases.toLocaleString()}</b> = FTL ${P.totals.casesFTL.toLocaleString()} · LTL ${P.totals.casesLTL.toLocaleString()} · Dedicated ${P.totals.casesDed.toLocaleString()} · Manual ${P.totals.casesManual.toLocaleString()} · Needs-DC ${P.totals.casesNeed.toLocaleString()}${P.totals.casesMissing ? ` &nbsp;|&nbsp; <span style="color:#b8860b;">⚠ ${P.totals.casesMissing.toLocaleString()} cases with no item config</span>` : ''}</div>
+          ${oppCount ? `<div style="background:rgba(124,58,237,0.07);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:var(--sans);font-size:12px;line-height:1.5;color:var(--ink);">&#9889; <b>${oppCount} consolidation ${oppCount === 1 ? 'opportunity' : 'opportunities'}.</b> A small truck ships to the same DC as a fuller truck within ${s.opp_window_days || 7} days and would fit on it — waiting to combine saves a truck, but needs the buyer to approve a delivery-date change. Flagged in the plan below (⚡) with the target truck; set that truck's status to <b>Hold — consolidate</b> to park it for buyer sign-off.</div>` : ''}
           ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — switch Source to <b>Test (Ordering Data)</b> to see them route, or add the DC column to the live feed.</div>` : ''}
           <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Truck plan (${allTrucks.length})</div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Orders combine onto one truck only when their projected ship dates fall within ${s.date_window_days || 1} day(s) of each other, and never exceed ${s.max_pallets || 28} pallets / ${money(s.max_weight || 40000)} lb / ${s.max_stops || 3} stops. Mode: <b>FTL</b> ≥ ${s.ftl_min_pallets || 15} plt · <b>LTL</b> ≤ ${s.ltl_max_pallets || 4} plt · <b>Review</b> in between · <b>Dedicated</b> = C&amp;S / Target. Expand multi-stop trucks with the ▸ toggle.</div>
@@ -47493,26 +47516,27 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           body.querySelectorAll('.fr-det-' + b.dataset.tid).forEach(r => { r.style.display = open ? 'none' : ''; });
           b.textContent = (open ? '▸' : '▾') + b.textContent.trim().slice(1);
         }));
-        body.querySelectorAll('.fr-approve').forEach(btn => btn.addEventListener('click', async () => {
-          const sig = btn.dataset.sig; const nowApproved = btn.textContent.trim() === 'Approve';
-          btn.disabled = true;
+        body.querySelectorAll('.fr-status-sel').forEach(sel => sel.addEventListener('change', async () => {
+          const sig = sel.dataset.sig; const val = sel.value;
+          const colors = { approved: '#2e7d32', rejected: 'var(--lost)', hold: '#b8860b' };
+          sel.disabled = true;
           try {
-            if (nowApproved) { await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: sig, status: 'approved', updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' }); }
-            else { await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', sig); }
-            const row = btn.closest('tr'); const st = row.querySelector('.fr-status');
-            st.textContent = nowApproved ? 'Approved' : 'Pending'; st.style.color = nowApproved ? '#2e7d32' : '#b8860b';
-            btn.textContent = nowApproved ? 'Undo' : 'Approve';
-          } catch (e) { alert('Could not save approval: ' + (e.message || e)); }
-          btn.disabled = false;
+            if (!val) { await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', sig); }
+            else { await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: sig, status: val, updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' }); }
+            sel.style.color = colors[val] || 'var(--ink-3)';
+          } catch (e) { alert('Could not save: ' + (e.message || e)); }
+          sel.disabled = false;
         }));
         const dlBtn = document.getElementById('hl-fr-dl');
         if (dlBtn) dlBtn.addEventListener('click', () => {
           const esc = v => { const x = v == null ? '' : String(v); return /[",\n]/.test(x) ? '"' + x.replace(/"/g, '""') + '"' : x; };
-          const hdr = ['#', 'Mode', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan pallets', 'Weight (lb)', 'Util %', 'Flags', 'Status'];
+          const hdr = ['#', 'Mode', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan pallets', 'Weight (lb)', 'Util %', 'Flags', 'Opportunity', 'Status'];
           const lines = [hdr.join(',')];
+          const stLabel = { approved: 'Approved', hold: 'Hold — consolidate', rejected: 'Rejected', change: 'Needs change' };
           allTrucks.forEach((t, i) => {
-            const sig = sigOf(t); const approved = apprSet.has(sig);
-            lines.push([i + 1, t.mode, laneName(t.lane), custOf(t), t.stops.map(x => x.dc || _frCustShort(x.customer)).join(' > '), shipWin(t), t.cases, t.plan, Math.round(t.weight), Math.round(t.plan / (s.max_pallets || 28) * 100), t.flags.join('; '), approved ? 'Approved' : 'Pending Approval'].map(esc).join(','));
+            const sig = sigOf(t); const status = stLabel[apprMap[sig]] || 'Pending Approval';
+            const opp = t.opp ? `combine into #${t.opp.num} (${t.opp.ship}, +${t.opp.days}d) -> ${t.opp.sum} plt, needs buyer date change` : '';
+            lines.push([i + 1, t.mode, laneName(t.lane), custOf(t), t.stops.map(x => x.dc || _frCustShort(x.customer)).join(' > '), shipWin(t), t.cases, t.plan, Math.round(t.weight), Math.round(t.plan / (s.max_pallets || 28) * 100), t.flags.join('; '), opp, status].map(esc).join(','));
           });
           const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
           const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'freight-truck-plan-' + new Date().toISOString().slice(0, 10) + '.csv'; a.click(); URL.revokeObjectURL(a.href);
@@ -47576,7 +47600,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:22px;">
               ${field('ftl_min_pallets', 'FTL crossover', s.ftl_min_pallets, 'pallets', 'FTL cheaper than LTL above ~this')}
               ${field('ltl_max_pallets', 'LTL threshold', s.ltl_max_pallets, 'pallets', 'Small drops that deviate → LTL')}
-              ${field('date_window_days', 'Delivery-date window', s.date_window_days, 'days', 'Max ship-date spread to combine (~1)')}
+              ${field('date_window_days', 'Delivery-date window', s.date_window_days, 'days', 'Max ship-date spread to auto-combine (~1)')}
+              ${field('opp_window_days', 'Consolidation-opportunity window', s.opp_window_days, 'days', 'Flag same-DC trucks within this many days (needs buyer date change)')}
               ${field('unload_hours', 'Unload time per stop', s.unload_hours, 'hours', 'For dock-hour feasibility (2–5)')}
               ${field('stop_transit_days', 'Added-stop transit', s.stop_transit_days, 'days', 'X, then X+n per extra stop')}
             </div>
@@ -47619,7 +47644,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     apply();
   }
   let _frSettingsCache = null;
-  function _frDefaults() { return { truck_type: 'Frozen FTL Reefer', max_pallets: 28, max_weight: 40000, cube: null, max_stops: 3, stop_fee: 300, ftl_min_pallets: 15, ltl_max_pallets: 4, date_window_days: 1, unload_hours: 2, stop_transit_days: 1, missed_delivery_fee: 800, late_fee: 300 }; }
+  function _frDefaults() { return { truck_type: 'Frozen FTL Reefer', max_pallets: 28, max_weight: 40000, cube: null, max_stops: 3, stop_fee: 300, ftl_min_pallets: 15, ltl_max_pallets: 4, date_window_days: 1, opp_window_days: 7, unload_hours: 2, stop_transit_days: 1, missed_delivery_fee: 800, late_fee: 300 }; }
   function _frDcKey(s) { return s ? String(s).trim().toLowerCase().replace(/\s+/g, ' ').replace(/[,.]+$/, '') : ''; }
   function _frNorm(s) { return (s == null ? '' : String(s)).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
   function _frLayerStr(cases, cpp, ti) {
