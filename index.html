@@ -47409,8 +47409,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const id = 'r' + i; const sig = sigOf(t); const st8 = apprMap[sig] || '';
             const nLines = t.stops.reduce((a, st) => a + (st.ships || []).reduce((b, so) => b + (linesBySo[so] || []).length, 0), 0);
             const caret = `<button class="fr-exp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:11px;padding:0 5px 0 0;">&#9656; ${t.stops.length > 1 ? t.stops.length + ' stops · ' : ''}${nLines} items</button>`;
-            const stColor = st8 === 'approved' ? '#2e7d32' : st8 === 'rejected' ? 'var(--lost)' : st8 === 'hold' ? '#b8860b' : 'var(--ink-3)';
-            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${[['', 'Pending'], ['approved', 'Approved'], ['hold', 'Hold — consolidate'], ['rejected', 'Rejected'], ['change', 'Needs change']].map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select></td>`;
+            const stColor = st8 === 'approved' ? '#2e7d32' : st8 === 'rejected' ? 'var(--lost)' : st8 === 'hold' ? '#b8860b' : st8 === 'buyer' ? '#7c3aed' : 'var(--ink-3)';
+            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${[['', 'Pending'], ['approved', 'Approved'], ['buyer', 'Need buyer approval'], ['hold', 'Hold — consolidate'], ['rejected', 'Rejected'], ['change', 'Needs change']].map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select></td>`;
             const oppNote = t.opp ? `<div style="color:#7c3aed;">&#9889; combine into #${t.opp.num} (${t.opp.ship}, +${t.opp.days}d) &rarr; ${t.opp.sum} plt · needs buyer date change</div>` : '';
             const consolidated = t.stops.some(st => (st.ships || []).some(so => ovrMap[so]));
             const consNote = consolidated ? `<div style="color:#7c3aed;">&#10003; consolidated · date changed to ${t.minShip}</div>` : '';
@@ -47437,7 +47437,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
               if (gap <= autoWin || gap > oppWin) return;
               if (u.plan + t.plan <= mP && u.weight + t.weight <= mW && u.stops.length <= mS) { if (!best || u.plan > best.plan) best = u; }
             });
-            if (best) t.opp = { num: best._num, ship: best.minShip, days: Math.round(dd(t.minShip, best.minShip)), sum: best.plan + t.plan, dc: [...new Set(t.stops.map(x => x.dc).filter(Boolean))][0] || '' };
+            if (best) t.opp = { num: best._num, ship: best.minShip, days: Math.round(dd(t.minShip, best.minShip)), sum: best.plan + t.plan, dc: [...new Set(t.stops.map(x => x.dc).filter(Boolean))][0] || '', target: best, tsos: [...new Set(best.stops.flatMap(st => st.ships || []))] };
           });
         })();
         const oppCount = allTrucks.filter(t => t.opp).length;
@@ -47446,7 +47446,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const oppPanel = (oppCount || nOvr) ? `<div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:12px 14px;margin-bottom:16px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:15px;">&#9889; Consolidation opportunities${oppCount ? ` (${oppCount})` : ''}</div>${nOvr ? `<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);">Reset all consolidations (${nOvr})</button>` : ''}</div>
           <div style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">A small order ships to the same DC as a fuller truck within ${s.opp_window_days || 7} days and fits on it. <b>Combine</b> shifts the small order to the target's date and merges them into one truck — this assumes the buyer approves the delivery-date change.</div>
-          ${oppCount ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['DC', 'Order to move', 'From', 'Combine with', 'Result', 'Action'].map(h => th(h, false)).join('')}</tr></thead><tbody>${oppList.map(t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return `<tr>${td(t.opp.dc)}${td(custOf(t) + ' · ' + t.plan + ' plt / ' + t.cases + ' cs')}${td(t.minShip)}${td(t.opp.ship + ' (+' + t.opp.days + 'd)')}${td(t.opp.sum + ' plt — full truck')}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);"><button class="fr-combine" data-sos="${sos.join(',')}" data-ship="${t.opp.ship}" style="font-family:var(--mono);font-size:11px;padding:4px 14px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Combine</button></td></tr>`; }).join('')}</tbody></table></div>` : `<div style="font-family:var(--mono);font-size:11px;color:#2e7d32;">${nOvr} active consolidation${nOvr === 1 ? '' : 's'} applied. No further opportunities.</div>`}
+          ${oppCount ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['#', 'DC', 'Order to move', 'Pallets', 'Weight (lb)', 'Ship window', 'Result', 'Action'].map((h, i) => th(h, i === 3 || i === 4 || i === 6)).join('')}</tr></thead><tbody>${oppList.map((t, oi) => { const id = 'opp' + oi; const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; const tgt = t.opp.target; const summ = u => `#${u._num} · ${u.mode} · ${escapeHtml(u.stops.map(x => x.dc || _frCustShort(x.customer)).join(' → '))} · ${u.minShip} · ${u.plan} plt / ${u.cases} cs`; const main = `<tr>${td('#' + t._num + ' &rarr; #' + t.opp.num)}${td(t.opp.dc)}${td(custOf(t))}${td(t.plan, true)}${td(money(t.weight), true)}${td(t.minShip + ' &rarr; ' + t.opp.ship + ' (+' + t.opp.days + 'd)')}${td(t.opp.sum + ' plt', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0 8px 0 0;">&#9656;</button><button class="fr-combine" data-sos="${sos.join(',')}" data-tsos="${t.opp.tsos.join(',')}" data-ship="${t.opp.ship}" style="font-family:var(--mono);font-size:11px;padding:4px 14px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Combine</button></td></tr>`; const det = `<tr class="fr-oppdet-${id}" style="display:none;background:rgba(124,58,237,0.05);"><td colspan="8" style="padding:8px 9px 8px 26px;font-size:11px;color:var(--ink);line-height:1.8;"><div><b>Move &#8627;</b> ${summ(t)}</div><div><b>Into &#8627;</b> ${summ(tgt)}</div></td></tr>`; return main + det; }).join('')}</tbody></table></div>` : `<div style="font-family:var(--mono);font-size:11px;color:#2e7d32;">${nOvr} active consolidation${nOvr === 1 ? '' : 's'} applied. No further opportunities.</div>`}
         </div>` : '';
         const modesPresent = [...new Set(allTrucks.map(t => t.mode))];
         const allShips = allTrucks.flatMap(t => t.stops).concat(P.manual, P.needsDc);
@@ -47529,7 +47529,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         }));
         body.querySelectorAll('.fr-status-sel').forEach(sel => sel.addEventListener('change', async () => {
           const sig = sel.dataset.sig; const val = sel.value;
-          const colors = { approved: '#2e7d32', rejected: 'var(--lost)', hold: '#b8860b' };
+          const colors = { approved: '#2e7d32', rejected: 'var(--lost)', hold: '#b8860b', buyer: '#7c3aed' };
           sel.disabled = true;
           try {
             if (!val) { await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', sig); }
@@ -47539,12 +47539,19 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           sel.disabled = false;
         }));
         body.querySelectorAll('.fr-combine').forEach(btn => btn.addEventListener('click', async () => {
-          const sos = (btn.dataset.sos || '').split(',').filter(Boolean); const ship = btn.dataset.ship;
+          const sos = (btn.dataset.sos || '').split(',').filter(Boolean); const tsos = (btn.dataset.tsos || '').split(',').filter(Boolean); const ship = btn.dataset.ship;
           btn.disabled = true; btn.textContent = 'Combining…';
           try {
             await sb.from('freight_overrides').upsert(sos.map(so => ({ brand_id: brandId, so_num: so, ship_date: ship, note: 'consolidated (buyer date change)', updated_at: new Date().toISOString() })), { onConflict: 'brand_id,so_num' });
+            const mergedSig = [...new Set([...sos, ...tsos])].sort().join('|');
+            await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: mergedSig, status: 'buyer', updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' });
             _frRenderTab(brandId, sb);
           } catch (e) { alert('Could not combine: ' + (e.message || e)); btn.disabled = false; btn.textContent = 'Combine'; }
+        }));
+        body.querySelectorAll('.fr-oppexp').forEach(b => b.addEventListener('click', () => {
+          const open = b.textContent.trim().charAt(0) === '▾';
+          body.querySelectorAll('.fr-oppdet-' + b.dataset.tid).forEach(r => { r.style.display = open ? 'none' : ''; });
+          b.textContent = open ? '▸' : '▾';
         }));
         const resetBtn = document.getElementById('hl-fr-reset-ovr');
         if (resetBtn) resetBtn.addEventListener('click', async () => { if (!confirm('Remove all consolidation date-changes and restore original ship dates?')) return; try { await sb.from('freight_overrides').delete().eq('brand_id', brandId); _frRenderTab(brandId, sb); } catch (e) { alert(e.message || e); } });
