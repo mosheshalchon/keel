@@ -47479,7 +47479,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
             ${card('Pending cases', P.totals.cases.toLocaleString())}${card('FTL trucks', P.trucks.length)}${card('LTL', P.ltl.length)}${card('Dedicated', P.dedicated.length)}${card('Manual', P.manual.length)}${card('Planning pallets', P.totals.plan)}${card('Needs DC', P.needsDc.length, 'awaiting ship-to')}
           </div>
-          <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;line-height:1.6;">Cases reconciliation — pending <b style="color:var(--ink);">${P.totals.cases.toLocaleString()}</b> = FTL ${P.totals.casesFTL.toLocaleString()} · LTL ${P.totals.casesLTL.toLocaleString()} · Dedicated ${P.totals.casesDed.toLocaleString()} · Manual ${P.totals.casesManual.toLocaleString()} · Needs-DC ${P.totals.casesNeed.toLocaleString()}${P.totals.casesMissing ? ` &nbsp;|&nbsp; <span style="color:#b8860b;">⚠ ${P.totals.casesMissing.toLocaleString()} cases with no item config</span>` : ''}</div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;line-height:1.6;">Cases reconciliation — pending <b style="color:var(--ink);">${P.totals.cases.toLocaleString()}</b> = FTL ${P.totals.casesFTL.toLocaleString()} · LTL ${P.totals.casesLTL.toLocaleString()} · Dedicated ${P.totals.casesDed.toLocaleString()} · Manual ${P.totals.casesManual.toLocaleString()} · Needs-DC ${P.totals.casesNeed.toLocaleString()}${P.totals.casesMissing ? ` &nbsp;|&nbsp; <span style="color:#b8860b;">⚠ ${P.totals.casesMissing.toLocaleString()} cases with no item config</span>` : ''}${P.totals.cases3pl ? ` &nbsp;|&nbsp; <span style="color:var(--ink-3);">3PL excluded: ${P.totals.cases3pl.toLocaleString()} cases (booked by 3PL, not us)</span>` : ''}</div>
           ${oppPanel}
           ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — switch Source to <b>Test (Ordering Data)</b> to see them route, or add the DC column to the live feed.</div>` : ''}
           <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Truck plan (${allTrucks.length})</div>
@@ -47615,19 +47615,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (!list.length) { body.innerHTML = empty('dock hours'); return; }
         const withHours = list.filter(r => r.summary).length;
         const head = ['DC', 'Customer', 'Source', 'Hours', ...days].map((h, i) => th(h, i >= 4)).join('');
-        const trs = list.map(r => `<tr data-s="${escapeHtml([r.dc, r.customer, r.source, r.summary].filter(Boolean).join(' ').toLowerCase())}">${td(r.dc)}${td(r.customer)}${td(r.source)}${td(r.summary)}${days.map(dd => td(fmt(r.hours, dd), true)).join('')}</tr>`).join('');
+        const trs = list.map(r => { const parsed = r.hours ? null : _frDayHours(r.summary); return `<tr data-s="${escapeHtml([r.dc, r.customer, r.source, r.summary].filter(Boolean).join(' ').toLowerCase())}">${td(r.dc)}${td(r.customer)}${td(r.source)}${td(r.summary)}${days.map(dd => td(fmt(r.hours, dd) || (parsed ? parsed[dd] : null), true)).join('')}</tr>`; }).join('');
         body.innerHTML = _frSearchBox('hl-fr-search-dock', 'dock', 'Search DC, customer, source…') + wrap(head, trs, `${list.length} DCs · ${withHours} with dock hours · every customer listed; KeHE/UNFI show per-day windows, pickup & not-servicing have none`);
         _frWireSearch(body, 'hl-fr-search-dock', 'dock');
       } else if (_frSubTab === 'lanes') {
         const { data } = await sb.from('freight_lanes').select('*').eq('brand_id', brandId).order('kind').order('lane_no');
         const lanes = (data || []).filter(r => r.kind === 'lane');
-        const routes = (data || []).filter(r => r.kind === 'route_logic');
         const laneHead = ['#', 'Lane', 'States'].map(h => th(h)).join('');
         const laneTrs = lanes.map(r => `<tr>${td(r.lane_no)}${td(r.lane_name)}${td(r.states)}</tr>`).join('');
-        const rHead = ['Lane Path', 'Frequency', 'Avg Cost'].map((h, i) => th(h, i >= 1)).join('');
-        const rTrs = routes.map(r => `<tr>${td(r.route_path)}${td(r.frequency, true)}${td(r.avg_cost != null ? '$' + Math.round(r.avg_cost).toLocaleString() : null, true)}</tr>`).join('');
-        body.innerHTML = `<div style="font-family:var(--serif);font-size:15px;margin-bottom:8px;">Freight lanes</div>${wrap(laneHead, laneTrs)}
-          <div style="font-family:var(--serif);font-size:15px;margin:22px 0 8px;">Route logic — top multi-drop lanes (analyst history)</div>${routes.length ? wrap(rHead, rTrs) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">No route-logic rows yet — upload the workbook.</div>`}`;
+        body.innerHTML = `<div style="font-family:var(--serif);font-size:15px;margin-bottom:4px;">Freight lanes</div><p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:0 0 12px;">The optimizer assigns each order a lane by its destination state, and only consolidates orders on the same lane.</p>${wrap(laneHead, laneTrs)}`;
       } else if (_frSubTab === 'assumptions') {
         const s = await _frLoadSettings(brandId, sb);
         const field = (key, label, val, unit, hint) => `<div style="display:flex;flex-direction:column;gap:4px;">
@@ -47727,6 +47723,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
   function _frPlan(orders, items, mapRows, settings, customers, lanes, overrides) {
     overrides = overrides || {};
+    const _tpl = new Set((customers || []).filter(c => (c.service_type || '').toLowerCase() === '3pl').map(c => _frNorm(_frCustShort(c.customer))));
+    let cases3pl = 0;
+    orders = (orders || []).filter(o => { if (_tpl.has(_frNorm(_frCustShort(o.customer)))) { cases3pl += Number(o.cases_ordered) || 0; return false; } return true; });
     const S = settings || {};
     const maxPlt = S.max_pallets || 28, maxWt = S.max_weight || 40000, maxStops = S.max_stops || 3;
     const ftlMin = S.ftl_min_pallets || 15, ltlMax = S.ltl_max_pallets || 4, windowDays = S.date_window_days || 1;
@@ -47805,9 +47804,24 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     totals.casesDed = dedTrucks.reduce((a, t) => a + (t.cases || 0), 0);
     totals.casesManual = manual.reduce((a, sh) => a + (sh.cases || 0), 0);
     totals.casesNeed = needsDc.reduce((a, sh) => a + (sh.cases || 0), 0);
+    totals.cases3pl = cases3pl;
     totals.palletsFTL = ftl.reduce((a, t) => a + t.plan, 0); totals.palletsLTL = ltl.reduce((a, t) => a + t.plan, 0); totals.palletsDed = dedTrucks.reduce((a, t) => a + t.plan, 0);
     totals.weightFTL = ftl.reduce((a, t) => a + t.weight, 0); totals.weightLTL = ltl.reduce((a, t) => a + t.weight, 0); totals.weightDed = dedTrucks.reduce((a, t) => a + t.weight, 0);
     return { trucks: ftl, ltl, dedicated: dedTrucks, manual, needsDc, unmatched, totals, shipments };
+  }
+  function _frDayHours(text) {
+    const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']; const out = {}; days.forEach(d => out[d] = null);
+    if (!text) return out;
+    const dmap = { su: 0, sun: 0, sunday: 0, m: 1, mo: 1, mon: 1, monday: 1, tu: 2, tue: 2, tues: 2, tuesday: 2, w: 3, we: 3, wed: 3, weds: 3, wednesday: 3, th: 4, thu: 4, thur: 4, thurs: 4, thursday: 4, f: 5, fr: 5, fri: 5, friday: 5, sa: 6, sat: 6, saturday: 6 };
+    const t = String(text).replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+    const fmtT = x => { x = x.replace(/[^0-9:]/g, ''); if (!x.includes(':') && x.length >= 3) x = x.padStart(4, '0').replace(/(\d{2})(\d{2})/, '$1:$2'); if (x.includes(':') && x.indexOf(':') === 1) x = '0' + x; return x; };
+    const tm = t.match(/(\d{1,2}:?\d{2})\s*[a-z]{0,2}\s*-\s*(\d{1,2}:?\d{2})/i);
+    if (!tm) return out;
+    const win = fmtT(tm[1]) + '–' + fmtT(tm[2]);
+    const dr = t.match(/([a-z]+)\s*-\s*([a-z]+)/i);
+    if (dr) { const a = dmap[dr[1].toLowerCase()], b = dmap[dr[2].toLowerCase()]; if (a != null && b != null) { let i = a; while (true) { out[days[i]] = win; if (i === b) break; i = (i + 1) % 7; } return out; } }
+    t.split(/[^a-z]+/i).forEach(w => { const di = dmap[w.toLowerCase()]; if (di != null) out[days[di]] = win; });
+    return out;
   }
   function _frHoursSummary(row) {
     if (row && row.notes) return row.notes;
