@@ -47339,16 +47339,18 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       } else if (_frSubTab === 'test') {
         const [{ data }, { data: items }] = await Promise.all([
           sb.from('freight_orders_test').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: false }).limit(1000),
-          sb.from('freight_items').select('item_description,cases_per_pallet').eq('brand_id', brandId)
+          sb.from('freight_items').select('item_description,cases_per_pallet,pallet_ti').eq('brand_id', brandId)
         ]);
         const rows = data || [];
         const _mo = {}; _frDefaultItemMap().forEach(p => _mo[_frNorm(p[0])] = p[1]);
         const _cd = {}; (items || []).forEach(it => _cd[_frNorm(it.item_description)] = it);
-        const palletsOf = r => { const d = _mo[_frNorm(r.sku)]; const cfg = d ? _cd[_frNorm(d)] : null; return (cfg && cfg.cases_per_pallet) ? (Number(r.cases_ordered) || 0) / Number(cfg.cases_per_pallet) : null; };
+        const _cfgOf = r => { const d = _mo[_frNorm(r.sku)]; return d ? _cd[_frNorm(d)] : null; };
+        const palletsOf = r => { const cfg = _cfgOf(r); return (cfg && cfg.cases_per_pallet) ? (Number(r.cases_ordered) || 0) / Number(cfg.cases_per_pallet) : null; };
+        const layersOf = r => { const cfg = _cfgOf(r); return (cfg && cfg.cases_per_pallet) ? _frLayerStr(r.cases_ordered, cfg.cases_per_pallet, cfg.pallet_ti) : null; };
         const banner = `<div style="background:rgba(46,125,50,0.07);border:1px solid rgba(46,125,50,0.3);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:var(--sans);font-size:12px;line-height:1.5;">Test data from the workbook's <b>Ordering Data</b> tab — it carries real ship-to DCs (column E), so the optimizer can route it end-to-end. Loaded into a separate table; your live feed and Order Data tab are untouched. Then open <b>Output</b> and switch its source to <b>Test</b>.</div>`;
         const upBtn = `<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;"><input type="file" id="hl-fr-test-file" accept=".xlsx,.xls" style="display:none;" /><button class="hl-btn-primary" id="hl-fr-test-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load Ordering Data (from logistics workbook)</button><span id="hl-fr-test-msg" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${rows.length ? rows.length + ' pending test orders loaded' : 'no test orders yet'}</span></div>`;
-        const head = ['Customer', 'Customer DC', 'Origin', 'Proj Ship', 'Item', 'Cases', 'Pallets', 'Status'].map((h, i) => th(h, i === 5 || i === 6)).join('');
-        const trs = rows.map(r => { const p = palletsOf(r); return `<tr data-s="${escapeHtml([r.customer, r.customer_dc, r.sku].filter(Boolean).join(' ').toLowerCase())}">${td(_frCustShort(r.customer))}${td(r.customer_dc)}${td(r.location)}${td(r.projected_ship_date)}${td(r.sku)}${td(r.cases_ordered, true)}${td(p != null ? p.toFixed(2) : null, true)}${td(r.status)}</tr>`; }).join('');
+        const head = ['Customer', 'Customer DC', 'Origin', 'Proj Ship', 'Item', 'Cases', 'Pallets', 'Layers', 'Status'].map((h, i) => th(h, i === 5 || i === 6)).join('');
+        const trs = rows.map(r => { const p = palletsOf(r); return `<tr data-s="${escapeHtml([r.customer, r.customer_dc, r.sku].filter(Boolean).join(' ').toLowerCase())}">${td(_frCustShort(r.customer))}${td(r.customer_dc)}${td(r.location)}${td(r.projected_ship_date)}${td(r.sku)}${td(r.cases_ordered, true)}${td(p != null ? p.toFixed(2) : null, true)}${td(layersOf(r))}${td(r.status)}</tr>`; }).join('');
         body.innerHTML = banner + upBtn + (rows.length ? (_frOrderSummaryHtml(rows, th, td, wrap, true, palletsOf) + _frSearchBox('hl-fr-search-test', 'test', 'Search customer, DC, item…') + wrap(head, trs, `${rows.length} rows (Pending Fulfillment, real DCs) · pallets = cases ÷ cases-per-pallet`)) : `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No test orders yet — click "Load Ordering Data" and pick the logistics workbook.</div>`);
         const fi = document.getElementById('hl-fr-test-file'); const btn = document.getElementById('hl-fr-test-btn'); const msg = document.getElementById('hl-fr-test-msg');
         btn.addEventListener('click', () => fi.click());
@@ -47358,7 +47360,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const src = _frSource === 'test' ? 'freight_orders_test' : 'freight_orders';
         const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }, { data: apprv }] = await Promise.all([
           sb.from(src).select('*').eq('brand_id', brandId),
-          sb.from('freight_items').select('item_description,cases_per_pallet,case_weight,unit_upc').eq('brand_id', brandId),
+          sb.from('freight_items').select('item_description,cases_per_pallet,case_weight,unit_upc,pallet_ti').eq('brand_id', brandId),
           sb.from('freight_item_map').select('order_item,item_description').eq('brand_id', brandId),
           sb.from('freight_customers').select('customer,dc_name,address,service_type').eq('brand_id', brandId),
           sb.from('freight_lanes').select('kind,lane_no,lane_name,states').eq('brand_id', brandId),
@@ -47371,6 +47373,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const P = _frPlan(orders, items, mapRows, s, customers, lanes);
         const _mo2 = {}; _frDefaultItemMap().forEach(p => _mo2[_frNorm(p[0])] = p[1]); (mapRows || []).forEach(m => _mo2[_frNorm(m.order_item)] = m.item_description);
         const _du = {}; (items || []).forEach(it => _du[_frNorm(it.item_description)] = it.unit_upc);
+        const _di = {}; (items || []).forEach(it => _di[_frNorm(it.item_description)] = it);
+        const skuCfg = sku => { const d = _mo2[_frNorm(sku)]; return d ? _di[_frNorm(d)] : null; };
         const skuName = sku => _mo2[_frNorm(sku)] || sku;
         const skuUpc = sku => { const d = _mo2[_frNorm(sku)]; return d ? (_du[_frNorm(d)] || '') : ''; };
         const linesBySo = {}; orders.forEach(o => { const so = o.so_num || '(no SO)'; (linesBySo[so] = linesBySo[so] || []).push({ sku: o.sku, cases: Number(o.cases_ordered) || 0 }); });
@@ -47405,7 +47409,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const caret = `<button class="fr-exp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:11px;padding:0 5px 0 0;">&#9656; ${t.stops.length > 1 ? t.stops.length + ' stops · ' : ''}${nLines} items</button>`;
             const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><span class="fr-status" style="font-family:var(--mono);font-size:10px;font-weight:700;color:${approved ? '#2e7d32' : '#b8860b'};">${approved ? 'Approved' : 'Pending'}</span> <button class="fr-approve" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:3px;background:transparent;cursor:pointer;color:var(--ink);margin-left:4px;">${approved ? 'Undo' : 'Approve'}</button></td>`;
             const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(i + 1)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}</td>${statusCell}</tr>`;
-            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => (linesBySo[so] || []).map(ln => `<tr class="fr-det-${id}" style="display:none;background:rgba(0,0,0,0.02);">${dcell('')}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell('&#8627; ' + escapeHtml(st.dc || '') + ' · ' + escapeHtml(skuName(ln.sku)) + (skuUpc(ln.sku) ? ` <span style="color:var(--ink-3);">${escapeHtml(skuUpc(ln.sku))}</span>` : ''))}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}</tr>`))).join('');
+            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; return `<tr class="fr-det-${id}" style="display:none;background:rgba(0,0,0,0.02);">${dcell('')}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell('&#8627; ' + escapeHtml(st.dc || '') + ' · ' + escapeHtml(skuName(ln.sku)) + (skuUpc(ln.sku) ? ` <span style="color:var(--ink-3);">${escapeHtml(skuUpc(ln.sku))}</span>` : '') + (ll ? ` <span style="color:var(--ink-3);">· ${ll}</span>` : ''))}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}</tr>`; }))).join('');
             return main + det;
           }).join('');
           return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -47618,6 +47622,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _frDefaults() { return { truck_type: 'Frozen FTL Reefer', max_pallets: 28, max_weight: 40000, cube: null, max_stops: 3, stop_fee: 300, ftl_min_pallets: 15, ltl_max_pallets: 4, date_window_days: 1, unload_hours: 2, stop_transit_days: 1, missed_delivery_fee: 800, late_fee: 300 }; }
   function _frDcKey(s) { return s ? String(s).trim().toLowerCase().replace(/\s+/g, ' ').replace(/[,.]+$/, '') : ''; }
   function _frNorm(s) { return (s == null ? '' : String(s)).toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+  function _frLayerStr(cases, cpp, ti) {
+    cases = Number(cases) || 0; cpp = Number(cpp) || 0; ti = Number(ti) || 0;
+    if (!cpp) return '';
+    const fullP = Math.floor(cases / cpp); const rem = cases - fullP * cpp;
+    const lyr = ti ? Math.round((rem / ti) * 10) / 10 : 0;
+    const parts = [];
+    if (fullP > 0) parts.push(fullP + (fullP === 1 ? ' plt' : ' plts'));
+    if (lyr > 0 || fullP === 0) parts.push(lyr + (lyr === 1 ? ' layer' : ' layers'));
+    return parts.join(' + ');
+  }
   function _frStateOf(s) { if (!s) return null; const t = String(s).toUpperCase(); let m = t.match(/\b([A-Z]{2})\s+\d{5}/); if (m) return m[1]; m = t.match(/,\s*([A-Z]{2})\b/); if (m) return m[1]; m = t.match(/\b([A-Z]{2})\s*$/); if (m) return m[1]; return null; }
   function _frCustShort(c) { return String(c || '').replace(/^CUST\d+\s*/i, '').trim(); }
   function _frDefaultItemMap() { return [['CHEESE PIZZA, 12"', '12" Three Cheese - 1ct/6pk'], ['PEPPERONI PIZZA, 12"', '12" Pepperoni - 1ct/6pk'], ['PESTO PIZZA (NEW), 12"', '12" Pesto - 1ct/6pk'], ['MARGHERITA PIZZA , 12"', '12" Margherita - 1ct/6pk'], ['SHELLS, PIZZA RETAIL', '12" Pizza Shell - 1ct/8pk'], ['SHELLS, PIZZA FOOD SERVICE', 'Food Service 12" Pizza Shell - 1ct/12pk'], ['ORIGINAL BAGUETTES (12-pack)', 'Original Baguettes - 2ct/12pk'], ['ORIGINAL BAGUETTES (8-PACK)', 'Original Baguettes - 2ct/8pk'], ['ORIGINAL ROLLS (12-pack)', 'Original Rolls - 4ct/12pk'], ['ORIGINAL ROLLS (8-pack)', 'Original Rolls - 4ct/8pk'], ['PEPPERONI POCKETS (2CT-6PK)', 'Pepperoni Pockets - 2ct/6pk'], ['CHEESESTEAK POCKETS (2CT-6PK)', 'Cheesesteak Pockets - 2ct/6pk'], ['PITA (8-pack)', 'Pita - 5ct/8pk'], ['SINGLE SERVE PEPPERONI PIZZA, 8 "', 'Pepperoni Pizza Singles - 1ct/8pk'], ['SINGLE SERVE CHEESE PIZZA, 8 "', 'Cheese Pizza Singles - 1ct/8pk'], ['SINGLE SERVE PESTO PIZZA, 8 "', 'Pesto Pizza Singles - 1ct/8pk'], ['THIN CHEESE PIZZA, 10"', '10" Three Cheese Thin Crust Pizza - 1ct/6pk'], ['THIN PEPPERONI PIZZA, 10"', '10" Pepperoni Thin Crust Pizza - 1ct/6pk'], ['THIN PESTO PIZZA, 10"', '10" Pesto Thin Crust Pizza - 1ct/6pk'], ['CHEESE PIZZA POPPERS 6oz', 'Cheese Pizza Poppers - 10ct/6pk'], ['PEPPERONI PIZZA POPPERS 6oz', 'Pepperoni Pizza Poppers - 10ct/6pk'], ['SAUSAGE PIZZA POPPERS 6oz', 'Sausage Pizza Poppers - 10ct/6pk'], ['CPB6', 'Cheese Pizza Poppers - 10ct/6pk'], ['RPB6', 'Pepperoni Pizza Poppers - 10ct/6pk'], ['SPB6', 'Sausage Pizza Poppers - 10ct/6pk'], ['PLAIN BAGEL (8-PACK)', 'Plain Bagels - 4ct/8pk'], ['GARLIC ROSEMARY DINNER ROLLS (8-PACK)', 'Garlic Rosemary Dinner Rolls - 5ct/8pk'], ['EVERYTHING BAGEL (8-PACK)', 'Everything Bagels - 4ct/8pk']]; }
