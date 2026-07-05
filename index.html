@@ -47409,13 +47409,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const id = 'r' + i; const sig = sigOf(t); const st8 = apprMap[sig] || '';
             const nLines = t.stops.reduce((a, st) => a + (st.ships || []).reduce((b, so) => b + (linesBySo[so] || []).length, 0), 0);
             const caret = `<button class="fr-exp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:11px;padding:0 5px 0 0;">&#9656; ${t.stops.length > 1 ? t.stops.length + ' stops · ' : ''}${nLines} items</button>`;
-            const stColor = st8 === 'approved' ? '#2e7d32' : st8 === 'rejected' ? 'var(--lost)' : st8 === 'hold' ? '#b8860b' : st8 === 'buyer' ? '#7c3aed' : 'var(--ink-3)';
-            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${[['', 'Pending'], ['approved', 'Approved'], ['buyer', 'Need buyer approval'], ['hold', 'Hold — consolidate'], ['rejected', 'Rejected'], ['change', 'Needs change']].map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select></td>`;
+            const stColor = (st8 === 'approved' || st8 === 'buyer_approved') ? '#2e7d32' : (st8 === 'rejected' || st8 === 'buyer_rejected') ? 'var(--lost)' : st8 === 'hold' ? '#b8860b' : st8 === 'buyer' ? '#7c3aed' : 'var(--ink-3)';
+            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${[['', 'Pending'], ['approved', 'Approved'], ['buyer', 'Need buyer approval'], ['buyer_approved', 'Buyer approved'], ['buyer_rejected', 'Buyer rejected'], ['hold', 'Hold — consolidate'], ['rejected', 'Rejected'], ['change', 'Needs change']].map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select></td>`;
             const oppNote = t.opp ? `<div style="color:#7c3aed;">&#9889; combine into #${t.opp.num} (${t.opp.ship}, +${t.opp.days}d) &rarr; ${t.opp.sum} plt · needs buyer date change</div>` : '';
             const consolidated = t.stops.some(st => (st.ships || []).some(so => ovrMap[so]));
             const consNote = consolidated ? `<div style="color:#7c3aed;">&#10003; consolidated · date changed to ${t.minShip}</div>` : '';
             const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(i + 1)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}${oppNote}${consNote}</td>${statusCell}</tr>`;
-            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; return `<tr class="fr-det-${id}" style="display:none;background:rgba(0,0,0,0.02);">${dcell('')}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell('&#8627; ' + escapeHtml(st.dc || '') + ' · ' + escapeHtml(skuName(ln.sku)) + (skuUpc(ln.sku) ? ` <span style="color:var(--ink-3);">${escapeHtml(skuUpc(ln.sku))}</span>` : '') + (ll ? ` <span style="color:var(--ink-3);">· ${ll}</span>` : ''))}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}</tr>`; }))).join('');
+            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => { const moved = !!ovrMap[so]; return (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; return `<tr class="fr-det-${id}" style="display:none;background:${moved ? 'rgba(124,58,237,0.09)' : 'rgba(0,0,0,0.02)'};">${dcell('')}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell('&#8627; ' + escapeHtml(st.dc || '') + ' · ' + escapeHtml(skuName(ln.sku)) + (skuUpc(ln.sku) ? ` <span style="color:var(--ink-3);">${escapeHtml(skuUpc(ln.sku))}</span>` : '') + (ll ? ` <span style="color:var(--ink-3);">· ${ll}</span>` : '') + (moved ? ` <span style="color:#7c3aed;font-weight:700;">⚡ moved · needs buyer OK</span>` : ''))}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}</tr>`; }); })).join('');
             return main + det;
           }).join('');
           return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -47529,9 +47529,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         }));
         body.querySelectorAll('.fr-status-sel').forEach(sel => sel.addEventListener('change', async () => {
           const sig = sel.dataset.sig; const val = sel.value;
-          const colors = { approved: '#2e7d32', rejected: 'var(--lost)', hold: '#b8860b', buyer: '#7c3aed' };
+          const colors = { approved: '#2e7d32', buyer_approved: '#2e7d32', rejected: 'var(--lost)', buyer_rejected: 'var(--lost)', hold: '#b8860b', buyer: '#7c3aed' };
           sel.disabled = true;
           try {
+            if (val === 'buyer_rejected') {
+              const sos = sig.split('|').filter(Boolean);
+              const d1 = await sb.from('freight_overrides').delete().eq('brand_id', brandId).in('so_num', sos); if (d1.error) throw d1.error;
+              const d2 = await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', sig); if (d2.error) throw d2.error;
+              _frRenderTab(brandId, sb); return;
+            }
             let r;
             if (!val) { r = await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', sig); }
             else { r = await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: sig, status: val, updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' }); }
@@ -47562,13 +47568,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const dlBtn = document.getElementById('hl-fr-dl');
         if (dlBtn) dlBtn.addEventListener('click', () => {
           const esc = v => { const x = v == null ? '' : String(v); return /[",\n]/.test(x) ? '"' + x.replace(/"/g, '""') + '"' : x; };
-          const hdr = ['#', 'Mode', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan pallets', 'Weight (lb)', 'Util %', 'Flags', 'Opportunity', 'Status'];
+          const hdr = ['Row', '#', 'Mode', 'Lane', 'Customer', 'Route / Item', 'UPC', 'Ship', 'Cases', 'Pallets', 'Weight (lb)', 'Util %', 'Layers', 'Flags', 'Opportunity', 'Status', 'Moved (needs buyer)'];
           const lines = [hdr.join(',')];
-          const stLabel = { approved: 'Approved', hold: 'Hold — consolidate', rejected: 'Rejected', change: 'Needs change' };
+          const stLabel = { approved: 'Approved', buyer: 'Need buyer approval', buyer_approved: 'Buyer approved', buyer_rejected: 'Buyer rejected', hold: 'Hold — consolidate', rejected: 'Rejected', change: 'Needs change' };
           allTrucks.forEach((t, i) => {
             const sig = sigOf(t); const status = stLabel[apprMap[sig]] || 'Pending Approval';
             const opp = t.opp ? `combine into #${t.opp.num} (${t.opp.ship}, +${t.opp.days}d) -> ${t.opp.sum} plt, needs buyer date change` : '';
-            lines.push([i + 1, t.mode, laneName(t.lane), custOf(t), t.stops.map(x => x.dc || _frCustShort(x.customer)).join(' > '), shipWin(t), t.cases, t.plan, Math.round(t.weight), Math.round(t.plan / (s.max_pallets || 28) * 100), t.flags.join('; '), opp, status].map(esc).join(','));
+            const util = Math.round(t.plan / (s.max_pallets || 28) * 100);
+            lines.push(['Truck', i + 1, t.mode, laneName(t.lane), custOf(t), t.stops.map(x => x.dc || _frCustShort(x.customer)).join(' > '), '', shipWin(t), t.cases, t.plan, Math.round(t.weight), util, '', t.flags.join('; '), opp, status, ''].map(esc).join(','));
+            t.stops.forEach(st => (st.ships || []).forEach(so => { const moved = ovrMap[so] ? 'yes' : ''; (linesBySo[so] || []).forEach(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)).toFixed(2) : ''; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; lines.push(['Item', i + 1, '', '', _frCustShort(st.customer), (st.dc || '') + ' · ' + skuName(ln.sku), skuUpc(ln.sku), st.ship || '', ln.cases, lp, '', '', ll, '', '', '', moved].map(esc).join(',')); }); }));
           });
           const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
           const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'freight-truck-plan-' + new Date().toISOString().slice(0, 10) + '.csv'; a.click(); URL.revokeObjectURL(a.href);
