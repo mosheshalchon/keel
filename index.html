@@ -47262,7 +47262,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div>
       <div style="margin-top:20px;"></div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:6px 0 0;flex-wrap:wrap;">
-        ${tab('output', 'Output')}<span style="border-left:1px solid var(--rule-soft);margin:0 4px;"></span>${tab('customers', 'Customer/3PL')}${tab('items', 'Items')}${tab('orders', 'Order Data')}${tab('test', 'Test Orders')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('distributors', 'Distributors')}${tab('assumptions', 'Assumptions')}
+        ${tab('output', 'Output')}<span style="border-left:1px solid var(--rule-soft);margin:0 4px;"></span>${tab('customers', 'Customer/3PL')}${tab('items', 'Items')}${tab('orders', 'Order Data')}${tab('test', 'Test Orders')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('distributors', 'Distributors')}${tab('analytics', 'Analytics')}${tab('assumptions', 'Assumptions')}
       </div>
       <div id="hl-fr-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>`;
 
@@ -47682,6 +47682,31 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.querySelectorAll('.fr-dist').forEach(inp => { inp.addEventListener('focus', () => { inp.style.borderColor = 'var(--rule-soft)'; inp.style.background = 'var(--paper)'; }); inp.addEventListener('blur', () => { inp.style.borderColor = 'transparent'; inp.style.background = 'transparent'; }); inp.addEventListener('change', async () => { const upd = {}; upd[inp.dataset.field] = inp.value || null; const { error } = await sb.from('freight_distributors').update(upd).eq('id', inp.dataset.id); if (error) alert('Could not save: ' + error.message); }); });
         const addBtn = document.getElementById('fr-dist-add'); if (addBtn) addBtn.addEventListener('click', async () => { const { error } = await sb.from('freight_distributors').insert({ brand_id: brandId, company: 'New distributor' }); if (error) { alert(error.message); return; } _frRenderTab(brandId, sb); });
         body.querySelectorAll('.fr-dist-del').forEach(b => b.addEventListener('click', async () => { if (!confirm('Delete this distributor?')) return; const { error } = await sb.from('freight_distributors').delete().eq('id', b.dataset.id); if (error) { alert(error.message); return; } _frRenderTab(brandId, sb); }));
+      } else if (_frSubTab === 'analytics') {
+        const { data } = await sb.from('freight_history').select('*').eq('brand_id', brandId);
+        const rows = data || [];
+        const upBtn = `<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;"><input type="file" id="hl-fr-hist-file" accept=".htm,.html" style="display:none;" /><button class="hl-btn-primary" id="hl-fr-hist-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load freight history (dashboard .htm)</button><span id="hl-fr-hist-msg" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${rows.length ? rows.length + ' records loaded' : 'no history yet'}</span></div>`;
+        const wireUp = () => { const fi = document.getElementById('hl-fr-hist-file'), btn = document.getElementById('hl-fr-hist-btn'), msg = document.getElementById('hl-fr-hist-msg'); if (!btn) return; btn.addEventListener('click', () => fi.click()); fi.addEventListener('change', async e => { const f = (e.target.files || [])[0]; if (!f) return; msg.textContent = 'Reading…'; try { const res = await _frUploadHistory(f, brandId, sb, m => msg.textContent = m); msg.textContent = res.loaded + ' loaded'; setTimeout(() => _frRenderTab(brandId, sb), 700); } catch (err) { msg.textContent = 'Failed: ' + (err.message || 'error'); } fi.value = ''; }); };
+        if (!rows.length) { body.innerHTML = `<p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:0 0 14px;">Historical freight-out spend. Load the ATG Freight Out dashboard export (.htm) to populate.</p>` + upBtn + `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No freight history yet — click "Load freight history".</div>`; wireUp(); return; }
+        const money = n => '$' + Math.round(n || 0).toLocaleString();
+        const num = n => Math.round(n || 0).toLocaleString();
+        const monthOf = r => (r.date || '').slice(0, 7);
+        const filters = _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(rows, r => r.customer) }, { key: 'vendor', label: 'Carrier', options: _frDistinct(rows, r => r.vendor) }, { key: 'state', label: 'State', options: _frDistinct(rows, r => r.state) }, { key: 'mode', label: 'Mode', options: _frDistinct(rows, r => r.mode) }, { key: 'month', label: 'Month', options: _frDistinct(rows, r => monthOf(r)) }]);
+        body.innerHTML = `<p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:0 0 12px;">Historical freight-out spend (${rows.length} shipments). Filter to slice the KPIs and breakdowns.</p>` + upBtn + filters + `<div id="fr-an-body"></div>`;
+        const container = document.getElementById('fr-an-body');
+        const card = (label, val, sub) => `<div style="border:1px solid var(--rule-soft);border-radius:6px;padding:12px 14px;min-width:118px;"><div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">${label}</div><div style="font-family:var(--serif);font-size:20px;margin-top:2px;">${val}</div>${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}</div>`;
+        const grp = (F, key) => { const m = {}; F.forEach(r => { const k = r[key] || '—'; const g = m[k] || (m[k] = { loads: 0, spend: 0, pallets: 0, cases: 0 }); g.loads++; g.spend += (+r.freight || 0); g.pallets += (+r.pallets || 0); g.cases += (+r.cases || 0); }); return Object.entries(m).map(([k, v]) => Object.assign({ name: k }, v)).sort((a, b) => b.spend - a.spend); };
+        const bTable = (title, arr) => { const head = [title, 'Loads', 'Freight $', 'Pallets', '$/pallet'].map((h, i) => th(h, i >= 1)).join(''); const trs = arr.slice(0, 15).map(x => `<tr>${td(x.name)}${td(x.loads, true)}${td(money(x.spend), true)}${td(x.pallets.toFixed(0), true)}${td('$' + Math.round(x.pallets ? x.spend / x.pallets : 0).toLocaleString(), true)}</tr>`).join(''); return `<div style="font-family:var(--serif);font-size:15px;margin:24px 0 6px;">${title} — freight spend (top ${Math.min(15, arr.length)})</div><div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${trs}</tbody></table></div>`; };
+        const render = (F) => {
+          const spend = F.reduce((a, r) => a + (+r.freight || 0), 0), pallets = F.reduce((a, r) => a + (+r.pallets || 0), 0), cases = F.reduce((a, r) => a + (+r.cases || 0), 0);
+          const ftl = F.filter(r => r.mode === 'FTL').length, ltl = F.filter(r => r.mode === 'LTL').length;
+          const byMonth = {}; F.forEach(r => { const mo = monthOf(r); if (!mo) return; const g = byMonth[mo] || (byMonth[mo] = { spend: 0, loads: 0 }); g.spend += (+r.freight || 0); g.loads++; }); const months = Object.keys(byMonth).sort(); const maxM = Math.max(1, ...months.map(mo => byMonth[mo].spend));
+          const monthBars = months.map(mo => `<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;font-family:var(--mono);font-size:11px;"><div style="width:64px;color:var(--ink-3);">${mo}</div><div style="flex:1;background:var(--rule-soft);border-radius:3px;height:16px;"><div style="width:${Math.round(byMonth[mo].spend / maxM * 100)}%;background:var(--ink);height:100%;border-radius:3px;"></div></div><div style="width:96px;text-align:right;">${money(byMonth[mo].spend)}</div><div style="width:58px;text-align:right;color:var(--ink-3);">${byMonth[mo].loads} lds</div></div>`).join('');
+          container.innerHTML = `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">${card('Freight spend', money(spend))}${card('Loads', num(F.length))}${card('Pallets', num(pallets))}${card('Cases', num(cases))}${card('Avg $/pallet', money(pallets ? spend / pallets : 0))}${card('Avg $/case', '$' + (cases ? spend / cases : 0).toFixed(2))}${card('FTL / LTL', ftl + ' / ' + ltl)}</div><div style="font-family:var(--serif);font-size:15px;margin:20px 0 8px;">Freight spend by month</div>${monthBars || '<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">No data.</div>'}${bTable('Carrier', grp(F, 'vendor'))}${bTable('Customer', grp(F, 'customer'))}${bTable('Destination state', grp(F, 'state'))}`;
+        };
+        render(rows);
+        _frWireFilters(body, sel => { const F = rows.filter(r => { const chk = (k, v) => !sel || !sel[k] || sel[k].has((v || '').toString().toLowerCase()); return chk('cust', r.customer) && chk('vendor', r.vendor) && chk('state', r.state) && chk('mode', r.mode) && chk('month', monthOf(r)); }); render(F); });
+        wireUp();
       } else if (_frSubTab === 'assumptions') {
         const s = await _frLoadSettings(brandId, sb);
         const field = (key, label, val, unit, hint) => `<div style="display:flex;flex-direction:column;gap:4px;">
@@ -47790,11 +47815,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div></div>`;
   }
   function _frFilterBar(defs) { return `<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">${defs.map(d => _frMsBox(d.key, d.label, d.options)).join('')}</div>`; }
-  function _frWireFilters(body) {
+  function _frWireFilters(body, onApply) {
     const panels = [...body.querySelectorAll('.fr-ms')]; if (!panels.length) return;
     const readSel = ms => { const opts = [...ms.querySelectorAll('.fr-ms-opt')]; const on = opts.filter(o => o.checked); return on.length === opts.length ? null : new Set(on.map(o => o.value)); };
     const updateLbl = ms => { const opts = [...ms.querySelectorAll('.fr-ms-opt')]; const n = opts.filter(o => o.checked).length; ms.querySelector('.fr-ms-lbl').textContent = (n === opts.length) ? 'All' : (n + ' of ' + opts.length); };
-    const apply = () => { const sel = {}; panels.forEach(ms => sel[ms.dataset.key] = readSel(ms)); body.querySelectorAll('tbody tr[data-frow]').forEach(tr => { let show = true; for (const k in sel) { if (!sel[k]) continue; const vals = (tr.getAttribute('data-f-' + k) || '').split('|').filter(Boolean); if (!vals.some(v => sel[k].has(v))) { show = false; break; } } tr.style.display = show ? '' : 'none'; }); };
+    const apply = () => { const sel = {}; panels.forEach(ms => sel[ms.dataset.key] = readSel(ms)); if (onApply) { onApply(sel); return; } body.querySelectorAll('tbody tr[data-frow]').forEach(tr => { let show = true; for (const k in sel) { if (!sel[k]) continue; const vals = (tr.getAttribute('data-f-' + k) || '').split('|').filter(Boolean); if (!vals.some(v => sel[k].has(v))) { show = false; break; } } tr.style.display = show ? '' : 'none'; }); };
     panels.forEach(ms => {
       const btn = ms.querySelector('.fr-ms-btn'), panel = ms.querySelector('.fr-ms-panel');
       btn.addEventListener('click', e => { e.stopPropagation(); const open = panel.style.display !== 'none'; panels.forEach(p => p.querySelector('.fr-ms-panel').style.display = 'none'); panel.style.display = open ? 'none' : 'block'; });
@@ -47927,6 +47952,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return _frSettingsCache;
   }
 
+  async function _frUploadHistory(file, brandId, sb, onMsg) {
+    const text = await file.text();
+    const m = text.match(/const DATA = (\[[\s\S]*?\]);/);
+    if (!m) throw new Error('Could not find freight data in this file (expected the ATG Freight Out dashboard HTML).');
+    let arr; try { arr = JSON.parse(m[1]); } catch (e) { throw new Error('Freight data parse error: ' + e.message); }
+    const recs = arr.map(d => ({ brand_id: brandId, id: String(d.id), date: d.date || null, type: d.type || null, number: d.number || null, po: d.po || null, customer: d.customer || null, city: d.city || null, state: d.state || null, total: _frNum(d.total), cases: _frNum(d.cases), pallets: _frNum(d.pallets), weight: _frNum(d.weight), freight_unit: _frNum(d.freightUnit), freight: _frNum(d.freight), so: d.so || null, fpo: d.fpo || null, mode: d.mode || null, vendor: d.vendor || null }));
+    if (onMsg) onMsg(`Loading ${recs.length} freight records…`);
+    const del = await sb.from('freight_history').delete().eq('brand_id', brandId); if (del.error) throw new Error(del.error.message);
+    for (let i = 0; i < recs.length; i += 500) { const { error } = await sb.from('freight_history').insert(recs.slice(i, i + 500)); if (error) throw new Error(error.message); }
+    return { loaded: recs.length };
+  }
   async function _frUploadTestOrders(file, brandId, sb, onMsg) {
     const ab = await file.arrayBuffer();
     const wb = XLSX.read(ab, { type: 'array', cellDates: true });
