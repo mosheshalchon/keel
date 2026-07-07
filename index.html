@@ -47317,25 +47317,27 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const all = custRows.concat(tplRows);
         if (!all.length) { body.innerHTML = empty('customers'); return; }
         const head = ['Customer', 'DC / 3PL', 'Address', 'Service', 'Dock Hours', 'Transit (days)'].map(h => th(h)).join('');
-        const trs = all.map(r => `<tr data-s="${escapeHtml([r.customer, r.dc_name, r.address, r.service_type].filter(Boolean).join(' ').toLowerCase())}">${td(r.customer)}${td(r.dc_name)}${td(r.address)}${td(r.service_type)}${td(dockOf(r))}${td(r.transit_times, true)}</tr>`).join('');
-        body.innerHTML = `<div style="margin-bottom:10px;"><label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);cursor:pointer;"><input type="checkbox" id="hl-fr-pickup" ${showPickup ? 'checked' : ''} style="vertical-align:middle;margin-right:6px;">Show pickup customers (calc uses Delivered only)</label></div>` + _frSearchBox('hl-fr-search-cust', 'customers', 'Search customer, DC, city…') + wrap(head, trs, `${custRows.length} delivered/pickup + ${tplRows.length} 3PL &middot; "Not Servicing" hidden &middot; dock hours from the row's own info or the Dock Hours tab`);
+        const trs = all.map(r => `<tr data-frow data-f-cust="${escapeHtml((r.customer || '').toLowerCase())}" data-f-dc="${escapeHtml((r.dc_name || '').toLowerCase())}" data-f-svc="${escapeHtml((r.service_type || '').toLowerCase())}">${td(r.customer)}${td(r.dc_name)}${td(r.address)}${td(r.service_type)}${td(dockOf(r))}${td(r.transit_times, true)}</tr>`).join('');
+        const filters = _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(all, r => r.customer) }, { key: 'dc', label: 'DC', options: _frDistinct(all, r => r.dc_name) }, { key: 'svc', label: 'Service', options: _frDistinct(all, r => r.service_type) }]);
+        body.innerHTML = `<div style="margin-bottom:10px;"><label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);cursor:pointer;"><input type="checkbox" id="hl-fr-pickup" ${showPickup ? 'checked' : ''} style="vertical-align:middle;margin-right:6px;">Show pickup customers (calc uses Delivered only)</label></div>` + filters + wrap(head, trs, `${custRows.length} delivered/pickup + ${tplRows.length} 3PL &middot; "Not Servicing" hidden &middot; dock hours from the row's own info or the Dock Hours tab`);
         const cb = document.getElementById('hl-fr-pickup'); if (cb) cb.addEventListener('change', () => { _frShowPickup = cb.checked; _frRenderTab(brandId, sb); });
-        _frWireSearch(body, 'hl-fr-search-cust', 'customers');
+        _frWireFilters(body);
       } else if (_frSubTab === 'items') {
         const { data } = await sb.from('freight_items').select('*').eq('brand_id', brandId).order('item_description');
         if (!data || !data.length) { body.innerHTML = empty('items'); return; }
         const head = ['Item', 'UPC', 'Units/Case', 'Case L', 'Case W', 'Case H', 'Case Wt', 'Ti', 'Hi', 'Cases/Pallet'].map((h, i) => th(h, i >= 2)).join('');
-        const trs = data.map(r => `<tr data-s="${escapeHtml([r.item_description, r.unit_upc].filter(Boolean).join(' ').toLowerCase())}">${td(r.item_description)}${td(r.unit_upc)}${td(r.units_per_case, true)}${td(r.case_length, true)}${td(r.case_width, true)}${td(r.case_height, true)}${td(r.case_weight, true)}${td(r.pallet_ti, true)}${td(r.pallet_hi, true)}${td(r.cases_per_pallet, true)}</tr>`).join('');
-        body.innerHTML = _frSearchBox('hl-fr-search-items', 'items', 'Search item or UPC…') + wrap(head, trs, `${data.length} items`);
-        _frWireSearch(body, 'hl-fr-search-items', 'items');
+        const trs = data.map(r => `<tr data-frow data-f-item="${escapeHtml((r.item_description || '').toLowerCase())}">${td(r.item_description)}${td(r.unit_upc)}${td(r.units_per_case, true)}${td(r.case_length, true)}${td(r.case_width, true)}${td(r.case_height, true)}${td(r.case_weight, true)}${td(r.pallet_ti, true)}${td(r.pallet_hi, true)}${td(r.cases_per_pallet, true)}</tr>`).join('');
+        body.innerHTML = _frFilterBar([{ key: 'item', label: 'Item', options: _frDistinct(data, r => r.item_description) }]) + wrap(head, trs, `${data.length} items`);
+        _frWireFilters(body);
       } else if (_frSubTab === 'orders') {
         const { data } = await sb.from('freight_orders').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: true }).limit(3000);
         if (!data || !data.length) { body.innerHTML = empty('orders'); return; }
         const money = (v, dec) => v == null ? null : '$' + (dec ? Number(v).toFixed(2) : Math.round(Number(v)).toLocaleString());
         const head = ['PO Date', 'Proj Ship', 'Customer', 'Item', 'Status', 'Cases', 'Case $', 'Total $'].map((h, i) => th(h, i >= 5)).join('');
-        const trs = data.map(r => `<tr data-s="${escapeHtml([r.customer, r.sku, r.status].filter(Boolean).join(' ').toLowerCase())}">${td(r.po_date)}${td(r.projected_ship_date)}${td(r.customer)}${td(r.sku)}${td(r.status)}${td(r.cases_ordered, true)}${td(money(r.case_price, true), true)}${td(money(r.sales, false), true)}</tr>`).join('');
-        body.innerHTML = _frOrderSummaryHtml(data, th, td, wrap, false) + _frSearchBox('hl-fr-search-orders', 'orders', 'Search customer, item, status…') + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
-        _frWireSearch(body, 'hl-fr-search-orders', 'orders');
+        const trs = data.map(r => `<tr data-frow data-f-cust="${escapeHtml((r.customer || '').toLowerCase())}" data-f-item="${escapeHtml((r.sku || '').toLowerCase())}" data-f-status="${escapeHtml((r.status || '').toLowerCase())}">${td(r.po_date)}${td(r.projected_ship_date)}${td(r.customer)}${td(r.sku)}${td(r.status)}${td(r.cases_ordered, true)}${td(money(r.case_price, true), true)}${td(money(r.sales, false), true)}</tr>`).join('');
+        const filters = _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(data, r => r.customer) }, { key: 'item', label: 'Item', options: _frDistinct(data, r => r.sku) }, { key: 'status', label: 'Status', options: _frDistinct(data, r => r.status) }]);
+        body.innerHTML = _frOrderSummaryHtml(data, th, td, wrap, false) + filters + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
+        _frWireFilters(body);
       } else if (_frSubTab === 'test') {
         const [{ data }, { data: items }] = await Promise.all([
           sb.from('freight_orders_test').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: false }).limit(1000),
@@ -47350,12 +47352,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const banner = `<div style="background:rgba(46,125,50,0.07);border:1px solid rgba(46,125,50,0.3);border-radius:6px;padding:10px 14px;margin-bottom:14px;font-family:var(--sans);font-size:12px;line-height:1.5;">Test data from the workbook's <b>Ordering Data</b> tab — it carries real ship-to DCs (column E), so the optimizer can route it end-to-end. Loaded into a separate table; your live feed and Order Data tab are untouched. Then open <b>Output</b> and switch its source to <b>Test</b>.</div>`;
         const upBtn = `<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;"><input type="file" id="hl-fr-test-file" accept=".xlsx,.xls" style="display:none;" /><button class="hl-btn-primary" id="hl-fr-test-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load Ordering Data (from logistics workbook)</button><span id="hl-fr-test-msg" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${rows.length ? rows.length + ' pending test orders loaded' : 'no test orders yet'}</span></div>`;
         const head = ['Customer', 'Customer DC', 'Origin', 'Proj Ship', 'Item', 'Cases', 'Pallets', 'Layers', 'Status'].map((h, i) => th(h, i === 5 || i === 6)).join('');
-        const trs = rows.map(r => { const p = palletsOf(r); return `<tr data-s="${escapeHtml([r.customer, r.customer_dc, r.sku].filter(Boolean).join(' ').toLowerCase())}">${td(_frCustShort(r.customer))}${td(r.customer_dc)}${td(r.location)}${td(r.projected_ship_date)}${td(r.sku)}${td(r.cases_ordered, true)}${td(p != null ? p.toFixed(2) : null, true)}${td(layersOf(r))}${td(r.status)}</tr>`; }).join('');
-        body.innerHTML = banner + upBtn + (rows.length ? (_frOrderSummaryHtml(rows, th, td, wrap, true, palletsOf) + _frSearchBox('hl-fr-search-test', 'test', 'Search customer, DC, item…') + wrap(head, trs, `${rows.length} rows (Pending Fulfillment, real DCs) · pallets = cases ÷ cases-per-pallet`)) : `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No test orders yet — click "Load Ordering Data" and pick the logistics workbook.</div>`);
+        const trs = rows.map(r => { const p = palletsOf(r); return `<tr data-frow data-f-cust="${escapeHtml(_frCustShort(r.customer).toLowerCase())}" data-f-dc="${escapeHtml((r.customer_dc || '').toLowerCase())}" data-f-item="${escapeHtml((r.sku || '').toLowerCase())}">${td(_frCustShort(r.customer))}${td(r.customer_dc)}${td(r.location)}${td(r.projected_ship_date)}${td(r.sku)}${td(r.cases_ordered, true)}${td(p != null ? p.toFixed(2) : null, true)}${td(layersOf(r))}${td(r.status)}</tr>`; }).join('');
+        const tFilters = rows.length ? _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(rows, r => _frCustShort(r.customer)) }, { key: 'dc', label: 'DC', options: _frDistinct(rows, r => r.customer_dc) }, { key: 'item', label: 'Item', options: _frDistinct(rows, r => r.sku) }]) : '';
+        body.innerHTML = banner + upBtn + (rows.length ? (_frOrderSummaryHtml(rows, th, td, wrap, true, palletsOf) + tFilters + wrap(head, trs, `${rows.length} rows (Pending Fulfillment, real DCs) · pallets = cases ÷ cases-per-pallet`)) : `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No test orders yet — click "Load Ordering Data" and pick the logistics workbook.</div>`);
         const fi = document.getElementById('hl-fr-test-file'); const btn = document.getElementById('hl-fr-test-btn'); const msg = document.getElementById('hl-fr-test-msg');
         btn.addEventListener('click', () => fi.click());
         fi.addEventListener('change', async e => { const f = (e.target.files || [])[0]; if (!f) return; msg.textContent = 'Reading…'; try { const res = await _frUploadTestOrders(f, brandId, sb, m => { msg.textContent = m; }); msg.textContent = res.pending_loaded + ' loaded'; setTimeout(() => _frRenderTab(brandId, sb), 700); } catch (err) { msg.textContent = 'Failed: ' + (err.message || 'error'); } fi.value = ''; });
-        if (rows.length) _frWireSearch(body, 'hl-fr-search-test', 'test');
+        if (rows.length) _frWireFilters(body);
       } else if (_frSubTab === 'output') {
         const src = _frSource === 'test' ? 'freight_orders_test' : 'freight_orders';
         const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }, { data: apprv }, { data: ovrRows }] = await Promise.all([
@@ -47615,9 +47618,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (!list.length) { body.innerHTML = empty('dock hours'); return; }
         const withHours = list.filter(r => r.summary).length;
         const head = ['DC', 'Customer', 'Source', 'Hours', ...days].map((h, i) => th(h, i >= 4)).join('');
-        const trs = list.map(r => { const parsed = r.hours ? null : _frDayHours(r.summary); return `<tr data-s="${escapeHtml([r.dc, r.customer, r.source, r.summary].filter(Boolean).join(' ').toLowerCase())}">${td(r.dc)}${td(r.customer)}${td(r.source)}${td(r.summary)}${days.map(dd => td(fmt(r.hours, dd) || (parsed ? parsed[dd] : null), true)).join('')}</tr>`; }).join('');
-        body.innerHTML = _frSearchBox('hl-fr-search-dock', 'dock', 'Search DC, customer, source…') + wrap(head, trs, `${list.length} DCs · ${withHours} with dock hours · every customer listed; KeHE/UNFI show per-day windows, pickup & not-servicing have none`);
-        _frWireSearch(body, 'hl-fr-search-dock', 'dock');
+        const trs = list.map(r => { const parsed = r.hours ? null : _frDayHours(r.summary); return `<tr data-frow data-f-dc="${escapeHtml((r.dc || '').toLowerCase())}" data-f-cust="${escapeHtml((r.customer || '').toLowerCase())}" data-f-source="${escapeHtml((r.source || '').toLowerCase())}">${td(r.dc)}${td(r.customer)}${td(r.source)}${td(r.summary)}${days.map(dd => td(fmt(r.hours, dd) || (parsed ? parsed[dd] : null), true)).join('')}</tr>`; }).join('');
+        const dFilters = _frFilterBar([{ key: 'dc', label: 'DC', options: _frDistinct(list, r => r.dc) }, { key: 'cust', label: 'Customer', options: _frDistinct(list, r => r.customer) }, { key: 'source', label: 'Source', options: _frDistinct(list, r => r.source) }]);
+        body.innerHTML = dFilters + wrap(head, trs, `${list.length} DCs · ${withHours} with dock hours · every customer listed; KeHE/UNFI show per-day windows, pickup & not-servicing have none`);
+        _frWireFilters(body);
       } else if (_frSubTab === 'lanes') {
         const { data } = await sb.from('freight_lanes').select('*').eq('brand_id', brandId).order('kind').order('lane_no');
         const lanes = (data || []).filter(r => r.kind === 'lane');
@@ -47721,6 +47725,34 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const foot = `<tr style="border-top:2px solid var(--ink);"><td style="padding:7px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total · ${g.length}</td><td></td>${cell(g.reduce((a, x) => a + x.pos, 0))}${cell(g.reduce((a, x) => a + x.cases, 0).toLocaleString())}${hasP ? cell(g.reduce((a, x) => a + x.pallets, 0).toFixed(1)) : ''}${cell('$' + Math.round(g.reduce((a, x) => a + x.sales, 0)).toLocaleString())}</tr>`;
     return `<div style="font-family:var(--serif);font-size:15px;margin:0 0 6px;">Summary by ${byDc ? 'DC' : 'customer'} (${g.length})</div><div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${trs}</tbody><tfoot>${foot}</tfoot></table></div><div style="font-family:var(--serif);font-size:15px;margin:26px 0 6px;">Detailed orders</div>`;
   }
+  function _frMsBox(key, label, options) {
+    return `<div class="fr-ms" data-key="${key}" style="position:relative;">
+      <button type="button" class="fr-ms-btn" style="font-family:var(--mono);font-size:11px;padding:7px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);cursor:pointer;white-space:nowrap;">${label}: <span class="fr-ms-lbl">All</span> ▾</button>
+      <div class="fr-ms-panel" style="display:none;position:absolute;z-index:60;top:100%;left:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;padding:8px;max-height:340px;overflow:auto;min-width:240px;box-shadow:0 6px 20px rgba(0,0,0,0.14);">
+        <input type="text" class="fr-ms-search" placeholder="Search…" style="width:100%;box-sizing:border-box;padding:6px 8px;margin-bottom:6px;border:1px solid var(--rule-soft);border-radius:4px;font-size:12px;background:var(--paper);color:var(--ink);">
+        <label style="display:block;font-family:var(--mono);font-size:11px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="fr-ms-all" checked style="margin-right:6px;vertical-align:middle;">Select all</label>
+        <div style="border-top:1px solid var(--rule-soft);margin:4px 0;"></div>
+        ${options.map(o => `<label class="fr-ms-row" style="display:block;font-size:12px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="fr-ms-opt" value="${escapeHtml(String(o).toLowerCase())}" checked style="margin-right:6px;vertical-align:middle;">${escapeHtml(String(o))}</label>`).join('')}
+      </div></div>`;
+  }
+  function _frFilterBar(defs) { return `<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">${defs.map(d => _frMsBox(d.key, d.label, d.options)).join('')}</div>`; }
+  function _frWireFilters(body) {
+    const panels = [...body.querySelectorAll('.fr-ms')]; if (!panels.length) return;
+    const readSel = ms => { const opts = [...ms.querySelectorAll('.fr-ms-opt')]; const on = opts.filter(o => o.checked); return on.length === opts.length ? null : new Set(on.map(o => o.value)); };
+    const updateLbl = ms => { const opts = [...ms.querySelectorAll('.fr-ms-opt')]; const n = opts.filter(o => o.checked).length; ms.querySelector('.fr-ms-lbl').textContent = (n === opts.length) ? 'All' : (n + ' of ' + opts.length); };
+    const apply = () => { const sel = {}; panels.forEach(ms => sel[ms.dataset.key] = readSel(ms)); body.querySelectorAll('tbody tr[data-frow]').forEach(tr => { let show = true; for (const k in sel) { if (!sel[k]) continue; const vals = (tr.getAttribute('data-f-' + k) || '').split('|').filter(Boolean); if (!vals.some(v => sel[k].has(v))) { show = false; break; } } tr.style.display = show ? '' : 'none'; }); };
+    panels.forEach(ms => {
+      const btn = ms.querySelector('.fr-ms-btn'), panel = ms.querySelector('.fr-ms-panel');
+      btn.addEventListener('click', e => { e.stopPropagation(); const open = panel.style.display !== 'none'; panels.forEach(p => p.querySelector('.fr-ms-panel').style.display = 'none'); panel.style.display = open ? 'none' : 'block'; });
+      panel.addEventListener('click', e => e.stopPropagation());
+      ms.querySelector('.fr-ms-all').addEventListener('change', e => { ms.querySelectorAll('.fr-ms-opt').forEach(o => { o.checked = e.target.checked; }); updateLbl(ms); apply(); });
+      ms.querySelectorAll('.fr-ms-opt').forEach(o => o.addEventListener('change', () => { const opts = [...ms.querySelectorAll('.fr-ms-opt')]; ms.querySelector('.fr-ms-all').checked = opts.every(x => x.checked); updateLbl(ms); apply(); }));
+      const srch = ms.querySelector('.fr-ms-search'); srch.addEventListener('input', () => { const q = srch.value.toLowerCase(); const opts = [...ms.querySelectorAll('.fr-ms-opt')]; ms.querySelectorAll('.fr-ms-row').forEach(r => { r.style.display = r.textContent.toLowerCase().includes(q) ? '' : 'none'; }); if (q) { opts.forEach(o => { o.checked = o.parentElement.textContent.toLowerCase().includes(q); }); ms.querySelector('.fr-ms-all').checked = false; } else { opts.forEach(o => { o.checked = true; }); ms.querySelector('.fr-ms-all').checked = true; } updateLbl(ms); apply(); });
+    });
+    if (!window._frMsDocClose) { window._frMsDocClose = true; document.addEventListener('click', () => { document.querySelectorAll('.fr-ms-panel').forEach(p => { p.style.display = 'none'; }); }); }
+    apply();
+  }
+  function _frDistinct(rows, fn) { return [...new Set((rows || []).map(fn).filter(v => v != null && v !== ''))].sort(); }
   function _frPlan(orders, items, mapRows, settings, customers, lanes, overrides) {
     overrides = overrides || {};
     const _tpl = new Set((customers || []).filter(c => (c.service_type || '').toLowerCase() === '3pl').map(c => _frNorm(_frCustShort(c.customer))));
