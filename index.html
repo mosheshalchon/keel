@@ -41324,9 +41324,19 @@ render();
     // Index values by entity → month, using the selected metric ($ or units),
     // and remember each entity's UPC.
     const metricKey = _spState.metric === 'units' ? 'units' : 'amount';
+    // Closed-month rule: a COMPLETE (past) month counts only finalized statuses —
+    // Billed + Closed. The in-progress CURRENT calendar month counts every status
+    // so the live pipeline (incl. Pending) shows. Because the sync runs daily, as
+    // orders flip Pending → Billed after month-end, the closed month ticks up on
+    // its own. Skipped entirely when the user has picked an explicit status filter.
+    const curMonthKey = spMonthKey(today.getFullYear(), today.getMonth() + 1);
+    const FINAL_STATUSES = new Set(['billed', 'closed']);
+    const statusFilterActive = !!(_spState.statusSel && _spState.statusSel.length);
+    const countRow = (r) => statusFilterActive || r.month === curMonthKey || FINAL_STATUSES.has(String(r.status || '').trim().toLowerCase());
     const byEntity = new Map();
     const upcByEntity = new Map();
     for (const r of rows) {
+      if (!countRow(r)) continue;
       if (!byEntity.has(r.entity)) byEntity.set(r.entity, {});
       const v = r[metricKey];
       byEntity.get(r.entity)[r.month] = (byEntity.get(r.entity)[r.month] || 0) + Number(v || 0);
@@ -41644,6 +41654,7 @@ render();
 
   function spTableHtml(windowMonths, perEntity, anchorKey, periods, totalsByMonth, grandL12, grandCur, grandVarAbs, grandVarPct) {
     const fmt$ = spFmt;
+    const curMonthKey = spMonthKey(new Date().getFullYear(), new Date().getMonth() + 1);
     const fmtSigned$ = spFmtSigned;
     const varColor = (abs) => abs > 0 ? 'var(--won, #3a7a3a)' : (abs < 0 ? 'var(--lost)' : 'var(--ink-3)');
     const pctStr = (pct) => pct == null ? 'n/a' : `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
@@ -41661,9 +41672,9 @@ render();
       </th>`;
 
     const monthTh = (w) => {
-      const isAnchor = w.key === anchorKey;
-      const bg = isAnchor ? 'background:var(--bone-2);' : '';
-      const tag = isAnchor ? '<div style="font-size:7px;color:var(--ink-3);letter-spacing:0.08em;">CURR</div>' : '';
+      const isCurr = w.key === curMonthKey;
+      const bg = isCurr ? 'background:var(--bone-2);' : '';
+      const tag = isCurr ? '<div style="font-size:7px;color:var(--ink-3);letter-spacing:0.08em;">CURR</div>' : '';
       return `<th data-sp-sortkey="m:${w.key}" style="cursor:pointer;text-align:right;padding:8px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);white-space:nowrap;${bg}">${w.label.replace(' ', '<br>')}${tag} ${sortIcon('m:' + w.key)}</th>`;
     };
     const head = `
@@ -41676,7 +41687,7 @@ render();
       </tr>
     `;
     const monthTd = (v, w) => {
-      const bg = w.key === anchorKey ? 'background:var(--bone-2);' : '';
+      const bg = w.key === curMonthKey ? 'background:var(--bone-2);' : '';
       return `<td style="text-align:right;padding:6px 8px;font-family:var(--mono);font-size:11px;color:${v ? 'var(--ink-2)' : 'var(--ink-4)'};${bg}">${v ? fmt$(v) : '·'}</td>`;
     };
     const bodyRows = perEntity.map(pe => `
@@ -41695,7 +41706,7 @@ render();
         <td style="position:sticky;left:0;background:var(--bone-2);text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;font-weight:700;color:var(--ink);text-transform:uppercase;letter-spacing:0.04em;z-index:1;">Total</td>
         ${windowMonths.map(w => {
           const v = totalsByMonth[w.key] || 0;
-          const bg = w.key === anchorKey ? 'background:var(--bone);' : '';
+          const bg = w.key === curMonthKey ? 'background:var(--bone);' : '';
           return `<td style="text-align:right;padding:8px 8px;font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink);${bg}">${v ? fmt$(v) : '·'}</td>`;
         }).join('')}
         <td style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:11px;font-weight:700;color:var(--ink);border-left:1px solid var(--rule-soft);">${fmt$(grandL12)}</td>
