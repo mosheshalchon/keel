@@ -47347,13 +47347,25 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.innerHTML = _frFilterBar([{ key: 'item', label: 'Item', options: _frDistinct(data, r => r.item_description) }]) + wrap(head, trs, `${data.length} items`);
         _frWireFilters(body);
       } else if (_frSubTab === 'orders') {
-        const { data } = await sb.from('freight_orders').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: true }).limit(3000);
+        const [ordRes, custRes] = await Promise.all([
+          sb.from('freight_orders').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: true }).limit(3000),
+          sb.from('freight_customers').select('customer,service_type').eq('brand_id', brandId),
+        ]);
+        const data = ordRes.data;
         if (!data || !data.length) { body.innerHTML = empty('orders'); return; }
+        // Same pickup/3PL exclusion rule the Book tab uses, so the two tie out.
+        const _deliv = new Set(), _excl = new Set();
+        (custRes.data || []).forEach(c => { const k = _frNorm(_frCustShort(c.customer)); const sv = (c.service_type || '').toLowerCase(); if (sv.includes('deliver')) _deliv.add(k); else if (sv.includes('pickup') || sv.includes('not servic') || sv.includes('3pl')) _excl.add(k); });
+        const isExcl = (o) => { const k = _frNorm(_frCustShort(o.customer)); return _excl.has(k) && !_deliv.has(k); };
+        const fulfillOf = (o) => isExcl(o) ? 'Pickup / 3PL' : 'Delivered';
         const money = (v, dec) => v == null ? null : '$' + (dec ? Number(v).toFixed(2) : Math.round(Number(v)).toLocaleString());
-        const head = ['PO Date', 'Proj Ship', 'Customer', 'Item', 'Status', 'Cases', 'Case $', 'Total $'].map((h, i) => th(h, i >= 5)).join('');
-        const trs = data.map(r => `<tr data-frow data-f-cust="${escapeHtml((r.customer || '').toLowerCase())}" data-f-item="${escapeHtml((r.sku || '').toLowerCase())}" data-f-status="${escapeHtml((r.status || '').toLowerCase())}" data-f-month="${escapeHtml((r.projected_ship_date || '').slice(0, 7))}">${td(r.po_date)}${td(r.projected_ship_date)}${td(r.customer)}${td(r.sku)}${td(r.status)}${td(r.cases_ordered, true)}${td(money(r.case_price, true), true)}${td(money(r.sales, false), true)}</tr>`).join('');
-        const filters = _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(data, r => r.customer) }, { key: 'month', label: 'Ship month', options: _frDistinct(data, r => (r.projected_ship_date || '').slice(0, 7)) }, { key: 'item', label: 'Item', options: _frDistinct(data, r => r.sku) }, { key: 'status', label: 'Status', options: _frDistinct(data, r => r.status) }]);
-        body.innerHTML = _frOrderSummaryHtml(data, th, td, wrap, false) + filters + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
+        let bC = 0, bS = 0, xC = 0, xS = 0;
+        data.forEach(o => { const c = Number(o.cases_ordered) || 0, s = Number(o.sales) || 0; if (isExcl(o)) { xC += c; xS += s; } else { bC += c; bS += s; } });
+        const splitLine = `<div style="background:var(--bone-2);border:1px solid var(--rule-soft);border-radius:6px;padding:10px 14px;margin-bottom:16px;font-family:var(--mono);font-size:11px;line-height:1.8;color:var(--ink-3);">Delivered (booked): <b style="color:var(--ink);">${bC.toLocaleString()} cases · $${Math.round(bS).toLocaleString()}</b> — ties to the Book tab &nbsp;·&nbsp; Pickup / 3PL (excluded): <b style="color:var(--ink);">${xC.toLocaleString()} cases · $${Math.round(xS).toLocaleString()}</b> &nbsp;·&nbsp; Total pending: <b style="color:var(--ink);">${(bC + xC).toLocaleString()} cases · $${Math.round(bS + xS).toLocaleString()}</b></div>`;
+        const head = ['PO Date', 'Proj Ship', 'Customer', 'Item', 'Fulfillment', 'Cases', 'Case $', 'Total $'].map((h, i) => th(h, i >= 5)).join('');
+        const trs = data.map(r => `<tr data-frow data-f-cust="${escapeHtml((r.customer || '').toLowerCase())}" data-f-item="${escapeHtml((r.sku || '').toLowerCase())}" data-f-fulfill="${escapeHtml(fulfillOf(r).toLowerCase())}" data-f-month="${escapeHtml((r.projected_ship_date || '').slice(0, 7))}">${td(r.po_date)}${td(r.projected_ship_date)}${td(r.customer)}${td(r.sku)}${td(fulfillOf(r))}${td(r.cases_ordered, true)}${td(money(r.case_price, true), true)}${td(money(r.sales, false), true)}</tr>`).join('');
+        const filters = _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(data, r => r.customer) }, { key: 'month', label: 'Ship month', options: _frDistinct(data, r => (r.projected_ship_date || '').slice(0, 7)) }, { key: 'item', label: 'Item', options: _frDistinct(data, r => r.sku) }, { key: 'fulfill', label: 'Fulfillment', options: ['Delivered', 'Pickup / 3PL'] }]);
+        body.innerHTML = splitLine + _frOrderSummaryHtml(data, th, td, wrap, false) + filters + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
         _frWireFilters(body);
       } else if (_frSubTab === 'test') {
         const [{ data }, { data: items }] = await Promise.all([
@@ -47842,7 +47854,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const head = [(byDc ? 'DC' : 'Customer'), 'Ship dates', 'POs', 'Cases'].concat(hasP ? ['Pallets'] : []).concat(['Sales']).map((h, i) => th(h, i >= 2)).join('');
     const trs = g.map(x => `<tr>${td(x.key)}${td(shipTxt(x))}${td(x.pos, true)}${td(x.cases.toLocaleString(), true)}${hasP ? td(x.pallets.toFixed(1), true) : ''}${td('$' + Math.round(x.sales).toLocaleString(), true)}</tr>`).join('');
     const cell = v => `<td style="padding:7px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${v}</td>`;
-    const foot = `<tr style="border-top:2px solid var(--ink);"><td style="padding:7px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total · ${g.length}</td><td></td>${cell(g.reduce((a, x) => a + x.pos, 0))}${cell(g.reduce((a, x) => a + x.cases, 0).toLocaleString())}${hasP ? cell(g.reduce((a, x) => a + x.pallets, 0).toFixed(1)) : ''}${cell('$' + Math.round(g.reduce((a, x) => a + x.sales, 0)).toLocaleString())}</tr>`;
+    const foot = `<tr style="border-top:2px solid var(--ink);"><td style="padding:7px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total · ${g.length} ${byDc ? 'DCs' : 'customers'}</td><td></td>${cell(g.reduce((a, x) => a + x.pos, 0))}${cell(g.reduce((a, x) => a + x.cases, 0).toLocaleString())}${hasP ? cell(g.reduce((a, x) => a + x.pallets, 0).toFixed(1)) : ''}${cell('$' + Math.round(g.reduce((a, x) => a + x.sales, 0)).toLocaleString())}</tr>`;
     return `<div style="font-family:var(--serif);font-size:15px;margin:0 0 6px;">Summary by ${byDc ? 'DC' : 'customer'} (${g.length})</div><div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${trs}</tbody><tfoot>${foot}</tfoot></table></div><div style="font-family:var(--serif);font-size:15px;margin:26px 0 6px;">Detailed orders</div>`;
   }
   function _frMsBox(key, label, options) {
