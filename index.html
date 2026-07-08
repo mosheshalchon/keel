@@ -47247,7 +47247,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
 
   // ===================== FREIGHT TOOL (Phase 1: Inputs) =====================
-  let _frSubTab = (() => { try { return localStorage.getItem('keel_fr_subtab') || 'output'; } catch (e) { return 'output'; } })();
+  let _frSubTab = (() => { try { const s = localStorage.getItem('keel_fr_subtab'); return (!s || s === 'test') ? 'output' : s; } catch (e) { return 'output'; } })();
   const _frClean = (v) => { if (v == null) return null; let s = String(v).replace(/_x000D_/g, ' ').replace(/[\r\n]+/g, ' ').replace(/\u00a0/g, ' ').trim(); return s === '' ? null : s; };
   const _frNum = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : null; };
   const _frDate = (v) => { if (v == null || v === '') return null; if (v instanceof Date) return v.toISOString().slice(0, 10); const s = String(v); let m = s.match(/(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`; m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`; return null; };
@@ -47273,7 +47273,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div>
       <div style="margin-top:20px;"></div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:6px 0 0;flex-wrap:wrap;">
-        ${tab('output', 'Book')}${tab('analytics', 'Analytics')}<span style="border-left:1px solid var(--rule-soft);margin:0 4px;"></span>${tab('orders', 'Order Data')}${tab('test', 'Test Orders')}${tab('distributors', 'Carriers')}${tab('customers', 'Customers')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('items', 'Items')}${tab('assumptions', 'Assumptions')}
+        ${tab('output', 'Book')}${tab('analytics', 'Analytics')}<span style="border-left:1px solid var(--rule-soft);margin:0 4px;"></span>${tab('orders', 'Order Data')}${tab('distributors', 'Carriers')}${tab('customers', 'Customers')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('items', 'Items')}${tab('assumptions', 'Assumptions')}
       </div>
       <div id="hl-fr-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>`;
 
@@ -47377,7 +47377,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         fi.addEventListener('change', async e => { const f = (e.target.files || [])[0]; if (!f) return; msg.textContent = 'Reading…'; try { const res = await _frUploadTestOrders(f, brandId, sb, m => { msg.textContent = m; }); msg.textContent = res.pending_loaded + ' loaded'; setTimeout(() => _frRenderTab(brandId, sb), 700); } catch (err) { msg.textContent = 'Failed: ' + (err.message || 'error'); } fi.value = ''; });
         if (rows.length) _frWireFilters(body);
       } else if (_frSubTab === 'output') {
-        const src = _frSource === 'test' ? 'freight_orders_test' : 'freight_orders';
+        const src = 'freight_orders';
         const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }, { data: apprv }, { data: ovrRows }, { data: distRows }] = await Promise.all([
           sb.from(src).select('*').eq('brand_id', brandId),
           sb.from('freight_items').select('item_description,cases_per_pallet,case_weight,unit_upc,pallet_ti').eq('brand_id', brandId),
@@ -47390,9 +47390,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         ]);
         const s = await _frLoadSettings(brandId, sb);
         const ovrMap = {}; (ovrRows || []).forEach(o => { ovrMap[o.so_num] = o.ship_date; });
-        const srcToggle = `<div style="margin-bottom:14px;display:flex;gap:8px;align-items:center;"><span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Source:</span>${['live', 'test'].map(v => `<button class="hl-fr-src" data-src="${v}" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border-radius:4px;cursor:pointer;border:1px solid var(--rule-soft);${_frSource === v ? 'background:var(--ink);color:var(--paper);' : 'background:transparent;color:var(--ink-3);'}">${v === 'live' ? 'Live sync' : 'Test (Ordering Data)'}</button>`).join('')}</div>`;
-        const wireSrc = () => body.querySelectorAll('.hl-fr-src').forEach(b => b.addEventListener('click', () => { _frSource = b.dataset.src; _frRenderTab(brandId, sb); }));
-        if (!orders || !orders.length) { body.innerHTML = srcToggle + `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">${_frSource === 'test' ? 'No test orders — load them in the Test Orders tab.' : 'No orders — run the daily sync first.'}</div>`; wireSrc(); return; }
+        const srcToggle = '';
+        const wireSrc = () => {};
+        if (!orders || !orders.length) { body.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No pending orders yet — the daily sync runs each morning, or trigger it manually.</div>`; wireSrc(); return; }
         const P = _frPlan(orders, items, mapRows, s, customers, lanes, ovrMap);
         const _mo2 = {}; _frDefaultItemMap().forEach(p => _mo2[_frNorm(p[0])] = p[1]); (mapRows || []).forEach(m => _mo2[_frNorm(m.order_item)] = m.item_description);
         const _du = {}; (items || []).forEach(it => _du[_frNorm(it.item_description)] = it.unit_upc);
@@ -47492,22 +47492,32 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const needPlan = P.needsDc.reduce((a, sh) => a + sh.plan, 0), needWt = P.needsDc.reduce((a, sh) => a + sh.weight, 0);
         const sumCases = P.totals.casesFTL + P.totals.casesLTL + P.totals.casesDed + P.totals.casesManual + P.totals.casesNeed;
         const reconOK = sumCases === P.totals.cases;
-        const rbRow = (name, count, cases, plan, weight) => `<tr>${td(name)}${td(count, true)}${td(cases.toLocaleString(), true)}${td(plan, true)}${td(money(weight), true)}</tr>`;
-        const reconTable = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${['Bucket', 'Count', 'Cases', 'Plan plt', 'Weight (lb)'].map((h, i) => th(h, i >= 1)).join('')}</tr></thead><tbody>
-          ${rbRow('FTL trucks', P.trucks.length, P.totals.casesFTL, P.totals.palletsFTL, P.totals.weightFTL)}
-          ${rbRow('LTL', P.ltl.length, P.totals.casesLTL, P.totals.palletsLTL, P.totals.weightLTL)}
-          ${rbRow('Dedicated trucks', P.dedicated.length, P.totals.casesDed, P.totals.palletsDed, P.totals.weightDed)}
-          ${rbRow('Manual review', P.manual.length, P.totals.casesManual, manPlan, manWt)}
-          ${rbRow('Needs ship-to DC', P.needsDc.length, P.totals.casesNeed, needPlan, needWt)}
-          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${sumCases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td></tr></tfoot></table></div>
-          <div style="font-family:var(--mono);font-size:11px;margin-top:8px;color:${reconOK ? '#2e7d32' : '#b8860b'};">${reconOK ? `✓ Reconciled — all ${P.totals.cases.toLocaleString()} pending cases are accounted for across the buckets.` : `⚠ Mismatch — buckets sum to ${sumCases.toLocaleString()} vs ${P.totals.cases.toLocaleString()} pending.`}</div>`;
+        const salesBySo = {}; (orders || []).forEach(o => { if (o.so_num) salesBySo[o.so_num] = (salesBySo[o.so_num] || 0) + (Number(o.sales) || 0); });
+        const _getSos = (t) => t.stops ? [...new Set(t.stops.flatMap(x => x.ships || []))] : (t.ships ? [...new Set(t.ships)] : (t.so_num ? [t.so_num] : []));
+        const _assignedSo = new Set();
+        const _bSales = (list) => { let s = 0; (list || []).forEach(t => _getSos(t).forEach(so => { if (!_assignedSo.has(so)) { _assignedSo.add(so); s += salesBySo[so] || 0; } })); return s; };
+        const salesFTL = _bSales(P.trucks), salesLTL = _bSales(P.ltl), salesDed = _bSales(P.dedicated), salesMan = _bSales(P.manual), salesNeed = _bSales(P.needsDc);
+        const salesPlanned = salesFTL + salesLTL + salesDed + salesMan + salesNeed;
+        const salesAll = (orders || []).reduce((a, o) => a + (Number(o.sales) || 0), 0);
+        const salesExcluded = salesAll - salesPlanned;
+        const dollars = v => '$' + Math.round(v).toLocaleString();
+        const rbRow = (name, count, cases, plan, weight, sales) => `<tr>${td(name)}${td(count, true)}${td(cases.toLocaleString(), true)}${td(plan, true)}${td(money(weight), true)}${td(dollars(sales), true)}</tr>`;
+        const reconTable = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${['Bucket', 'Count', 'Cases', 'Plan plt', 'Weight (lb)', '$ Sales'].map((h, i) => th(h, i >= 1)).join('')}</tr></thead><tbody>
+          ${rbRow('FTL trucks', P.trucks.length, P.totals.casesFTL, P.totals.palletsFTL, P.totals.weightFTL, salesFTL)}
+          ${rbRow('LTL', P.ltl.length, P.totals.casesLTL, P.totals.palletsLTL, P.totals.weightLTL, salesLTL)}
+          ${rbRow('Dedicated trucks', P.dedicated.length, P.totals.casesDed, P.totals.palletsDed, P.totals.weightDed, salesDed)}
+          ${rbRow('Manual review', P.manual.length, P.totals.casesManual, manPlan, manWt, salesMan)}
+          ${rbRow('Needs ship-to DC', P.needsDc.length, P.totals.casesNeed, needPlan, needWt, salesNeed)}
+          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total (booked)</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${sumCases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${dollars(salesPlanned)}</td></tr></tfoot></table></div>
+          <div style="font-family:var(--mono);font-size:11px;margin-top:8px;color:${reconOK ? '#2e7d32' : '#b8860b'};">${reconOK ? `✓ Reconciled — all ${P.totals.cases.toLocaleString()} pending cases are accounted for across the buckets.` : `⚠ Mismatch — buckets sum to ${sumCases.toLocaleString()} vs ${P.totals.cases.toLocaleString()} pending.`}</div>
+          <div style="font-family:var(--mono);font-size:11px;margin-top:4px;color:var(--ink-3);">$ Sales — booked ${dollars(salesPlanned)}${salesExcluded > 1 ? ` + excluded (pickup / 3PL / not-serviced) ${dollars(salesExcluded)}` : ''} = <b style="color:var(--ink);">${dollars(salesAll)}</b> total Pending Fulfillment (ties to the Excel file).</div>`;
         body.innerHTML = srcToggle + `
           <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
             ${card('Pending cases', P.totals.cases.toLocaleString())}${card('FTL trucks', P.trucks.length)}${card('LTL', P.ltl.length)}${card('Dedicated', P.dedicated.length)}${card('Manual', P.manual.length)}${card('Planning pallets', P.totals.plan)}${card('Needs DC', P.needsDc.length, 'awaiting ship-to')}
           </div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;line-height:1.6;">Cases reconciliation — pending <b style="color:var(--ink);">${P.totals.cases.toLocaleString()}</b> = FTL ${P.totals.casesFTL.toLocaleString()} · LTL ${P.totals.casesLTL.toLocaleString()} · Dedicated ${P.totals.casesDed.toLocaleString()} · Manual ${P.totals.casesManual.toLocaleString()} · Needs-DC ${P.totals.casesNeed.toLocaleString()}${P.totals.casesMissing ? ` &nbsp;|&nbsp; <span style="color:#b8860b;">⚠ ${P.totals.casesMissing.toLocaleString()} cases with no item config</span>` : ''}${P.totals.cases3pl ? ` &nbsp;|&nbsp; <span style="color:var(--ink-3);">Excluded ${P.totals.cases3pl.toLocaleString()} cases (pickup / 3PL / not-serviced — not ATG-booked)</span>` : ''}</div>
           ${oppPanel}
-          ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — switch Source to <b>Test (Ordering Data)</b> to see them route, or add the DC column to the live feed.</div>` : ''}
+          ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — these orders are missing a DC value in the feed.</div>` : ''}
           <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Truck plan (${allTrucks.length})</div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Orders combine onto one truck only when their projected ship dates fall within ${s.date_window_days || 1} day(s) of each other, and never exceed ${s.max_pallets || 28} pallets / ${money(s.max_weight || 40000)} lb / ${s.max_stops || 3} stops. Mode: <b>LTL</b> ≤ ${s.ltl_max_pallets || 4} plt, otherwise <b>FTL</b> (consolidated toward the ${s.max_pallets || 28}-pallet max) · <b>Dedicated</b> = C&amp;S / Target. Expand multi-stop trucks with the ▸ toggle.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
@@ -47796,7 +47806,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
   let _frShowPickup = true;
   let _frSearch = { customers: '', dock: '', items: '', orders: '', output: '', test: '' };
-  let _frSource = 'test';
+  let _frSource = 'live';
   function _frSearchBox(id, key, placeholder) {
     return `<input type="text" id="${id}" value="${(_frSearch[key] || '').replace(/"/g, '&quot;')}" placeholder="${placeholder}" style="width:100%;max-width:340px;padding:8px 12px;margin-bottom:12px;border:1px solid var(--rule-soft);border-radius:4px;font-family:var(--sans);font-size:13px;background:var(--paper);color:var(--ink);" />`;
   }
