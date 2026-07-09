@@ -46778,6 +46778,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const rec = _mrpRecOrder(r);
       const _pend = _mrpOrdersByIng.get(_mrpNorm(r.ing)) || [];
       const pendPill = _pend.length ? ` <span style="background:#3d7a4e;color:#fff;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;vertical-align:middle;">${_pend.length} on order</span>` : '';
+      const _onorm = _mrpEsc(_mrpNorm(r.ing));
+      const _obtn = (bg, label) => `<td data-mrporder="${_onorm}" style="padding:6px 10px;text-align:center;white-space:nowrap;"><button style="background:${bg};color:#fff;border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.03em;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer;">${label}</button></td>`;
+      const orderCell = _pend.length ? _obtn('#3d7a4e', '✓ Ordered') : ((rec && rec.qty > 0) ? _obtn('#7c86e0', 'Order') : `<td style="padding:6px 10px;"></td>`);
       const recVal = (rec && rec.qty > 0) ? (dollars ? (r.avgCost ? '$' + _mrpFmt(rec.qty * r.avgCost, 0) : '—') : _mrpFmt(rec.qty, 0)) : '—';
       const recHtml = (rec && rec.qty > 0)
         ? `${recVal}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
@@ -46796,7 +46799,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:8px 10px;">${status}</td>
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
         ${orderQtyCell}
-        ${(rec && rec.qty > 0) ? `<td data-mrporder="${_mrpEsc(_mrpNorm(r.ing))}" style="padding:6px 10px;text-align:center;white-space:nowrap;"><button style="background:#7c86e0;color:#fff;border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.03em;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer;">Order</button></td>` : `<td style="padding:6px 10px;"></td>`}
+        ${orderCell}
         <td style="padding:0;width:10px;border-left:1px solid var(--rule-soft);"></td>
         ${cells}
       </tr>`;
@@ -46809,7 +46812,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
     return wrap(`<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          ${unitBtn('units','Units')}${unitBtn('dollars','Dollars')}
+          ${unitBtn('units','Units')}${unitBtn('dollars','Dollars')}${pendToggle}
           <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Start</label>
           <input type="date" id="hl-mrp-grid-start" value="${_mrpGridStart || ''}" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;" />
           <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Weeks</label>
@@ -46817,7 +46820,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             ${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}
           </select>
           <input id="hl-mrp-grid-search" placeholder="Search ingredient…" value="${_mrpEsc(_mrpGridSearch)}" style="margin-left:6px;font-family:var(--serif);font-size:13px;padding:5px 10px;border:1px solid var(--rule-soft);border-radius:6px;min-width:170px;" />
-          ${pendToggle}
         </div>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${gq ? rows.length + ' of ' + allRows.length : allRows.length} ingredients · <span style="color:#a8381f;">${counts.stockout} stockout</span> · <span style="color:#b8860b;">${counts.reorder} reorder</span></div>
       </div>
