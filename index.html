@@ -45901,6 +45901,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _mrpSubTab = 'recipes';            // 'recipes' | 'ingredients' | 'planning'
   let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
   let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [];
+  let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false;
   let _mrpGridUnit = 'units';             // 'units' | 'dollars'
   let _mrpGridHorizon = 13;               // weeks shown
   let _mrpGridStart = null;               // ISO week_start of first column
@@ -46002,6 +46003,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const k = _mrpNorm(s.ingredient);
         if (k && !_mrpSupByIng.has(k)) _mrpSupByIng.set(k, s);
       }
+      try { const ordD = await sb.from('mrp_orders').select('*').eq('brand_id', brandId); _mrpOrders = (((ordD && ordD.data) || [])).filter(o => o.status === 'on_order'); } catch (e) { _mrpOrders = []; }
+      _mrpOrdersByIng = new Map();
+      for (const o of _mrpOrders) { const k = _mrpNorm(o.ingredient); const a = _mrpOrdersByIng.get(k) || []; a.push(o); _mrpOrdersByIng.set(k, a); }
       _mrpLoaded = true;
     } catch (e) {
       _mrpErr = e;
@@ -46405,6 +46409,26 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       line('Recommended order', f(rec.qty,0) + ' ' + uom, {strong:true, color: rec.qty>0?'var(--ink)':'var(--ink-3)'}),
     ].join('');
     const conflictBanner = rec.conflict ? `<div style="margin-top:12px;padding:10px 12px;background:#f3ecf6;border-left:3px solid #7b4397;font-family:var(--serif);font-size:12px;color:#5a2f6e;">Conflict: one minimum order (${f(rec.moq,0)} ${uom}) is more than shelf life allows you to hold (${f(rec.weekly*rec.shelf,0)} ${uom} over ${f(rec.shelf,0)} weeks). You'll either over-buy past spoilage or need a smaller minimum from the supplier.</div>` : '';
+    const ingRec = _mrpIngs.find(x => _mrpNorm(x.ingredient) === norm) || {};
+    const sup = _mrpSupByIng.get(norm) || {};
+    const vEmail = sup.email || '';
+    const leadWks = rec.lead != null ? rec.lead : (Number(ingRec.lead_time_weeks) || 0);
+    const needByDefault = (() => { const d = new Date(); d.setDate(d.getDate() + Math.round((Number(leadWks) || 0) * 7)); return d.toISOString().slice(0, 10); })();
+    const pending = _mrpOrdersByIng.get(norm) || [];
+    const pendingHtml = pending.length ? `<div style="margin-top:14px;padding:10px 12px;background:#eef3ee;border-left:3px solid #3d7a4e;font-family:var(--mono);font-size:11px;line-height:1.9;">On-order for this ingredient:<br>${pending.map(o => `${_mrpFmt(Number(o.qty), 0)} ${_mrpEsc(o.uom || uom)}${o.vendor ? ' · ' + _mrpEsc(o.vendor) : ''} · need-by ${_mrpEsc(o.need_by || '—')} <button data-mrpcancelorder="${o.id}" style="margin-left:4px;background:transparent;border:1px solid var(--rule-soft);border-radius:3px;font-family:var(--mono);font-size:9px;padding:1px 6px;cursor:pointer;color:#a8381f;">Cancel</button>`).join('<br>')}</div>` : '';
+    const orderFooter = rec.qty > 0 ? `<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--rule-soft);">
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px;">Place order</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-bottom:12px;">
+            <label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Quantity (${_mrpEsc(uom)})<input id="hl-mrp-ord-qty" type="number" min="${rec.moq || 0}" value="${Math.round(rec.qty)}" style="display:block;width:100%;box-sizing:border-box;margin-top:3px;font-family:var(--mono);font-size:13px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;" /></label>
+            <label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Need by<input id="hl-mrp-ord-needby" type="date" value="${needByDefault}" style="display:block;width:100%;box-sizing:border-box;margin-top:3px;font-family:var(--mono);font-size:13px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;" /></label>
+            <label style="font-family:var(--mono);font-size:11px;color:var(--ink-3);grid-column:1/3;">Vendor email<input id="hl-mrp-ord-email" type="email" value="${_mrpEsc(vEmail)}" placeholder="vendor@example.com" style="display:block;width:100%;box-sizing:border-box;margin-top:3px;font-family:var(--mono);font-size:13px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;" /></label>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button data-mrp-emailvendor="${_mrpEsc(norm)}" style="background:#7c86e0;color:#fff;border:none;font-family:var(--mono);font-size:11px;padding:8px 14px;border-radius:5px;cursor:pointer;">✉ Email vendor</button>
+            <button data-mrp-markordered="${_mrpEsc(norm)}" style="background:var(--ink);color:#f4efe6;border:none;font-family:var(--mono);font-size:11px;padding:8px 14px;border-radius:5px;cursor:pointer;">Mark as ordered</button>
+          </div>
+          <div style="font-family:var(--serif);font-size:11px;color:var(--ink-3);font-style:italic;margin-top:8px;line-height:1.5;">“Email vendor” opens a pre-filled email for you to review and send. “Mark as ordered” logs it as on-order (visible in the projection) — no inventory is changed; NetSuite on-hand updates when it arrives.</div>
+        </div>` : '';
     const html = `<div id="hl-mrp-cell-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
       <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:560px;width:100%;max-height:86vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
         <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
@@ -46417,16 +46441,58 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <div style="padding:14px 22px 20px;">
           <table style="width:100%;border-collapse:collapse;">${rows}</table>
           ${conflictBanner}
-          <div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">We top up to lead + target hold weeks of demand, subtract what's on hand and on order, then round the shortfall up to the supplier minimum. Shelf life caps the target so you don't buy more than you can use before it spoils.</div>
+          ${pendingHtml}
+          ${orderFooter}
         </div>
       </div></div>`;
     document.body.insertAdjacentHTML('beforeend', html);
     const modal = document.getElementById('hl-mrp-cell-modal');
     if (modal) {
-      modal.addEventListener('click', (ev) => { if (ev.target === modal || ev.target.closest('[data-mrpcellclose]')) _mrpCloseCell(); });
+      modal.addEventListener('click', (ev) => {
+        if (ev.target === modal || ev.target.closest('[data-mrpcellclose]')) { _mrpCloseCell(); return; }
+        const em = ev.target.closest('[data-mrp-emailvendor]'); if (em) { _mrpEmailVendor(em.dataset.mrpEmailvendor, r); return; }
+        const mk = ev.target.closest('[data-mrp-markordered]'); if (mk) { _mrpMarkOrdered(mk.dataset.mrpMarkordered, r); return; }
+        const cn = ev.target.closest('[data-mrpcancelorder]'); if (cn) { _mrpCancelOrder(cn.dataset.mrpcancelorder); return; }
+      });
       const onKey = (ev) => { if (ev.key === 'Escape') { _mrpCloseCell(); document.removeEventListener('keydown', onKey); } };
       document.addEventListener('keydown', onKey);
     }
+  }
+
+  function _mrpOrderInputs() {
+    const q = document.getElementById('hl-mrp-ord-qty'), n = document.getElementById('hl-mrp-ord-needby'), e = document.getElementById('hl-mrp-ord-email');
+    return { qty: q ? Number(q.value) : 0, needBy: n ? n.value : '', email: e ? e.value.trim() : '' };
+  }
+  function _mrpEmailVendor(norm, r) {
+    const { qty, needBy, email } = _mrpOrderInputs();
+    const uom = r.uom || 'units';
+    const ingRec = _mrpIngs.find(x => _mrpNorm(x.ingredient) === norm) || {};
+    const vendor = ingRec.vendor || '';
+    const subject = `Purchase Order — ${r.ing}`;
+    const body = `Hello${vendor ? ' ' + vendor : ''},\n\nWe'd like to place the following order:\n\nIngredient: ${r.ing}\nQuantity: ${_mrpFmt(qty, 0)} ${uom}\nNeed by: ${needBy || 'ASAP'}\n\nPlease confirm availability, pricing, and expected ship date.\n\nThank you.`;
+    window.location.href = `mailto:${encodeURIComponent(email || '')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  }
+  async function _mrpMarkOrdered(norm, r) {
+    const { qty, needBy, email } = _mrpOrderInputs();
+    if (!(qty > 0)) { alert('Enter a quantity greater than zero.'); return; }
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    const ingRec = _mrpIngs.find(x => _mrpNorm(x.ingredient) === norm) || {};
+    const rec = _mrpRecOrder(r) || {};
+    const row = { brand_id: brandId, ingredient: norm, ingredient_label: r.ing, vendor: ingRec.vendor || null, vendor_email: email || null, qty: qty, uom: r.uom || null, need_by: needBy || null, lead_time_weeks: rec.lead != null ? rec.lead : (Number(ingRec.lead_time_weeks) || null), status: 'on_order', ordered_at: new Date().toISOString() };
+    const { data, error } = await sb.from('mrp_orders').insert(row).select().single();
+    if (error) { alert('Save failed: ' + error.message); return; }
+    _mrpOrders.push(data); const a = _mrpOrdersByIng.get(norm) || []; a.push(data); _mrpOrdersByIng.set(norm, a);
+    _mrpCloseCell(); _mrpRenderBody();
+  }
+  async function _mrpCancelOrder(id) {
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    const { error } = await sb.from('mrp_orders').update({ status: 'cancelled' }).eq('brand_id', brandId).eq('id', id);
+    if (error) { alert('Cancel failed: ' + error.message); return; }
+    _mrpOrders = _mrpOrders.filter(o => String(o.id) !== String(id));
+    _mrpOrdersByIng = new Map(); for (const o of _mrpOrders) { const k = _mrpNorm(o.ingredient); const arr = _mrpOrdersByIng.get(k) || []; arr.push(o); _mrpOrdersByIng.set(k, arr); }
+    _mrpCloseCell(); _mrpRenderBody();
   }
 
   function _mrpShowCell(normIng, weekIdx) {
@@ -46692,6 +46758,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}" style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${bg}${col}">${cellVal(r, v)}</td>`;
       }).join('');
       const rec = _mrpRecOrder(r);
+      const _pend = _mrpOrdersByIng.get(_mrpNorm(r.ing)) || [];
+      const pendPill = _pend.length ? ` <span style="background:#3d7a4e;color:#fff;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;vertical-align:middle;">${_pend.length} on order</span>` : '';
       const recVal = (rec && rec.qty > 0) ? (dollars ? (r.avgCost ? '$' + _mrpFmt(rec.qty * r.avgCost, 0) : '—') : _mrpFmt(rec.qty, 0)) : '—';
       const recHtml = (rec && rec.qty > 0)
         ? `${recVal}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
@@ -46702,7 +46770,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         ? `<td data-ordercalc="${_mrpEsc(_mrpNorm(r.ing))}" style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;color:var(--ink);cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;">${recHtml}</td>`
         : `<td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">—</td>`;
       return `<tr style="border-top:1px solid var(--rule-soft);">
-        <td style="padding:8px 12px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:200px;">${_mrpEsc(r.ing)}</td>
+        <td style="padding:8px 12px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:200px;">${_mrpEsc(r.ing)}${pendPill}</td>
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${cellVal(r, r.startOnHand)}</td>
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.avgWk > 0 ? cellVal(r, r.avgWk) : '—'}</td>
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${ohWks}</td>
