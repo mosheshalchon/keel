@@ -30847,7 +30847,7 @@ render();
         // that may not yet exist in distributor_sales_lines. On first column-missing error, strip them
         // and retry. This lets the upload succeed without requiring a manual ALTER TABLE.
         const recs = parsed.lineRows.map(r => ({ ...r, upload_id: up.id, brand_id: brandId }));
-        const isClearvueFile = parsed.summary && parsed.summary.format === 'clearvue';
+        const isClearvueFile = parsed.summary && (parsed.summary.format === 'clearvue' || parsed.summary.format === 'kehe');
         let saved = 0;
         let clearvueExtrasStripped = false;
         const stripClearvueExtras = (r) => {
@@ -30955,6 +30955,95 @@ render();
   // We store at chain × store × month granularity. The week_starting field gets the month-start
   // date so the existing weekly-bucketed views can still render this data; the Distributor Sales TS
   // view detects "monthly source" and labels accordingly.
+  // ─── Sales: KeHe "Chains and Stores that ordered an Item" parser ───
+  // Hierarchical report where indentation is encoded by COLUMN position:
+  //   col 0 = chain/parent · col 2 = retailer group · col 3 = banner · col 4 = store · col 6 = item
+  // Measures: ORDERED $ (weekly sales, valued at vendor cost), SHIPPED $, FILL RATE.
+  // Only col-6 (item) rows are leaves; everything above is a subtotal we must NOT sum.
+  // Week comes from a "M/D/YYYY - M/D/YYYY" range cell; we use the range START as week_starting.
+  async function parseDistSalesFileKehe(file, aoa, productByUpc) {
+    const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const getNum = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[$,\s()]/g, '')); return isNaN(n) ? null : n; };
+
+    // week_starting from the date-range cell
+    let weekStarting = null;
+    for (let r = 0; r < Math.min(15, aoa.length) && !weekStarting; r++) {
+      for (const c of (aoa[r] || [])) {
+        const m = String(c ?? '').match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s*-\s*\d/);
+        if (m) { weekStarting = `${m[3]}-${String(m[1]).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`; break; }
+      }
+    }
+    if (!weekStarting) throw new Error('KeHe: could not find the week date range (e.g. "6/28/2026 - 7/4/2026").');
+
+    // header row + ORDERED column (match by name so it survives column shifts)
+    let hdrIdx = -1, cOrdered = -1;
+    for (let r = 0; r < Math.min(20, aoa.length); r++) {
+      const row = (aoa[r] || []).map(norm);
+      const io = row.findIndex(h => h === 'ordered');
+      if (io >= 0 && row.some(h => h === 'shipped' || h.includes('fill rate'))) { hdrIdx = r; cOrdered = io; break; }
+    }
+    if (hdrIdx < 0 || cOrdered < 0) throw new Error('KeHe: could not locate the ORDERED column.');
+
+    const upcRe = /\((\d{6,})\)/;
+    const matchProduct = (upc) => {
+      if (!upc) return null;
+      const k = String(upc).replace(/[^0-9]/g, ''); if (!k) return null;
+      return productByUpc.get(k) || productByUpc.get('0' + k) || (k.length >= 12 ? productByUpc.get(k.slice(-12)) : null) || (k.length >= 11 ? productByUpc.get(k.slice(-11)) : null) || null;
+    };
+
+    let chain = '', retailer = '', banner = '', store = '';
+    const agg = new Map();   // key = upc|store  → summed ORDERED
+    for (let r = hdrIdx + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      const g = (i) => { const v = row[i]; return v == null ? '' : String(v).trim(); };
+      const c0 = g(0), c2 = g(2), c3 = g(3), c4 = g(4), c6 = g(6);
+      if (c0) { chain = c0; retailer = ''; banner = ''; store = ''; }
+      if (c2) { retailer = c2; banner = ''; store = ''; }
+      if (c3) { banner = c3; store = ''; }
+      if (c4) { store = c4; }
+      if (!c6) continue;                                   // subtotal row, not an item leaf
+      if (/^total\b/i.test(c6)) continue;
+      const ordered = getNum(row[cOrdered]);
+      if (ordered == null) continue;
+      const m = c6.match(upcRe);
+      const upc = m ? m[1] : null;
+      const itemDesc = c6.replace(/\s*\(\d{6,}\)\s*$/, '').trim();
+      const chainName = banner || retailer || chain || null;
+      const storeName = store || null;
+      const key = (upc || itemDesc) + '|' + (storeName || '');
+      const cur = agg.get(key) || { item: itemDesc, upc, chainName, storeName, ordered: 0 };
+      cur.ordered += ordered;
+      if (!cur.item && itemDesc) cur.item = itemDesc;
+      agg.set(key, cur);
+    }
+
+    const lineRows = [];
+    const items = new Set();
+    let matched = 0;
+    for (const v of agg.values()) {
+      if (!v.ordered) continue;
+      const p = matchProduct(v.upc);
+      if (p) matched++;
+      items.add(v.upc || v.item);
+      lineRows.push({
+        product_id: p ? p.id : null,
+        unit_upc: v.upc || null,
+        item_description: v.item,
+        brand: null,
+        dc_code: 'KeHe',
+        week_starting: weekStarting,
+        units_sold: null,
+        chain_name: v.chainName,
+        store_name: v.storeName,
+        channel: null,
+        dollars: Math.round(v.ordered * 100) / 100,
+        period_type: 'weekly',
+      });
+    }
+    if (!lineRows.length) throw new Error('KeHe: parsed 0 item rows — check the file structure.');
+    return { lineRows, itemRows: items.size, weekCount: 1, matched, summary: { format: 'kehe', week: weekStarting, distributor: 'KeHe' } };
+  }
+
   async function parseDistSalesFileClearvue(file, aoa, headerRowIdx, productByUpc) {
     const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
     const headers = (aoa[headerRowIdx] || []);
@@ -31173,6 +31262,26 @@ render();
     // Detection is liberal: any row with ≥3 of {date, chain, dollars/units, product, store, brand} counts.
     // Scans the first 30 rows in case there are title/metadata rows above the headers.
     const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+    // ── Detect KeHe "Chains and Stores that ordered an Item" report ──
+    // Signals: a header row with ORDERED + (SHIPPED or FILL RATE) + an "item / retailer" label,
+    // or the report title. Hierarchical / indentation-by-column — its own parser.
+    {
+      let keheHdr = -1;
+      for (let r = 0; r < Math.min(15, aoa.length); r++) {
+        const row = (aoa[r] || []).map(norm);
+        const hasOrdered = row.some(c => c === 'ordered');
+        const hasShipOrFill = row.some(c => c === 'shipped' || c.includes('fill rate'));
+        const hasItemRetailer = row.some(c => c.includes('item') && c.includes('retailer'));
+        if (hasOrdered && hasShipOrFill && hasItemRetailer) { keheHdr = r; break; }
+      }
+      const titleHit = aoa.slice(0, 8).some(row => (row || []).some(c => /chains?\s*\/?\s*stores?\s+that\s+ordered/i.test(String(c ?? ''))));
+      if (keheHdr >= 0 || titleHit) {
+        console.log('[KeHe detect] matched chains/stores-that-ordered report');
+        return parseDistSalesFileKehe(file, aoa, productByUpc);
+      }
+    }
+
     const diagnostic = [];
     let clearvueHeaderIdx = -1;
     let clearvueSheetIdx = 0;
