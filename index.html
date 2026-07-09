@@ -46485,7 +46485,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const { error } = await sb.from('mrp_orders').update(upd).eq('brand_id', brandId).eq('id', existing.id);
       if (error) { alert('Update failed: ' + error.message); return; }
       Object.assign(existing, upd);
-      _mrpCloseCell(); _mrpRenderBody(); return;
+      _mrpShowPending = true; _mrpCloseCell(); _mrpRenderBody(); return;
     }
     const ingRec = _mrpIngs.find(x => _mrpNorm(x.ingredient) === norm) || {};
     const rec = _mrpRecOrder(r) || {};
@@ -46493,7 +46493,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const { data, error } = await sb.from('mrp_orders').insert(row).select().single();
     if (error) { alert('Save failed: ' + error.message); return; }
     _mrpOrders.push(data); const a = _mrpOrdersByIng.get(norm) || []; a.push(data); _mrpOrdersByIng.set(norm, a);
-    _mrpCloseCell(); _mrpRenderBody();
+    _mrpShowPending = true; _mrpCloseCell(); _mrpRenderBody();
   }
   async function _mrpCancelOrder(id) {
     const sb = window.Auth.getClient();
@@ -46645,32 +46645,34 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (info.on_hand == null) continue;                            // tracked elsewhere but not inventoried (e.g. Water)
       const sup = _mrpSupByIng.get(_mrpNorm(ing));
       const totalOH = (Number(info.on_hand) || 0) + (Number(info.on_order) || 0);
-      const receipts = new Array(weeks.length).fill(0);
-      if (_mrpShowPending) {
-        const leadForArr = info.lead_time_weeks != null ? Number(info.lead_time_weeks) : (sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : 0);
-        const pend = _mrpOrdersByIng.get(_mrpNorm(ing)) || [];
-        for (const o of pend) { const idx = _mrpArrivalWeekIdx(o, weeks, leadForArr); if (idx >= 0 && idx < weeks.length) receipts[idx] += Number(o.qty) || 0; }
-      }
-      let boh = totalOH;
-      const eoh = [];
-      for (let w = 0; w < weeks.length; w++) { boh = boh + receipts[w] - dem[w]; eoh.push(boh); }
       const totalDem = dem.reduce((a,b) => a + b, 0);
       const avgWk = totalDem / weeks.length;
       const lead = info.lead_time_weeks != null ? Number(info.lead_time_weeks) : (sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null);
       const targetHold = info.target_hold_weeks != null ? Number(info.target_hold_weeks) : null;
       const reorderWeeks = lead != null ? lead : ((Number(_mrpSettings.target_months) || 2) * 4.33);
       const targetQty = avgWk * reorderWeeks;   // reorder point = lead-time worth of demand
-      let firstBreach = -1, firstStockout = -1;
-      for (let w = 0; w < weeks.length; w++) {
-        if (firstStockout < 0 && eoh[w] < 0) firstStockout = w;
-        if (firstBreach < 0 && eoh[w] < targetQty) firstBreach = w;
+      // Real projection (no pending orders) — drives the STABLE row order so toggling pending never re-sorts.
+      let rboh = totalOH; const realEoh = [];
+      for (let w = 0; w < weeks.length; w++) { rboh = rboh - dem[w]; realEoh.push(rboh); }
+      let realFirstBreach = -1, realFirstStockout = -1;
+      for (let w = 0; w < weeks.length; w++) { if (realFirstStockout < 0 && realEoh[w] < 0) realFirstStockout = w; if (realFirstBreach < 0 && realEoh[w] < targetQty) realFirstBreach = w; }
+      // Displayed projection — adds pending orders as receipts when the toggle is on.
+      const receipts = new Array(weeks.length).fill(0);
+      if (_mrpShowPending) {
+        const leadForArr = lead != null ? lead : 0;
+        const pend = _mrpOrdersByIng.get(_mrpNorm(ing)) || [];
+        for (const o of pend) { const idx = _mrpArrivalWeekIdx(o, weeks, leadForArr); if (idx >= 0 && idx < weeks.length) receipts[idx] += Number(o.qty) || 0; }
       }
-      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, receipts, avgWk, targetQty, firstBreach, firstStockout, lead, targetHold, startOnHand: totalOH, onHand: Number(info.on_hand) || 0, onOrder: Number(info.on_order) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
+      let boh = totalOH; const eoh = [];
+      for (let w = 0; w < weeks.length; w++) { boh = boh + receipts[w] - dem[w]; eoh.push(boh); }
+      let firstBreach = -1, firstStockout = -1;
+      for (let w = 0; w < weeks.length; w++) { if (firstStockout < 0 && eoh[w] < 0) firstStockout = w; if (firstBreach < 0 && eoh[w] < targetQty) firstBreach = w; }
+      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, receipts, avgWk, targetQty, firstBreach, firstStockout, realFirstBreach, realFirstStockout, lead, targetHold, startOnHand: totalOH, onHand: Number(info.on_hand) || 0, onOrder: Number(info.on_order) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
     }
     if (unmatched.length) console.warn('[MRP] ingredients with no master match (on-hand shows 0):', unmatched);
     rows.sort((a,b) => {
-      const ax = a.firstStockout >= 0 ? a.firstStockout : (a.firstBreach >= 0 ? 1000 + a.firstBreach : 99999);
-      const bx = b.firstStockout >= 0 ? b.firstStockout : (b.firstBreach >= 0 ? 1000 + b.firstBreach : 99999);
+      const ax = a.realFirstStockout >= 0 ? a.realFirstStockout : (a.realFirstBreach >= 0 ? 1000 + a.realFirstBreach : 99999);
+      const bx = b.realFirstStockout >= 0 ? b.realFirstStockout : (b.realFirstBreach >= 0 ? 1000 + b.realFirstBreach : 99999);
       return ax - bx || a.ing.localeCompare(b.ing);
     });
     return { weeks, rows };
@@ -46797,6 +46799,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const _onorm = _mrpEsc(_mrpNorm(r.ing));
       const _obtn = (bg, label) => `<td data-mrporder="${_onorm}" style="padding:6px 10px;text-align:center;white-space:nowrap;"><button style="background:${bg};color:#fff;border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.03em;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer;">${label}</button></td>`;
       const orderCell = _pend.length ? _obtn('#3d7a4e', '✓ Ordered') : ((rec && rec.qty > 0) ? _obtn('#7c86e0', 'Order') : `<td style="padding:6px 10px;"></td>`);
+      const orderedQty = _pend.reduce((s, o) => s + (Number(o.qty) || 0), 0);
+      const orderedCell = _mrpShowPending ? `<td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;color:#2f5d3a;white-space:nowrap;">${_pend.length ? cellVal(r, orderedQty) : '—'}</td>` : '';
       const recVal = (rec && rec.qty > 0) ? (dollars ? (r.avgCost ? '$' + _mrpFmt(rec.qty * r.avgCost, 0) : '—') : _mrpFmt(rec.qty, 0)) : '—';
       const recHtml = (rec && rec.qty > 0)
         ? `${recVal}${rec.conflict ? ' <span title="One minimum order exceeds shelf life" style="color:#7b4397;">⚠</span>' : ''}`
@@ -46816,6 +46820,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
         ${orderQtyCell}
         ${orderCell}
+        ${orderedCell}
         <td style="padding:0;width:10px;border-left:1px solid var(--rule-soft);"></td>
         ${cells}
       </tr>`;
@@ -46824,7 +46829,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const unitBtn = (id, label) => `<button data-mrpunit="${id}" style="background:${_mrpGridUnit===id?'var(--ink)':'transparent'};color:${_mrpGridUnit===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
     const _pendTotal = _mrpOrders.length;
     const pendToggle = `<button data-mrppendtoggle style="background:${_mrpShowPending?'#3d7a4e':'transparent'};color:${_mrpShowPending?'#fff':'#3d7a4e'};border:1px solid #3d7a4e;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${_mrpShowPending?'✓ ':''}Show pending orders${_pendTotal?` (${_pendTotal})`:''}</button>`;
-    const pendBanner = _mrpShowPending ? `<div style="margin-bottom:12px;padding:10px 14px;background:#eef3ee;border:1px solid #3d7a4e;border-radius:6px;font-family:var(--mono);font-size:11px;color:#2f5d3a;line-height:1.6;"><b>Projected view</b> — pending orders are added as future receipts (green top-border marks the week each lands). This is a projection of what the schedule <i>would</i> look like once these arrive — <b>not</b> current inventory. Toggle off for actual on-hand.</div>` : '';
+    const appliedOrders = _mrpShowPending ? _mrpOrders.map(o => { const idx = _mrpArrivalWeekIdx(o, weeks, Number(o.lead_time_weeks) || 0); return { label: o.ingredient_label || o.ingredient, qty: Number(o.qty) || 0, wk: (idx >= 0 && idx < weeks.length) ? _mrpWeekLabel(weeks[idx]) : '—' }; }) : [];
+    const pendBanner = _mrpShowPending ? `<div style="margin-bottom:12px;padding:10px 14px;background:#eef3ee;border:1px solid #3d7a4e;border-radius:6px;font-family:var(--mono);font-size:11px;color:#2f5d3a;line-height:1.6;"><b>Projected view</b> — pending orders added as future receipts (green top-border marks the week each lands). This is a projection of what the schedule <i>would</i> look like once these arrive — <b>not</b> current inventory. Toggle off for actual on-hand.${appliedOrders.length ? `<div style="margin-top:6px;color:#1f4a2c;">Applied: ${appliedOrders.map(a => `${_mrpEsc(a.label)} <b>+${_mrpFmt(a.qty,0)}</b> → ${a.wk}`).join(' &nbsp;·&nbsp; ')}</div>` : `<div style="margin-top:6px;color:#7a5c1e;">No pending orders yet — mark an ingredient as ordered and it'll appear here.</div>`}</div>` : '';
 
     return wrap(`<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0;flex-wrap:wrap;">
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -46850,6 +46856,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order by</th>
           <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order qty</th>
           <th style="padding:9px 10px;text-align:center;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order</th>
+          ${_mrpShowPending ? `<th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:#2f5d3a;text-transform:uppercase;">Ordered</th>` : ''}
           <th style="padding:0;width:10px;border-left:1px solid var(--rule-soft);background:#efe9dd;"></th>
           ${headWeeks}
         </tr></thead>
