@@ -46634,9 +46634,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (info.on_hand == null) continue;                            // tracked elsewhere but not inventoried (e.g. Water)
       const sup = _mrpSupByIng.get(_mrpNorm(ing));
       const totalOH = (Number(info.on_hand) || 0) + (Number(info.on_order) || 0);
+      const receipts = new Array(weeks.length).fill(0);
+      if (_mrpShowPending) {
+        const leadForArr = info.lead_time_weeks != null ? Number(info.lead_time_weeks) : (sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : 0);
+        const pend = _mrpOrdersByIng.get(_mrpNorm(ing)) || [];
+        for (const o of pend) { const idx = _mrpArrivalWeekIdx(o, weeks, leadForArr); if (idx >= 0 && idx < weeks.length) receipts[idx] += Number(o.qty) || 0; }
+      }
       let boh = totalOH;
       const eoh = [];
-      for (let w = 0; w < weeks.length; w++) { boh = boh - dem[w]; eoh.push(boh); }
+      for (let w = 0; w < weeks.length; w++) { boh = boh + receipts[w] - dem[w]; eoh.push(boh); }
       const totalDem = dem.reduce((a,b) => a + b, 0);
       const avgWk = totalDem / weeks.length;
       const lead = info.lead_time_weeks != null ? Number(info.lead_time_weeks) : (sup && sup.lead_time_weeks != null ? Number(sup.lead_time_weeks) : null);
@@ -46648,7 +46654,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (firstStockout < 0 && eoh[w] < 0) firstStockout = w;
         if (firstBreach < 0 && eoh[w] < targetQty) firstBreach = w;
       }
-      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, avgWk, targetQty, firstBreach, firstStockout, lead, targetHold, startOnHand: totalOH, onHand: Number(info.on_hand) || 0, onOrder: Number(info.on_order) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
+      rows.push({ ing: info.ingredient || ing, srcIng: ing, info, sup, dem, eoh, receipts, avgWk, targetQty, firstBreach, firstStockout, lead, targetHold, startOnHand: totalOH, onHand: Number(info.on_hand) || 0, onOrder: Number(info.on_order) || 0, avgCost: Number(info.avg_cost) || 0, uom: info.uom || '' });
     }
     if (unmatched.length) console.warn('[MRP] ingredients with no master match (on-hand shows 0):', unmatched);
     rows.sort((a,b) => {
@@ -46661,6 +46667,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _mrpWeekLabel(iso) {
     const d = new Date(iso + 'T00:00:00');
     return (d.getMonth()+1) + '/' + d.getDate();
+  }
+  // Which grid-week does a pending order land in? need_by if set, else ordered_at + lead weeks.
+  function _mrpArrivalWeekIdx(o, weeks, lead) {
+    if (!weeks || !weeks.length) return -1;
+    let arrive = o.need_by ? new Date(o.need_by + 'T00:00:00') : null;
+    if (!arrive && o.ordered_at) { const lw = o.lead_time_weeks != null ? Number(o.lead_time_weeks) : (Number(lead) || 0); arrive = new Date(new Date(o.ordered_at).getTime() + lw * 7 * 864e5); }
+    if (!arrive || isNaN(arrive.getTime())) return 0;
+    const t = arrive.getTime();
+    for (let w = weeks.length - 1; w >= 0; w--) { if (new Date(weeks[w] + 'T00:00:00').getTime() <= t) return w; }
+    return 0; // arrives before the horizon → treat as landed at week 0
   }
   function _mrpRecOrder(r) {
     const wk = r.avgWk; if (!(wk > 0)) return null;
@@ -46752,9 +46768,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       }
       const cells = r.eoh.map((v,w) => {
         const breach = v < r.targetQty, neg = v < 0;
+        const hasReceipt = _mrpShowPending && r.receipts && r.receipts[w] > 0;
         const bg = neg ? 'background:#f6e3de;' : breach ? 'background:#faf0d7;' : '';
         const col = neg ? 'color:#a8381f;font-weight:600;' : '';
-        return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}" style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${bg}${col}">${cellVal(r, v)}</td>`;
+        const recMark = hasReceipt ? 'box-shadow:inset 0 3px 0 #3d7a4e;' : '';
+        const recTitle = hasReceipt ? ` title="+${_mrpFmt(r.receipts[w],0)} ${_mrpEsc(r.uom||'')} on-order arrives"` : '';
+        return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}"${recTitle} style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${bg}${col}${recMark}">${cellVal(r, v)}</td>`;
       }).join('');
       const rec = _mrpRecOrder(r);
       const _pend = _mrpOrdersByIng.get(_mrpNorm(r.ing)) || [];
@@ -46784,6 +46803,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }).join('');
 
     const unitBtn = (id, label) => `<button data-mrpunit="${id}" style="background:${_mrpGridUnit===id?'var(--ink)':'transparent'};color:${_mrpGridUnit===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
+    const _pendTotal = _mrpOrders.length;
+    const pendToggle = `<button data-mrppendtoggle style="background:${_mrpShowPending?'#3d7a4e':'transparent'};color:${_mrpShowPending?'#fff':'var(--ink-3)'};border:1px solid ${_mrpShowPending?'#3d7a4e':'var(--rule-soft)'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;margin-left:10px;">${_mrpShowPending?'✓ ':''}Show pending orders${_pendTotal?` (${_pendTotal})`:''}</button>`;
+    const pendBanner = _mrpShowPending ? `<div style="margin-bottom:12px;padding:10px 14px;background:#eef3ee;border:1px solid #3d7a4e;border-radius:6px;font-family:var(--mono);font-size:11px;color:#2f5d3a;line-height:1.6;"><b>Projected view</b> — pending orders are added as future receipts (green top-border marks the week each lands). This is a projection of what the schedule <i>would</i> look like once these arrive — <b>not</b> current inventory. Toggle off for actual on-hand.</div>` : '';
 
     return wrap(`<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
@@ -46795,9 +46817,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             ${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}
           </select>
           <input id="hl-mrp-grid-search" placeholder="Search ingredient…" value="${_mrpEsc(_mrpGridSearch)}" style="margin-left:6px;font-family:var(--serif);font-size:13px;padding:5px 10px;border:1px solid var(--rule-soft);border-radius:6px;min-width:170px;" />
+          ${pendToggle}
         </div>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${gq ? rows.length + ' of ' + allRows.length : allRows.length} ingredients · <span style="color:#a8381f;">${counts.stockout} stockout</span> · <span style="color:#b8860b;">${counts.reorder} reorder</span></div>
       </div>
+      ${pendBanner}
       <div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;"><table style="border-collapse:collapse;min-width:100%;">
         <thead><tr style="background:#efe9dd;">
           <th style="padding:9px 12px;text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;position:sticky;left:0;background:#efe9dd;">Ingredient</th>
@@ -46860,6 +46884,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (_mrpExpanded.has(code)) _mrpExpanded.delete(code); else _mrpExpanded.add(code);
         _mrpRenderBody();
       }
+      if (e.target.closest('[data-mrppendtoggle]')) { _mrpShowPending = !_mrpShowPending; _mrpRenderBody(); return; }
       const unitBtn = e.target.closest('[data-mrpunit]');
       if (unitBtn) { _mrpGridUnit = unitBtn.dataset.mrpunit; _mrpRenderBody(); }
       const srcBtn = e.target.closest('[data-mrpsrc]');
