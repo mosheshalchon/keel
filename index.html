@@ -45901,7 +45901,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes') ? s : 'recipes'; } catch (e) { return 'recipes'; } })();            // 'recipes' | 'ingredients' | 'planning'
   let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
   let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [];
-  let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false;
+  let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false, _mrpStatusFilter = 'all';
   let _mrpGridUnit = 'units';             // 'units' | 'dollars'
   let _mrpGridHorizon = 13;               // weeks shown
   let _mrpGridStart = null;               // ISO week_start of first column
@@ -46702,10 +46702,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _mrpGridSetupHtml() {
     const opts = _mrpScenarios.map(s => `<option value="${_mrpEsc(s.id)}" ${s.id===_mrpScenarioId?'selected':''}>${_mrpEsc(s.name)}</option>`).join('');
     const mapped = _mrpMappedCount();
-    const fc = `<label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Forecast</label>
-        <select id="hl-mrp-scenario" style="font-family:var(--serif);font-size:13px;padding:4px 8px;border:1px solid var(--rule-soft);border-radius:4px;max-width:280px;">${opts || '<option>No scenarios</option>'}</select>
-        <button id="hl-mrp-mapbtn" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;color:${mapped<_mrpBoms.length?'#a8381f':'var(--ink-3)'};">SKU map ${mapped}/${_mrpBoms.length}</button>`;
-    return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">${fc}</div>`;
+    const unmapped = mapped < _mrpBoms.length;
+    const field = (label, control) => `<div style="display:flex;flex-direction:column;gap:5px;"><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;">${label}</span>${control}</div>`;
+    const fcSel = `<select id="hl-mrp-scenario" style="font-family:var(--serif);font-size:13px;padding:6px 9px;border:1px solid var(--rule-soft);border-radius:4px;max-width:280px;">${opts || '<option>No scenarios</option>'}</select>`;
+    const mapBtn = `<button id="hl-mrp-mapbtn" style="background:${unmapped?'rgba(184,134,11,0.12)':'transparent'};border:1px solid ${unmapped?'#b8860b':'var(--rule-soft)'};font-family:var(--mono);font-size:11px;letter-spacing:0.03em;padding:6px 11px;cursor:pointer;border-radius:4px;color:${unmapped?'#8a6410':'var(--ink-3)'};">${unmapped?'⚠ ':''}${mapped}/${_mrpBoms.length} mapped</button>`;
+    const startInp = `<input type="date" id="hl-mrp-grid-start" value="${_mrpGridStart || ''}" style="font-family:var(--mono);font-size:12px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;" />`;
+    const wksSel = `<select id="hl-mrp-grid-horizon" style="font-family:var(--mono);font-size:12px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;">${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}</select>`;
+    return `<div style="display:flex;flex-wrap:wrap;align-items:flex-end;gap:20px;padding-bottom:14px;border-bottom:1px solid var(--rule-soft);">${field('Select forecast', fcSel)}${field('SKU mapping', mapBtn)}${field('Planning start date', startInp)}${field('Display wks', wksSel)}</div>`;
   }
   function _mrpMapEditorHtml() {
     const rows = _mrpBoms.map(b => {
@@ -46735,7 +46738,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _mrpGridHtml() {
     const dollars = _mrpGridUnit === 'dollars';
     const setup = _mrpGridSetupHtml();
-    const wrap = (inner) => `<div style="margin-bottom:14px;">${setup}</div>${_mrpShowMap ? _mrpMapEditorHtml() : ''}${inner}`;
+    const wrap = (inner) => `<div>${setup}</div>${_mrpShowMap ? _mrpMapEditorHtml() : ''}${inner}`;
 
     if (_mrpDemandSource === 'forecast') {
       if (!_mrpScenarios.length) return wrap(`<div class="hl-loading">No forecast scenarios found.</div>`);
@@ -46751,7 +46754,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     _mrpLastWeeks = weeks;
     _mrpRowByIng = new Map(allRows.map(r => [_mrpNorm(r.ing), r]));
     const gq = _mrpGridSearch.trim().toLowerCase();
-    const rows = gq ? allRows.filter(r => (r.ing || '').toLowerCase().includes(gq)) : allRows;
+    let rows = gq ? allRows.filter(r => (r.ing || '').toLowerCase().includes(gq)) : allRows;
+    if (_mrpStatusFilter === 'stockout') rows = rows.filter(r => r.firstStockout >= 0);
+    else if (_mrpStatusFilter === 'reorder') rows = rows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0);
     const cellVal = (r, v) => dollars ? (r.avgCost ? '$' + _mrpFmt(v * r.avgCost, 0) : '—') : _mrpFmt(v, 0);
     const counts = { stockout: allRows.filter(r => r.firstStockout >= 0).length, reorder: allRows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length };
     const headWeeks = weeks.map(w => `<th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${_mrpWeekLabel(w)}</th>`).join('');
@@ -46810,18 +46815,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const pendToggle = `<button data-mrppendtoggle style="background:${_mrpShowPending?'#3d7a4e':'transparent'};color:${_mrpShowPending?'#fff':'var(--ink-3)'};border:1px solid ${_mrpShowPending?'#3d7a4e':'var(--rule-soft)'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;margin-left:10px;">${_mrpShowPending?'✓ ':''}Show pending orders${_pendTotal?` (${_pendTotal})`:''}</button>`;
     const pendBanner = _mrpShowPending ? `<div style="margin-bottom:12px;padding:10px 14px;background:#eef3ee;border:1px solid #3d7a4e;border-radius:6px;font-family:var(--mono);font-size:11px;color:#2f5d3a;line-height:1.6;"><b>Projected view</b> — pending orders are added as future receipts (green top-border marks the week each lands). This is a projection of what the schedule <i>would</i> look like once these arrive — <b>not</b> current inventory. Toggle off for actual on-hand.</div>` : '';
 
-    return wrap(`<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          ${unitBtn('units','Units')}${unitBtn('dollars','Dollars')}${pendToggle}
-          <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Start</label>
-          <input type="date" id="hl-mrp-grid-start" value="${_mrpGridStart || ''}" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;" />
-          <label style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-left:6px;">Weeks</label>
-          <select id="hl-mrp-grid-horizon" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;">
-            ${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}
-          </select>
-          <input id="hl-mrp-grid-search" placeholder="Search ingredient…" value="${_mrpEsc(_mrpGridSearch)}" style="margin-left:6px;font-family:var(--serif);font-size:13px;padding:5px 10px;border:1px solid var(--rule-soft);border-radius:6px;min-width:170px;" />
+    return wrap(`<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0;flex-wrap:wrap;">
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          ${unitBtn('units','Units')}${unitBtn('dollars','Dollars')}
+          ${pendToggle}
+          <input id="hl-mrp-grid-search" placeholder="Search ingredient…" value="${_mrpEsc(_mrpGridSearch)}" style="font-family:var(--serif);font-size:13px;padding:6px 10px;border:1px solid var(--rule-soft);border-radius:6px;min-width:170px;" />
         </div>
-        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${gq ? rows.length + ' of ' + allRows.length : allRows.length} ingredients · <span style="color:#a8381f;">${counts.stockout} stockout</span> · <span style="color:#b8860b;">${counts.reorder} reorder</span></div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span style="font-family:var(--mono);font-size:12px;color:var(--ink-3);">${(gq || _mrpStatusFilter!=='all') ? rows.length + ' of ' + allRows.length : allRows.length} ingredients</span>
+          <button data-mrpstatusfilter="stockout" style="cursor:pointer;border:1px solid ${_mrpStatusFilter==='stockout'?'#a8381f':'transparent'};background:${_mrpStatusFilter==='stockout'?'#a8381f':'rgba(168,56,31,0.1)'};color:${_mrpStatusFilter==='stockout'?'#fff':'#a8381f'};font-family:var(--mono);font-size:12px;padding:4px 10px;border-radius:4px;">${counts.stockout} stockout</button>
+          <button data-mrpstatusfilter="reorder" style="cursor:pointer;border:1px solid ${_mrpStatusFilter==='reorder'?'#b8860b':'transparent'};background:${_mrpStatusFilter==='reorder'?'#b8860b':'rgba(184,134,11,0.12)'};color:${_mrpStatusFilter==='reorder'?'#fff':'#8a6410'};font-family:var(--mono);font-size:12px;padding:4px 10px;border-radius:4px;">${counts.reorder} reorder</button>
+        </div>
       </div>
       ${pendBanner}
       <div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;"><table style="border-collapse:collapse;min-width:100%;">
@@ -46887,6 +46891,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         _mrpRenderBody();
       }
       if (e.target.closest('[data-mrppendtoggle]')) { _mrpShowPending = !_mrpShowPending; _mrpRenderBody(); return; }
+      const sf = e.target.closest('[data-mrpstatusfilter]');
+      if (sf) { const v = sf.dataset.mrpstatusfilter; _mrpStatusFilter = (_mrpStatusFilter === v) ? 'all' : v; _mrpRenderBody(); return; }
       const unitBtn = e.target.closest('[data-mrpunit]');
       if (unitBtn) { _mrpGridUnit = unitBtn.dataset.mrpunit; _mrpRenderBody(); }
       const srcBtn = e.target.closest('[data-mrpsrc]');
