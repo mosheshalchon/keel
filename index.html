@@ -45898,7 +45898,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   const _mrpEsc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const _mrpNorm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
-  let _mrpSubTab = 'recipes';            // 'recipes' | 'ingredients' | 'planning'
+  let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes') ? s : 'recipes'; } catch (e) { return 'recipes'; } })();            // 'recipes' | 'ingredients' | 'planning'
   let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
   let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [];
   let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false;
@@ -46388,7 +46388,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
   }
 
-  function _mrpShowOrderCalc(norm) {
+  function _mrpShowOrderCalc(norm, withOrder) {
     const r = _mrpRowByIng.get(norm); if (!r) return;
     const rec = _mrpRecOrder(r); if (!rec) return;
     const uom = r.uom || 'units';
@@ -46441,8 +46441,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <div style="padding:14px 22px 20px;">
           <table style="width:100%;border-collapse:collapse;">${rows}</table>
           ${conflictBanner}
-          ${pendingHtml}
-          ${orderFooter}
+          ${withOrder ? (pendingHtml + orderFooter) : `<div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">We top up to lead + target hold weeks of demand, subtract what's on hand and on order, then round the shortfall up to the supplier minimum. Shelf life caps the target so you don't buy more than you can use before it spoils.</div>`}
         </div>
       </div></div>`;
     document.body.insertAdjacentHTML('beforeend', html);
@@ -46778,6 +46777,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:8px 10px;">${status}</td>
         <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:#7a5c1e;">${orderBy}</td>
         ${orderQtyCell}
+        ${(rec && rec.qty > 0) ? `<td data-mrporder="${_mrpEsc(_mrpNorm(r.ing))}" style="padding:6px 10px;text-align:center;white-space:nowrap;"><button style="background:#7c86e0;color:#fff;border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.03em;text-transform:uppercase;padding:5px 12px;border-radius:4px;cursor:pointer;">Order</button></td>` : `<td style="padding:6px 10px;"></td>`}
         <td style="padding:0;width:10px;border-left:1px solid var(--rule-soft);"></td>
         ${cells}
       </tr>`;
@@ -46808,6 +46808,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <th style="padding:9px 10px;text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Status</th>
           <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order by</th>
           <th style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order qty</th>
+          <th style="padding:9px 10px;text-align:center;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;">Order</th>
           <th style="padding:0;width:10px;border-left:1px solid var(--rule-soft);background:#efe9dd;"></th>
           ${headWeeks}
         </tr></thead>
@@ -46848,7 +46849,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     `;
     // sub-tab switch
     main.querySelectorAll('.hl-mrp-tab').forEach(btn => btn.addEventListener('click', () => {
-      _mrpSubTab = btn.dataset.mrpsubtab; renderMrpPage();
+      _mrpSubTab = btn.dataset.mrpsubtab; try { localStorage.setItem('keel_mrp_subtab', _mrpSubTab); } catch (e) {} renderMrpPage();
     }));
     // delegated events on body
     const body = document.getElementById('hl-mrp-body');
@@ -46870,6 +46871,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (cell) { _mrpShowCell(cell.dataset.celling, Number(cell.dataset.cellweek)); }
       const ordC = e.target.closest('[data-ordercalc]');
       if (ordC) { _mrpShowOrderCalc(ordC.dataset.ordercalc); }
+      const ordBtn = e.target.closest('[data-mrporder]');
+      if (ordBtn) { _mrpShowOrderCalc(ordBtn.dataset.mrporder, true); }
       const ingExp = e.target.closest('[data-ingexp]');
       if (ingExp) { const k = ingExp.dataset.ingexp; if (_mrpIngExpanded.has(k)) _mrpIngExpanded.delete(k); else _mrpIngExpanded.add(k); _mrpRenderBody(); }
       const ingCalc = e.target.closest('[data-ingcalc]');
