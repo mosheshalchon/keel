@@ -46828,7 +46828,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
     const unitBtn = (id, label) => `<button data-mrpunit="${id}" style="background:${_mrpGridUnit===id?'var(--ink)':'transparent'};color:${_mrpGridUnit===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
     const _pendTotal = _mrpOrders.length;
-    const pendToggle = `<button data-mrppendtoggle style="background:${_mrpShowPending?'#3d7a4e':'transparent'};color:${_mrpShowPending?'#fff':'#3d7a4e'};border:1px solid #3d7a4e;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${_mrpShowPending?'✓ ':''}Show pending orders${_pendTotal?` (${_pendTotal})`:''}</button>`;
+    const pendToggle = `<button data-mrppendtoggle style="background:#3d7a4e;color:#fff;border:1px solid #3d7a4e;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${_mrpShowPending?'✓ ':''}Show pending orders${_pendTotal?` (${_pendTotal})`:''}</button>`;
     const appliedOrders = _mrpShowPending ? _mrpOrders.map(o => { const idx = _mrpArrivalWeekIdx(o, weeks, Number(o.lead_time_weeks) || 0); return { label: o.ingredient_label || o.ingredient, qty: Number(o.qty) || 0, wk: (idx >= 0 && idx < weeks.length) ? _mrpWeekLabel(weeks[idx]) : '—' }; }) : [];
     const pendBanner = _mrpShowPending ? `<div style="margin-bottom:12px;padding:10px 14px;background:#eef3ee;border:1px solid #3d7a4e;border-radius:6px;font-family:var(--mono);font-size:11px;color:#2f5d3a;line-height:1.6;"><b>Projected view</b> — pending orders added as future receipts (green top-border marks the week each lands). This is a projection of what the schedule <i>would</i> look like once these arrive — <b>not</b> current inventory. Toggle off for actual on-hand.${appliedOrders.length ? `<div style="margin-top:6px;color:#1f4a2c;">Applied: ${appliedOrders.map(a => `${_mrpEsc(a.label)} <b>+${_mrpFmt(a.qty,0)}</b> → ${a.wk}`).join(' &nbsp;·&nbsp; ')}</div>` : `<div style="margin-top:6px;color:#7a5c1e;">No pending orders yet — mark an ingredient as ordered and it'll appear here.</div>`}</div>` : '';
 
@@ -46837,6 +46837,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${unitBtn('units','Units')}${unitBtn('dollars','Dollars')}
           ${pendToggle}
           <input id="hl-mrp-grid-search" placeholder="Search ingredient…" value="${_mrpEsc(_mrpGridSearch)}" style="font-family:var(--serif);font-size:13px;padding:6px 10px;border:1px solid var(--rule-soft);border-radius:6px;min-width:170px;" />
+          <button data-mrpexport style="background:transparent;color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:6px 11px;cursor:pointer;border-radius:4px;">↓ Export</button>
         </div>
         <div style="display:flex;align-items:center;gap:10px;">
           <span style="font-family:var(--mono);font-size:12px;color:var(--ink-3);">${(gq || _mrpStatusFilter!=='all') ? rows.length + ' of ' + allRows.length : allRows.length} ingredients</span>
@@ -46875,6 +46876,31 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     _mrpRenderBody();
     const { error } = await sb.from('mrp_boms').update({ dough_yield: y, updated_at: new Date().toISOString() }).eq('brand_id', brandId).eq('code', code);
     if (error) { alert('Yield save failed: ' + error.message); }
+  }
+
+  function _mrpExportGrid() {
+    const { weeks, rows } = _mrpComputeGrid();
+    const esc = (v) => { const s = (v == null ? '' : String(v)); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const statusOf = (r) => r.firstStockout >= 0 ? 'Stockout' : (r.firstBreach >= 0 ? 'Reorder' : 'OK');
+    const orderByOf = (r) => r.firstBreach >= 0 ? (r.firstBreach === 0 ? 'now' : _mrpWeekLabel(weeks[r.firstBreach])) : '';
+    const header = ['Ingredient', 'UOM', 'OH+OR', 'Weekly demand', 'OH+OR weeks', 'Target weeks', 'Status', 'Order by', 'Order qty', 'On order'].concat(weeks.map(w => _mrpWeekLabel(w)));
+    const lines = [header.map(esc).join(',')];
+    for (const r of rows) {
+      const rec = _mrpRecOrder(r) || {};
+      const pend = _mrpOrdersByIng.get(_mrpNorm(r.ing)) || [];
+      const ordered = pend.reduce((s, o) => s + (Number(o.qty) || 0), 0);
+      const targetWks = r.lead != null ? (r.lead + (r.targetHold != null ? r.targetHold : 0)) : '';
+      const ohWks = r.avgWk > 0 ? (r.startOnHand / r.avgWk).toFixed(1) : '';
+      const row = [r.ing, r.uom, Math.round(r.startOnHand), Math.round(r.avgWk), ohWks, targetWks, statusOf(r), orderByOf(r), (rec.qty > 0 ? Math.round(rec.qty) : ''), (ordered > 0 ? Math.round(ordered) : '')].concat(r.eoh.map(v => Math.round(v)));
+      lines.push(row.map(esc).join(','));
+    }
+    const note = _mrpShowPending ? ' (projected — includes pending orders)' : ' (current on-hand)';
+    const blob = new Blob(['\ufeff' + lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `keel-procurement-plan-${new Date().toISOString().slice(0, 10)}${_mrpShowPending ? '-projected' : ''}.csv`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   function _mrpVendorsHtml() {
@@ -46940,6 +46966,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (_mrpExpanded.has(code)) _mrpExpanded.delete(code); else _mrpExpanded.add(code);
         _mrpRenderBody();
       }
+      if (e.target.closest('[data-mrpexport]')) { _mrpExportGrid(); return; }
       if (e.target.closest('[data-mrppendtoggle]')) { _mrpShowPending = !_mrpShowPending; _mrpRenderBody(); return; }
       const sf = e.target.closest('[data-mrpstatusfilter]');
       if (sf) { const v = sf.dataset.mrpstatusfilter; _mrpStatusFilter = (_mrpStatusFilter === v) ? 'all' : v; _mrpRenderBody(); return; }
@@ -47115,12 +47142,18 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const dollars = _prodView === 'dollars';
     const q = _prodSearch.trim().toLowerCase();
 
+    // On-hand is a point-in-time snapshot — NEVER additive across snapshot dates.
+    // Use only the most recent snapshot_date; otherwise every past sync gets summed in.
+    const _snapDates = [...new Set(_prodFg.map(f => f.snapshot_date).filter(Boolean))].sort();
+    const _latestSnap = _snapDates.length ? _snapDates[_snapDates.length - 1] : null;
+    const fg = _latestSnap ? _prodFg.filter(f => f.snapshot_date === _latestSnap) : _prodFg;
+
     // all locations present (for the dropdown), regardless of current filter
-    const allLocs = [...new Set(_prodFg.map(f => (f.location || '').trim()).filter(Boolean))].sort();
+    const allLocs = [...new Set(fg.map(f => (f.location || '').trim()).filter(Boolean))].sort();
 
     // group by item across the location filter
     const groups = new Map();
-    for (const f of _prodFg) {
+    for (const f of fg) {
       const loc = (f.location || '').trim();
       if (_prodLocFilter !== 'all' && loc !== _prodLocFilter) continue;
       const g = groups.get(f.item) || { item: f.item, onHand: 0, priceWtNum: 0, priceWtDen: 0, priceMin: 0, locations: new Set(), snapshot: f.snapshot_date, product_id: null };
@@ -47147,7 +47180,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const av = a.weeksSupply == null ? 1e9 : a.weeksSupply, bv = b.weeksSupply == null ? 1e9 : b.weeksSupply;
       return av - bv;   // tightest supply first
     });
-    const snapshot = _prodFg.find(f => f.snapshot_date) ? _prodFg.find(f => f.snapshot_date).snapshot_date : '';
+    const snapshot = _latestSnap || '';
     const totalVal = rows.reduce((s, r) => s + r.value, 0);
     const flagged = rows.filter(r => r.weekly != null && r.weeksSupply != null && r.weeksSupply < _prodTargetWeeks).length;
     _prodRowsByItem = new Map(rows.map(r => [r.item, r]));
@@ -47203,7 +47236,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const shownItems = new Set(rows.map(r => r.item));   // respects line + search + location filters
     const priceByItem = new Map(rows.map(r => [r.item, r.price]));
     const byLoc = new Map();
-    for (const f of _prodFg) {
+    for (const f of fg) {
       if (!shownItems.has(f.item)) continue;
       const loc = (f.location || '').trim() || '(none)';
       if (_prodLocFilter !== 'all' && loc !== _prodLocFilter) continue;
