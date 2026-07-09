@@ -45898,10 +45898,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   const _mrpEsc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const _mrpNorm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
-  let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes') ? s : 'recipes'; } catch (e) { return 'recipes'; } })();            // 'recipes' | 'ingredients' | 'planning'
+  let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes' || s === 'vendors') ? s : 'planning'; } catch (e) { return 'planning'; } })();            // 'planning' | 'recipes' | 'ingredients' | 'vendors'
   let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
   let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [];
-  let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false, _mrpStatusFilter = 'all';
+  let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false, _mrpStatusFilter = 'all', _mrpVendors = [];
   let _mrpGridUnit = 'units';             // 'units' | 'dollars'
   let _mrpGridHorizon = 13;               // weeks shown
   let _mrpGridStart = null;               // ISO week_start of first column
@@ -46004,6 +46004,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (k && !_mrpSupByIng.has(k)) _mrpSupByIng.set(k, s);
       }
       try { const ordD = await sb.from('mrp_orders').select('*').eq('brand_id', brandId); _mrpOrders = (((ordD && ordD.data) || [])).filter(o => o.status === 'on_order'); } catch (e) { _mrpOrders = []; }
+      try { const venD = await sb.from('mrp_vendors').select('*').eq('brand_id', brandId).order('vendor_name'); _mrpVendors = (venD && venD.data) || []; } catch (e) { _mrpVendors = []; }
       _mrpOrdersByIng = new Map();
       for (const o of _mrpOrders) { const k = _mrpNorm(o.ingredient); const a = _mrpOrdersByIng.get(k) || []; a.push(o); _mrpOrdersByIng.set(k, a); }
       _mrpLoaded = true;
@@ -46031,6 +46032,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     if (!_mrpLoaded) { body.innerHTML = `<div class="hl-loading">Loading…</div>`; return; }
     body.innerHTML = _mrpSubTab === 'ingredients' ? _mrpIngredientsHtml()
                    : _mrpSubTab === 'planning'    ? _mrpGridHtml()
+                   : _mrpSubTab === 'vendors'     ? _mrpVendorsHtml()
                    : _mrpRecipesHtml();
   }
 
@@ -46812,7 +46814,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
     const unitBtn = (id, label) => `<button data-mrpunit="${id}" style="background:${_mrpGridUnit===id?'var(--ink)':'transparent'};color:${_mrpGridUnit===id?'#f4efe6':'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${label}</button>`;
     const _pendTotal = _mrpOrders.length;
-    const pendToggle = `<button data-mrppendtoggle style="background:${_mrpShowPending?'#3d7a4e':'transparent'};color:${_mrpShowPending?'#fff':'var(--ink-3)'};border:1px solid ${_mrpShowPending?'#3d7a4e':'var(--rule-soft)'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;margin-left:10px;">${_mrpShowPending?'✓ ':''}Show pending orders${_pendTotal?` (${_pendTotal})`:''}</button>`;
+    const pendToggle = `<button data-mrppendtoggle style="background:${_mrpShowPending?'#3d7a4e':'transparent'};color:${_mrpShowPending?'#fff':'#3d7a4e'};border:1px solid #3d7a4e;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:5px 11px;cursor:pointer;border-radius:4px;">${_mrpShowPending?'✓ ':''}Show pending orders${_pendTotal?` (${_pendTotal})`:''}</button>`;
     const pendBanner = _mrpShowPending ? `<div style="margin-bottom:12px;padding:10px 14px;background:#eef3ee;border:1px solid #3d7a4e;border-radius:6px;font-family:var(--mono);font-size:11px;color:#2f5d3a;line-height:1.6;"><b>Projected view</b> — pending orders are added as future receipts (green top-border marks the week each lands). This is a projection of what the schedule <i>would</i> look like once these arrive — <b>not</b> current inventory. Toggle off for actual on-hand.</div>` : '';
 
     return wrap(`<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0;flex-wrap:wrap;">
@@ -46859,6 +46861,38 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     if (error) { alert('Yield save failed: ' + error.message); }
   }
 
+  function _mrpVendorsHtml() {
+    const rows = _mrpVendors;
+    const cols = [['vendor_name', 'Vendor'], ['contact_name', 'Contact'], ['email', 'Email'], ['phone', 'Phone'], ['account_number', 'Account #'], ['payment_terms', 'Payment terms'], ['default_moq', 'MOQ'], ['default_lead_weeks', 'Lead (wks)'], ['default_pack_size', 'Pack size'], ['comments', 'Comments']];
+    const head = cols.map(([, h]) => `<th style="padding:8px 9px;text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;">${h}</th>`).join('') + '<th style="background:#efe9dd;"></th>';
+    const ec = (r, field) => `<td style="padding:4px 7px;border-top:1px solid var(--rule-soft);"><input data-vendorfield="${field}" data-vendorid="${r.id}" value="${_mrpEsc(r[field] == null ? '' : r[field])}" placeholder="—" style="width:100%;min-width:88px;box-sizing:border-box;border:1px solid transparent;background:transparent;font-family:var(--sans);font-size:12px;color:var(--ink);padding:3px 5px;border-radius:3px;"></td>`;
+    const trs = rows.map(r => `<tr>${cols.map(([f]) => ec(r, f)).join('')}<td style="padding:4px 9px;border-top:1px solid var(--rule-soft);"><button data-vendordel="${r.id}" title="Delete" style="background:none;border:none;color:#a8381f;cursor:pointer;font-size:15px;line-height:1;">&times;</button></td></tr>`).join('');
+    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap;"><p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:0;max-width:680px;line-height:1.5;">Your ingredient vendors — contact details and commercial terms. When you order an ingredient, its assigned vendor's email pre-fills the order. MOQ / lead / pack here are per-vendor <i>defaults</i>; per-ingredient terms can still override them. Click any cell to edit — saves automatically.</p><button id="hl-mrp-vendor-add" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:11px;padding:7px 12px;border-radius:6px;cursor:pointer;white-space:nowrap;">+ Add vendor</button></div>${rows.length ? `<div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;"><table style="border-collapse:collapse;min-width:100%;"><thead><tr style="background:#efe9dd;">${head}</tr></thead><tbody>${trs}</tbody></table></div><div style="margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${rows.length} vendors</div>` : '<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);font-family:var(--serif);">No vendors yet — click "+ Add vendor".</div>'}`;
+  }
+  async function _mrpSaveVendorField(id, field, value) {
+    const sb = window.Auth.getClient(); const brandId = BrandLibrary.getSession().brandId;
+    const numFields = new Set(['default_moq', 'default_lead_weeks']);
+    let v = String(value).trim() === '' ? null : value;
+    if (numFields.has(field) && v != null) { v = Number(String(v).replace(/[^0-9.\-]/g, '')); if (isNaN(v)) v = null; }
+    const row = _mrpVendors.find(x => String(x.id) === String(id)); if (row) row[field] = v;
+    const upd = {}; upd[field] = v;
+    const { error } = await sb.from('mrp_vendors').update(upd).eq('brand_id', brandId).eq('id', id);
+    if (error) alert('Could not save: ' + error.message);
+  }
+  async function _mrpAddVendor() {
+    const sb = window.Auth.getClient(); const brandId = BrandLibrary.getSession().brandId;
+    const { data, error } = await sb.from('mrp_vendors').insert({ brand_id: brandId, vendor_name: 'New vendor' }).select().single();
+    if (error) { alert(error.message); return; }
+    _mrpVendors.push(data); _mrpRenderBody();
+  }
+  async function _mrpDelVendor(id) {
+    if (!confirm('Delete this vendor?')) return;
+    const sb = window.Auth.getClient(); const brandId = BrandLibrary.getSession().brandId;
+    const { error } = await sb.from('mrp_vendors').delete().eq('brand_id', brandId).eq('id', id);
+    if (error) { alert(error.message); return; }
+    _mrpVendors = _mrpVendors.filter(x => String(x.id) !== String(id)); _mrpRenderBody();
+  }
+
   function renderMrpPage() {
     const session = HL.mountPage('mrp');
     if (!session) return;
@@ -46873,7 +46907,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         </div>
       </div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:18px 0 0;">
-        ${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}${tab('planning','Planning')}
+        ${tab('planning','Planning')}${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}${tab('vendors','Vendors')}
       </div>
       <div id="hl-mrp-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
     `;
@@ -46893,6 +46927,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (e.target.closest('[data-mrppendtoggle]')) { _mrpShowPending = !_mrpShowPending; _mrpRenderBody(); return; }
       const sf = e.target.closest('[data-mrpstatusfilter]');
       if (sf) { const v = sf.dataset.mrpstatusfilter; _mrpStatusFilter = (_mrpStatusFilter === v) ? 'all' : v; _mrpRenderBody(); return; }
+      if (e.target.id === 'hl-mrp-vendor-add') { _mrpAddVendor(); return; }
+      const vdel = e.target.closest('[data-vendordel]'); if (vdel) { _mrpDelVendor(vdel.dataset.vendordel); return; }
       const unitBtn = e.target.closest('[data-mrpunit]');
       if (unitBtn) { _mrpGridUnit = unitBtn.dataset.mrpunit; _mrpRenderBody(); }
       const srcBtn = e.target.closest('[data-mrpsrc]');
@@ -46921,6 +46957,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (mapSel) _mrpSaveSkuMap(mapSel.dataset.mapcode, mapSel.value);
       const ingF = e.target.closest('[data-ingfield]');
       if (ingF) _mrpSaveIngField(ingF.dataset.ing, ingF.dataset.ingfield, ingF.value);
+      const venF = e.target.closest('[data-vendorfield]');
+      if (venF) _mrpSaveVendorField(venF.dataset.vendorid, venF.dataset.vendorfield, venF.value);
     });
     body.addEventListener('input', (e) => {
       if (e.target.id === 'hl-mrp-ing-search') {
