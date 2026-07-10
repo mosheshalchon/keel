@@ -28460,6 +28460,7 @@ render();
   let _distSalesFilterCat = null;
   let _distSalesPeriod = 'weekly';  // 'weekly' | 'monthly'
   let _distSalesDcFilter = '';
+  let _distSalesDistFilter = '';
   let _distSalesShowAllWeeks = false;        // false = last 12 weeks; true = all weeks in DB
   let _distSalesHideLow = true;              // hide items with zero/near-zero across the window
   let _distSalesShowUnmatched = false;
@@ -28568,6 +28569,10 @@ render();
 
     const allDcs = [...new Set(lines.map(l => l.dc_code).filter(Boolean))].sort();
 
+    const uploadDistById = new Map((uploads || []).map(u => [u.id, u.distributor]));
+    const distOf = (l) => uploadDistById.get(l.upload_id) || "";
+    const allDistributors = [...new Set((uploads || []).map(u => u.distributor).filter(Boolean))].sort();
+
     const renderSalesTable = () => {
       // Filter-driven mode: three forecast-summary-style dropdowns (Item / Product Line / Category)
       // each default to "All ..." If a specific value is picked, table & chart drill in.
@@ -28590,6 +28595,7 @@ render();
       else if (filterCat) groupBy = 'category';
       else groupBy = 'product_line';             // default top-level grouping
       const dcFilter = _distSalesDcFilter || '';
+      const distFilter = _distSalesDistFilter || '';
       const hideLow = _distSalesHideLow !== false;
       const showUnmOnly = _distSalesShowUnmatched === true;
 
@@ -28616,6 +28622,7 @@ render();
       for (const l of lines) {
         // DC filter applies across all view types
         if (dcFilter && l.dc_code !== dcFilter) continue;
+        if (distFilter && distOf(l) !== distFilter) continue;
         // Clearvue filters (only narrow when the data supports them)
         if (filterChain && (l.chain_name || '') !== filterChain) continue;
         if (filterStore && (l.store_name || '') !== filterStore) continue;
@@ -28964,6 +28971,15 @@ render();
           ${(filterItem || filterPL || filterCat) ? `<button id="hl-sales-clear-filters" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:4px 10px;cursor:pointer;text-transform:uppercase;border-radius:4px;">Clear</button>` : ''}
         </div>
       `;
+      const distControl = allDistributors.length > 1 ? `
+        <div style="display:flex;align-items:center;gap:6px;">
+          <label style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;margin:0;">Distributor:</label>
+          <select id="hl-sales-dist-filter" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+            <option value="">All</option>
+            ${allDistributors.map(d => `<option value="${esc(d)}" ${d === _distSalesDistFilter ? 'selected' : ''}>${esc(d)}</option>`).join('')}
+          </select>
+        </div>
+      ` : '';
       const dcControl = allDcs.length > 1 ? `
         <div style="display:flex;align-items:center;gap:6px;">
           <label style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;margin:0;">DC:</label>
@@ -29067,6 +29083,7 @@ render();
           ${groupByControl}
           ${clearvueFilters}
           ${periodControl}
+          ${distControl}
           ${dcControl}
           ${showAllControl}
           ${filterControls}
@@ -29184,6 +29201,11 @@ render();
       const dcFilterEl = document.getElementById('hl-sales-dc-filter');
       if (dcFilterEl) dcFilterEl.addEventListener('change', (e) => {
         _distSalesDcFilter = e.target.value;
+        renderSalesTable();
+      });
+      const distFilterEl = document.getElementById('hl-sales-dist-filter');
+      if (distFilterEl) distFilterEl.addEventListener('change', (e) => {
+        _distSalesDistFilter = e.target.value;
         renderSalesTable();
       });
       const showAllBtn = document.getElementById('hl-sales-show-all');
