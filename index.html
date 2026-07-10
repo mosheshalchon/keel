@@ -27015,7 +27015,7 @@ render();
         <div style="display:flex;gap:8px;align-items:center;margin-top:24px;flex-wrap:wrap;">
           <button class="hl-btn-secondary" id="hl-dist-uploads-btn">⏱ Upload history</button>
           <input type="file" id="hl-dist-inv-upload" accept=".xlsx,.xls,.csv" multiple style="display:none;" />
-          <input type="file" id="hl-dist-sales-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
+          <input type="file" id="hl-dist-sales-upload" accept=".xlsx,.xls,.csv" multiple style="display:none;" />
           <input type="file" id="hl-dist-svc-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
           <button class="hl-btn-primary" id="hl-dist-inv-upload-btn">+ Upload inventory</button>
           <button class="hl-btn-primary" id="hl-dist-sales-upload-btn" style="display:none;">+ Upload sales</button>
@@ -27059,10 +27059,10 @@ render();
       document.getElementById('hl-dist-sales-upload').click();
     });
     document.getElementById('hl-dist-sales-upload').addEventListener('change', async (e) => {
-      const file = e.target.files?.[0];
+      const files = Array.from(e.target.files || []);
       e.target.value = '';
-      if (!file) return;
-      await openDistSalesUploadModal(file);
+      if (!files.length) return;
+      await openDistSalesBulkUploadModal(files);
     });
     document.getElementById('hl-dist-svc-upload-btn').addEventListener('click', () => {
       document.getElementById('hl-dist-svc-upload').click();
@@ -30722,6 +30722,147 @@ render();
     }
 
     return { lineRows, itemRows, weekCount: weekColumns.length, unmatchedItems, skippedTotalRows };
+  }
+
+  // ─── Sales: bulk upload modal (multiple files, distributor + date per file) ───
+  async function openDistSalesBulkUploadModal(files) {
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    let modal = document.getElementById('hl-sales-bulk-modal');
+    if (modal) modal.remove();
+    modal = document.createElement('div');
+    modal.id = 'hl-sales-bulk-modal';
+    modal.className = 'hl-modal-backdrop';
+    modal.innerHTML = `
+      <div class="hl-modal" style="max-width:760px;width:96%;max-height:90vh;display:flex;flex-direction:column;">
+        <div class="hl-modal-header">
+          <h2>Upload distributor sales · ${files.length} file${files.length === 1 ? '' : 's'}</h2>
+          <button class="hl-modal-close" id="hl-sales-bulk-close">×</button>
+        </div>
+        <div class="hl-modal-body" style="overflow-y:auto;flex:1;">
+          <p style="font-family:var(--serif);font-style:italic;font-size:13px;color:var(--ink-3);margin:0 0 14px 0;">
+            For each file, confirm the distributor. The sales week is read from inside the file automatically; the date shown is detected from the filename as a cross-check. Uploading replaces existing sales for the weeks each file contains.
+          </p>
+          <div id="hl-sales-bulk-list"></div>
+        </div>
+        <div class="hl-modal-footer" style="justify-content:space-between;">
+          <span class="hl-status-msg" id="hl-sales-bulk-status"></span>
+          <div>
+            <button class="hl-btn-secondary" id="hl-sales-bulk-cancel">Cancel</button>
+            <button class="hl-btn-primary" id="hl-sales-bulk-go">Parse &amp; save</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+
+    const detectDistributor = (name) => {
+      const n = name.toLowerCase();
+      if (n.includes('kehe') || /chains?.*stores?.*ordered/.test(n)) return 'KeHe';
+      if (n.includes('unfi')) return 'UNFI';
+      return 'UNFI';
+    };
+    const detectDate = (name) => {
+      const iso = name.match(/(20\d{2})[-_](\d{1,2})[-_](\d{1,2})/);
+      if (iso) return `${iso[1]}-${String(iso[2]).padStart(2, '0')}-${String(iso[3]).padStart(2, '0')}`;
+      const us = name.match(/(\d{1,2})[-_](\d{1,2})[-_](20\d{2})/);
+      if (us) return `${us[3]}-${String(us[1]).padStart(2, '0')}-${String(us[2]).padStart(2, '0')}`;
+      return '';
+    };
+
+    const list = document.getElementById('hl-sales-bulk-list');
+    files.forEach((f, idx) => {
+      const dist = detectDistributor(f.name);
+      const dt = detectDate(f.name);
+      const row = document.createElement('div');
+      row.style.cssText = 'background:var(--bone-2);border-radius:4px;padding:10px 12px;margin-bottom:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;';
+      row.innerHTML = `
+        <div style="flex:1;min-width:220px;font-family:var(--serif);font-size:13px;">${esc(f.name)}</div>
+        <select data-file-idx="${idx}" data-fld="distributor" style="padding:5px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+          <option value="UNFI" ${dist === 'UNFI' ? 'selected' : ''}>UNFI</option>
+          <option value="KeHe" ${dist === 'KeHe' ? 'selected' : ''}>KeHe</option>
+        </select>
+        <input type="date" data-file-idx="${idx}" data-fld="date" value="${dt}" style="padding:5px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);font-family:var(--mono);" />
+        <span data-file-idx="${idx}" data-fld="result" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);min-width:80px;text-align:right;"></span>`;
+      list.appendChild(row);
+    });
+
+    document.getElementById('hl-sales-bulk-close').addEventListener('click', () => modal.remove());
+    document.getElementById('hl-sales-bulk-cancel').addEventListener('click', () => modal.remove());
+
+    document.getElementById('hl-sales-bulk-go').addEventListener('click', async () => {
+      const status = document.getElementById('hl-sales-bulk-status');
+      const goBtn = document.getElementById('hl-sales-bulk-go');
+      goBtn.disabled = true; status.style.color = 'var(--ink-3)';
+      try {
+        const sb = window.Auth.getClient();
+        const brandId = window.BrandLibrary?.getSession()?.brandId;
+        status.textContent = 'Loading products…';
+        const { data: products } = await sb.from('products').select('id, unit_upc, item_description').eq('brand_id', brandId);
+        const productByUpc = new Map();
+        const addUpc = (k, p) => { if (k && !productByUpc.has(k)) productByUpc.set(k, p); };
+        for (const p of (products || [])) {
+          if (!p.unit_upc) continue;
+          const k = String(p.unit_upc).replace(/[^0-9]/g, ''); if (!k) continue;
+          addUpc(k, p); addUpc('0' + k, p);
+          if (k.startsWith('0')) addUpc(k.slice(1), p);
+          if (k.length >= 11) addUpc(k.slice(0, 11), p);
+          if (k.length >= 12) addUpc(k.slice(0, 12), p);
+          if (k.length >= 11) addUpc(k.slice(-11), p);
+          if (k.length >= 12) addUpc(k.slice(-12), p);
+        }
+
+        let okCount = 0, failCount = 0, totalRows = 0;
+        for (let idx = 0; idx < files.length; idx++) {
+          const f = files[idx];
+          const distributor = modal.querySelector(`select[data-file-idx="${idx}"][data-fld="distributor"]`).value;
+          const resEl = modal.querySelector(`span[data-file-idx="${idx}"][data-fld="result"]`);
+          status.textContent = `Parsing ${idx + 1}/${files.length}: ${f.name}…`;
+          try {
+            const parsed = await parseDistSalesFile(f, productByUpc);
+            if (!parsed.lineRows.length) throw new Error('no rows');
+            const weekDates = parsed.lineRows.map(r => r.week_starting).sort();
+            const earliestWeek = weekDates[0], latestWeek = weekDates[weekDates.length - 1];
+            const { data: existingUploads } = await sb.from('distributor_sales_uploads').select('id').eq('brand_id', brandId).eq('distributor', distributor);
+            const existingUploadIds = (existingUploads || []).map(u => u.id);
+            if (existingUploadIds.length > 0) {
+              const uniqueNewWeeks = [...new Set(weekDates)];
+              for (let i = 0; i < uniqueNewWeeks.length; i += 200) {
+                const chunk = uniqueNewWeeks.slice(i, i + 200);
+                const { error: delErr } = await sb.from('distributor_sales_lines').delete().eq('brand_id', brandId).in('upload_id', existingUploadIds).in('week_starting', chunk);
+                if (delErr) throw delErr;
+              }
+            }
+            const { data: up, error: upErr } = await sb.from('distributor_sales_uploads').insert({ brand_id: brandId, distributor, filename: f.name, earliest_week: earliestWeek, latest_week: latestWeek, row_count: parsed.lineRows.length }).select().single();
+            if (upErr) throw upErr;
+            const recs = parsed.lineRows.map(r => ({ ...r, upload_id: up.id, brand_id: brandId }));
+            const hasExtras = parsed.summary && (parsed.summary.format === 'clearvue' || parsed.summary.format === 'kehe');
+            let extrasStripped = false;
+            const strip = (r) => { const { chain_name, store_name, channel, dollars, period_type, ...core } = r; return core; };
+            for (let i = 0; i < recs.length; i += 200) {
+              const chunk = recs.slice(i, i + 200);
+              const toInsert = extrasStripped ? chunk.map(strip) : chunk;
+              const { error: lErr } = await sb.from('distributor_sales_lines').insert(toInsert);
+              if (lErr && hasExtras && /column .* does not exist|chain_name|store_name|channel|dollars|period_type/i.test(lErr.message || '')) {
+                extrasStripped = true;
+                const retry = await sb.from('distributor_sales_lines').insert(chunk.map(strip));
+                if (retry.error) throw retry.error;
+              } else if (lErr) throw lErr;
+            }
+            okCount++; totalRows += parsed.lineRows.length;
+            resEl.textContent = `✓ ${parsed.lineRows.length} rows`; resEl.style.color = '#3d7a4e';
+          } catch (err) {
+            failCount++;
+            resEl.textContent = `✗ ${String(err.message || err).slice(0, 32)}`; resEl.style.color = '#a8381f';
+          }
+        }
+        status.textContent = `Done — ${okCount} file${okCount === 1 ? '' : 's'} saved (${totalRows.toLocaleString()} rows)${failCount ? `, ${failCount} failed` : ''}.`;
+        status.style.color = failCount ? '#a8381f' : '#3d7a4e';
+        goBtn.textContent = 'Close'; goBtn.disabled = false;
+        goBtn.onclick = () => { modal.remove(); renderDistSalesView(); };
+      } catch (e) {
+        status.textContent = 'Error: ' + (e.message || e); status.style.color = '#a8381f';
+        goBtn.disabled = false;
+      }
+    });
   }
 
   // ─── Sales: upload modal (single file) ───
