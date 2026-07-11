@@ -29029,13 +29029,11 @@ render();
         </div>
       ` : '';
 
-      // ─── Retailer / Store multi-select ───
-      const chainList = [...allChains].sort();
-      const storeList = [...allStores].sort();
+      // Retailer / Store dropdowns removed — the KeHe/UNFI reports in use carry no retailer or store detail.
       const channelList = [...allChannels].sort();
-      const retailerMs = chainList.length ? msBox('chain', 'Retailer', chainList, _distSalesChainSel) : '';
-      const storeMs = storeList.length ? msBox('store', 'Stores', storeList, _distSalesStoreSel) : '';
-      const anyFilter = _distSalesChainSel.size || _distSalesStoreSel.size || _distSalesItemSel.size || _distSalesPLSel.size || _distSalesCatSel.size || _distSalesDistSel.size || _distSalesDcSel.size;
+      const retailerMs = '';
+      const storeMs = '';
+      const anyFilter = _distSalesItemSel.size || _distSalesPLSel.size || _distSalesCatSel.size || _distSalesDistSel.size || _distSalesDcSel.size;
       const clearRetailers = anyFilter ? `<button id="hl-sales-clear-cvfilters" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 10px;cursor:pointer;text-transform:uppercase;border-radius:4px;">Clear all</button>` : '';
       const clearvueFilters = '';
 
@@ -29047,8 +29045,6 @@ render();
       host.innerHTML = `
         <div style="background:var(--bone-2);border-radius:6px;padding:10px 14px;margin-bottom:14px;">
           <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
-            ${distControl}
-            ${dcControl}
             ${periodControl}
             ${metricControl}
             ${viewByControl}
@@ -29056,8 +29052,8 @@ render();
             <button id="hl-sales-history" style="background:var(--paper);color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 12px;cursor:pointer;text-transform:uppercase;font-weight:500;border-radius:4px;">⏱ Uploads</button>
           </div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--rule-soft);">
-            ${retailerMs}
-            ${storeMs}
+            ${distControl}
+            ${dcControl}
             ${groupByControl}
             ${clearRetailers}
           </div>
