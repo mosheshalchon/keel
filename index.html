@@ -26998,7 +26998,7 @@ render();
     alert('Excel promo upload coming next — ' + file.name);
   }
 
-  let _distActiveSubTab = 'inventory';  // 'inventory' | 'sales' | 'service-levels'
+  let _distActiveSubTab = (() => { try { const s = localStorage.getItem('keel_dist_subtab'); return (s === 'inventory' || s === 'sales' || s === 'service-levels') ? s : 'inventory'; } catch (e) { return 'inventory'; } })();  // 'inventory' | 'sales' | 'service-levels'
   let _svcShowAllHistory = false;  // service levels: false = last 12 weeks only
 
   function renderDistributionPage() {
@@ -27092,6 +27092,7 @@ render();
         btn.style.fontWeight = '600';
         const tab = btn.dataset.distsubtab;
         _distActiveSubTab = tab;
+        try { localStorage.setItem('keel_dist_subtab', tab); } catch (e) {}
         showUploadButtonsForTab(tab);
         if (tab === 'inventory') renderDistInventoryView();
         else if (tab === 'sales') renderDistSalesView();
@@ -27099,10 +27100,14 @@ render();
       });
     });
 
-    // Restore previously-active tab
-    if (_distActiveSubTab === 'sales') {
+    // Restore previously-active tab (read fresh from storage — module init may predate it)
+    let _restoreTab = _distActiveSubTab;
+    try { const s = localStorage.getItem('keel_dist_subtab'); if (s === 'inventory' || s === 'sales' || s === 'service-levels') _restoreTab = s; } catch (e) {}
+    _distActiveSubTab = _restoreTab;
+    showUploadButtonsForTab(_restoreTab);
+    if (_restoreTab === 'sales') {
       document.querySelector('[data-distsubtab="sales"]')?.click();
-    } else if (_distActiveSubTab === 'service-levels') {
+    } else if (_restoreTab === 'service-levels') {
       document.querySelector('[data-distsubtab="service-levels"]')?.click();
     } else {
       renderDistInventoryView();
@@ -28588,6 +28593,8 @@ render();
       const filterStore = _distSalesFilterStore || '';
       const filterChannel = _distSalesFilterChannel || '';
       const viewBy = _distSalesViewBy || 'item';
+      // KeHe reports dollars only (no units) — units would compute to 0 and get hidden by "hide low-activity".
+      if ((_distSalesDistFilter || '') === 'KeHe') _distSalesMetric = 'dollars';
       const metric = _distSalesMetric || 'units';
       let groupBy;
       if (filterItem) groupBy = 'item';          // base level (one row per DC)
@@ -29206,6 +29213,7 @@ render();
       const distFilterEl = document.getElementById('hl-sales-dist-filter');
       if (distFilterEl) distFilterEl.addEventListener('change', (e) => {
         _distSalesDistFilter = e.target.value;
+        if (e.target.value === 'KeHe') _distSalesMetric = 'dollars';   // KeHe is $ only; units would zero out + get hidden
         renderSalesTable();
       });
       const showAllBtn = document.getElementById('hl-sales-show-all');
@@ -30833,10 +30841,19 @@ render();
         }
 
         let okCount = 0, failCount = 0, totalRows = 0;
+        // Duplicate guard: skip filenames already uploaded for this brand, and repeats within this batch.
+        const { data: priorUploads } = await sb.from('distributor_sales_uploads').select('filename').eq('brand_id', brandId);
+        const priorNames = new Set((priorUploads || []).map(u => String(u.filename || '').toLowerCase()));
+        const seenThisBatch = new Set();
         for (let idx = 0; idx < files.length; idx++) {
           const f = files[idx];
           const distributor = modal.querySelector(`select[data-file-idx="${idx}"][data-fld="distributor"]`).value;
           const resEl = modal.querySelector(`span[data-file-idx="${idx}"][data-fld="result"]`);
+          const lname = f.name.toLowerCase();
+          if (priorNames.has(lname) || seenThisBatch.has(lname)) {
+            resEl.textContent = '✗ already uploaded'; resEl.style.color = '#a8381f'; failCount++; continue;
+          }
+          seenThisBatch.add(lname);
           status.textContent = `Parsing ${idx + 1}/${files.length}: ${f.name}…`;
           try {
             const parsed = await parseDistSalesFile(f, productByUpc);
