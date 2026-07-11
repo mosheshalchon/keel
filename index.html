@@ -28468,6 +28468,11 @@ render();
   let _distSalesDistFilter = '';
   let _distSalesChainSel = new Set();   // multi-select retailers (empty = all)
   let _distSalesStoreSel = new Set();   // multi-select stores (empty = all)
+  let _distSalesItemSel = new Set();    // multi-select items
+  let _distSalesPLSel = new Set();      // multi-select product lines
+  let _distSalesCatSel = new Set();     // multi-select categories
+  let _distSalesDistSel = new Set();    // multi-select distributors
+  let _distSalesDcSel = new Set();      // multi-select DCs
   let _distSalesOpenMs = null;          // which multi-select panel is open (survives re-render)
   let _distSalesShowAllWeeks = false;        // false = last 12 weeks; true = all weeks in DB
   let _distSalesHideLow = true;              // hide items with zero/near-zero across the window
@@ -28591,18 +28596,17 @@ render();
       //   none selected     → show product lines (top-level rollup with +/− to items)
       const filterItem = _distSalesFilterItem || '';
       const filterPL = _distSalesFilterPL || '';
-      const filterCat = _distSalesFilterCat || '';
-      const filterChain = _distSalesFilterChain || '';
+      const filterCat = _distSalesFilterCat || '';      const filterChain = _distSalesFilterChain || '';
       const filterStore = _distSalesFilterStore || '';
       const filterChannel = _distSalesFilterChannel || '';
       const viewBy = _distSalesViewBy || 'item';
       // KeHe reports dollars only (no units) — units would compute to 0 and get hidden by "hide low-activity".
-      if ((_distSalesDistFilter || '') === 'KeHe') _distSalesMetric = 'dollars';
+      if (_distSalesDistSel.size === 1 && _distSalesDistSel.has('KeHe')) _distSalesMetric = 'dollars';
       const metric = _distSalesMetric || 'units';
       let groupBy;
-      if (filterItem) groupBy = 'item';          // base level (one row per DC)
-      else if (filterPL) groupBy = 'product_line';
-      else if (filterCat) groupBy = 'category';
+      if (_distSalesItemSel.size) groupBy = 'item';          // base level (one row per DC)
+      else if (_distSalesPLSel.size) groupBy = 'product_line';
+      else if (_distSalesCatSel.size) groupBy = 'category';
       else groupBy = 'product_line';             // default top-level grouping
       const dcFilter = _distSalesDcFilter || '';
       const distFilter = _distSalesDistFilter || '';
@@ -28631,8 +28635,8 @@ render();
       const weeksPresent = new Set();
       for (const l of lines) {
         // DC filter applies across all view types
-        if (dcFilter && l.dc_code !== dcFilter) continue;
-        if (distFilter && distOf(l) !== distFilter) continue;
+        if (_distSalesDcSel.size && !_distSalesDcSel.has(l.dc_code || '')) continue;
+        if (_distSalesDistSel.size && !_distSalesDistSel.has(distOf(l))) continue;
         // Clearvue filters (only narrow when the data supports them)
         if (_distSalesChainSel.size && !_distSalesChainSel.has(l.chain_name || '')) continue;
         if (_distSalesStoreSel.size && !_distSalesStoreSel.has(l.store_name || '')) continue;
@@ -28646,9 +28650,9 @@ render();
         const upcDisp = p?.unit_upc || l.unit_upc || '—';
         const dc = l.dc_code || '(No DC)';
         // Item-level filters still apply (so even retailer view can be narrowed to one item)
-        if (filterItem && itemDesc !== filterItem) continue;
-        if (filterPL && pl !== filterPL) continue;
-        if (filterCat && cat !== filterCat) continue;
+        if (_distSalesItemSel.size && !_distSalesItemSel.has(itemDesc)) continue;
+        if (_distSalesPLSel.size && !_distSalesPLSel.has(pl)) continue;
+        if (_distSalesCatSel.size && !_distSalesCatSel.has(cat)) continue;
 
         // Determine the base key for this view
         let baseKey, displayMeta;
@@ -28963,42 +28967,29 @@ render();
       const allPLs = [...allPLsSet].sort();
       const allCats = [...allCatsSet].sort();
 
-      // Three forecast-summary-style dropdowns: Item / Product Line / Category
+      // ─── Shared multi-select (search + checkboxes) used by every sales filter ───
+      const msBox = (key, label, options, sel) => {
+        const open = _distSalesOpenMs === key;
+        const lbl = sel.size === 0 ? 'All' : (sel.size === 1 ? [...sel][0] : `${sel.size} selected`);
+        return `<div class="sales-ms" data-mskey="${key}" style="position:relative;">
+          <button type="button" class="sales-ms-btn" style="font-family:var(--mono);font-size:11px;padding:5px 11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);cursor:pointer;white-space:nowrap;max-width:250px;overflow:hidden;text-overflow:ellipsis;">${esc(label)}: <span style="color:${sel.size ? 'var(--ink)' : 'var(--ink-3)'};">${esc(String(lbl).slice(0, 26))}</span> ▾</button>
+          <div class="sales-ms-panel" style="display:${open ? 'block' : 'none'};position:absolute;z-index:60;top:100%;left:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;padding:8px;max-height:320px;overflow:auto;min-width:250px;box-shadow:0 6px 20px rgba(0,0,0,0.14);">
+            <input type="text" class="sales-ms-search" placeholder="Search…" style="width:100%;box-sizing:border-box;padding:6px 8px;margin-bottom:6px;border:1px solid var(--rule-soft);border-radius:4px;font-size:12px;background:var(--paper);color:var(--ink);">
+            <label style="display:block;font-family:var(--mono);font-size:11px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="sales-ms-all" ${sel.size === 0 ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">Select all</label>
+            <div style="border-top:1px solid var(--rule-soft);margin:4px 0;"></div>
+            ${options.map(o => `<label class="sales-ms-row" data-txt="${esc(String(o).toLowerCase())}" style="display:block;font-size:12px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="sales-ms-opt" value="${esc(String(o))}" ${sel.has(o) ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">${esc(String(o))}</label>`).join('')}
+          </div></div>`;
+      };
+
       const groupByControl = `
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <select id="hl-sales-filter-item" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);font-family:var(--mono);min-width:180px;">
-            <option value="">All items</option>
-            ${allItems.map(i => `<option value="${esc(i)}" ${i === filterItem ? 'selected' : ''}>${esc(i)}</option>`).join('')}
-          </select>
-          <select id="hl-sales-filter-pl" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);font-family:var(--mono);min-width:150px;">
-            <option value="">All product lines</option>
-            ${allPLs.map(pl => `<option value="${esc(pl)}" ${pl === filterPL ? 'selected' : ''}>${esc(pl)}</option>`).join('')}
-          </select>
-          <select id="hl-sales-filter-cat" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);font-family:var(--mono);min-width:150px;">
-            <option value="">All categories</option>
-            ${allCats.map(c => `<option value="${esc(c)}" ${c === filterCat ? 'selected' : ''}>${esc(c)}</option>`).join('')}
-          </select>
-          ${(filterItem || filterPL || filterCat) ? `<button id="hl-sales-clear-filters" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:4px 10px;cursor:pointer;text-transform:uppercase;border-radius:4px;">Clear</button>` : ''}
+          ${msBox('item', 'Item', allItems, _distSalesItemSel)}
+          ${msBox('pl', 'Product line', allPLs, _distSalesPLSel)}
+          ${msBox('cat', 'Category', allCats, _distSalesCatSel)}
         </div>
       `;
-      const distControl = allDistributors.length > 1 ? `
-        <div style="display:flex;align-items:center;gap:6px;">
-          <label style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;margin:0;">Distributor:</label>
-          <select id="hl-sales-dist-filter" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
-            <option value="">All</option>
-            ${allDistributors.map(d => `<option value="${esc(d)}" ${d === _distSalesDistFilter ? 'selected' : ''}>${esc(d)}</option>`).join('')}
-          </select>
-        </div>
-      ` : '';
-      const dcControl = allDcs.length > 1 ? `
-        <div style="display:flex;align-items:center;gap:6px;">
-          <label style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;margin:0;">DC:</label>
-          <select id="hl-sales-dc-filter" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
-            <option value="">All</option>
-            ${allDcs.map(d => `<option value="${esc(d)}" ${d === _distSalesDcFilter ? 'selected' : ''}>${esc(d)}</option>`).join('')}
-          </select>
-        </div>
-      ` : '';
+      const distControl = allDistributors.length > 1 ? msBox('dist', 'Distributor', allDistributors, _distSalesDistSel) : '';
+      const dcControl = allDcs.length > 1 ? msBox('dc', 'DC', allDcs, _distSalesDcSel) : '';
       const periodLabel = period === 'monthly' ? 'months' : 'weeks';
       // Weekly / Monthly period toggle
       const periodControl = `
@@ -29025,10 +29016,6 @@ render();
       const viewByControl = `
         <div style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:4px;overflow:hidden;">
           <button class="hl-sales-viewby" data-viewby="item" style="background:${viewBy === 'item' ? 'var(--ink)' : 'var(--paper)'};color:${viewBy === 'item' ? 'var(--paper)' : 'var(--ink-3)'};border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${viewBy === 'item' ? '600' : '500'};">Items</button>
-          ${hasClearvueData ? `
-            <button class="hl-sales-viewby" data-viewby="retailer" style="background:${viewBy === 'retailer' ? 'var(--ink)' : 'var(--paper)'};color:${viewBy === 'retailer' ? 'var(--paper)' : 'var(--ink-3)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${viewBy === 'retailer' ? '600' : '500'};">Retailers</button>
-            <button class="hl-sales-viewby" data-viewby="channel" style="background:${viewBy === 'channel' ? 'var(--ink)' : 'var(--paper)'};color:${viewBy === 'channel' ? 'var(--paper)' : 'var(--ink-3)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${viewBy === 'channel' ? '600' : '500'};">Channels</button>
-          ` : ''}
           <button class="hl-sales-viewby" data-viewby="distributor" style="background:${viewBy === 'distributor' ? 'var(--ink)' : 'var(--paper)'};color:${viewBy === 'distributor' ? 'var(--paper)' : 'var(--ink-3)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${viewBy === 'distributor' ? '600' : '500'};">DCs</button>
         </div>
       `;
@@ -29042,25 +29029,14 @@ render();
         </div>
       ` : '';
 
-      // ─── Retailer / Store multi-select (search + checkboxes, freight-style) ───
+      // ─── Retailer / Store multi-select ───
       const chainList = [...allChains].sort();
       const storeList = [...allStores].sort();
       const channelList = [...allChannels].sort();
-      const msBox = (key, label, options, sel) => {
-        const open = _distSalesOpenMs === key;
-        const lbl = sel.size === 0 ? 'All' : (sel.size === 1 ? [...sel][0] : `${sel.size} selected`);
-        return `<div class="sales-ms" data-mskey="${key}" style="position:relative;">
-          <button type="button" class="sales-ms-btn" style="font-family:var(--mono);font-size:11px;padding:5px 11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);cursor:pointer;white-space:nowrap;max-width:230px;overflow:hidden;text-overflow:ellipsis;">${esc(label)}: <span style="color:${sel.size ? 'var(--ink)' : 'var(--ink-3)'};">${esc(String(lbl).slice(0, 24))}</span> ▾</button>
-          <div class="sales-ms-panel" style="display:${open ? 'block' : 'none'};position:absolute;z-index:60;top:100%;left:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;padding:8px;max-height:320px;overflow:auto;min-width:250px;box-shadow:0 6px 20px rgba(0,0,0,0.14);">
-            <input type="text" class="sales-ms-search" placeholder="Search…" style="width:100%;box-sizing:border-box;padding:6px 8px;margin-bottom:6px;border:1px solid var(--rule-soft);border-radius:4px;font-size:12px;background:var(--paper);color:var(--ink);">
-            <label style="display:block;font-family:var(--mono);font-size:11px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="sales-ms-all" ${sel.size === 0 ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">All</label>
-            <div style="border-top:1px solid var(--rule-soft);margin:4px 0;"></div>
-            ${options.map(o => `<label class="sales-ms-row" data-txt="${esc(String(o).toLowerCase())}" style="display:block;font-size:12px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="sales-ms-opt" value="${esc(String(o))}" ${sel.has(o) ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">${esc(String(o))}</label>`).join('')}
-          </div></div>`;
-      };
       const retailerMs = chainList.length ? msBox('chain', 'Retailer', chainList, _distSalesChainSel) : '';
       const storeMs = storeList.length ? msBox('store', 'Stores', storeList, _distSalesStoreSel) : '';
-      const clearRetailers = (_distSalesChainSel.size || _distSalesStoreSel.size) ? `<button id="hl-sales-clear-cvfilters" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 10px;cursor:pointer;text-transform:uppercase;border-radius:4px;">Clear</button>` : '';
+      const anyFilter = _distSalesChainSel.size || _distSalesStoreSel.size || _distSalesItemSel.size || _distSalesPLSel.size || _distSalesCatSel.size || _distSalesDistSel.size || _distSalesDcSel.size;
+      const clearRetailers = anyFilter ? `<button id="hl-sales-clear-cvfilters" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 10px;cursor:pointer;text-transform:uppercase;border-radius:4px;">Clear all</button>` : '';
       const clearvueFilters = '';
 
       const groupHeader = viewBy === 'retailer' ? 'Retailer'
@@ -29117,38 +29093,6 @@ render();
       `;
 
       // Wire controls — three filter dropdowns
-      const filterItemEl = document.getElementById('hl-sales-filter-item');
-      if (filterItemEl) {
-        filterItemEl.addEventListener('change', (e) => {
-          _distSalesFilterItem = e.target.value || null;
-          _distSalesExpandedGroups = new Set();  // reset expansion on filter change
-          renderSalesTable();
-        });
-      }
-      const filterPLEl = document.getElementById('hl-sales-filter-pl');
-      if (filterPLEl) {
-        filterPLEl.addEventListener('change', (e) => {
-          _distSalesFilterPL = e.target.value || null;
-          _distSalesExpandedGroups = new Set();
-          renderSalesTable();
-        });
-      }
-      const filterCatEl = document.getElementById('hl-sales-filter-cat');
-      if (filterCatEl) {
-        filterCatEl.addEventListener('change', (e) => {
-          _distSalesFilterCat = e.target.value || null;
-          _distSalesExpandedGroups = new Set();
-          renderSalesTable();
-        });
-      }
-      const clearBtn = document.getElementById('hl-sales-clear-filters');
-      if (clearBtn) clearBtn.addEventListener('click', () => {
-        _distSalesFilterItem = null;
-        _distSalesFilterPL = null;
-        _distSalesFilterCat = null;
-        _distSalesExpandedGroups = new Set();
-        renderSalesTable();
-      });
       // View-by toggle (Items / Retailers / Channels / DCs)
       host.querySelectorAll('.hl-sales-viewby').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -29165,17 +29109,20 @@ render();
         });
       });
       // Clearvue filter dropdowns: Chain / Store / Channel
-      // ─── Retailer / Store multi-select wiring (search + checkboxes) ───
+      // ─── Multi-select wiring (all sales filters: search + checkboxes) ───
+      const _msSets = { chain: _distSalesChainSel, store: _distSalesStoreSel, item: _distSalesItemSel, pl: _distSalesPLSel, cat: _distSalesCatSel, dist: _distSalesDistSel, dc: _distSalesDcSel };
       host.querySelectorAll('.sales-ms').forEach(box => {
         const key = box.dataset.mskey;
-        const sel = key === 'chain' ? _distSalesChainSel : _distSalesStoreSel;
+        const sel = _msSets[key];
+        if (!sel) return;
         const btn = box.querySelector('.sales-ms-btn');
         const panel = box.querySelector('.sales-ms-panel');
         btn.addEventListener('click', (ev) => {
           ev.stopPropagation();
-          _distSalesOpenMs = (_distSalesOpenMs === key) ? null : key;
+          const willOpen = _distSalesOpenMs !== key;
           host.querySelectorAll('.sales-ms-panel').forEach(p => { p.style.display = 'none'; });
-          if (_distSalesOpenMs === key) { panel.style.display = 'block'; panel.querySelector('.sales-ms-search')?.focus(); }
+          _distSalesOpenMs = willOpen ? key : null;
+          if (willOpen) { panel.style.display = 'block'; panel.querySelector('.sales-ms-search')?.focus(); }
         });
         panel.addEventListener('click', (ev) => ev.stopPropagation());
         const search = panel.querySelector('.sales-ms-search');
@@ -29186,12 +29133,15 @@ render();
         const allCb = panel.querySelector('.sales-ms-all');
         if (allCb) allCb.addEventListener('change', () => {
           sel.clear();
+          if (key === 'dist') _distSalesDistFilter = '';
           _distSalesExpandedGroups = new Set();
           renderSalesTable();
         });
         panel.querySelectorAll('.sales-ms-opt').forEach(cb => {
           cb.addEventListener('change', () => {
             if (cb.checked) sel.add(cb.value); else sel.delete(cb.value);
+            // KeHe reports dollars only — flip the metric so rows don't zero out
+            if (key === 'dist' && _distSalesDistSel.size === 1 && _distSalesDistSel.has('KeHe')) _distSalesMetric = 'dollars';
             _distSalesExpandedGroups = new Set();
             renderSalesTable();
           });
@@ -29202,9 +29152,9 @@ render();
       }, { once: true });
       const clearCvBtn = document.getElementById('hl-sales-clear-cvfilters');
       if (clearCvBtn) clearCvBtn.addEventListener('click', () => {
-        _distSalesChainSel.clear();
-        _distSalesStoreSel.clear();
+        Object.values(_msSets).forEach(s => s.clear());
         _distSalesFilterChannel = null;
+        _distSalesDistFilter = '';
         _distSalesExpandedGroups = new Set();
         renderSalesTable();
       });
@@ -29216,17 +29166,6 @@ render();
           else _distSalesExpandedGroups.add(k);
           renderSalesTable();
         });
-      });
-      const dcFilterEl = document.getElementById('hl-sales-dc-filter');
-      if (dcFilterEl) dcFilterEl.addEventListener('change', (e) => {
-        _distSalesDcFilter = e.target.value;
-        renderSalesTable();
-      });
-      const distFilterEl = document.getElementById('hl-sales-dist-filter');
-      if (distFilterEl) distFilterEl.addEventListener('change', (e) => {
-        _distSalesDistFilter = e.target.value;
-        if (e.target.value === 'KeHe') _distSalesMetric = 'dollars';   // KeHe is $ only; units would zero out + get hidden
-        renderSalesTable();
       });
       // Weekly / Monthly period toggle
       host.querySelectorAll('.hl-sales-period').forEach(btn => {
