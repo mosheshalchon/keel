@@ -28466,6 +28466,9 @@ render();
   let _distSalesPeriod = 'weekly';  // 'weekly' | 'monthly'
   let _distSalesDcFilter = '';
   let _distSalesDistFilter = '';
+  let _distSalesChainSel = new Set();   // multi-select retailers (empty = all)
+  let _distSalesStoreSel = new Set();   // multi-select stores (empty = all)
+  let _distSalesOpenMs = null;          // which multi-select panel is open (survives re-render)
   let _distSalesShowAllWeeks = false;        // false = last 12 weeks; true = all weeks in DB
   let _distSalesHideLow = true;              // hide items with zero/near-zero across the window
   let _distSalesShowUnmatched = false;
@@ -28631,8 +28634,8 @@ render();
         if (dcFilter && l.dc_code !== dcFilter) continue;
         if (distFilter && distOf(l) !== distFilter) continue;
         // Clearvue filters (only narrow when the data supports them)
-        if (filterChain && (l.chain_name || '') !== filterChain) continue;
-        if (filterStore && (l.store_name || '') !== filterStore) continue;
+        if (_distSalesChainSel.size && !_distSalesChainSel.has(l.chain_name || '')) continue;
+        if (_distSalesStoreSel.size && !_distSalesStoreSel.has(l.store_name || '')) continue;
         if (filterChannel && (l.channel || '') !== filterChannel) continue;
 
         const p = findProduct(l);
@@ -28713,9 +28716,9 @@ render();
       } else {
         allSortedWeeks = [...weeksPresent].sort();
       }
-      // Default window: 12 weeks OR 12 months, depending on period
-      const windowSize = 12;
-      const visibleWeeks = _distSalesShowAllWeeks ? allSortedWeeks : allSortedWeeks.slice(-windowSize);
+      // Window: always the most recent 8 periods (or all of them if fewer than 8 exist).
+      const windowSize = 8;
+      const visibleWeeks = allSortedWeeks.slice(-windowSize);
       // Header label fn — picks weekly or monthly format based on period
       const _periodLabel = (k) => period === 'monthly' ? monthLabelFromKey(k) : weekLabelFromDate(k);
 
@@ -28997,11 +29000,6 @@ render();
         </div>
       ` : '';
       const periodLabel = period === 'monthly' ? 'months' : 'weeks';
-      const showAllControl = `
-        <button id="hl-sales-show-all" style="background:${_distSalesShowAllWeeks ? 'var(--ink)' : 'var(--paper)'};color:${_distSalesShowAllWeeks ? 'var(--paper)' : 'var(--ink-3)'};border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${_distSalesShowAllWeeks ? '600' : '500'};border-radius:4px;">
-          ${_distSalesShowAllWeeks ? `− Show last 12 ${periodLabel}` : `+ Show all ${allSortedWeeks.length} ${periodLabel}`}
-        </button>
-      `;
       // Weekly / Monthly period toggle
       const periodControl = `
         <div style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:4px;overflow:hidden;">
@@ -29014,12 +29012,6 @@ render();
           <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:${hideLow ? 'var(--ink)' : 'var(--ink-3)'};text-transform:uppercase;user-select:none;">
             <input id="hl-sales-hidelow" type="checkbox" ${hideLow ? 'checked' : ''} style="margin:0;cursor:pointer;">
             Hide low-activity
-          </label>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;">
-          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:${showUnmOnly ? 'var(--lost)' : 'var(--ink-3)'};text-transform:uppercase;user-select:none;">
-            <input id="hl-sales-showunm" type="checkbox" ${showUnmOnly ? 'checked' : ''} style="margin:0;cursor:pointer;">
-            Show unmatched only
           </label>
         </div>
       `;
@@ -29050,33 +29042,26 @@ render();
         </div>
       ` : '';
 
-      // ─── NEW: Chain / Store / Channel dropdowns ─── (Clearvue files only)
+      // ─── Retailer / Store multi-select (search + checkboxes, freight-style) ───
       const chainList = [...allChains].sort();
       const storeList = [...allStores].sort();
       const channelList = [...allChannels].sort();
-      const clearvueFilters = hasClearvueData ? `
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          ${chainList.length > 0 ? `
-            <select id="hl-sales-filter-chain" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);font-family:var(--mono);min-width:160px;">
-              <option value="">All retailers</option>
-              ${chainList.map(c => `<option value="${esc(c)}" ${c === filterChain ? 'selected' : ''}>${esc(c)}</option>`).join('')}
-            </select>
-          ` : ''}
-          ${storeList.length > 0 ? `
-            <select id="hl-sales-filter-store" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);font-family:var(--mono);min-width:140px;">
-              <option value="">All stores</option>
-              ${storeList.map(s => `<option value="${esc(s)}" ${s === filterStore ? 'selected' : ''}>${esc(s)}</option>`).join('')}
-            </select>
-          ` : ''}
-          ${channelList.length > 0 ? `
-            <select id="hl-sales-filter-channel" style="padding:4px 8px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);font-family:var(--mono);min-width:140px;">
-              <option value="">All channels</option>
-              ${channelList.map(ch => `<option value="${esc(ch)}" ${ch === filterChannel ? 'selected' : ''}>${esc(ch)}</option>`).join('')}
-            </select>
-          ` : ''}
-          ${(filterChain || filterStore || filterChannel) ? `<button id="hl-sales-clear-cvfilters" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:4px 10px;cursor:pointer;text-transform:uppercase;border-radius:4px;">Clear retailers</button>` : ''}
-        </div>
-      ` : '';
+      const msBox = (key, label, options, sel) => {
+        const open = _distSalesOpenMs === key;
+        const lbl = sel.size === 0 ? 'All' : (sel.size === 1 ? [...sel][0] : `${sel.size} selected`);
+        return `<div class="sales-ms" data-mskey="${key}" style="position:relative;">
+          <button type="button" class="sales-ms-btn" style="font-family:var(--mono);font-size:11px;padding:5px 11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);cursor:pointer;white-space:nowrap;max-width:230px;overflow:hidden;text-overflow:ellipsis;">${esc(label)}: <span style="color:${sel.size ? 'var(--ink)' : 'var(--ink-3)'};">${esc(String(lbl).slice(0, 24))}</span> ▾</button>
+          <div class="sales-ms-panel" style="display:${open ? 'block' : 'none'};position:absolute;z-index:60;top:100%;left:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;padding:8px;max-height:320px;overflow:auto;min-width:250px;box-shadow:0 6px 20px rgba(0,0,0,0.14);">
+            <input type="text" class="sales-ms-search" placeholder="Search…" style="width:100%;box-sizing:border-box;padding:6px 8px;margin-bottom:6px;border:1px solid var(--rule-soft);border-radius:4px;font-size:12px;background:var(--paper);color:var(--ink);">
+            <label style="display:block;font-family:var(--mono);font-size:11px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="sales-ms-all" ${sel.size === 0 ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">All</label>
+            <div style="border-top:1px solid var(--rule-soft);margin:4px 0;"></div>
+            ${options.map(o => `<label class="sales-ms-row" data-txt="${esc(String(o).toLowerCase())}" style="display:block;font-size:12px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="sales-ms-opt" value="${esc(String(o))}" ${sel.has(o) ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">${esc(String(o))}</label>`).join('')}
+          </div></div>`;
+      };
+      const retailerMs = chainList.length ? msBox('chain', 'Retailer', chainList, _distSalesChainSel) : '';
+      const storeMs = storeList.length ? msBox('store', 'Stores', storeList, _distSalesStoreSel) : '';
+      const clearRetailers = (_distSalesChainSel.size || _distSalesStoreSel.size) ? `<button id="hl-sales-clear-cvfilters" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 10px;cursor:pointer;text-transform:uppercase;border-radius:4px;">Clear</button>` : '';
+      const clearvueFilters = '';
 
       const groupHeader = viewBy === 'retailer' ? 'Retailer'
         : viewBy === 'channel' ? 'Channel'
@@ -29084,20 +29069,27 @@ render();
         : (groupBy === 'item' ? 'Item / DC' : (groupBy === 'product_line' ? 'Product Line' : 'Category'));
 
       host.innerHTML = `
-        <div style="background:var(--bone-2);border-radius:6px;padding:10px 14px;margin-bottom:14px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
-          ${viewByControl}
-          ${metricControl}
-          ${groupByControl}
-          ${clearvueFilters}
-          ${periodControl}
-          ${distControl}
-          ${dcControl}
-          ${showAllControl}
-          ${filterControls}
-          <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;">${displayRows.filter(d => d.kind !== 'child').length} ${groupBy === 'item' ? 'rows' : 'groups'} · ${visibleWeeks.length} of ${allSortedWeeks.length} ${periodLabel}</span>
-          ${hiddenSummary}
-          <button id="hl-sales-export" style="background:var(--paper);color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:6px 12px;cursor:pointer;text-transform:uppercase;font-weight:500;border-radius:4px;margin-left:auto;">↓ Export to Excel</button>
-          <button id="hl-sales-history" style="background:var(--paper);color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:6px 12px;cursor:pointer;text-transform:uppercase;font-weight:500;border-radius:4px;">⏱ Uploads</button>
+        <div style="background:var(--bone-2);border-radius:6px;padding:10px 14px;margin-bottom:14px;">
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+            ${distControl}
+            ${dcControl}
+            ${periodControl}
+            ${metricControl}
+            ${viewByControl}
+            <button id="hl-sales-export" style="background:var(--paper);color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 12px;cursor:pointer;text-transform:uppercase;font-weight:500;border-radius:4px;margin-left:auto;">↓ Export to Excel</button>
+            <button id="hl-sales-history" style="background:var(--paper);color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 12px;cursor:pointer;text-transform:uppercase;font-weight:500;border-radius:4px;">⏱ Uploads</button>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--rule-soft);">
+            ${retailerMs}
+            ${storeMs}
+            ${groupByControl}
+            ${clearRetailers}
+          </div>
+          <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--rule-soft);">
+            ${filterControls}
+            <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;">${displayRows.filter(d => d.kind !== 'child').length} ${groupBy === 'item' ? 'rows' : 'groups'} · ${visibleWeeks.length} ${periodLabel}</span>
+            ${hiddenSummary}
+          </div>
         </div>
         <div style="border:1px solid var(--rule-soft);border-radius:4px;overflow:auto;max-height:680px;">
           <table style="width:100%;border-collapse:collapse;font-size:12px;">
@@ -29115,7 +29107,7 @@ render();
           </table>
         </div>
         <p style="font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);margin-top:8px;">
-          Dollar sales to retailers per ${period === 'monthly' ? 'month' : 'week'}. ${_distSalesShowAllWeeks ? `Showing all ${periodLabel} in DB.` : `Showing last 12 ${periodLabel} — click "+ Show all" to expand.`}
+          Dollar sales to retailers per ${period === 'monthly' ? 'month' : 'week'}. Showing the most recent ${visibleWeeks.length} ${periodLabel}.
         </p>
 
         <!-- Trend chart: auto-driven by the filter dropdowns above -->
@@ -29173,27 +29165,47 @@ render();
         });
       });
       // Clearvue filter dropdowns: Chain / Store / Channel
-      const filterChainEl = document.getElementById('hl-sales-filter-chain');
-      if (filterChainEl) filterChainEl.addEventListener('change', (e) => {
-        _distSalesFilterChain = e.target.value || null;
-        _distSalesExpandedGroups = new Set();
-        renderSalesTable();
+      // ─── Retailer / Store multi-select wiring (search + checkboxes) ───
+      host.querySelectorAll('.sales-ms').forEach(box => {
+        const key = box.dataset.mskey;
+        const sel = key === 'chain' ? _distSalesChainSel : _distSalesStoreSel;
+        const btn = box.querySelector('.sales-ms-btn');
+        const panel = box.querySelector('.sales-ms-panel');
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          _distSalesOpenMs = (_distSalesOpenMs === key) ? null : key;
+          host.querySelectorAll('.sales-ms-panel').forEach(p => { p.style.display = 'none'; });
+          if (_distSalesOpenMs === key) { panel.style.display = 'block'; panel.querySelector('.sales-ms-search')?.focus(); }
+        });
+        panel.addEventListener('click', (ev) => ev.stopPropagation());
+        const search = panel.querySelector('.sales-ms-search');
+        if (search) search.addEventListener('input', () => {
+          const q = search.value.trim().toLowerCase();
+          panel.querySelectorAll('.sales-ms-row').forEach(r => { r.style.display = (!q || (r.dataset.txt || '').includes(q)) ? 'block' : 'none'; });
+        });
+        const allCb = panel.querySelector('.sales-ms-all');
+        if (allCb) allCb.addEventListener('change', () => {
+          sel.clear();
+          _distSalesExpandedGroups = new Set();
+          renderSalesTable();
+        });
+        panel.querySelectorAll('.sales-ms-opt').forEach(cb => {
+          cb.addEventListener('change', () => {
+            if (cb.checked) sel.add(cb.value); else sel.delete(cb.value);
+            _distSalesExpandedGroups = new Set();
+            renderSalesTable();
+          });
+        });
       });
-      const filterStoreEl = document.getElementById('hl-sales-filter-store');
-      if (filterStoreEl) filterStoreEl.addEventListener('change', (e) => {
-        _distSalesFilterStore = e.target.value || null;
-        renderSalesTable();
-      });
-      const filterChannelEl = document.getElementById('hl-sales-filter-channel');
-      if (filterChannelEl) filterChannelEl.addEventListener('change', (e) => {
-        _distSalesFilterChannel = e.target.value || null;
-        renderSalesTable();
-      });
+      document.addEventListener('click', () => {
+        if (_distSalesOpenMs) { _distSalesOpenMs = null; host.querySelectorAll('.sales-ms-panel').forEach(p => { p.style.display = 'none'; }); }
+      }, { once: true });
       const clearCvBtn = document.getElementById('hl-sales-clear-cvfilters');
       if (clearCvBtn) clearCvBtn.addEventListener('click', () => {
-        _distSalesFilterChain = null;
-        _distSalesFilterStore = null;
+        _distSalesChainSel.clear();
+        _distSalesStoreSel.clear();
         _distSalesFilterChannel = null;
+        _distSalesExpandedGroups = new Set();
         renderSalesTable();
       });
       // Expand/collapse +/− on rollup groups
@@ -29216,11 +29228,6 @@ render();
         if (e.target.value === 'KeHe') _distSalesMetric = 'dollars';   // KeHe is $ only; units would zero out + get hidden
         renderSalesTable();
       });
-      const showAllBtn = document.getElementById('hl-sales-show-all');
-      if (showAllBtn) showAllBtn.addEventListener('click', () => {
-        _distSalesShowAllWeeks = !_distSalesShowAllWeeks;
-        renderSalesTable();
-      });
       // Weekly / Monthly period toggle
       host.querySelectorAll('.hl-sales-period').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -29234,11 +29241,6 @@ render();
       const hideLowEl = document.getElementById('hl-sales-hidelow');
       if (hideLowEl) hideLowEl.addEventListener('change', (e) => {
         _distSalesHideLow = e.target.checked;
-        renderSalesTable();
-      });
-      const showUnmEl = document.getElementById('hl-sales-showunm');
-      if (showUnmEl) showUnmEl.addEventListener('change', (e) => {
-        _distSalesShowUnmatched = e.target.checked;
         renderSalesTable();
       });
       const exportBtn = document.getElementById('hl-sales-export');
