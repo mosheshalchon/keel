@@ -46350,8 +46350,22 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         }));
         body.querySelectorAll('.fr-quote').forEach(btn => btn.addEventListener('click', () => {
           const selEl = btn.parentElement.querySelector('.fr-status-sel'); const st = selEl ? selEl.value : '';
-          if (st !== 'approved' && st !== 'buyer_approved') { alert('A quote can only be generated after status has changed to Approved.'); return; }
           const t = allTrucks[+btn.dataset.idx]; if (!t) return;
+          if (st === 'buyer') {
+            // "Need buyer approval" → email the customer (buyer) for approval; auto-fills their email.
+            const contacts = t.stops.map(contactFor).filter(Boolean);
+            const emails = [...new Set(contacts.map(c => c.email).filter(Boolean))];
+            if (!emails.length) { alert('No customer contact email on file for this order — add it on the Customers tab.'); return; }
+            const named = contacts.find(c => c.name);
+            const bDcs = [...new Set(t.stops.map(x => x.dc).filter(Boolean))].join('; ') || custOf(t);
+            const subject = `Buyer approval requested — ${bDcs} — ship ${shipWin(t)}`;
+            const bodyArr = [named ? `Hello ${named.name},` : 'Hello,', '', "We're planning the following shipment and need your approval before we book freight:", '', `Route: Brattleboro, VT → ${bDcs}`, `Ship window: ${shipWin(t)}`, `Pallets: ${t.plan}`, `Cases: ${t.cases}`, `Weight: ${Math.round(t.weight)} lb`, '', 'Stops:'];
+            t.stops.forEach(stp => bodyArr.push(`  - ${stp.dc || _frCustShort(stp.customer)}: ${stp.plan} plt / ${stp.cases} cs (ship ${stp.ship || t.minShip})`));
+            bodyArr.push('', 'Please confirm this works so we can proceed.', '', 'Thank you.');
+            window.location.href = `mailto:${emails.join(',')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(bodyArr.join('\n'))}`;
+            return;
+          }
+          if (st !== 'approved' && st !== 'buyer_approved') { alert('A quote can only be generated after status is set to "Need buyer approval" (emails the customer) or "Approved" / "Buyer approved" (shows carriers).'); return; }
           const dcs = [...new Set(t.stops.map(x => x.dc).filter(Boolean))].join('; ') || custOf(t);
           const overlay = document.createElement('div'); overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:99999;display:flex;align-items:center;justify-content:center;';
           const box = document.createElement('div'); box.style.cssText = 'background:var(--paper);border-radius:8px;padding:20px 22px;max-width:480px;width:92%;box-shadow:0 10px 40px rgba(0,0,0,0.3);';
