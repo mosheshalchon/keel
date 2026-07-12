@@ -45552,6 +45552,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _prodTargetWeeks = 8, _prodView = 'units', _prodSearch = '';
   let _prodLocFilter = 'all', _prodLineFilter = 'all';
   let _prodLineTargets = new Map(), _prodRowsByItem = new Map();
+  // Weekly production schedule state (Coverage | Weekly schedule toggle)
+  let _prodTab = 'coverage';            // 'coverage' | 'schedule'
+  let _prodSchedWeek = null;            // Monday ISO date of the shown week
+  let _prodSettings = null;             // { production_days: [...] }
+  let _prodCfg = new Map();             // product_id -> { cases_per_day, prod_group }
+  let _prodSched = new Map();           // `${product_id}|${weekday}` -> cases
+  let _prodSchedLoaded = false, _prodSchedLoading = false, _prodSchedWkLoaded = null;
   const _prodEsc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
   const _prodFmt = (n, d = 0) => (n == null || isNaN(n)) ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
   const WK_PER_MONTH = 52 / 12;
@@ -45650,9 +45657,107 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return { label: 'Overstock', bg: '#dde2ef', fg: '#3f527a' };
   }
 
+  // ─── Weekly production schedule ───────────────────────────────────
+  const _PROD_DAYS_ALL = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  function _prodMonday(d) { const x = new Date(d); const off = (x.getDay() + 6) % 7; x.setDate(x.getDate() - off); return x.toISOString().slice(0, 10); }
+  function _prodActiveDays() { const pd = _prodSettings && Array.isArray(_prodSettings.production_days) ? _prodSettings.production_days : null; const days = (pd && pd.length) ? _PROD_DAYS_ALL.filter(d => pd.includes(d)) : ['Mon', 'Tue', 'Wed', 'Thu']; return days; }
+  // Recompute per-item rows (same pipeline as the coverage view) so the schedule can read each product's `produce`.
+  function _prodComputeRows() {
+    const snapDates = [...new Set(_prodFg.map(f => f.snapshot_date).filter(Boolean))].sort();
+    const latest = snapDates.length ? snapDates[snapDates.length - 1] : null;
+    const fg = latest ? _prodFg.filter(f => f.snapshot_date === latest) : _prodFg;
+    const groups = new Map();
+    for (const f of fg) {
+      const loc = (f.location || '').trim();
+      const g = groups.get(f.item) || { item: f.item, onHand: 0, priceWtNum: 0, priceWtDen: 0, priceMin: 0, locations: new Set(), snapshot: f.snapshot_date, product_id: null };
+      const oh = Number(f.on_hand_cases) || 0; g.onHand += oh;
+      const p = Number(f.unit_price) || 0;
+      if (p > 0) { if (oh > 0) { g.priceWtNum += p * oh; g.priceWtDen += oh; } if (g.priceMin === 0 || p < g.priceMin) g.priceMin = p; }
+      if (oh !== 0 && loc) g.locations.add(loc);
+      if (f.product_id) g.product_id = f.product_id;
+      if (f.snapshot_date) g.snapshot = f.snapshot_date;
+      groups.set(f.item, g);
+    }
+    for (const g of groups.values()) g.price = g.priceWtDen > 0 ? g.priceWtNum / g.priceWtDen : g.priceMin;
+    return [...groups.values()].map(_prodRow);
+  }
+  async function _prodSchedLoad() {
+    if (_prodSchedLoading) return;
+    _prodSchedLoading = true;
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    if (!_prodSchedWeek) _prodSchedWeek = _prodMonday(new Date());
+    try {
+      const [setR, cfgR, schR] = await Promise.all([
+        sb.from('production_settings').select('*').eq('brand_id', brandId).maybeSingle(),
+        sb.from('production_config').select('*').eq('brand_id', brandId),
+        sb.from('production_schedule').select('*').eq('brand_id', brandId).eq('week_start', _prodSchedWeek),
+      ]);
+      _prodSettings = (setR && setR.data) || _prodSettings || null;
+      _prodCfg = new Map(((cfgR && cfgR.data) || []).map(c => [c.product_id, { cases_per_day: c.cases_per_day, prod_group: c.prod_group }]));
+      _prodSched = new Map(((schR && schR.data) || []).map(s => [s.product_id + '|' + s.weekday, Number(s.cases) || 0]));
+    } catch (e) { console.error('[PROD sched] load failed:', e); }
+    finally { _prodSchedLoaded = true; _prodSchedWkLoaded = _prodSchedWeek; _prodSchedLoading = false; _prodRenderBody(); }
+  }
+  function _prodRenderSchedule(host) {
+    if (!_prodSchedLoaded || _prodSchedWkLoaded !== _prodSchedWeek) { if (!_prodSchedLoading) _prodSchedLoad(); host.innerHTML = '<div class="hl-loading">Loading schedule…</div>'; return; }
+    const esc = _prodEsc, fmt = (n) => _prodFmt(Math.round(n), 0);
+    const activeDays = _prodActiveDays();
+    const rows = _prodComputeRows().filter(r => r.prodId && Math.round(r.produce) > 0)
+      .sort((a, b) => String((_prodCfg.get(a.prodId) || {}).prod_group || '~').localeCompare(String((_prodCfg.get(b.prodId) || {}).prod_group || '~')) || a.item.localeCompare(b.item));
+    const btn = 'font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:5px;background:transparent;cursor:pointer;color:var(--ink);';
+    const dayChips = _PROD_DAYS_ALL.map(d => { const on = activeDays.includes(d); return `<button class="hl-psd-day" data-day="${d}" style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:5px;border:1px solid var(--rule-soft);cursor:pointer;background:${on ? 'var(--ink)' : 'transparent'};color:${on ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};">${d}</button>`; }).join(' ');
+    const dayHead = activeDays.map(d => `<th style="padding:8px 6px;text-align:center;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${d}</th>`).join('');
+    const bodyRows = rows.map(r => {
+      const cfg = _prodCfg.get(r.prodId) || {}; const cap = Number(cfg.cases_per_day) || 0; let sched = 0;
+      const dayCells = activeDays.map(d => { const v = _prodSched.get(r.prodId + '|' + d) || 0; sched += v; const over = cap > 0 && v > cap; return `<td style="padding:4px 4px;text-align:center;"><input class="hl-psd-cell" data-pid="${esc(r.prodId)}" data-day="${d}" type="number" min="0" value="${v || ''}" placeholder="0" style="width:56px;text-align:right;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid ${over ? '#e24b4a' : 'var(--rule-soft)'};border-radius:4px;${over ? 'color:#a8381f;' : ''}"></td>`; }).join('');
+      const met = sched >= Math.round(r.produce);
+      return `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${cfg.prod_group ? `<div style="font-family:var(--mono);font-size:9px;color:#534AB7;">${esc(cfg.prod_group)}</div>` : ''}</td>
+        <td style="padding:4px 6px;text-align:center;"><input class="hl-psd-cap" data-pid="${esc(r.prodId)}" type="number" min="0" value="${cap || ''}" placeholder="—" title="Max cases/day for this product" style="width:56px;text-align:right;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;"></td>
+        <td style="padding:4px 6px;"><input class="hl-psd-group" data-pid="${esc(r.prodId)}" value="${esc(cfg.prod_group || '')}" placeholder="group" style="width:92px;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;"></td>
+        ${dayCells}
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">${fmt(r.produce)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:${met ? '#3f6f4a' : '#a8381f'};">${fmt(sched)}${met ? ' ✓' : ''}</td>
+      </tr>`;
+    }).join('');
+    host.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+        <div style="display:flex;align-items:center;gap:8px;"><button id="hl-psd-prev" style="${btn}">◀</button><span style="font-family:var(--mono);font-size:12px;">Week of ${esc(_prodSchedWeek)}</span><button id="hl-psd-next" style="${btn}">▶</button></div>
+        <div style="display:flex;gap:8px;"><button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);">Suggest schedule</button><button id="hl-psd-clear" style="${btn}">Clear week</button></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;"><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Production days</span>${dayChips}</div>
+      ${rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th><th style="padding:8px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Cases/day</th><th style="padding:8px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Group</th>${dayHead}<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Need</th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sched</th></tr></thead><tbody>${bodyRows}</tbody></table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Need = cases to produce to hit target coverage (from the Coverage tab). Cells save as you type; a red cell is over that product's cases/day. <b>Suggest schedule</b> spreads each product's need across the production days above, capped per day, keeping products in the same group on the same days.</p>`;
+    _prodSchedWire(host, rows, activeDays);
+  }
+  function _prodSchedWire(host, rows, activeDays) {
+    const sb = window.Auth.getClient();
+    const brandId = BrandLibrary.getSession().brandId;
+    const saveCell = async (pid, day, cases) => { try { await sb.from('production_schedule').upsert({ brand_id: brandId, week_start: _prodSchedWeek, product_id: pid, weekday: day, cases: cases }, { onConflict: 'brand_id,week_start,product_id,weekday' }); } catch (e) { alert('Could not save cell — is the production_schedule table created? ' + (e.message || e)); } };
+    const saveCfg = async (pid, patch) => { const cur = _prodCfg.get(pid) || {}; const next = Object.assign({}, cur, patch); _prodCfg.set(pid, next); try { await sb.from('production_config').upsert({ brand_id: brandId, product_id: pid, cases_per_day: next.cases_per_day == null ? null : next.cases_per_day, prod_group: next.prod_group || null }, { onConflict: 'brand_id,product_id' }); } catch (e) { alert('Could not save config — is the production_config table created? ' + (e.message || e)); } };
+    const saveDays = async (days) => { _prodSettings = Object.assign({}, _prodSettings, { production_days: days }); try { await sb.from('production_settings').upsert({ brand_id: brandId, production_days: days, updated_at: new Date().toISOString() }, { onConflict: 'brand_id' }); } catch (e) { alert('Could not save production days — is the production_settings table created? ' + (e.message || e)); } };
+    host.querySelectorAll('.hl-psd-cell').forEach(inp => inp.addEventListener('change', async () => { const pid = inp.dataset.pid, day = inp.dataset.day; const v = Math.max(0, Math.round(Number(inp.value) || 0)); _prodSched.set(pid + '|' + day, v); await saveCell(pid, day, v); _prodRenderBody(); }));
+    host.querySelectorAll('.hl-psd-cap').forEach(inp => inp.addEventListener('change', async () => { const v = inp.value === '' ? null : Math.max(0, Math.round(Number(inp.value) || 0)); await saveCfg(inp.dataset.pid, { cases_per_day: v }); _prodRenderBody(); }));
+    host.querySelectorAll('.hl-psd-group').forEach(inp => inp.addEventListener('change', async () => { await saveCfg(inp.dataset.pid, { prod_group: (inp.value || '').trim() }); _prodRenderBody(); }));
+    host.querySelectorAll('.hl-psd-day').forEach(b => b.addEventListener('click', async () => { const d = b.dataset.day; const cur = _prodActiveDays(); const next = cur.includes(d) ? cur.filter(x => x !== d) : _PROD_DAYS_ALL.filter(x => cur.includes(x) || x === d); if (!next.length) { alert('Keep at least one production day.'); return; } await saveDays(next); _prodRenderBody(); }));
+    const prev = host.querySelector('#hl-psd-prev'); if (prev) prev.addEventListener('click', () => { const d = new Date(_prodSchedWeek); d.setDate(d.getDate() - 7); _prodSchedWeek = _prodMonday(d); _prodSchedLoaded = false; _prodRenderBody(); });
+    const next = host.querySelector('#hl-psd-next'); if (next) next.addEventListener('click', () => { const d = new Date(_prodSchedWeek); d.setDate(d.getDate() + 7); _prodSchedWeek = _prodMonday(d); _prodSchedLoaded = false; _prodRenderBody(); });
+    const clr = host.querySelector('#hl-psd-clear'); if (clr) clr.addEventListener('click', async () => { if (!confirm('Clear all scheduled cases for this week?')) return; try { await sb.from('production_schedule').delete().eq('brand_id', brandId).eq('week_start', _prodSchedWeek); } catch (e) { alert(e.message || e); return; } _prodSched = new Map(); _prodRenderBody(); });
+    const sug = host.querySelector('#hl-psd-suggest'); if (sug) sug.addEventListener('click', async () => {
+      const newSched = new Map();
+      for (const r of rows) { let need = Math.round(r.produce); if (need <= 0) continue; const cap = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0; const perDay = cap > 0 ? cap : Math.ceil(need / activeDays.length); for (const day of activeDays) { if (need <= 0) break; const amt = Math.min(perDay, need); newSched.set(r.prodId + '|' + day, amt); need -= amt; } }
+      _prodSched = newSched;
+      const recs = []; for (const [k, v] of newSched.entries()) { const [pid, day] = k.split('|'); recs.push({ brand_id: brandId, week_start: _prodSchedWeek, product_id: pid, weekday: day, cases: v }); }
+      try { await sb.from('production_schedule').delete().eq('brand_id', brandId).eq('week_start', _prodSchedWeek); if (recs.length) { const { error } = await sb.from('production_schedule').insert(recs); if (error) throw error; } } catch (e) { alert('Could not save suggested schedule — is the production_schedule table created? ' + (e.message || e)); }
+      _prodRenderBody();
+    });
+  }
+
   function _prodRenderBody() {
     const host = document.getElementById('hl-prod-body');
     if (!host) return;
+    if (_prodTab === 'schedule') { _prodRenderSchedule(host); return; }
     if (_prodLoading && !_prodLoaded) { host.innerHTML = '<div class="hl-loading">Loading finished-goods inventory…</div>'; return; }
     if (_prodErr) { host.innerHTML = `<div style="padding:18px;color:#a8381f;font-family:var(--serif);">Couldn't load: ${_prodEsc(_prodErr.message || _prodErr)}</div>`; return; }
     if (!_prodFg.length) {
@@ -46924,8 +47029,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <p class="page-meta">Finished-goods on-hand vs forecast demand: days of supply, target coverage, and how much to produce.</p>
         </div>
       </div>
+      <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:16px 0 0;">
+        <button class="hl-prod-tab" data-prodtab="coverage" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;color:${_prodTab === 'coverage' ? 'var(--ink)' : 'var(--ink-3)'};text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid ${_prodTab === 'coverage' ? 'var(--ink)' : 'transparent'};font-weight:${_prodTab === 'coverage' ? '600' : '400'};">Coverage</button>
+        <button class="hl-prod-tab" data-prodtab="schedule" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;color:${_prodTab === 'schedule' ? 'var(--ink)' : 'var(--ink-3)'};text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid ${_prodTab === 'schedule' ? 'var(--ink)' : 'transparent'};font-weight:${_prodTab === 'schedule' ? '600' : '400'};">Weekly schedule</button>
+      </div>
       <div id="hl-prod-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
     `;
+    main.querySelectorAll('.hl-prod-tab').forEach(b => b.addEventListener('click', () => {
+      _prodTab = b.dataset.prodtab;
+      main.querySelectorAll('.hl-prod-tab').forEach(x => { const on = x.dataset.prodtab === _prodTab; x.style.color = on ? 'var(--ink)' : 'var(--ink-3)'; x.style.borderBottom = on ? '2px solid var(--ink)' : '2px solid transparent'; x.style.fontWeight = on ? '600' : '400'; });
+      _prodRenderBody();
+    }));
     if (_prodLoaded || _prodErr) { _prodRenderBody(); _prodComputeForecast(); } else { _prodLoad(); }
   }
 
