@@ -28547,9 +28547,9 @@ render();
     }
     console.log('[Sales] total lines fetched:', lines.length, 'across', uploads.length, 'uploads');
 
-    // Load products for category/product_line linkage
+    // Load products for category/product_line linkage + pricing (to estimate $ where a feed reports units only)
     const { data: products } = await sb.from('products')
-      .select('id, unit_upc, item_description, category, product_line').eq('brand_id', brandId);
+      .select('id, unit_upc, item_description, category, product_line, wholesale_unit_price, case_pack, units_per_case').eq('brand_id', brandId);
     const productById = new Map();
     const productByUpc = new Map();
     const addUpc = (k, p) => { if (k && !productByUpc.has(k)) productByUpc.set(k, p); };
@@ -28594,6 +28594,14 @@ render();
       //   PL selected       → show items in that PL (rollup with +/− to DCs)
       //   category selected → show product lines in that category (rollup with +/− to items)
       //   none selected     → show product lines (top-level rollup with +/− to items)
+      // Wholesale CASE price = unit price × units per case (UNFI movement is in cases).
+      const casePriceOf = (p) => {
+        const unit = Number(p && p.wholesale_unit_price) || 0;
+        if (!unit) return 0;
+        const per = Number(p.units_per_case) || Number(p.case_pack) || 1;
+        return unit * per;
+      };
+      let usedEstimatedDollars = false;
       const filterItem = _distSalesFilterItem || '';
       const filterPL = _distSalesFilterPL || '';
       const filterCat = _distSalesFilterCat || '';      const filterChain = _distSalesFilterChain || '';
@@ -28690,11 +28698,22 @@ render();
         }
         const b = baseRows.get(baseKey);
         if (isMatched) b.hasAnyMatched = true;
-        // Pick the metric: 'dollars' (Clearvue) or 'units' (legacy default).
-        // If user picked dollars but the row doesn't have dollars data, contribute 0.
-        const value = metric === 'dollars'
-          ? (Number(l.dollars) || 0)
-          : (Number(l.units_sold) || 0);
+        // Metric value. KeHe reports real $ (vendor cost). UNFI reports CASES only — for those we
+        // ESTIMATE dollars as cases × wholesale case price (unit price × units per case).
+        // Estimated $ is clearly labelled in the UI so it's never mistaken for invoiced revenue.
+        let value;
+        if (metric === 'dollars') {
+          const realD = Number(l.dollars) || 0;
+          if (realD) { value = realD; }
+          else {
+            const cases = Number(l.units_sold) || 0;
+            const cp = p ? casePriceOf(p) : 0;
+            value = cases * cp;
+            if (value) usedEstimatedDollars = true;
+          }
+        } else {
+          value = Number(l.units_sold) || 0;
+        }
         b.weeks.set(weekKey, (b.weeks.get(weekKey) || 0) + value);
       }
 
@@ -28804,14 +28823,46 @@ render();
         else if (b.isLow) hiddenLow++;
       }
 
+      // Does the current metric actually exist in the filtered data? (UNFI = units only; KeHe = dollars only)
+      let metricHasData = false;
+      for (const b of baseRows.values()) { if (b.total) { metricHasData = true; break; } }
+      const otherMetric = metric === 'dollars' ? 'units' : 'dollars';
+      const metricNote = (metric === 'dollars' && usedEstimatedDollars)
+        ? `<div style="background:rgba(184,134,11,0.10);border:1px solid #b8860b;border-radius:6px;padding:8px 13px;margin-bottom:12px;font-family:var(--mono);font-size:11px;color:#8a6410;line-height:1.6;"><b>Estimated dollars</b> — UNFI reports cases only, so $ = cases × wholesale case price (from Brand Library). KeHe rows use its real reported $. Estimates exclude promo/deal pricing, so treat them as directional, not invoiced revenue.</div>`
+        : ((!metricHasData && baseRows.size > 0)
+          ? `<div style="background:rgba(184,134,11,0.12);border:1px solid #b8860b;border-radius:6px;padding:9px 13px;margin-bottom:12px;font-family:var(--mono);font-size:11px;color:#8a6410;line-height:1.6;">No <b>${metric === 'dollars' ? 'dollar' : 'unit'}</b> data for this selection${metric === 'dollars' ? ' — and no wholesale price on file for these items to estimate from' : ' — KeHe reports dollars only'}. Switch to <b>${otherMetric === 'dollars' ? 'Dollars' : 'Units'}</b> to see it.</div>`
+          : '');
+
       if (displayRows.length === 0 || visibleWeeks.length === 0) {
+        // Keep the toolbar rendered — otherwise the user is stranded with no way to change the filters.
         host.innerHTML = `
-          <div style="text-align:center;padding:48px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
-            ${(hiddenLow + hiddenUnm > 0)
+        <div style="background:var(--bone-2);border-radius:6px;padding:10px 14px;margin-bottom:14px;">
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+            ${periodControl}
+            ${metricControl}
+            ${viewByControl}
+            <button id="hl-sales-export" style="background:var(--paper);color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 12px;cursor:pointer;text-transform:uppercase;font-weight:500;border-radius:4px;margin-left:auto;">↓ Export to Excel</button>
+            <button id="hl-sales-history" style="background:var(--paper);color:var(--ink);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 12px;cursor:pointer;text-transform:uppercase;font-weight:500;border-radius:4px;">⏱ Uploads</button>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--rule-soft);">
+            ${distControl}
+            ${dcControl}
+            ${groupByControl}
+            ${clearRetailers}
+          </div>
+          <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--rule-soft);">
+            ${filterControls}
+          </div>
+        </div>
+        ${metricNote}
+        <div style="text-align:center;padding:48px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
+          ${!metricHasData && baseRows.size > 0
+            ? `No ${metric === 'dollars' ? 'dollar' : 'unit'} data for this selection — use the controls above to switch metric or change filters.`
+            : (hiddenLow + hiddenUnm > 0)
               ? `All rows hidden by filters (${hiddenLow + hiddenUnm} hidden). Toggle off "Hide low-activity" to see them.`
               : 'No sales data in the visible window.'}
-          </div>
-        `;
+        </div>`;
+        wireSalesControls();
         return;
       }
 
@@ -29022,12 +29073,12 @@ render();
 
       // ─── NEW: Metric toggle ─── Dollars or Units. Only show when Clearvue dollars are present.
       const hasDollarsData = lines.some(l => l.dollars != null);
-      const metricControl = hasDollarsData ? `
+      const metricControl = `
         <div style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:4px;overflow:hidden;">
           <button class="hl-sales-metric" data-metric="units" style="background:${metric === 'units' ? 'var(--ink)' : 'var(--paper)'};color:${metric === 'units' ? 'var(--paper)' : 'var(--ink-3)'};border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${metric === 'units' ? '600' : '500'};">Units</button>
-          <button class="hl-sales-metric" data-metric="dollars" style="background:${metric === 'dollars' ? 'var(--ink)' : 'var(--paper)'};color:${metric === 'dollars' ? 'var(--paper)' : 'var(--ink-3)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${metric === 'dollars' ? '600' : '500'};">Dollars</button>
+          <button class="hl-sales-metric" data-metric="dollars" style="background:${metric === 'dollars' ? 'var(--ink)' : 'var(--paper)'};color:${metric === 'dollars' ? 'var(--paper)' : 'var(--ink-3)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:5px 11px;cursor:pointer;text-transform:uppercase;font-weight:${metric === 'dollars' ? '600' : '500'};">Dollars${usedEstimatedDollars ? ' (est.)' : ''}</button>
         </div>
-      ` : '';
+      `;
 
       // Retailer / Store dropdowns removed — the KeHe/UNFI reports in use carry no retailer or store detail.
       const channelList = [...allChannels].sort();
@@ -29063,6 +29114,7 @@ render();
             ${hiddenSummary}
           </div>
         </div>
+        ${metricNote}
         <div style="border:1px solid var(--rule-soft);border-radius:4px;overflow:auto;max-height:680px;">
           <table style="width:100%;border-collapse:collapse;font-size:12px;">
             <thead style="position:sticky;top:0;background:var(--bone-2);z-index:2;">
@@ -29088,102 +29140,107 @@ render();
         </div>
       `;
 
-      // Wire controls — three filter dropdowns
-      // View-by toggle (Items / Retailers / Channels / DCs)
-      host.querySelectorAll('.hl-sales-viewby').forEach(btn => {
-        btn.addEventListener('click', () => {
-          _distSalesViewBy = btn.dataset.viewby;
-          _distSalesExpandedGroups = new Set();
-          renderSalesTable();
-        });
-      });
-      // Metric toggle (Units / Dollars)
-      host.querySelectorAll('.hl-sales-metric').forEach(btn => {
-        btn.addEventListener('click', () => {
-          _distSalesMetric = btn.dataset.metric;
-          renderSalesTable();
-        });
-      });
-      // Clearvue filter dropdowns: Chain / Store / Channel
-      // ─── Multi-select wiring (all sales filters: search + checkboxes) ───
-      const _msSets = { chain: _distSalesChainSel, store: _distSalesStoreSel, item: _distSalesItemSel, pl: _distSalesPLSel, cat: _distSalesCatSel, dist: _distSalesDistSel, dc: _distSalesDcSel };
-      host.querySelectorAll('.sales-ms').forEach(box => {
-        const key = box.dataset.mskey;
-        const sel = _msSets[key];
-        if (!sel) return;
-        const btn = box.querySelector('.sales-ms-btn');
-        const panel = box.querySelector('.sales-ms-panel');
-        btn.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          const willOpen = _distSalesOpenMs !== key;
-          host.querySelectorAll('.sales-ms-panel').forEach(p => { p.style.display = 'none'; });
-          _distSalesOpenMs = willOpen ? key : null;
-          if (willOpen) { panel.style.display = 'block'; panel.querySelector('.sales-ms-search')?.focus(); }
-        });
-        panel.addEventListener('click', (ev) => ev.stopPropagation());
-        const search = panel.querySelector('.sales-ms-search');
-        if (search) search.addEventListener('input', () => {
-          const q = search.value.trim().toLowerCase();
-          panel.querySelectorAll('.sales-ms-row').forEach(r => { r.style.display = (!q || (r.dataset.txt || '').includes(q)) ? 'block' : 'none'; });
-        });
-        const allCb = panel.querySelector('.sales-ms-all');
-        if (allCb) allCb.addEventListener('change', () => {
-          sel.clear();
-          if (key === 'dist') _distSalesDistFilter = '';
-          _distSalesExpandedGroups = new Set();
-          renderSalesTable();
-        });
-        panel.querySelectorAll('.sales-ms-opt').forEach(cb => {
-          cb.addEventListener('change', () => {
-            if (cb.checked) sel.add(cb.value); else sel.delete(cb.value);
-            // KeHe reports dollars only — flip the metric so rows don't zero out
-            if (key === 'dist' && _distSalesDistSel.size === 1 && _distSalesDistSel.has('KeHe')) _distSalesMetric = 'dollars';
+      function wireSalesControls(displayRows, baseRows, visibleWeeks, groupBy) {
+        // Wire controls — three filter dropdowns
+        // View-by toggle (Items / Retailers / Channels / DCs)
+        host.querySelectorAll('.hl-sales-viewby').forEach(btn => {
+          btn.addEventListener('click', () => {
+            _distSalesViewBy = btn.dataset.viewby;
             _distSalesExpandedGroups = new Set();
             renderSalesTable();
           });
         });
-      });
-      document.addEventListener('click', () => {
-        if (_distSalesOpenMs) { _distSalesOpenMs = null; host.querySelectorAll('.sales-ms-panel').forEach(p => { p.style.display = 'none'; }); }
-      }, { once: true });
-      const clearCvBtn = document.getElementById('hl-sales-clear-cvfilters');
-      if (clearCvBtn) clearCvBtn.addEventListener('click', () => {
-        Object.values(_msSets).forEach(s => s.clear());
-        _distSalesFilterChannel = null;
-        _distSalesDistFilter = '';
-        _distSalesExpandedGroups = new Set();
-        renderSalesTable();
-      });
-      // Expand/collapse +/− on rollup groups
-      host.querySelectorAll('.hl-sales-toggle').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const k = btn.dataset.gkey;
-          if (_distSalesExpandedGroups.has(k)) _distSalesExpandedGroups.delete(k);
-          else _distSalesExpandedGroups.add(k);
+        // Metric toggle (Units / Dollars)
+        host.querySelectorAll('.hl-sales-metric').forEach(btn => {
+          btn.addEventListener('click', () => {
+            _distSalesMetric = btn.dataset.metric;
+            renderSalesTable();
+          });
+        });
+        // Clearvue filter dropdowns: Chain / Store / Channel
+        // ─── Multi-select wiring (all sales filters: search + checkboxes) ───
+        const _msSets = { chain: _distSalesChainSel, store: _distSalesStoreSel, item: _distSalesItemSel, pl: _distSalesPLSel, cat: _distSalesCatSel, dist: _distSalesDistSel, dc: _distSalesDcSel };
+        host.querySelectorAll('.sales-ms').forEach(box => {
+          const key = box.dataset.mskey;
+          const sel = _msSets[key];
+          if (!sel) return;
+          const btn = box.querySelector('.sales-ms-btn');
+          const panel = box.querySelector('.sales-ms-panel');
+          btn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const willOpen = _distSalesOpenMs !== key;
+            host.querySelectorAll('.sales-ms-panel').forEach(p => { p.style.display = 'none'; });
+            _distSalesOpenMs = willOpen ? key : null;
+            if (willOpen) { panel.style.display = 'block'; panel.querySelector('.sales-ms-search')?.focus(); }
+          });
+          panel.addEventListener('click', (ev) => ev.stopPropagation());
+          const search = panel.querySelector('.sales-ms-search');
+          if (search) search.addEventListener('input', () => {
+            const q = search.value.trim().toLowerCase();
+            panel.querySelectorAll('.sales-ms-row').forEach(r => { r.style.display = (!q || (r.dataset.txt || '').includes(q)) ? 'block' : 'none'; });
+          });
+          const allCb = panel.querySelector('.sales-ms-all');
+          if (allCb) allCb.addEventListener('change', () => {
+            sel.clear();
+            if (key === 'dist') _distSalesDistFilter = '';
+            _distSalesExpandedGroups = new Set();
+            renderSalesTable();
+          });
+          panel.querySelectorAll('.sales-ms-opt').forEach(cb => {
+            cb.addEventListener('change', () => {
+              if (cb.checked) sel.add(cb.value); else sel.delete(cb.value);
+              // KeHe reports dollars only — flip the metric so rows don't zero out
+              if (key === 'dist' && _distSalesDistSel.size === 1 && _distSalesDistSel.has('KeHe')) _distSalesMetric = 'dollars';
+              _distSalesExpandedGroups = new Set();
+              renderSalesTable();
+            });
+          });
+        });
+        document.addEventListener('click', () => {
+          if (_distSalesOpenMs) { _distSalesOpenMs = null; host.querySelectorAll('.sales-ms-panel').forEach(p => { p.style.display = 'none'; }); }
+        }, { once: true });
+        const clearCvBtn = document.getElementById('hl-sales-clear-cvfilters');
+        if (clearCvBtn) clearCvBtn.addEventListener('click', () => {
+          Object.values(_msSets).forEach(s => s.clear());
+          _distSalesFilterChannel = null;
+          _distSalesDistFilter = '';
+          _distSalesExpandedGroups = new Set();
           renderSalesTable();
         });
-      });
-      // Weekly / Monthly period toggle
-      host.querySelectorAll('.hl-sales-period').forEach(btn => {
-        btn.addEventListener('click', () => {
-          if (_distSalesPeriod !== btn.dataset.period) {
-            _distSalesPeriod = btn.dataset.period;
-            _distSalesExpandedGroups = new Set();  // expanded keys no longer valid
-          }
+        // Expand/collapse +/− on rollup groups
+        host.querySelectorAll('.hl-sales-toggle').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const k = btn.dataset.gkey;
+            if (_distSalesExpandedGroups.has(k)) _distSalesExpandedGroups.delete(k);
+            else _distSalesExpandedGroups.add(k);
+            renderSalesTable();
+          });
+        });
+        // Weekly / Monthly period toggle
+        host.querySelectorAll('.hl-sales-period').forEach(btn => {
+          btn.addEventListener('click', () => {
+            if (_distSalesPeriod !== btn.dataset.period) {
+              _distSalesPeriod = btn.dataset.period;
+              _distSalesExpandedGroups = new Set();  // expanded keys no longer valid
+            }
+            renderSalesTable();
+          });
+        });
+        const hideLowEl = document.getElementById('hl-sales-hidelow');
+        if (hideLowEl) hideLowEl.addEventListener('change', (e) => {
+          _distSalesHideLow = e.target.checked;
           renderSalesTable();
         });
-      });
-      const hideLowEl = document.getElementById('hl-sales-hidelow');
-      if (hideLowEl) hideLowEl.addEventListener('change', (e) => {
-        _distSalesHideLow = e.target.checked;
-        renderSalesTable();
-      });
-      const exportBtn = document.getElementById('hl-sales-export');
-      if (exportBtn) exportBtn.addEventListener('click', () => {
-        exportSalesToExcel(displayRows, baseRows, visibleWeeks, groupBy);
-      });
-      const historyBtn = document.getElementById('hl-sales-history');
-      if (historyBtn) historyBtn.addEventListener('click', () => openDistInvUploadsHistory('sales'));
+        const exportBtn = document.getElementById('hl-sales-export');
+        if (exportBtn) exportBtn.addEventListener('click', () => {
+          if (!displayRows || !displayRows.length) { alert('Nothing to export for the current filters.'); return; }
+          exportSalesToExcel(displayRows, baseRows, visibleWeeks, groupBy);
+        });
+        const historyBtn = document.getElementById('hl-sales-history');
+        if (historyBtn) historyBtn.addEventListener('click', () => openDistInvUploadsHistory('sales'));
+      }
+
+      wireSalesControls(displayRows, baseRows, visibleWeeks, groupBy);
 
       // ─── Trend chart: driven directly by the filter dropdowns ───
       // The chart series mirror what's in the table:
