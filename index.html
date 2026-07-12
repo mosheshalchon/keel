@@ -46109,7 +46109,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (rows.length) _frWireFilters(body);
       } else if (_frSubTab === 'output') {
         const src = 'freight_orders';
-        const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }, { data: apprv }, { data: ovrRows }, { data: distRows }] = await Promise.all([
+        const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }, { data: apprv }, { data: ovrRows }, { data: distRows }, { data: avoidRows }] = await Promise.all([
           sb.from(src).select('*').eq('brand_id', brandId),
           sb.from('freight_items').select('item_description,cases_per_pallet,case_weight,unit_upc,pallet_ti').eq('brand_id', brandId),
           sb.from('freight_item_map').select('order_item,item_description').eq('brand_id', brandId),
@@ -46117,14 +46117,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           sb.from('freight_lanes').select('kind,lane_no,lane_name,states').eq('brand_id', brandId),
           sb.from('freight_approvals').select('signature,status').eq('brand_id', brandId),
           sb.from('freight_overrides').select('so_num,ship_date').eq('brand_id', brandId),
-          sb.from('freight_distributors').select('*').eq('brand_id', brandId).order('company')
+          sb.from('freight_distributors').select('*').eq('brand_id', brandId).order('company'),
+          sb.from('freight_avoid_lanes').select('state_a,state_b,note').eq('brand_id', brandId)
         ]);
         const s = await _frLoadSettings(brandId, sb);
         const ovrMap = {}; (ovrRows || []).forEach(o => { ovrMap[o.so_num] = o.ship_date; });
         const srcToggle = '';
         const wireSrc = () => {};
         if (!orders || !orders.length) { body.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No pending orders yet — the daily sync runs each morning, or trigger it manually.</div>`; wireSrc(); return; }
-        const P = _frPlan(orders, items, mapRows, s, customers, lanes, ovrMap);
+        const P = _frPlan(orders, items, mapRows, s, customers, lanes, ovrMap, avoidRows);
         const _mo2 = {}; _frDefaultItemMap().forEach(p => _mo2[_frNorm(p[0])] = p[1]); (mapRows || []).forEach(m => _mo2[_frNorm(m.order_item)] = m.item_description);
         const _du = {}; (items || []).forEach(it => _du[_frNorm(it.item_description)] = it.unit_upc);
         const _di = {}; (items || []).forEach(it => _di[_frNorm(it.item_description)] = it);
@@ -46433,11 +46434,21 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.innerHTML = dFilters + wrap(head, trs, `${list.length} DCs · ${withHours} with dock hours · every customer listed; KeHE/UNFI show per-day windows, pickup & not-servicing have none`);
         _frWireFilters(body);
       } else if (_frSubTab === 'lanes') {
-        const { data } = await sb.from('freight_lanes').select('*').eq('brand_id', brandId).order('kind').order('lane_no');
-        const lanes = (data || []).filter(r => r.kind === 'lane');
+        const [laneRes, avoidRes] = await Promise.all([
+          sb.from('freight_lanes').select('*').eq('brand_id', brandId).order('kind').order('lane_no'),
+          sb.from('freight_avoid_lanes').select('*').eq('brand_id', brandId).order('state_a')
+        ]);
+        const lanes = (laneRes.data || []).filter(r => r.kind === 'lane');
+        const avoidRows = avoidRes.data || [];
         const laneHead = ['#', 'Lane', 'States'].map(h => th(h)).join('');
         const laneTrs = lanes.map(r => `<tr>${td(r.lane_no)}${td(r.lane_name)}${td(r.states)}</tr>`).join('');
-        body.innerHTML = `<div style="font-family:var(--serif);font-size:15px;margin-bottom:4px;">Freight lanes</div><p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:0 0 12px;">The optimizer assigns each order a lane by its destination state, and only consolidates orders on the same lane.</p>${wrap(laneHead, laneTrs)}`;
+        const ac = (r, field, ph) => `<td style="padding:4px 9px;border-top:1px solid var(--rule-soft);"><input class="fr-avoid" data-id="${r.id}" data-field="${field}" value="${escapeHtml(r[field] || '')}" placeholder="${ph}" style="width:100%;box-sizing:border-box;border:1px solid transparent;background:transparent;font-family:var(--sans);font-size:12px;color:var(--ink);padding:3px 5px;border-radius:3px;"></td>`;
+        const avoidHead = ['From state(s)', 'To state(s)', 'Reason', ''].map(h => th(h)).join('');
+        const avoidTrs = avoidRows.map(r => `<tr>${ac(r, 'state_a', 'CA')}${ac(r, 'state_b', 'OR, WA')}${ac(r, 'note', 'why avoid this route')}<td style="padding:4px 9px;border-top:1px solid var(--rule-soft);"><button class="fr-avoid-del" data-id="${r.id}" title="Delete" style="background:none;border:none;color:var(--lost);cursor:pointer;font-size:15px;line-height:1;">×</button></td></tr>`).join('');
+        body.innerHTML = `<div style="font-family:var(--serif);font-size:15px;margin-bottom:4px;">Freight lanes</div><p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:0 0 12px;">The optimizer assigns each order a lane by its destination state, and only consolidates orders on the same lane.</p>${wrap(laneHead, laneTrs)}<div style="display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin:24px 0 6px;flex-wrap:wrap;"><div><div style="font-family:var(--serif);font-size:15px;">Lanes to avoid</div><p style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin:2px 0 0;max-width:700px;">The optimizer will never place a stop in a <b>From</b> state on the same truck as a stop in any <b>To</b> state. Comma-separate multiple states (e.g. From <b>CA</b> → To <b>OR, WA</b> stops a truck from running down to California and then back up to Oregon/Washington). A single-stop run to any one state is unaffected. Fields save on edit; changes apply next time you open the Book tab.</p></div><button id="fr-avoid-add" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">+ Add avoid rule</button></div>${avoidRows.length ? wrap(avoidHead, avoidTrs, `${avoidRows.length} rule${avoidRows.length === 1 ? '' : 's'}`) : '<div class="hl-empty" style="padding:20px;text-align:center;color:var(--ink-3);">No custom avoid rules yet — click "+ Add avoid rule". (Built-in default pairs still apply.)</div>'}`;
+        body.querySelectorAll('.fr-avoid').forEach(inp => { inp.addEventListener('focus', () => { inp.style.borderColor = 'var(--rule-soft)'; inp.style.background = 'var(--paper)'; }); inp.addEventListener('blur', () => { inp.style.borderColor = 'transparent'; inp.style.background = 'transparent'; }); inp.addEventListener('change', async () => { const val = inp.dataset.field === 'note' ? (inp.value || null) : ((inp.value || '').toUpperCase().replace(/\s+/g, ' ').trim() || null); const upd = {}; upd[inp.dataset.field] = val; const { error } = await sb.from('freight_avoid_lanes').update(upd).eq('id', inp.dataset.id); if (error) alert('Could not save: ' + error.message); }); });
+        const avAddBtn = document.getElementById('fr-avoid-add'); if (avAddBtn) avAddBtn.addEventListener('click', async () => { const { error } = await sb.from('freight_avoid_lanes').insert({ brand_id: brandId, state_a: '', state_b: '', note: '' }); if (error) { alert(error.message + '\n\n(If the table is missing, run the freight_avoid_lanes SQL in Supabase.)'); return; } _frRenderTab(brandId, sb); });
+        body.querySelectorAll('.fr-avoid-del').forEach(b => b.addEventListener('click', async () => { if (!confirm('Delete this avoid rule?')) return; const { error } = await sb.from('freight_avoid_lanes').delete().eq('id', b.dataset.id); if (error) { alert(error.message); return; } _frRenderTab(brandId, sb); }));
       } else if (_frSubTab === 'distributors') {
         const { data } = await sb.from('freight_distributors').select('*').eq('brand_id', brandId).order('company');
         const rows = data || [];
@@ -46628,7 +46639,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     apply();
   }
   function _frDistinct(rows, fn) { return [...new Set((rows || []).map(fn).filter(v => v != null && v !== ''))].sort(); }
-  function _frPlan(orders, items, mapRows, settings, customers, lanes, overrides) {
+  function _frPlan(orders, items, mapRows, settings, customers, lanes, overrides, avoidRules) {
     overrides = overrides || {};
     const _deliv = new Set(), _excl = new Set();
     (customers || []).forEach(c => { const k = _frNorm(_frCustShort(c.customer)); const sv = (c.service_type || '').toLowerCase(); if (sv.includes('deliver')) _deliv.add(k); else if (sv.includes('pickup') || sv.includes('not servic') || sv.includes('3pl')) _excl.add(k); });
@@ -46672,6 +46683,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     for (const sh of expanded) { if (!sh.resolved) { needsDc.push(sh); continue; } if (sh.plan > maxPlt || sh.weight > maxWt) { manual.push(sh); continue; } if (sh.dedicated) dedShips.push(sh); else pool.push(sh); }
     const avoid = new Set(['FL|WA', 'CA|FL', 'FL|OR', 'AZ|FL', 'CA|TX', 'AZ|TX', 'OR|TX', 'TX|WA']);
     const pk = (a, b) => [a, b].sort().join('|');
+    // Custom avoid rules (Lanes & Routes → "Lanes to avoid"): never put a stop in any From state
+    // on the same truck as a stop in any To state. state_a/state_b may each be comma lists.
+    (avoidRules || []).forEach(r => { const as = String(r.state_a || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean); const bs = String(r.state_b || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean); as.forEach(a => bs.forEach(b => { if (a !== b) avoid.add(pk(a, b)); })); });
     const dayDiff = (a, b) => { if (!a || !b) return 0; return Math.abs((new Date(a) - new Date(b)) / 86400000); };
     const stopKey = sh => _frDcKey(sh.dc || (_frCustShort(sh.customer) + ' ' + (sh.state || '')));
     function packShipments(items2, groupKeyFn) {
