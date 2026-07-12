@@ -27000,6 +27000,7 @@ render();
 
   let _distActiveSubTab = (() => { try { const s = localStorage.getItem('keel_dist_subtab'); return (s === 'inventory' || s === 'service-levels') ? s : 'inventory'; } catch (e) { return 'inventory'; } })();  // 'inventory' | 'service-levels'
   let _svcShowAllHistory = false;  // service levels: false = last 12 weeks only
+  let _svcLinesCache = null;        // { key, lines } — session cache for the SL tab; cleared on SL upload/delete
 
   function renderDistributionPage() {
     const session = HL.mountPage('distribution');
@@ -28510,46 +28511,53 @@ render();
     }
 
     // Load lines (filtered to the recent window unless showing all).
-    // Previously this paged SEQUENTIALLY — awaiting each 1000-row page before starting
-    // the next — so the ~12k-row window meant ~12 back-to-back round-trips that got
-    // progressively slower with offset depth. That was the main cause of the slow load.
-    // Now: get the window row-count once (header-only), then fetch all pages in PARALLEL.
-    // Ordered by (week_starting, id) to match the idx_dsll_brand_week composite index.
+    // Three-part speedup vs the original sequential select('*') paging:
+    //   1) Session cache keyed by window — instant on tab revisits (cleared on SL upload/delete).
+    //   2) Only the columns the view uses are fetched (was select('*')) to shrink payload.
+    //   3) Pages fetched in PARALLEL, ordered by (week_starting, id) to match idx_dsll_brand_week.
+    const SVC_COLS = 'unit_upc,service_level_pct,dc_code,item_description,week_starting,qty_ordered,qty_shipped,product_id,upload_id,direction';
     const PAGE_SIZE = 1000;
+    const _svcCacheKey = _svcShowAllHistory ? 'all' : ('win:' + (_svcCutoffDate || ''));
     let lines = [];
-    let _countQ = sb.from('distributor_service_level_lines')
-      .select('id', { count: 'exact', head: true })
-      .eq('brand_id', brandId);
-    if (_svcCutoffDate) _countQ = _countQ.gte('week_starting', _svcCutoffDate);
-    const { count: _svcCount } = await _countQ;
-    if (_svcCount && _svcCount > 0) {
-      const _pageCount = Math.ceil(_svcCount / PAGE_SIZE);
-      const _reqs = [];
-      for (let _p = 0; _p < _pageCount; _p++) {
-        let q = sb.from('distributor_service_level_lines')
-          .select('*')
-          .eq('brand_id', brandId);
-        if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
-        _reqs.push(q.order('week_starting', { ascending: true }).order('id', { ascending: true }).range(_p * PAGE_SIZE, _p * PAGE_SIZE + PAGE_SIZE - 1));
+    if (_svcLinesCache && _svcLinesCache.key === _svcCacheKey) {
+      lines = _svcLinesCache.lines;
+      console.log('[Service Levels] using cached lines:', lines.length);
+    } else {
+      let _countQ = sb.from('distributor_service_level_lines')
+        .select('id', { count: 'exact', head: true })
+        .eq('brand_id', brandId);
+      if (_svcCutoffDate) _countQ = _countQ.gte('week_starting', _svcCutoffDate);
+      const { count: _svcCount } = await _countQ;
+      if (_svcCount && _svcCount > 0) {
+        const _pageCount = Math.ceil(_svcCount / PAGE_SIZE);
+        const _reqs = [];
+        for (let _p = 0; _p < _pageCount; _p++) {
+          let q = sb.from('distributor_service_level_lines')
+            .select(SVC_COLS)
+            .eq('brand_id', brandId);
+          if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
+          _reqs.push(q.order('week_starting', { ascending: true }).order('id', { ascending: true }).range(_p * PAGE_SIZE, _p * PAGE_SIZE + PAGE_SIZE - 1));
+        }
+        const _results = await Promise.all(_reqs);
+        for (const r of _results) {
+          if (r.error) { console.error('Service level fetch error:', r.error); continue; }
+          if (r.data && r.data.length) lines = lines.concat(r.data);
+        }
+      } else if (_svcCount == null) {
+        // Row-count header unavailable (some proxies strip it) — fall back to sequential paging.
+        let from = 0;
+        while (true) {
+          let q = sb.from('distributor_service_level_lines').select(SVC_COLS).eq('brand_id', brandId);
+          if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
+          const { data: page, error } = await q.range(from, from + PAGE_SIZE - 1).order('week_starting', { ascending: true }).order('id', { ascending: true });
+          if (error) { console.error('Service level fetch error:', error); break; }
+          if (!page || page.length === 0) break;
+          lines = lines.concat(page);
+          if (page.length < PAGE_SIZE) break;
+          from += PAGE_SIZE;
+        }
       }
-      const _results = await Promise.all(_reqs);
-      for (const r of _results) {
-        if (r.error) { console.error('Service level fetch error:', r.error); continue; }
-        if (r.data && r.data.length) lines = lines.concat(r.data);
-      }
-    } else if (_svcCount == null) {
-      // Row-count header unavailable (some proxies strip it) — fall back to sequential paging.
-      let from = 0;
-      while (true) {
-        let q = sb.from('distributor_service_level_lines').select('*').eq('brand_id', brandId);
-        if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
-        const { data: page, error } = await q.range(from, from + PAGE_SIZE - 1).order('week_starting', { ascending: true }).order('id', { ascending: true });
-        if (error) { console.error('Service level fetch error:', error); break; }
-        if (!page || page.length === 0) break;
-        lines = lines.concat(page);
-        if (page.length < PAGE_SIZE) break;
-        from += PAGE_SIZE;
-      }
+      _svcLinesCache = { key: _svcCacheKey, lines };
     }
     console.log('[Service Levels] total lines fetched:', lines.length, 'across', uploads.length, 'uploads', _svcShowAllHistory ? '(all history)' : `(last ${SVC_WEEKS_WINDOW} weeks)`);
 
@@ -29647,6 +29655,7 @@ render();
         status.style.color = 'var(--won)';
         setTimeout(() => {
           modal.remove();
+          _svcLinesCache = null;   // new upload → invalidate SL cache
           renderDistSvcView();
         }, 1600);
       } catch (err) {
@@ -31469,6 +31478,7 @@ render();
             if (!confirm('Delete this service level upload and all its lines? This cannot be undone.')) return;
             await sb.from('distributor_service_level_uploads').delete().eq('id', btn.dataset.id);
             modal.remove();
+            _svcLinesCache = null;   // deleted an upload → invalidate SL cache
             openDistInvUploadsHistory(tab);
             if (typeof renderDistSvcView === 'function') renderDistSvcView();
           });
