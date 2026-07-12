@@ -41087,6 +41087,107 @@ render();
   }
 
   // ---- UNFI weekly customer upload (SBO Velocity Report) ----
+  // ─── KeHe weekly "Chains and Stores that ordered an Item" → distributor_customer_sales ───
+  // Hierarchical: col 0 = chain, col 2 = retailer group, col 3 = banner, col 4 = store, col 6 = item (UPC in parens).
+  // ORDERED $ is the weekly sales measure (at vendor cost). Only col-6 leaf rows are real; the rest are subtotals.
+  // KeHe reports no warehouse/DC, no region, and no units — those stay null/0.
+  async function handleKeheWeeklyCustomerUpload(file, brandId, sb, onProgress) {
+    const distributor = 'KeHe';
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+    const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true, defval: null });
+    const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+    // Week from the "6/28/2026 - 7/4/2026" range cell
+    let week_starting = null, week_end = null;
+    for (let r = 0; r < Math.min(15, aoa.length) && !week_starting; r++) {
+      for (const c of (aoa[r] || [])) {
+        const m = String(c ?? '').match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s*-\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        if (m) {
+          week_starting = `${m[3]}-${String(m[1]).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
+          week_end = `${m[6]}-${String(m[4]).padStart(2, '0')}-${String(m[5]).padStart(2, '0')}`;
+          break;
+        }
+      }
+    }
+    if (!week_starting) throw new Error('KeHe: could not find the week date range (e.g. "6/28/2026 - 7/4/2026").');
+
+    // Header row + ORDERED column (by name, so column shifts don't break it)
+    let hdrIdx = -1, cOrdered = -1;
+    for (let r = 0; r < Math.min(20, aoa.length); r++) {
+      const row = (aoa[r] || []).map(norm);
+      const io = row.findIndex(h => h === 'ordered');
+      if (io >= 0 && row.some(h => h === 'shipped' || h.includes('fill rate'))) { hdrIdx = r; cOrdered = io; break; }
+    }
+    if (hdrIdx < 0) throw new Error('KeHe: could not locate the ORDERED column. Is this the "Chains and Stores that ordered an Item" report?');
+
+    const { data: prods, error: perr } = await sb.from('products')
+      .select('id, item_description, unit_upc, category, product_line').eq('brand_id', brandId);
+    if (perr) throw new Error('Could not load products for UPC matching: ' + perr.message);
+    const upcMap = new Map();
+    for (const p of (prods || [])) for (const k of _dcsUpcKeys(p.unit_upc)) if (!upcMap.has(k)) upcMap.set(k, p);
+    const matchProduct = (raw) => { for (const k of _dcsUpcKeys(raw)) { const p = upcMap.get(k); if (p) return p; } return null; };
+
+    const upload_id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : (String(Date.now()) + Math.random());
+    const str = (v) => { const s = String(v == null ? '' : v).trim(); return s === '' ? null : s; };
+    const getNum = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[$,\s()]/g, '')); return isNaN(n) ? null : n; };
+
+    let chain = '', retailer = '', banner = '', store = '';
+    const agg = new Map();
+    for (let i = hdrIdx + 1; i < aoa.length; i++) {
+      const row = aoa[i] || [];
+      const g = (j) => { const v = row[j]; return v == null ? '' : String(v).trim(); };
+      const c0 = g(0), c2 = g(2), c3 = g(3), c4 = g(4), c6 = g(6);
+      if (c0) { chain = c0; retailer = ''; banner = ''; store = ''; }
+      if (c2) { retailer = c2; banner = ''; store = ''; }
+      if (c3) { banner = c3; store = ''; }
+      if (c4) { store = c4; }
+      if (!c6 || /^total\b/i.test(c6)) continue;         // subtotal rows carry no item — skip
+      const ordered = getNum(row[cOrdered]);
+      if (ordered == null) continue;
+      const m = c6.match(/\((\d{6,})\)/);
+      const upc = m ? m[1] : null;
+      const itemDesc = c6.replace(/\s*\(\d{6,}\)\s*$/, '').trim();
+      const chainName = banner || retailer || chain || null;
+      const key = (upc || itemDesc) + '|' + (store || '') + '|' + (chainName || '');
+      const cur = agg.get(key) || { upc, itemDesc, chainName, store: store || null, sales: 0 };
+      cur.sales += ordered;
+      agg.set(key, cur);
+    }
+    if (!agg.size) throw new Error('KeHe: parsed 0 item rows — check the file structure.');
+
+    const rows = []; let matched = 0, unmatched = 0;
+    for (const v of agg.values()) {
+      const p = matchProduct(v.upc);
+      if (p) matched++; else unmatched++;
+      rows.push({
+        brand_id: brandId, distributor, upload_id, report_type: 'weekly',
+        week_starting, period_start: week_starting, period_end: week_end,
+        region: null, cust_num: null, chain_code: null, chain_name: v.chainName,
+        store_name: v.store, city: null, state: null, zip: null,
+        channel_number: null, whs: null, upc: v.upc,
+        product_id: p ? p.id : null, item_description: p ? p.item_description : v.itemDesc,
+        product_line: p ? p.product_line : null, category: p ? p.category : null,
+        pack: null, size: null, file_brand: null,
+        file_description: v.itemDesc, file_category: null,
+        sales: Math.round(v.sales * 100) / 100, quantity: 0,   // KeHe reports $ only
+      });
+    }
+
+    // Replace this same week (idempotent re-upload), then insert.
+    const { error: delErr } = await sb.from('distributor_customer_sales').delete()
+      .eq('brand_id', brandId).eq('distributor', distributor).eq('report_type', 'weekly').eq('week_starting', week_starting);
+    if (delErr) throw new Error('Could not clear the prior KeHe rows for this week: ' + delErr.message);
+
+    const CH = 500;
+    for (let i = 0; i < rows.length; i += CH) {
+      const { error } = await sb.from('distributor_customer_sales').insert(rows.slice(i, i + CH));
+      if (error) throw new Error('Insert failed: ' + error.message);
+      if (onProgress) onProgress(Math.min(i + CH, rows.length), rows.length);
+    }
+    return { week_starting, total: rows.length, matched, unmatched };
+  }
+
   async function handleWeeklyCustomerUpload(file, brandId, sb, onProgress) {
     const distributor = 'UNFI';
     const ab = await file.arrayBuffer();
@@ -41174,7 +41275,8 @@ render();
   }
 
   // ---- UNFI Customer detail view (Phase 2a: L52 totals) ----
-  let _cdState = { products: null, cat: '', line: '', item: '', search: '', offset: 0, limit: 25, rows: [], fullCount: 0, brandId: null, sb: null, mode: 'totals', grain: 'week', periods: 8, trendRows: [], periodKeys: [], total: null, error: null };
+  let _cdState = { products: null, cat: '', line: '', item: '', search: '', offset: 0, limit: 25, rows: [], fullCount: 0, brandId: null, sb: null, mode: 'totals', grain: 'week', periods: 8, trendRows: [], periodKeys: [], total: null, error: null,
+    catSel: new Set(), lineSel: new Set(), itemSel: new Set(), distSel: new Set(), dcSel: new Set(), metric: 'dollars', openMs: null };
   function _cdSelStyle() { return 'padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;background:var(--paper);'; }
   function _cdMoney(n) { return '$' + Math.round(Number(n) || 0).toLocaleString(); }
   function _cdNum(n) { return (Number(n) || 0).toLocaleString(); }
@@ -41198,38 +41300,51 @@ render();
     _cdState.cat = ''; _cdState.line = ''; _cdState.item = ''; _cdState.search = ''; _cdState.grain = 'week'; _cdState.periods = 8; _cdState.offset = 0;
 
     if (!_cdState.rows.length) {
-      body.innerHTML = `<div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:8px;">UNFI &middot; Weekly customer detail</div>
-        <div class="hl-empty" style="padding:28px;text-align:center;color:var(--ink-3);">No weekly data yet. Upload weekly SBO files with &ldquo;+ Upload UNFI weekly&rdquo;.</div>`;
+      body.innerHTML = `<div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:8px;">Distributor &middot; Weekly customer detail</div>
+        <div class="hl-empty" style="padding:28px;text-align:center;color:var(--ink-3);">No weekly data yet. Upload with &ldquo;+ Upload UNFI weekly&rdquo; or &ldquo;+ Upload KeHe weekly&rdquo;.</div>`;
       return;
     }
 
     const cats = [...new Set(_cdState.products.map(p => p.category).filter(Boolean))].sort();
+    const allDists = [...new Set(_cdState.rows.map(r => r.distributor).filter(Boolean))].sort();
+    const allDcs = [...new Set(_cdState.rows.map(r => (r.whs && String(r.whs).trim()) ? String(r.whs).trim() : '—'))].sort();
     body.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
-        <div style="font-family:var(--serif);font-size:18px;color:var(--ink);">UNFI &middot; Weekly customer detail</div>
+        <div style="font-family:var(--serif);font-size:18px;color:var(--ink);">Distributor &middot; Weekly customer detail</div>
         <span style="display:inline-flex;gap:6px;align-items:center;"><button id="hl-cw-week"></button><button id="hl-cw-month"></button></span>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;">
         <input id="hl-cw-search" placeholder="Search retailer…" style="padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;min-width:200px;" />
-        <select id="hl-cw-cat" style="${_cdSelStyle()}"><option value="">All categories</option>${cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}</select>
-        <select id="hl-cw-line" style="${_cdSelStyle()}"><option value="">All product lines</option></select>
-        <select id="hl-cw-item" style="${_cdSelStyle()}"><option value="">All items</option></select>
+        ${_cwMs('dist', 'Distributor', allDists, _cdState.distSel)}
+        ${_cwMs('dc', 'DC', allDcs, _cdState.dcSel)}
+        ${_cwMs('cat', 'Categories', cats, _cdState.catSel)}
+        <span id="hl-cw-line-slot">${_cwMs('line', 'Product lines', [], _cdState.lineSel)}</span>
+        <span id="hl-cw-item-slot">${_cwMs('item', 'Items', [], _cdState.itemSel)}</span>
+        <span style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:4px;overflow:hidden;">
+          <button class="hl-cw-metric" data-metric="dollars" style="background:${_cdState.metric === 'dollars' ? 'var(--ink)' : 'var(--paper)'};color:${_cdState.metric === 'dollars' ? 'var(--paper)' : 'var(--ink-3)'};border:none;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:6px 11px;cursor:pointer;text-transform:uppercase;">Dollars</button>
+          <button class="hl-cw-metric" data-metric="units" style="background:${_cdState.metric === 'units' ? 'var(--ink)' : 'var(--paper)'};color:${_cdState.metric === 'units' ? 'var(--paper)' : 'var(--ink-3)'};border:none;border-left:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;padding:6px 11px;cursor:pointer;text-transform:uppercase;">Units</button>
+        </span>
       </div>
       <div id="hl-cw-results"></div>`;
 
-    const catSel = document.getElementById('hl-cw-cat'), lineSel = document.getElementById('hl-cw-line'), itemSel = document.getElementById('hl-cw-item'), search = document.getElementById('hl-cw-search');
+    const search = document.getElementById('hl-cw-search');
     const refillLines = () => {
-      const lines = [...new Set(_cdState.products.filter(p => !_cdState.cat || p.category === _cdState.cat).map(p => p.product_line).filter(Boolean))].sort();
-      lineSel.innerHTML = `<option value="">All product lines</option>` + lines.map(l => `<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join('');
+      const lines = [...new Set(_cdState.products.filter(p => !_cdState.catSel.size || _cdState.catSel.has(p.category)).map(p => p.product_line).filter(Boolean))].sort();
+      const slot = document.getElementById('hl-cw-line-slot');
+      if (slot) { slot.innerHTML = _cwMs('line', 'Product lines', lines, _cdState.lineSel); _cwWireMs(slot); }
     };
     const refillItems = () => {
-      const items = _cdState.products.filter(p => (!_cdState.cat || p.category === _cdState.cat) && (!_cdState.line || p.product_line === _cdState.line)).sort((a, b) => (a.item_description || '').localeCompare(b.item_description || ''));
-      itemSel.innerHTML = `<option value="">All items</option>` + items.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.item_description || '(unnamed)')}</option>`).join('');
+      const items = _cdState.products.filter(p => (!_cdState.catSel.size || _cdState.catSel.has(p.category)) && (!_cdState.lineSel.size || _cdState.lineSel.has(p.product_line)))
+        .sort((a, b) => (a.item_description || '').localeCompare(b.item_description || ''));
+      const slot = document.getElementById('hl-cw-item-slot');
+      if (slot) { slot.innerHTML = _cwMs('item', 'Items', items.map(p => ({ v: p.id, t: p.item_description || '(unnamed)' })), _cdState.itemSel); _cwWireMs(slot); }
     };
+    _cdState.refillLines = refillLines; _cdState.refillItems = refillItems;
     refillLines(); refillItems();
-    catSel.addEventListener('change', () => { _cdState.cat = catSel.value; _cdState.line = ''; _cdState.item = ''; refillLines(); refillItems(); _cdState.offset = 0; _cwRender(); });
-    lineSel.addEventListener('change', () => { _cdState.line = lineSel.value; _cdState.item = ''; refillItems(); _cdState.offset = 0; _cwRender(); });
-    itemSel.addEventListener('change', () => { _cdState.item = itemSel.value; _cdState.offset = 0; _cwRender(); });
+    _cwWireMs(body);
+    body.querySelectorAll('.hl-cw-metric').forEach(b => b.addEventListener('click', () => {
+      _cdState.metric = b.dataset.metric; _cdState.offset = 0; _cwInitRerenderToolbar();
+    }));
     let t = null; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { _cdState.search = search.value.trim(); _cdState.offset = 0; _cwRender(); }, 250); });
 
     const wbtn = document.getElementById('hl-cw-week'), mbtn = document.getElementById('hl-cw-month');
@@ -41249,8 +41364,8 @@ render();
     const PAGE = 1000; let all = [];
     for (let from = 0; ; from += PAGE) {
       const { data, error } = await sb.from('distributor_customer_sales')
-        .select('region,chain_name,item_description,category,product_id,product_line,week_starting,sales,quantity')
-        .eq('brand_id', brandId).eq('distributor', 'UNFI').eq('report_type', 'weekly')
+        .select('distributor,region,whs,chain_name,item_description,category,product_id,product_line,week_starting,sales,quantity')
+        .eq('brand_id', brandId).eq('report_type', 'weekly')
         .order('id', { ascending: true }).range(from, from + PAGE - 1);
       if (error) throw new Error(error.message);
       all = all.concat(data || []);
@@ -41259,58 +41374,132 @@ render();
     return all;
   }
 
+  // ─── Weekly customer detail: search+checkbox multi-select (same pattern as Distributors › Sales) ───
+  // options: array of strings, or {v,t} objects (value / display text)
+  function _cwMs(key, label, options, sel) {
+    const opts = (options || []).map(o => (o && typeof o === 'object') ? o : { v: o, t: o });
+    const open = _cdState.openMs === key;
+    const lbl = sel.size === 0 ? 'All' : (sel.size === 1 ? (opts.find(o => sel.has(o.v))?.t || `${sel.size} selected`) : `${sel.size} selected`);
+    return `<span class="cw-ms" data-mskey="${key}" style="position:relative;display:inline-block;">
+      <button type="button" class="cw-ms-btn" style="font-family:var(--mono);font-size:11px;padding:7px 11px;border:1px solid var(--rule-soft);border-radius:6px;background:var(--paper);color:var(--ink);cursor:pointer;white-space:nowrap;max-width:230px;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(label)}: <span style="color:${sel.size ? 'var(--ink)' : 'var(--ink-3)'};">${escapeHtml(String(lbl).slice(0, 22))}</span> ▾</button>
+      <span class="cw-ms-panel" style="display:${open ? 'block' : 'none'};position:absolute;z-index:70;top:100%;left:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;padding:8px;max-height:320px;overflow:auto;min-width:250px;box-shadow:0 6px 20px rgba(0,0,0,0.14);">
+        <input type="text" class="cw-ms-search" placeholder="Search…" style="width:100%;box-sizing:border-box;padding:6px 8px;margin-bottom:6px;border:1px solid var(--rule-soft);border-radius:4px;font-size:12px;background:var(--paper);color:var(--ink);">
+        <label style="display:block;font-family:var(--mono);font-size:11px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="cw-ms-all" ${sel.size === 0 ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">Select all</label>
+        <span style="display:block;border-top:1px solid var(--rule-soft);margin:4px 0;"></span>
+        ${opts.map(o => `<label class="cw-ms-row" data-txt="${escapeHtml(String(o.t).toLowerCase())}" style="display:block;font-size:12px;padding:3px 2px;cursor:pointer;"><input type="checkbox" class="cw-ms-opt" value="${escapeHtml(String(o.v))}" ${sel.has(o.v) ? 'checked' : ''} style="margin-right:6px;vertical-align:middle;">${escapeHtml(String(o.t))}</label>`).join('')}
+      </span></span>`;
+  }
+  function _cwWireMs(scope) {
+    const sets = { dist: _cdState.distSel, dc: _cdState.dcSel, cat: _cdState.catSel, line: _cdState.lineSel, item: _cdState.itemSel };
+    scope.querySelectorAll('.cw-ms').forEach(box => {
+      if (box.dataset.wired === '1') return; box.dataset.wired = '1';
+      const key = box.dataset.mskey, sel = sets[key];
+      if (!sel) return;
+      const btn = box.querySelector('.cw-ms-btn'), panel = box.querySelector('.cw-ms-panel');
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const willOpen = _cdState.openMs !== key;
+        document.querySelectorAll('.cw-ms-panel').forEach(p => { p.style.display = 'none'; });
+        _cdState.openMs = willOpen ? key : null;
+        if (willOpen) { panel.style.display = 'block'; panel.querySelector('.cw-ms-search')?.focus(); }
+      });
+      panel.addEventListener('click', (ev) => ev.stopPropagation());
+      const s = panel.querySelector('.cw-ms-search');
+      if (s) s.addEventListener('input', () => {
+        const q = s.value.trim().toLowerCase();
+        panel.querySelectorAll('.cw-ms-row').forEach(r => { r.style.display = (!q || (r.dataset.txt || '').includes(q)) ? 'block' : 'none'; });
+      });
+      const allCb = panel.querySelector('.cw-ms-all');
+      if (allCb) allCb.addEventListener('change', () => { sel.clear(); _cwAfterFilter(key); });
+      panel.querySelectorAll('.cw-ms-opt').forEach(cb => cb.addEventListener('change', () => {
+        if (cb.checked) sel.add(cb.value); else sel.delete(cb.value);
+        _cwAfterFilter(key);
+      }));
+    });
+  }
+  function _cwAfterFilter(key) {
+    if (key === 'cat') { _cdState.lineSel.clear(); _cdState.itemSel.clear(); _cdState.refillLines?.(); _cdState.refillItems?.(); }
+    if (key === 'line') { _cdState.itemSel.clear(); _cdState.refillItems?.(); }
+    _cdState.offset = 0;
+    _cwInitRerenderToolbar();
+  }
+  // Re-render just the filter buttons (to update their labels) + the table, keeping the open panel.
+  function _cwInitRerenderToolbar() {
+    document.querySelectorAll('.cw-ms').forEach(box => {
+      const key = box.dataset.mskey;
+      const sets = { dist: _cdState.distSel, dc: _cdState.dcSel, cat: _cdState.catSel, line: _cdState.lineSel, item: _cdState.itemSel };
+      const sel = sets[key]; if (!sel) return;
+      const btn = box.querySelector('.cw-ms-btn');
+      const lbl = sel.size === 0 ? 'All' : `${sel.size} selected`;
+      const span = btn.querySelector('span');
+      if (span) { span.textContent = sel.size === 1 ? String([...sel][0]).slice(0, 22) : lbl; span.style.color = sel.size ? 'var(--ink)' : 'var(--ink-3)'; }
+    });
+    document.querySelectorAll('.hl-cw-metric').forEach(b => {
+      const on = b.dataset.metric === _cdState.metric;
+      b.style.background = on ? 'var(--ink)' : 'var(--paper)';
+      b.style.color = on ? 'var(--paper)' : 'var(--ink-3)';
+    });
+    _cwRender();
+  }
+
   function _cwRender() {
     const res = document.getElementById('hl-cw-results');
     if (!res) return;
+    const S = _cdState;
     const cn = r => (r.chain_name && String(r.chain_name).trim()) ? String(r.chain_name).trim() : '(no chain name)';
-    const q = _cdState.search ? _cdState.search.toLowerCase() : '';
-    const f = _cdState.rows.filter(r =>
-      (!_cdState.cat || r.category === _cdState.cat) &&
-      (!_cdState.line || r.product_line === _cdState.line) &&
-      (!_cdState.item || r.product_id === _cdState.item) &&
+    const dcOf = r => (r.whs && String(r.whs).trim()) ? String(r.whs).trim() : '—';
+    const q = S.search ? S.search.toLowerCase() : '';
+    const f = S.rows.filter(r =>
+      (!S.catSel.size || S.catSel.has(r.category)) &&
+      (!S.lineSel.size || S.lineSel.has(r.product_line)) &&
+      (!S.itemSel.size || S.itemSel.has(r.product_id)) &&
+      (!S.distSel.size || S.distSel.has(r.distributor)) &&
+      (!S.dcSel.size || S.dcSel.has(dcOf(r))) &&
       (!q || cn(r).toLowerCase().includes(q)));
-    const pkey = r => _cdState.grain === 'month' ? String(r.week_starting).slice(0, 7) : String(r.week_starting);
+    const pkey = r => S.grain === 'month' ? String(r.week_starting).slice(0, 7) : String(r.week_starting);
     const allP = [...new Set(f.map(pkey))].sort().reverse();
-    const keys = allP.slice(0, _cdState.periods).reverse();
+    const keys = allP.slice(0, S.periods).reverse();
     const keep = new Set(keys);
     const groups = new Map();
     for (const r of f) {
       const pk = pkey(r); if (!keep.has(pk)) continue;
-      const gk = (r.region || '') + '|' + cn(r) + '|' + (r.item_description || '');
+      const gk = (r.region || '') + '|' + dcOf(r) + '|' + cn(r) + '|' + (r.item_description || '');
       let g = groups.get(gk);
-      if (!g) { g = { region: r.region || '', chain: cn(r), item: r.item_description || '', category: r.category || '', per: {}, ts: 0, tu: 0 }; groups.set(gk, g); }
+      if (!g) { g = { region: r.region || '', dc: dcOf(r), chain: cn(r), item: r.item_description || '', category: r.category || '', per: {}, ts: 0, tu: 0 }; groups.set(gk, g); }
       if (!g.per[pk]) g.per[pk] = { s: 0, u: 0 };
       g.per[pk].s += Number(r.sales) || 0; g.per[pk].u += Number(r.quantity) || 0;
       g.ts += Number(r.sales) || 0; g.tu += Number(r.quantity) || 0;
     }
-    const sorted = [...groups.values()].sort((a, b) => b.ts - a.ts);
+    const isUnits = S.metric === 'units';
+    const sorted = [...groups.values()].sort((a, b) => (isUnits ? b.tu - a.tu : b.ts - a.ts));
     if (sorted.length === 0) { res.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No matching customers.</div>`; return; }
-    const shown = sorted.slice(0, _cdState.offset + _cdState.limit);
+    const shown = sorted.slice(0, S.offset + S.limit);
 
     // per-week (column) totals + grand total across the full filtered set
     let gs = 0, gu = 0; const weekTot = {}; keys.forEach(k => weekTot[k] = { s: 0, u: 0 });
     for (const r of f) { const pk = pkey(r); if (weekTot[pk]) { const s = Number(r.sales) || 0, u = Number(r.quantity) || 0; weekTot[pk].s += s; weekTot[pk].u += u; gs += s; gu += u; } }
 
-    const label = k => _cdState.grain === 'month' ? k : k.slice(5);
-    const th = (h, i) => `<th style="padding:6px 6px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.03em;color:var(--ink);text-transform:uppercase;border-bottom:2px solid var(--rule-soft);${i >= 4 ? 'text-align:right;white-space:nowrap;' : 'text-align:left;'}">${escapeHtml(h)}</th>`;
-    const head = ['Region', 'Chain', 'Description', 'Cat', ...keys.map(label), 'Total'];
-    const metric = (s, u, big) => `${_cdMoney(s)}<br><span style="color:var(--ink-3);font-size:9px;">${_cdNum(u)}</span>`;
+    const label = k => S.grain === 'month' ? k : k.slice(5);
+    const th = (h, i) => `<th style="padding:6px 6px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.03em;color:var(--ink);text-transform:uppercase;border-bottom:2px solid var(--rule-soft);${i >= 5 ? 'text-align:right;white-space:nowrap;' : 'text-align:left;'}">${escapeHtml(h)}</th>`;
+    const head = ['Region', 'DC', 'Chain', 'Description', 'Cat', ...keys.map(label), 'Total'];
+    const metric = (s, u) => isUnits ? _cdNum(u) : _cdMoney(s);
     const cell = (g, k) => { const p = g.per[k]; return `<td style="padding:5px 6px;text-align:right;font-family:var(--mono);font-size:11px;white-space:nowrap;">${p ? metric(p.s, p.u) : '<span style="color:var(--ink-3);">&middot;</span>'}</td>`; };
     const trunc = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
     const tbody = shown.map(g => `<tr style="border-top:1px solid var(--rule-soft);">
       <td style="padding:5px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${escapeHtml(g.region)}</td>
+      <td style="padding:5px 6px;font-family:var(--mono);font-size:10px;color:var(--ink);">${escapeHtml(g.dc)}</td>
       <td style="padding:5px 6px;font-family:var(--serif);font-size:12px;max-width:120px;${trunc}" title="${escapeHtml(g.chain)}">${escapeHtml(g.chain)}</td>
       <td style="padding:5px 6px;font-family:var(--serif);font-size:12px;max-width:150px;${trunc}" title="${escapeHtml(g.item)}">${escapeHtml(g.item)}</td>
       <td style="padding:5px 6px;font-family:var(--mono);font-size:9px;color:var(--ink-3);text-transform:uppercase;">${escapeHtml(g.category)}</td>
       ${keys.map(k => cell(g, k)).join('')}
       <td style="padding:5px 6px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;white-space:nowrap;">${metric(g.ts, g.tu)}</td></tr>`).join('');
     const totalRow = `<tr style="border-top:2px solid var(--ink);background:rgba(0,0,0,0.02);">
-      <td colspan="4" style="padding:7px 6px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink);">Total &middot; ${sorted.length.toLocaleString()} rows</td>
+      <td colspan="5" style="padding:7px 6px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink);">Total &middot; ${sorted.length.toLocaleString()} rows</td>
       ${keys.map(k => `<td style="padding:7px 6px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;white-space:nowrap;">${metric(weekTot[k].s, weekTot[k].u)}</td>`).join('')}
       <td style="padding:7px 6px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:700;white-space:nowrap;">${metric(gs, gu)}</td></tr>`;
     const more = shown.length < sorted.length;
     res.innerHTML = `
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${shown.length.toLocaleString()} of ${sorted.length.toLocaleString()} &middot; ${_cdState.grain === 'month' ? 'monthly' : 'weekly'} &middot; each cell: $ over units &middot; ${keys.length} of ${allP.length} ${_cdState.grain === 'month' ? 'months' : 'weeks'}</div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:6px;">Showing ${shown.length.toLocaleString()} of ${sorted.length.toLocaleString()} &middot; ${S.grain === 'month' ? 'monthly' : 'weekly'} &middot; ${isUnits ? 'units' : 'dollars'} &middot; ${keys.length} of ${allP.length} ${S.grain === 'month' ? 'months' : 'weeks'}</div>
       <div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;table-layout:auto;font-variant-numeric:tabular-nums;">
         <thead><tr>${head.map((h, i) => th(h, i)).join('')}</tr></thead>
         <tbody>${tbody}</tbody><tfoot>${totalRow}</tfoot>
@@ -41341,8 +41530,10 @@ render();
           <input type="file" id="hl-sp-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <input type="file" id="hl-cd-upload" accept=".xlsx,.xls" style="display:none;" />
           <input type="file" id="hl-cw-upload" accept=".xlsx,.xls" multiple style="display:none;" />
+          <input type="file" id="hl-kw-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI L52 total</button>
           <button class="hl-btn-primary" id="hl-cw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI weekly</button>
+          <button class="hl-btn-primary" id="hl-kw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload KeHe weekly</button>
           <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
         </div>
       </div>
@@ -41399,6 +41590,32 @@ render();
       await renderCustomerDetailView(brandId, sb);
       if (errs.length) alert('Some weekly files failed:\n' + errs.join('\n'));
       cwInput.value = '';
+    });
+
+    const kwInput = document.getElementById('hl-kw-upload');
+    document.getElementById('hl-kw-upload-btn').addEventListener('click', () => kwInput.click());
+    kwInput.addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files || []);
+      if (!files.length) return;
+      const body = document.getElementById('hl-cd-section');
+      const done = []; const errs = [];
+      for (let fi = 0; fi < files.length; fi++) {
+        const file = files[fi];
+        body.innerHTML = `<div class="hl-loading">KeHe file ${fi + 1} of ${files.length}: parsing “${escapeHtml(file.name)}”…</div>`;
+        try {
+          const res = await handleKeheWeeklyCustomerUpload(file, brandId, sb, (d, total) => {
+            body.innerHTML = `<div class="hl-loading">File ${fi + 1}/${files.length} — saving ${d.toLocaleString()} / ${total.toLocaleString()} rows…</div>`;
+          });
+          console.log('[KeheWeekly]', file.name, res); done.push(res);
+        } catch (err) {
+          console.error('[KeheWeekly]', file.name, err); errs.push(`${file.name}: ${err.message || 'error'}`);
+        }
+      }
+      const weeks = done.map(r => r.week_starting).sort();
+      body.innerHTML = `<div class="hl-loading">Loaded ${done.length} KeHe week(s)${weeks.length ? ': ' + weeks.join(', ') : ''}${errs.length ? ` · ${errs.length} failed` : ''}. Refreshing…</div>`;
+      await renderCustomerDetailView(brandId, sb);
+      if (errs.length) alert('Some KeHe files failed:\n' + errs.join('\n'));
+      kwInput.value = '';
     });
     uploadInput.addEventListener('change', async (e) => {
       const files = Array.from(e.target.files || []);
