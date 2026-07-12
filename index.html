@@ -28509,23 +28509,47 @@ render();
       }
     }
 
-    // Load lines paginated (filtered to the recent window unless showing all).
+    // Load lines (filtered to the recent window unless showing all).
+    // Previously this paged SEQUENTIALLY — awaiting each 1000-row page before starting
+    // the next — so the ~12k-row window meant ~12 back-to-back round-trips that got
+    // progressively slower with offset depth. That was the main cause of the slow load.
+    // Now: get the window row-count once (header-only), then fetch all pages in PARALLEL.
+    // Ordered by (week_starting, id) to match the idx_dsll_brand_week composite index.
     const PAGE_SIZE = 1000;
     let lines = [];
-    let from = 0;
-    while (true) {
-      let q = sb.from('distributor_service_level_lines')
-        .select('*')
-        .eq('brand_id', brandId);
-      if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
-      const { data: page, error } = await q
-        .range(from, from + PAGE_SIZE - 1)
-        .order('id', { ascending: true });
-      if (error) { console.error('Service level fetch error:', error); break; }
-      if (!page || page.length === 0) break;
-      lines = lines.concat(page);
-      if (page.length < PAGE_SIZE) break;
-      from += PAGE_SIZE;
+    let _countQ = sb.from('distributor_service_level_lines')
+      .select('id', { count: 'exact', head: true })
+      .eq('brand_id', brandId);
+    if (_svcCutoffDate) _countQ = _countQ.gte('week_starting', _svcCutoffDate);
+    const { count: _svcCount } = await _countQ;
+    if (_svcCount && _svcCount > 0) {
+      const _pageCount = Math.ceil(_svcCount / PAGE_SIZE);
+      const _reqs = [];
+      for (let _p = 0; _p < _pageCount; _p++) {
+        let q = sb.from('distributor_service_level_lines')
+          .select('*')
+          .eq('brand_id', brandId);
+        if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
+        _reqs.push(q.order('week_starting', { ascending: true }).order('id', { ascending: true }).range(_p * PAGE_SIZE, _p * PAGE_SIZE + PAGE_SIZE - 1));
+      }
+      const _results = await Promise.all(_reqs);
+      for (const r of _results) {
+        if (r.error) { console.error('Service level fetch error:', r.error); continue; }
+        if (r.data && r.data.length) lines = lines.concat(r.data);
+      }
+    } else if (_svcCount == null) {
+      // Row-count header unavailable (some proxies strip it) — fall back to sequential paging.
+      let from = 0;
+      while (true) {
+        let q = sb.from('distributor_service_level_lines').select('*').eq('brand_id', brandId);
+        if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
+        const { data: page, error } = await q.range(from, from + PAGE_SIZE - 1).order('week_starting', { ascending: true }).order('id', { ascending: true });
+        if (error) { console.error('Service level fetch error:', error); break; }
+        if (!page || page.length === 0) break;
+        lines = lines.concat(page);
+        if (page.length < PAGE_SIZE) break;
+        from += PAGE_SIZE;
+      }
     }
     console.log('[Service Levels] total lines fetched:', lines.length, 'across', uploads.length, 'uploads', _svcShowAllHistory ? '(all history)' : `(last ${SVC_WEEKS_WINDOW} weeks)`);
 
@@ -29847,7 +29871,6 @@ render();
 
     return { lineRows, itemRows, weekCount: weekColumns.length, unmatchedItems, skippedTotalRows };
   }
-
 
   // Render the inventory UI for ONE upload (period). Includes period selector at top.
   function renderDistInventoryUI(host, uploads, selectedUpload, allLines) {
@@ -31465,7 +31488,7 @@ render();
         </div>
         <div style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);padding:0 18px;">
           <button class="hl-uph-tab" data-uphtab="inventory" style="${tabBtnStyle(tab === 'inventory')}">Inventory · ${invUploads.length}</button>
-          <button class="hl-uph-tab" data-uphtab="service-levels" style="${tabBtnStyle(tab === 'service-levels')}">Service Levels · ${svcUploads.length}</button>
+            <button class="hl-uph-tab" data-uphtab="service-levels" style="${tabBtnStyle(tab === 'service-levels')}">Service Levels · ${svcUploads.length}</button>
         </div>
         <div class="hl-modal-body" id="hl-uph-body" style="overflow-y:auto;flex:1;padding:0;">
           <div class="hl-loading">Loading…</div>
