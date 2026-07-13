@@ -45702,6 +45702,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
   function _prodRenderSchedule(host) {
     if (!_prodSchedLoaded || _prodSchedWkLoaded !== _prodSchedWeek) { if (!_prodSchedLoading) _prodSchedLoad(); host.innerHTML = '<div class="hl-loading">Loading schedule…</div>'; return; }
+    if (!_prodFc && (_mrpScenarios || []).length) { if (!_prodFcLoading) _prodComputeForecast(); host.innerHTML = '<div class="hl-loading">Calculating demand from the forecast…</div>'; return; }
     const esc = _prodEsc, fmt = (n) => _prodFmt(Math.round(n), 0);
     const activeDays = _prodActiveDays();
     const baseRows = _prodComputeRows().filter(r => r.prodId);
@@ -45722,8 +45723,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const met = sched >= Math.round(r.produce);
       const rem = Math.max(0, Math.round(r.produce) - sched);
       const isManual = Math.round(r.produce) <= 0;
+      const weekCap = cap > 0 ? cap * activeDays.length : Infinity;
+      const overCap = weekCap < Math.round(r.produce);
       return `<tr style="border-top:1px solid var(--rule-soft);">
-        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${cfg.prod_group ? `<div style="font-family:var(--mono);font-size:9px;color:#534AB7;">${esc(cfg.prod_group)}</div>` : ''}</td>
+        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${cfg.prod_group ? `<div style="font-family:var(--mono);font-size:9px;color:#534AB7;">${esc(cfg.prod_group)}</div>` : ''}${overCap ? `<div style="font-family:var(--mono);font-size:9px;color:#a8381f;" title="Cap ${fmt(cap)}/day × ${activeDays.length} days = ${fmt(weekCap)} < need ${fmt(r.produce)}">⚠ over week cap by ${fmt(Math.round(r.produce) - weekCap)}</div>` : ''}</td>
         <td style="padding:4px 6px;text-align:center;"><input class="hl-psd-cap" data-pid="${esc(r.prodId)}" type="number" min="0" value="${cap || ''}" placeholder="—" title="Max cases/day for this product" style="width:56px;text-align:right;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;"></td>
         <td style="padding:4px 6px;"><input class="hl-psd-group" data-pid="${esc(r.prodId)}" value="${esc(cfg.prod_group || '')}" placeholder="group" style="width:92px;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;"></td>
         ${dayCells}
@@ -45733,13 +45736,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:6px 8px;text-align:center;">${isManual ? `<button class="hl-psd-del" data-pid="${esc(r.prodId)}" title="Remove product" style="background:none;border:none;color:var(--lost);cursor:pointer;font-size:14px;line-height:1;">×</button>` : ''}</td>
       </tr>`;
     }).join('');
+    const overCount = rows.filter(r => { const c = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0; return c > 0 && c * activeDays.length < Math.round(r.produce); }).length;
     host.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
         <div style="display:flex;align-items:center;gap:8px;"><button id="hl-psd-prev" style="${btn}">◀</button><span style="font-family:var(--mono);font-size:12px;">Week of ${esc(_prodSchedWeek)}</span><button id="hl-psd-next" style="${btn}">▶</button></div>
-        <div style="display:flex;gap:8px;align-items:center;">${candidates.length ? `<select id="hl-psd-add" style="${btn}"><option value="">+ Add product…</option>${candidates.map(p => `<option value="${esc(p.id)}">${esc(p.item_description || p.id)}</option>`).join('')}</select>` : ''}<button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);">Suggest schedule</button><button id="hl-psd-clear" style="${btn}">Clear week</button></div>
+        <div style="display:flex;gap:8px;align-items:center;"><button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);">Suggest schedule</button><button id="hl-psd-clear" style="${btn}">Clear week</button></div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;"><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Production days</span>${dayChips}</div>
+      ${overCount ? `<div style="background:#f3dcd5;color:#a8381f;font-family:var(--mono);font-size:11px;padding:8px 12px;border-radius:6px;margin-bottom:12px;">⚠ ${overCount} product${overCount === 1 ? '' : 's'} can't be fully produced this week at the current cases/day and production days — add a day or raise a cap.</div>` : ''}
       ${rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th><th style="padding:8px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Cases/day</th><th style="padding:8px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Group</th>${dayHead}<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Need</th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sched</th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Still needed</th><th></th></tr></thead><tbody>${bodyRows}</tbody></table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
+      ${candidates.length ? `<div style="margin-top:10px;"><select id="hl-psd-add" style="${btn}"><option value="">+ Add product…</option>${candidates.map(p => `<option value="${esc(p.id)}">${esc(p.item_description || p.id)}</option>`).join('')}</select></div>` : ''}
       <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Need = cases to produce to hit target coverage (from the Coverage tab). Cells save as you type; a red cell is over that product's cases/day. <b>Suggest schedule</b> spreads each product's need across the production days above, capped per day, keeping products in the same group on the same days.</p>`;
     _prodSchedWire(host, rows, activeDays);
   }
