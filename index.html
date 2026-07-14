@@ -5153,7 +5153,7 @@ HL.NAV_GROUPS = [
   { type: 'item',  id: 'ask-keel' },
   { type: 'item',  id: 'brand-library' },
   { type: 'group', label: 'Sales',      children: ['retailer-library', 'timeline', 'submission-docs', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
-  { type: 'group', label: 'Operations', children: ['distribution', 'service-levels', 'mrp', 'production', 'freight'] },
+  { type: 'group', label: 'Operations', children: ['mrp', 'production', 'freight', 'service-levels', 'distribution'] },
   { type: 'item',  id: 'finance' },
   { type: 'item',  id: 'settings' },
 ];
@@ -27319,67 +27319,96 @@ render();
   // The Distributor tab was re-fetching ALL inventory lines AND re-fetching the
   // products table AND rebuilding the UPC→product map on EVERY view (snapshot vs
   // time-series) and EVERY tab visit. With ~10k+ lines and 40 uploads that was the
-  // 7–8s lag. These caches fetch once and reuse across views/visits; they're
-  // cleared when inventory data actually changes (a new upload — see clearInventoryCache).
-  let _invLinesCache = new Map();   // cacheKey → lines[]
-  let _invProductCache = null;      // { productById, productByUpc, findProductByUpc }
-  function clearInventoryCache() { _invLinesCache = new Map(); _invProductCache = null; }
+  // 7–8s lag. Originally bare module Maps; migrated to KeelCache below.
+  // ─── Inventory caches (KeelCache-backed, 2026-07) ───
+  // Previously bare module Maps with no TTL: a coworker's upload never appeared
+  // until hard refresh, and a transient products-fetch failure got cached as an
+  // empty map forever. Now:
+  //   distInv:lines:{key}      — 10 min TTL (heavy fetch; own writes invalidate)
+  //   distInv:uploads:{brand}  — 5 min TTL (uploads list, one row per upload)
+  //   products:invmap:{brand}  — 5 min TTL; the products: prefix means the
+  //                              existing invalidateProducts() (called on every
+  //                              product upsert) refreshes it automatically.
+  // Errors are thrown inside the fetchFn so KeelCache never caches a failure.
+  function clearInventoryCache() {
+    try {
+      window.KeelCache.invalidate(/^distInv:/);
+      window.KeelCache.invalidate(/^products:invmap:/);
+    } catch (e) {}
+  }
   window.clearInventoryCache = clearInventoryCache;
 
-  // Fetch (paginated) and cache inventory lines for a set of upload IDs.
+  // Fetch (and cache) inventory lines for a set of upload IDs.
   async function getInventoryLines(uploadIds, cacheKey) {
-    if (_invLinesCache.has(cacheKey)) return _invLinesCache.get(cacheKey);
     const sb = window.Auth.getClient();
-    // One query with .in() across all uploads, parallel-paginated past the 1k
-    // cap (was one sequential round trip per page).
-    const res = await window.sbPageAll((from, to, withCount) =>
-      sb.from('distributor_inventory_lines')
-        .select('*', withCount ? { count: 'exact' } : undefined)
-        .in('upload_id', uploadIds)
-        .order('id', { ascending: true }).range(from, to)
-    );
-    if (res.error) console.error('Inventory fetch error:', res.error);
-    const lines = res.data || [];
-    _invLinesCache.set(cacheKey, lines);
-    return lines;
+    try {
+      return await window.KeelCache.get('distInv:lines:' + cacheKey, async () => {
+        // One query with .in() across all uploads, parallel-paginated past the
+        // 1k cap.
+        const res = await window.sbPageAll((from, to, withCount) =>
+          sb.from('distributor_inventory_lines')
+            .select('*', withCount ? { count: 'exact' } : undefined)
+            .in('upload_id', uploadIds)
+            .order('id', { ascending: true }).range(from, to)
+        );
+        if (res.error) throw res.error;
+        return res.data || [];
+      }, 10 * 60 * 1000);
+    } catch (e) {
+      console.error('Inventory fetch error:', e);
+      return [];
+    }
   }
 
   // Fetch + build (and cache) the products lookup used to enrich inventory lines.
   async function getInventoryProductMap() {
-    if (_invProductCache) return _invProductCache;
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary?.getSession()?.brandId;
-    const { data: products } = await sb.from('products')
-      .select('id, unit_upc, item_description, category, product_line').eq('brand_id', brandId);
-    const productById = new Map();
-    const productByUpc = new Map();
-    const addUpc = (k, p) => { if (k && !productByUpc.has(k)) productByUpc.set(k, p); };
-    for (const p of (products || [])) {
-      productById.set(p.id, p);
-      if (!p.unit_upc) continue;
-      const k = String(p.unit_upc).replace(/[^0-9]/g, '');
-      if (!k) continue;
-      addUpc(k, p); addUpc('0' + k, p);
-      if (k.startsWith('0')) addUpc(k.slice(1), p);
-      if (k.length >= 11) addUpc(k.slice(0, 11), p);
-      if (k.length >= 12) addUpc(k.slice(0, 12), p);
-      if (k.length >= 11) addUpc(k.slice(-11), p);
-      if (k.length >= 12) addUpc(k.slice(-12), p);
-    }
-    const findProductByUpc = (raw) => {
-      if (!raw) return null;
-      const d = String(raw).replace(/[^0-9]/g, '');
-      if (!d) return null;
-      return productByUpc.get(d)
-          || productByUpc.get('0' + d)
-          || (d.startsWith('0') ? productByUpc.get(d.slice(1)) : null)
-          || (d.length >= 11 ? productByUpc.get(d.slice(-11)) : null)
-          || (d.length >= 12 ? productByUpc.get(d.slice(-12)) : null)
-          || (d.length >= 11 ? productByUpc.get(d.slice(0, 11)) : null)
-          || (d.length >= 12 ? productByUpc.get(d.slice(0, 12)) : null);
+    const build = (products) => {
+      const productById = new Map();
+      const productByUpc = new Map();
+      const addUpc = (k, p) => { if (k && !productByUpc.has(k)) productByUpc.set(k, p); };
+      for (const p of (products || [])) {
+        productById.set(p.id, p);
+        if (!p.unit_upc) continue;
+        const k = String(p.unit_upc).replace(/[^0-9]/g, '');
+        if (!k) continue;
+        addUpc(k, p); addUpc('0' + k, p);
+        if (k.startsWith('0')) addUpc(k.slice(1), p);
+        if (k.length >= 11) addUpc(k.slice(0, 11), p);
+        if (k.length >= 12) addUpc(k.slice(0, 12), p);
+        if (k.length >= 11) addUpc(k.slice(-11), p);
+        if (k.length >= 12) addUpc(k.slice(-12), p);
+      }
+      const findProductByUpc = (raw) => {
+        if (!raw) return null;
+        const d = String(raw).replace(/[^0-9]/g, '');
+        if (!d) return null;
+        return productByUpc.get(d)
+            || productByUpc.get('0' + d)
+            || (d.startsWith('0') ? productByUpc.get(d.slice(1)) : null)
+            || (d.length >= 11 ? productByUpc.get(d.slice(-11)) : null)
+            || (d.length >= 12 ? productByUpc.get(d.slice(-12)) : null)
+            || (d.length >= 11 ? productByUpc.get(d.slice(0, 11)) : null)
+            || (d.length >= 12 ? productByUpc.get(d.slice(0, 12)) : null);
+      };
+      return { productById, productByUpc, findProductByUpc };
     };
-    _invProductCache = { productById, productByUpc, findProductByUpc };
-    return _invProductCache;
+    try {
+      // Keyed under products: so invalidateProducts() (called on every product
+      // upsert) refreshes this map too — previously it never invalidated on
+      // product edits. NOTE: keeps its own brand_id-filtered query on purpose;
+      // cachedProducts() doesn't filter by brand.
+      return await window.KeelCache.get('products:invmap:' + (brandId || 'nobrand'), async () => {
+        const { data: products, error } = await sb.from('products')
+          .select('id, unit_upc, item_description, category, product_line').eq('brand_id', brandId);
+        if (error) throw error;
+        return build(products);
+      }, 5 * 60 * 1000);
+    } catch (e) {
+      console.error('Inventory product map fetch error:', e);
+      return build([]);   // NOT cached — next call refetches
+    }
   }
 
   async function renderDistInventoryView() {
@@ -27390,9 +27419,18 @@ render();
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary?.getSession()?.brandId;
 
-    // Load all uploads for this brand
-    const { data: uploads } = await sb.from('distributor_inventory_uploads')
-      .select('*').eq('brand_id', brandId).order('report_date', { ascending: false });
+    // Load all uploads for this brand (cached — was a fresh round trip on every
+    // tab visit; upload/delete both call clearInventoryCache so changes show
+    // immediately for the user who made them).
+    let uploads = null;
+    try {
+      uploads = await window.KeelCache.get('distInv:uploads:' + brandId, async () => {
+        const { data, error } = await sb.from('distributor_inventory_uploads')
+          .select('*').eq('brand_id', brandId).order('report_date', { ascending: false });
+        if (error) throw error;
+        return data || [];
+      }, 5 * 60 * 1000);
+    } catch (e) { console.error('Inventory uploads fetch error:', e); }
     if (!uploads || uploads.length === 0) {
       host.innerHTML = `
         <div style="text-align:center;padding:48px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
