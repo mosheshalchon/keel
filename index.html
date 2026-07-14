@@ -27266,7 +27266,12 @@ render();
     renderDistSvcView();
   }
   let _svcShowAllHistory = false;  // service levels: false = last 12 weeks only
-  let _svcLinesCache = null;        // { key, lines } — session cache for the SL tab; cleared on SL upload/delete
+  // Service-levels caches live in KeelCache under svcLvl: (lines + uploads list,
+  // 2026-07 — was a bare module object with no TTL). Cleared on SL upload/delete.
+  function clearSvcLevelCache() {
+    try { window.KeelCache.invalidate(/^svcLvl:/); } catch (e) {}
+  }
+  window.clearSvcLevelCache = clearSvcLevelCache;
 
 
   // ─── Distributor inventory: main view ─────────────────────────────
@@ -28683,9 +28688,17 @@ render();
       return '#3a7a3a';
     };
 
-    // Load uploads
-    const { data: uploads } = await sb.from('distributor_service_level_uploads')
-      .select('*').eq('brand_id', brandId).order('upload_date', { ascending: false });
+    // Load uploads (cached — was a fresh round trip on every visit; upload and
+    // delete both call clearSvcLevelCache so own changes show immediately).
+    let uploads = null;
+    try {
+      uploads = await window.KeelCache.get('svcLvl:uploads:' + brandId, async () => {
+        const { data, error } = await sb.from('distributor_service_level_uploads')
+          .select('*').eq('brand_id', brandId).order('upload_date', { ascending: false });
+        if (error) throw error;
+        return data || [];
+      }, 5 * 60 * 1000);
+    } catch (e) { console.error('Service level uploads fetch error:', e); }
     if (!uploads || uploads.length === 0) {
       host.innerHTML = `
         <div style="text-align:center;padding:48px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
@@ -28695,73 +28708,78 @@ render();
       return;
     }
 
-    // Determine the most recent week, then fetch only the last ~12 weeks of lines.
-    // The full table held ~56k rows (all history), which made this tab pull and
-    // pivot an enormous dataset on every visit — the cause of the "not loading"
-    // lag. The team works off recent weeks, so we cap the fetch window; older
-    // history can be loaded on demand via the toggle below.
     const SVC_WEEKS_WINDOW = _svcShowAllHistory ? 9999 : 12;
-    let _svcCutoffDate = null;
-    if (!_svcShowAllHistory) {
-      const { data: latestRow } = await sb.from('distributor_service_level_lines')
-        .select('week_starting').eq('brand_id', brandId)
-        .order('week_starting', { ascending: false }).limit(1).maybeSingle();
-      if (latestRow && latestRow.week_starting) {
-        const latest = new Date(latestRow.week_starting);
-        latest.setDate(latest.getDate() - (SVC_WEEKS_WINDOW * 7));
-        _svcCutoffDate = latest.toISOString().slice(0, 10);
-      }
-    }
 
     // Load lines (filtered to the recent window unless showing all).
-    // Three-part speedup vs the original sequential select('*') paging:
-    //   1) Session cache keyed by window — instant on tab revisits (cleared on SL upload/delete).
-    //   2) Only the columns the view uses are fetched (was select('*')) to shrink payload.
+    // Speedups vs the original sequential select('*') paging:
+    //   1) KeelCache keyed by window (10 min TTL) — instant on tab revisits;
+    //      cleared on SL upload/delete, and the whole unit (cutoff probe +
+    //      count + pages) is cached together so a revisit makes ZERO queries.
+    //   2) Only the columns the view uses are fetched (was select('*')).
     //   3) Pages fetched in PARALLEL, ordered by (week_starting, id) to match idx_dsll_brand_week.
     const SVC_COLS = 'unit_upc,service_level_pct,dc_code,item_description,week_starting,qty_ordered,qty_shipped,product_id,upload_id';
     const PAGE_SIZE = 1000;
-    const _svcCacheKey = _svcShowAllHistory ? 'all' : ('win:' + (_svcCutoffDate || ''));
     let lines = [];
-    if (_svcLinesCache && _svcLinesCache.key === _svcCacheKey) {
-      lines = _svcLinesCache.lines;
-      console.log('[Service Levels] using cached lines:', lines.length);
-    } else {
-      let _countQ = sb.from('distributor_service_level_lines')
-        .select('id', { count: 'exact', head: true })
-        .eq('brand_id', brandId);
-      if (_svcCutoffDate) _countQ = _countQ.gte('week_starting', _svcCutoffDate);
-      const { count: _svcCount } = await _countQ;
-      if (_svcCount && _svcCount > 0) {
-        const _pageCount = Math.ceil(_svcCount / PAGE_SIZE);
-        const _reqs = [];
-        for (let _p = 0; _p < _pageCount; _p++) {
-          let q = sb.from('distributor_service_level_lines')
-            .select(SVC_COLS)
+    let _svcCutoffDate = null;
+    try {
+      const cachedUnit = await window.KeelCache.get(
+        'svcLvl:lines:' + brandId + ':' + (_svcShowAllHistory ? 'all' : 'recent'),
+        async () => {
+          // Determine the most recent week, then fetch only the last ~12 weeks
+          // of lines. The full table held ~56k rows (all history); the team
+          // works off recent weeks, so we cap the window; older history loads
+          // on demand via the toggle below.
+          let cutoff = null;
+          if (!_svcShowAllHistory) {
+            const { data: latestRow } = await sb.from('distributor_service_level_lines')
+              .select('week_starting').eq('brand_id', brandId)
+              .order('week_starting', { ascending: false }).limit(1).maybeSingle();
+            if (latestRow && latestRow.week_starting) {
+              const latest = new Date(latestRow.week_starting);
+              latest.setDate(latest.getDate() - (SVC_WEEKS_WINDOW * 7));
+              cutoff = latest.toISOString().slice(0, 10);
+            }
+          }
+          let fetched = [];
+          let _countQ = sb.from('distributor_service_level_lines')
+            .select('id', { count: 'exact', head: true })
             .eq('brand_id', brandId);
-          if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
-          _reqs.push(q.order('week_starting', { ascending: true }).order('id', { ascending: true }).range(_p * PAGE_SIZE, _p * PAGE_SIZE + PAGE_SIZE - 1));
-        }
-        const _results = await Promise.all(_reqs);
-        for (const r of _results) {
-          if (r.error) { console.error('Service level fetch error:', r.error); continue; }
-          if (r.data && r.data.length) lines = lines.concat(r.data);
-        }
-      } else if (_svcCount == null) {
-        // Row-count header unavailable (some proxies strip it) — fall back to sequential paging.
-        let from = 0;
-        while (true) {
-          let q = sb.from('distributor_service_level_lines').select(SVC_COLS).eq('brand_id', brandId);
-          if (_svcCutoffDate) q = q.gte('week_starting', _svcCutoffDate);
-          const { data: page, error } = await q.range(from, from + PAGE_SIZE - 1).order('week_starting', { ascending: true }).order('id', { ascending: true });
-          if (error) { console.error('Service level fetch error:', error); break; }
-          if (!page || page.length === 0) break;
-          lines = lines.concat(page);
-          if (page.length < PAGE_SIZE) break;
-          from += PAGE_SIZE;
-        }
-      }
-      _svcLinesCache = { key: _svcCacheKey, lines };
-    }
+          if (cutoff) _countQ = _countQ.gte('week_starting', cutoff);
+          const { count: _svcCount } = await _countQ;
+          if (_svcCount && _svcCount > 0) {
+            const _pageCount = Math.ceil(_svcCount / PAGE_SIZE);
+            const _reqs = [];
+            for (let _p = 0; _p < _pageCount; _p++) {
+              let q = sb.from('distributor_service_level_lines')
+                .select(SVC_COLS)
+                .eq('brand_id', brandId);
+              if (cutoff) q = q.gte('week_starting', cutoff);
+              _reqs.push(q.order('week_starting', { ascending: true }).order('id', { ascending: true }).range(_p * PAGE_SIZE, _p * PAGE_SIZE + PAGE_SIZE - 1));
+            }
+            const _results = await Promise.all(_reqs);
+            for (const r of _results) {
+              if (r.error) { console.error('Service level fetch error:', r.error); continue; }
+              if (r.data && r.data.length) fetched = fetched.concat(r.data);
+            }
+          } else if (_svcCount == null) {
+            // Row-count header unavailable (some proxies strip it) — fall back to sequential paging.
+            let from = 0;
+            while (true) {
+              let q = sb.from('distributor_service_level_lines').select(SVC_COLS).eq('brand_id', brandId);
+              if (cutoff) q = q.gte('week_starting', cutoff);
+              const { data: page, error } = await q.range(from, from + PAGE_SIZE - 1).order('week_starting', { ascending: true }).order('id', { ascending: true });
+              if (error) { console.error('Service level fetch error:', error); break; }
+              if (!page || page.length === 0) break;
+              fetched = fetched.concat(page);
+              if (page.length < PAGE_SIZE) break;
+              from += PAGE_SIZE;
+            }
+          }
+          return { cutoff, lines: fetched };
+        }, 10 * 60 * 1000);
+      lines = cachedUnit.lines || [];
+      _svcCutoffDate = cachedUnit.cutoff;
+    } catch (e) { console.error('Service level fetch error:', e); }
     console.log('[Service Levels] total lines fetched:', lines.length, 'across', uploads.length, 'uploads', _svcShowAllHistory ? '(all history)' : `(last ${SVC_WEEKS_WINDOW} weeks)`);
 
     // Build a quick map of upload -> distributor (for the distributor filter)
@@ -29858,7 +29876,7 @@ render();
         status.style.color = 'var(--won)';
         setTimeout(() => {
           modal.remove();
-          _svcLinesCache = null;   // new upload → invalidate SL cache
+          clearSvcLevelCache();   // new upload → invalidate SL cache
           renderDistSvcView();
         }, 1600);
       } catch (err) {
@@ -31681,7 +31699,7 @@ render();
             if (!confirm('Delete this service level upload and all its lines? This cannot be undone.')) return;
             await sb.from('distributor_service_level_uploads').delete().eq('id', btn.dataset.id);
             modal.remove();
-            _svcLinesCache = null;   // deleted an upload → invalidate SL cache
+            clearSvcLevelCache();   // deleted an upload → invalidate SL cache
             openDistInvUploadsHistory(tab);
             if (typeof renderDistSvcView === 'function') renderDistSvcView();
           });
@@ -39312,6 +39330,7 @@ render();
       if (error) throw new Error(`Insert failed near row ${i}: ${error.message}`);
       if (onProgress) onProgress(Math.min(i + CHUNK, rows.length), rows.length);
     }
+    clearCustSalesCache();   // new upload → invalidate weekly customer cache
     return { total: rows.length, matched, unmatched, period_start, period_end };
   }
 
@@ -39414,6 +39433,7 @@ render();
       if (error) throw new Error('Insert failed: ' + error.message);
       if (onProgress) onProgress(Math.min(i + CH, rows.length), rows.length);
     }
+    clearCustSalesCache();   // new upload → invalidate weekly customer cache
     return { week_starting, total: rows.length, matched, unmatched };
   }
 
@@ -39500,6 +39520,7 @@ render();
     const { data: td } = await sb.rpc('dcs_trim_weekly', { p_brand: brandId, p_distributor: distributor, p_keep: 52 });
     if (typeof td === 'number') trimmed = td;
 
+    clearCustSalesCache();   // new upload (+trim) → invalidate weekly customer cache
     return { total: rows.length, matched, unmatched, week_starting, week_end, trimmed };
   }
 
@@ -39589,17 +39610,28 @@ render();
     _cwRender();
   }
 
+  // Customer-sales weekly cache: distributor_customer_sales is written ONLY by
+  // the three upload handlers below (incl. the dcs_trim_weekly RPC inside the
+  // UNFI one) — each invalidates on success. 10 min TTL for coworkers' uploads.
+  function clearCustSalesCache() {
+    try { window.KeelCache.invalidate(/^custSales:/); } catch (e) {}
+  }
+  window.clearCustSalesCache = clearCustSalesCache;
+
   async function _cwFetchWeekly(sb, brandId) {
-    // Parallel paging (was one sequential round trip per 1k rows — this is
-    // the biggest table behind Sales Pacing's customer detail view).
-    const res = await window.sbPageAll((from, to, withCount) =>
-      sb.from('distributor_customer_sales')
-        .select('distributor,region,whs,chain_name,item_description,category,product_id,product_line,week_starting,sales,quantity', withCount ? { count: 'exact' } : undefined)
-        .eq('brand_id', brandId).eq('report_type', 'weekly')
-        .order('id', { ascending: true }).range(from, to)
-    );
-    if (res.error) throw new Error(res.error.message);
-    return res.data || [];
+    // Cached — this ran ungated on EVERY render of the customer detail view,
+    // refetching the heaviest table on the page each visit. Parallel-paged.
+    const res = await window.KeelCache.get('custSales:weekly:' + brandId, async () => {
+      const r = await window.sbPageAll((from, to, withCount) =>
+        sb.from('distributor_customer_sales')
+          .select('distributor,region,whs,chain_name,item_description,category,product_id,product_line,week_starting,sales,quantity', withCount ? { count: 'exact' } : undefined)
+          .eq('brand_id', brandId).eq('report_type', 'weekly')
+          .order('id', { ascending: true }).range(from, to)
+      );
+      if (r.error) throw new Error(r.error.message);
+      return r.data || [];
+    }, 10 * 60 * 1000);
+    return res || [];
   }
 
   // ─── Weekly customer detail: search+checkbox multi-select (same pattern as Distributors › Sales) ───
@@ -39857,6 +39889,10 @@ render();
         });
         _spState.rows = null;  // force reload
         _spState.prodMap = null;
+        try {
+          window.KeelCache.invalidate('salesPacing:rows:' + brandId);
+          window.KeelCache.invalidate('products:spmap:' + brandId);
+        } catch (e) {}
         await loadAndRenderSalesPacing(brandId, sb);
       } catch (err) {
         console.error('[SalesPacing upload]', err);
@@ -39888,7 +39924,13 @@ render();
     const body = document.getElementById('hl-sp-body');
     if (!body) return;
     _spState.brandId = brandId;  // remember for metric-driven reloads
-    if (!_spState.rows) {
+    {
+      // Rows via KeelCache (10 min TTL). sales_actuals is ALSO written by the
+      // sync-sales-actuals Edge Function cron (2x/day) outside the browser —
+      // no client-side invalidation can see those writes, so the TTL is the
+      // freshness mechanism. (The old `if (!_spState.rows)` gate kept rows for
+      // the WHOLE session, so cron updates never appeared without a refresh —
+      // this is strictly fresher.) In-app uploads invalidate explicitly.
       // Try column sets from richest to leanest. Optional columns (upc, units)
       // may not exist on every brand's table yet; rather than rely on parsing the
       // error text (which is unreliable on a 400), we just fall through to the
@@ -39900,13 +39942,17 @@ render();
         'dimension, entity, upc, month, amount, source',
         'dimension, entity, month, amount, source',
       ];
-      let res = { data: null, error: { message: 'no attempt' } };
-      for (const cols of columnSets) {
-        res = await spFetchAll(sb, brandId, cols);
-        if (!res.error) break;  // this set worked
-      }
-      const { data, error } = res;
-      if (error) {
+      try {
+        _spState.rows = await window.KeelCache.get('salesPacing:rows:' + brandId, async () => {
+          let res = { data: null, error: { message: 'no attempt' } };
+          for (const cols of columnSets) {
+            res = await spFetchAll(sb, brandId, cols);
+            if (!res.error) break;  // this set worked
+          }
+          if (res.error) throw res.error;
+          return res.data || [];
+        }, 10 * 60 * 1000);
+      } catch (error) {
         if (/sales_actuals|does not exist|schema cache/i.test(error.message || '')) {
           body.innerHTML = spSetupNoticeHtml();
           return;
@@ -39914,19 +39960,25 @@ render();
         body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Couldn’t load sales data: ${escapeHtml(error.message)}</div>`;
         return;
       }
-      _spState.rows = data || [];
     }
     // Build a UPC → {category, product_line} map from the brand product library,
     // so product sales rows can be filtered by category and product line.
-    if (!_spState.prodMap) {
-      const map = {};
-      const { data: prods } = await sb.from('products')
-        .select('unit_upc, category, product_line').eq('brand_id', brandId);
-      (prods || []).forEach(p => {
-        const key = String(p.unit_upc || '').replace(/[^0-9]/g, '');
-        if (key) map[key] = { category: p.category || null, product_line: p.product_line || null };
-      });
-      _spState.prodMap = map;
+    // products: prefix → refreshed automatically by invalidateProducts().
+    try {
+      _spState.prodMap = await window.KeelCache.get('products:spmap:' + brandId, async () => {
+        const map = {};
+        const { data: prods, error } = await sb.from('products')
+          .select('unit_upc, category, product_line').eq('brand_id', brandId);
+        if (error) throw error;
+        (prods || []).forEach(p => {
+          const key = String(p.unit_upc || '').replace(/[^0-9]/g, '');
+          if (key) map[key] = { category: p.category || null, product_line: p.product_line || null };
+        });
+        return map;
+      }, 5 * 60 * 1000);
+    } catch (e) {
+      console.error('[SalesPacing] prodMap fetch error:', e);
+      _spState.prodMap = _spState.prodMap || {};   // keep previous map if any; not cached
     }
     renderSalesPacingBody(body, _spState.rows);
   }
