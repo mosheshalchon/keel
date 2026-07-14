@@ -26403,7 +26403,7 @@ render();
         const wks = Number(ls[0].p1_wks_per_event) || 0;
         rows.push({ key, rid: ls[0].retailer_id, group: ls[0].promoted_group,
           name: retById.get(ls[0].retailer_id) || '(unknown retailer)',
-          perRec, atg, annualUnits, grossSales, tradeSpend, events, margin, tradeRate, wks });
+          perRec, atg, baseUnits, edlpOnce, annualUnits, grossSales, tradeSpend, events, margin, tradeRate, wks });
       }
       rows.sort((a,b)=> b.grossSales - a.grossSales || a.name.localeCompare(b.name));
 
@@ -26431,21 +26431,32 @@ render();
                 </tr>
                 <tr class="hl-promo-detail" data-idx="${idx}" style="display:none;">
                   <td colspan="9" style="padding:0;background:var(--bone-2);">
-                    <div style="padding:7px 12px;font-family:var(--serif);font-style:italic;font-size:11px;color:var(--ink-3);">Base + EDLP are counted once for this retailer · group. Each row is one event — figures show that event's incremental contribution.</div>
+                    <div style="padding:7px 12px;font-family:var(--serif);font-style:italic;font-size:11px;color:var(--ink-3);">Base + EDLP are counted once for this retailer · group; each event row shows its incremental contribution. Base + events = group total.</div>
                     <table style="width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;">
-                      ${colgroup}
+                      <colgroup><col style="width:15%"><col style="width:9%"><col style="width:8%"><col style="width:7%"><col style="width:12%"><col style="width:13%"><col style="width:13%"><col style="width:8%"><col style="width:15%"></colgroup>
                       <thead><tr>
-                        ${th('Event · type')}${th('', true)}${th('Events', true)}${th('Wks', true)}${th('Incr. units', true)}${th('Incr. gross', true)}${th('Event trade', true)}${th('', true)}${th('')}
+                        ${th('Event date')}${th('Type')}${th('Events', true)}${th('Wks', true)}${th('Incr. units', true)}${th('Incr. gross', true)}${th('Event trade', true)}${th('', true)}${th('')}
                       </tr></thead>
                       <tbody>
+                        <tr style="border-top:1px solid var(--rule-softer);background:var(--bone);">
+                          <td class="text" style="padding:6px 10px;font-style:italic;color:var(--ink-2);">Base + EDLP</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);color:var(--ink-3);">once</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);color:var(--ink-3);">—</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);color:var(--ink-3);">—</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(row.baseUnits)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${money(row.baseUnits * row.atg)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);" title="EDLP spend (annual, counted once)">${money(row.edlpOnce)}</td>
+                          <td></td>
+                          <td></td>
+                        </tr>
                         ${row.perRec.map(({ l, r }) => {
                           const evDate = (Array.isArray(l.event_dates) && l.event_dates[0] && l.event_dates[0].start) ? l.event_dates[0].start : (l.start_date || '—');
                           const evTrade = (r.scan_dollars||0) + (r.distributor_fees||0) + (r.ad_fees||0) + (r.other_fees||0);
                           const evGross = (r.incremental_units||0) * (Number(l.atg_gross_price)||0);
                           return `
                           <tr style="border-top:1px solid var(--rule-softer);">
-                            <td class="text" style="padding:6px 10px;"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" class="hl-promo-delcb" data-id="${esc(l.id)}" ${selectedToDelete.has(l.id)?'checked':''} /><span>${esc(evDate)} <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">${esc(typeLabel(l.promo_type) || '')}</span></span></label></td>
-                            <td></td>
+                            <td class="text" style="padding:6px 10px;"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" class="hl-promo-delcb" data-id="${esc(l.id)}" ${selectedToDelete.has(l.id)?'checked':''} /><span>${esc(evDate)}</span></label></td>
+                            <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:9px;color:var(--ink-3);text-transform:uppercase;">${esc(typeLabel(l.promo_type) || '—')}</td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(l.p1_events)}</td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(l.p1_wks_per_event)}</td>
                             <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(r.incremental_units)}</td>
@@ -26455,6 +26466,17 @@ render();
                             <td style="text-align:right;padding:6px 10px;white-space:nowrap;"><button class="hl-promo-edit" data-id="${esc(l.id)}" style="${actBtn}">Edit</button> <button class="hl-promo-dup" data-id="${esc(l.id)}" style="${actBtn}" title="Duplicate as a new event draft">Dup</button></td>
                           </tr>`;
                         }).join('')}
+                        <tr style="border-top:2px solid var(--rule-soft);font-weight:600;">
+                          <td class="text" style="padding:6px 10px;">Group total</td>
+                          <td></td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(row.events)}</td>
+                          <td></td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${num(row.annualUnits)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${money(row.grossSales)}</td>
+                          <td style="text-align:right;padding:6px 10px;font-family:var(--mono);">${money(row.tradeSpend)}</td>
+                          <td></td>
+                          <td></td>
+                        </tr>
                       </tbody>
                     </table>
                   </td>
@@ -26662,6 +26684,28 @@ render();
     let selectedItemIds = new Set(Array.isArray(e.item_ids) ? e.item_ids : []);
     let manualItems = [];  // {name, upc} added manually this session
 
+    // Sibling events in this retailer + group, for prev/next navigation while editing.
+    let siblings = [];
+    if (promoId && e.retailer_id && e.promoted_group) {
+      const { data: sibs } = await sb.from('promos')
+        .select('id, start_date, event_dates')
+        .eq('brand_id', brandId).eq('retailer_id', e.retailer_id).eq('promoted_group', e.promoted_group);
+      siblings = (sibs || []).slice().sort((a,b)=>
+        String(a.start_date||'').localeCompare(String(b.start_date||'')) || String(a.id).localeCompare(String(b.id)));
+    }
+    const sibIdx = siblings.findIndex(s => String(s.id) === String(promoId));
+    const sibLabel = (s, i) => (Array.isArray(s.event_dates) && s.event_dates[0] && s.event_dates[0].start)
+      ? s.event_dates[0].start : (s.start_date || ('Event ' + (i+1)));
+    const chipBtn = 'font-family:var(--mono);font-size:10px;padding:4px 9px;border-radius:4px;border:1px solid var(--rule-soft);background:var(--paper);cursor:pointer;';
+    const navBtn  = 'font-family:var(--mono);font-size:11px;padding:4px 8px;border-radius:4px;border:1px solid var(--rule-soft);background:var(--paper);cursor:pointer;';
+    const sibNavHtml = siblings.length > 1 ? `
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:2px 0 4px;">
+        <span style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--ink-3);margin-right:2px;">Event ${sibIdx+1} of ${siblings.length} —</span>
+        <button id="hl-pc-nav-prev" title="Previous event" style="${navBtn}${sibIdx<=0?'opacity:0.4;cursor:default;':''}">◀ Prev</button>
+        ${siblings.map((s,i)=>{ const cur = String(s.id)===String(promoId); return `<button class="hl-pc-navchip" data-id="${esc(s.id)}" ${cur?'disabled':''} style="${chipBtn}${cur?'background:var(--ink);color:var(--paper);border-color:var(--ink);font-weight:600;':''}">${esc(sibLabel(s,i))}</button>`; }).join('')}
+        <button id="hl-pc-nav-next" title="Next event" style="${navBtn}${sibIdx>=siblings.length-1?'opacity:0.4;cursor:default;':''}">Next ▶</button>
+      </div>` : '';
+
     const inp = (id, val, ph, step) => `<input id="${id}" type="number" step="${step||'any'}" value="${val===''?'':esc(val)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" />`;
     // Percent-display input: shows the decimal value ×100 (e.g. 0.35 → 35) with a %
     // suffix; getInputs converts back to a decimal on read.
@@ -26676,6 +26720,7 @@ render();
         <button id="hl-pc-back" style="background:transparent;border:none;color:var(--ink-2);font-family:var(--mono);font-size:11px;letter-spacing:0.05em;cursor:pointer;padding:0;">← Back to promos</button>
       </div>
       <h1 class="page-title" id="hl-pc-title">${promoId ? 'Edit promo' : 'New promo'}</h1>
+      ${sibNavHtml}
 
       <!-- Step 1: retailer + promo group + items -->
       <div style="background:var(--bone-2);border-radius:8px;padding:18px;margin-top:14px;">
@@ -26765,6 +26810,19 @@ render();
 
     document.getElementById('hl-pc-back').addEventListener('click', () => renderPromosPage());
     document.getElementById('hl-pc-cancel').addEventListener('click', () => renderPromosPage());
+
+    // ── Prev/next navigation between the events in this retailer + group ──
+    let dirty = false;  // set true on any step-2 edit; guards navigation
+    const goTo = (id) => {
+      if (!id || String(id) === String(promoId)) return;
+      if (dirty && !confirm('Discard unsaved changes on this event?')) return;
+      openPromoCard(id);
+    };
+    const prevBtn = document.getElementById('hl-pc-nav-prev');
+    const nextBtn = document.getElementById('hl-pc-nav-next');
+    if (prevBtn) prevBtn.addEventListener('click', () => { if (sibIdx > 0) goTo(siblings[sibIdx-1].id); });
+    if (nextBtn) nextBtn.addEventListener('click', () => { if (sibIdx < siblings.length-1) goTo(siblings[sibIdx+1].id); });
+    document.querySelectorAll('.hl-pc-navchip').forEach(btn => btn.addEventListener('click', () => goTo(btn.dataset.id)));
 
     // ── Items step: load carried items for retailer that map to the chosen group ──
     let carriedItems = [];  // [{id, name, upc, product_line, product_id}]
@@ -26960,10 +27018,11 @@ render();
     };
 
     // wire recalc to all step-2 inputs (delegated, since step2 always in DOM)
-    step2El.addEventListener('input', recalc);
+    step2El.addEventListener('input', () => { dirty = true; recalc(); });
     // EDLP? toggle shows/hides the $ off field; No => EDLP treated as 0 in the calc.
     const edlpqEl = document.getElementById('hl-pc-edlpq');
     if (edlpqEl) edlpqEl.addEventListener('change', () => {
+      dirty = true;
       const wrap = document.getElementById('hl-pc-edlp-wrap');
       if (wrap) wrap.style.display = edlpqEl.value === 'yes' ? '' : 'none';
       recalc();
