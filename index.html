@@ -26656,6 +26656,8 @@ render();
     // For NEW promos, seed sensible defaults as REAL values (not placeholders) so the
     // calc runs immediately. For edits, use the saved value.
     const dv = (k, def) => (e[k] != null ? e[k] : (promoId ? '' : def));
+    // EDLP is either present or not (not seasonal). Yes/No toggle; seeded on from a saved $ off.
+    const edlpOn = (Number(v('edlp', 0)) > 0) ? 'yes' : 'no';
     // selected item ids for this promo (persisted in event_dates? no — store in promo.item_ids if present)
     let selectedItemIds = new Set(Array.isArray(e.item_ids) ? e.item_ids : []);
     let manualItems = [];  // {name, upc} added manually this session
@@ -26698,24 +26700,35 @@ render();
 
       <!-- Step 2: the calc card (hidden until retailer+group chosen) -->
       <div id="hl-pc-step2" style="display:none;margin-top:16px;">
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px;">
+        <div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Promo type</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px;align-items:end;">
           <div>
-            ${lbl('Promo type')}
+            ${lbl('Type')}
             <select id="hl-pc-type" style="width:100%;box-sizing:border-box;padding:7px 9px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
-              ${[['Scan','Scan'],['Direct','EDLP'],['MCB','MCB']].map(([val,label]) => `<option value="${val}" ${e.promo_type===val?'selected':''}>${label}</option>`).join('')}
+              ${[['Scan','Scan'],['BOGO','BOGO'],['MCB','MCB']].map(([val,label]) => `<option value="${val}" ${e.promo_type===val?'selected':''}>${label}</option>`).join('')}
             </select>
+          </div>
+          <div>
+            ${lbl('EDLP?')}
+            <select id="hl-pc-edlpq" style="width:100%;box-sizing:border-box;padding:7px 9px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+              <option value="no" ${edlpOn==='no'?'selected':''}>No</option>
+              <option value="yes" ${edlpOn==='yes'?'selected':''}>Yes</option>
+            </select>
+          </div>
+          <div id="hl-pc-edlp-wrap" style="${edlpOn==='yes'?'':'display:none;'}">
+            ${lbl('EDLP ($ off)')}${inp('hl-pc-edlp', v('edlp', 0), '0.23')}
           </div>
         </div>
 
-        <div class="hl-docs-label" style="margin-bottom:8px;">Pricing</div>
+        <div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Pricing</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('ATG gross price')}${inp('hl-pc-atg', v('atg_gross_price'), '4.87')}</div>
           <div>${lbl('Dist markup %')}${pctInp('hl-pc-markup', dv('dist_markup', 0.13), '13')}</div>
           <div>${lbl('Cur retail / SRP')}${inp('hl-pc-srp', v('srp'), '8.49')}</div>
-          <div>${lbl('EDLP ($ off)')}${inp('hl-pc-edlp', v('edlp', 0), '0.23')}</div>
+          <div></div>
         </div>
 
-        <div class="hl-docs-label" style="margin-bottom:8px;">Volume & promo</div>
+        <div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Volume & promo</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;">
           <div>${lbl('Base UPSPW (velocity)')}${inp('hl-pc-upspw', v('base_upspw'), '1.2')}</div>
           <div>${lbl('# Items (auto from selection)')}${inp('hl-pc-items-count', v('num_items'), '1')}</div>
@@ -26723,19 +26736,19 @@ render();
           <div>${lbl('Lift %')}${pctInp('hl-pc-lift', dv('lift', 0.35), '35')}</div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
-          <div>${lbl('EDLP lift override')}${inp('hl-pc-edlplift', v('edlp_lift_override', 0), '0')}</div>
           <div>${lbl('Wks per event')}${inp('hl-pc-wks', dv('p1_wks_per_event', 2), '2')}</div>
-          <div>${lbl('Scan / BB unit ($)')}${inp('hl-pc-scan', dv('scan_bb_unit', 1.10), '1.10')}</div>
+          <div>${lbl('Promo cost (Scan/MCB/BOGO) ($ unit)')}${inp('hl-pc-scan', dv('scan_bb_unit', 1.10), '1.10')}</div>
           <div>${lbl('Event start date')}<input id="hl-pc-startdate" type="date" value="${esc(v('start_date'))}" style="width:100%;box-sizing:border-box;padding:6px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" /></div>
+          <div>${lbl('Event end (auto)')}<div id="hl-pc-enddate" title="End = start + (Wks/event × 7) − 1 day. Tracked for forecasting; does not affect the calc." style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px dashed var(--rule-soft);border-radius:4px;background:var(--bone-2);color:var(--ink-2);text-align:right;">—</div></div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
           <div>${lbl('Distributor fee % (scan)')}${pctInp('hl-pc-distfee', v('distributor_fee_pct', 0.10), '10')}</div>
           <div>${lbl('Ad fees ($/yr)')}${inp('hl-pc-adfees', v('ad_fees', 0), '0')}</div>
           <div>${lbl('Other fees ($/yr)')}${inp('hl-pc-otherfees', v('other_fees', 0), '0')}</div>
-          <div>${lbl('Event end (auto)')}<div id="hl-pc-enddate" title="End = start + (Wks/event × 7) − 1 day. Tracked for forecasting; does not affect the calc." style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px dashed var(--rule-soft);border-radius:4px;background:var(--bone-2);color:var(--ink-2);text-align:right;">—</div></div>
+          <div></div>
         </div>
 
-        <div class="hl-docs-label" style="margin-bottom:8px;">Calculated</div>
+        <div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Calculated</div>
         <div id="hl-pc-calc-row1" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;"></div>
         <div id="hl-pc-calc-row2" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px;"></div>
 
@@ -26887,12 +26900,14 @@ render();
       atg_gross_price: parseFloat(document.getElementById('hl-pc-atg').value) || 0,
       dist_markup: (parseFloat(document.getElementById('hl-pc-markup').value) || 0) / 100,
       srp: parseFloat(document.getElementById('hl-pc-srp').value) || 0,
-      edlp: parseFloat(document.getElementById('hl-pc-edlp').value) || 0,
+      // EDLP only applies when the EDLP? toggle is Yes; otherwise it's 0 (calc shows zero).
+      edlp: (document.getElementById('hl-pc-edlpq') && document.getElementById('hl-pc-edlpq').value === 'yes')
+              ? (parseFloat(document.getElementById('hl-pc-edlp').value) || 0) : 0,
       base_upspw: parseFloat(document.getElementById('hl-pc-upspw').value) || 0,
       num_items: parseFloat(document.getElementById('hl-pc-items-count').value) || 0,
       doors: parseFloat(document.getElementById('hl-pc-doors').value) || 0,
       lift: (parseFloat(document.getElementById('hl-pc-lift').value) || 0) / 100,
-      edlp_lift_override: parseFloat(document.getElementById('hl-pc-edlplift').value) || 0,
+      edlp_lift_override: 0,  // field removed — always 0
       p1_events: 1,  // each record = exactly one event (replicate to build variants)
       p1_wks_per_event: parseFloat(document.getElementById('hl-pc-wks').value) || 0,
       scan_bb_unit: parseFloat(document.getElementById('hl-pc-scan').value) || 0,
@@ -26946,6 +26961,13 @@ render();
 
     // wire recalc to all step-2 inputs (delegated, since step2 always in DOM)
     step2El.addEventListener('input', recalc);
+    // EDLP? toggle shows/hides the $ off field; No => EDLP treated as 0 in the calc.
+    const edlpqEl = document.getElementById('hl-pc-edlpq');
+    if (edlpqEl) edlpqEl.addEventListener('change', () => {
+      const wrap = document.getElementById('hl-pc-edlp-wrap');
+      if (wrap) wrap.style.display = edlpqEl.value === 'yes' ? '' : 'none';
+      recalc();
+    });
 
     // Build + persist the promo row. Returns { ok, inputs, itemIds } so callers
     // (Save, Save & replicate) can chain. Shows/clears a busy label on the button.
