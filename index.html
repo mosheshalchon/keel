@@ -5135,7 +5135,8 @@ HL.NAV_ITEMS = [
   { id: 'sales-pacing',    label: 'Sales Pacing',    href: './sales-pacing.html' },
   { id: 'insights',        label: 'Insights',        href: './insights.html' },
   { id: 'sales-tools',     label: 'Sales Tools',     href: './sales-tools.html' },
-  { id: 'distribution',    label: 'Distributors',    href: './distribution.html' },
+  { id: 'distribution',    label: 'Distributor Inventory', href: './distribution.html' },
+  { id: 'service-levels',  label: 'Service Levels',  href: './service-levels.html' },
   { id: 'mrp',             label: 'Procurement',   href: './mrp.html' },
   { id: 'production',      label: 'Production',   href: './production.html' },
   { id: 'freight',         label: 'Freight',      href: './freight.html' },
@@ -5152,7 +5153,7 @@ HL.NAV_GROUPS = [
   { type: 'item',  id: 'ask-keel' },
   { type: 'item',  id: 'brand-library' },
   { type: 'group', label: 'Sales',      children: ['retailer-library', 'timeline', 'submission-docs', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
-  { type: 'group', label: 'Operations', children: ['distribution', 'mrp', 'production', 'freight'] },
+  { type: 'group', label: 'Operations', children: ['distribution', 'service-levels', 'mrp', 'production', 'freight'] },
   { type: 'item',  id: 'finance' },
   { type: 'item',  id: 'settings' },
 ];
@@ -27178,46 +27179,30 @@ render();
     alert('Excel promo upload coming next — ' + file.name);
   }
 
-  let _distActiveSubTab = (() => { try { const s = localStorage.getItem('keel_dist_subtab'); return (s === 'inventory' || s === 'service-levels') ? s : 'inventory'; } catch (e) { return 'inventory'; } })();  // 'inventory' | 'service-levels'
-  let _svcShowAllHistory = false;  // service levels: false = last 12 weeks only
-  let _svcLinesCache = null;        // { key, lines } — session cache for the SL tab; cleared on SL upload/delete
-
+  // (Service Levels moved to its own page under Operations — 2026-07. The old
+  // inventory/service-levels sub-tab state and localStorage key are gone.)
   function renderDistributionPage() {
     const session = HL.mountPage('distribution');
     if (!session) return;
     const main = document.getElementById('main-content');
     main.innerHTML = `
-      <div class="eyebrow">— Footprint</div>
+      <div class="eyebrow">— Operations</div>
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;">
         <div>
-          <h1 class="page-title">Distributors.</h1>
-          <p class="page-meta">Inventory and service levels from UNFI and KeHe. Upload weekly snapshots to track trends.</p>
+          <h1 class="page-title">Distributor Inventory.</h1>
+          <p class="page-meta">Inventory on hand and on order at UNFI and KeHe. Upload weekly snapshots to track trends.</p>
         </div>
         <div style="display:flex;gap:8px;align-items:center;margin-top:24px;flex-wrap:wrap;">
           <button class="hl-btn-secondary" id="hl-dist-uploads-btn">⏱ Upload history</button>
           <input type="file" id="hl-dist-inv-upload" accept=".xlsx,.xls,.csv" multiple style="display:none;" />
-          <input type="file" id="hl-dist-svc-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
           <button class="hl-btn-primary" id="hl-dist-inv-upload-btn">+ Upload inventory</button>
-          <button class="hl-btn-primary" id="hl-dist-svc-upload-btn" style="display:none;">+ Upload service levels</button>
         </div>
-      </div>
-
-      <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:18px 0 0;">
-        <button class="hl-dist-tab active" data-distsubtab="inventory" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;color:var(--ink);text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid var(--ink);font-weight:600;">Inventory</button>
-        <button class="hl-dist-tab" data-distsubtab="service-levels" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;padding:10px 16px;cursor:pointer;font-weight:400;">Service Levels</button>
       </div>
 
       <div id="hl-dist-body" style="margin-top:18px;">
         <div class="hl-loading">Loading inventory…</div>
       </div>
     `;
-
-    // Toggle which upload button is visible based on active sub-tab
-    const showUploadButtonsForTab = (tab) => {
-      document.getElementById('hl-dist-inv-upload-btn').style.display = tab === 'inventory' ? '' : 'none';
-      document.getElementById('hl-dist-svc-upload-btn').style.display = tab === 'service-levels' ? '' : 'none';
-    };
-    showUploadButtonsForTab(_distActiveSubTab);
 
     document.getElementById('hl-dist-inv-upload-btn').addEventListener('click', () => {
       document.getElementById('hl-dist-inv-upload').click();
@@ -27232,6 +27217,38 @@ render();
       }
       await openDistInvBulkUploadModal(files);
     });
+
+    document.getElementById('hl-dist-uploads-btn').addEventListener('click', () => {
+      openDistInvUploadsHistory('inventory');
+    });
+
+    renderDistInventoryView();
+  }
+
+  // ─── Service Levels: standalone page (was a sub-tab of Distributors) ───
+  function renderServiceLevelsPage() {
+    const session = HL.mountPage('service-levels');
+    if (!session) return;
+    const main = document.getElementById('main-content');
+    main.innerHTML = `
+      <div class="eyebrow">— Operations</div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;">
+        <div>
+          <h1 class="page-title">Service Levels.</h1>
+          <p class="page-meta">Fill rates by distributor and item from UNFI and KeHe weekly reports.</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:24px;flex-wrap:wrap;">
+          <button class="hl-btn-secondary" id="hl-svc-uploads-btn">⏱ Upload history</button>
+          <input type="file" id="hl-dist-svc-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
+          <button class="hl-btn-primary" id="hl-dist-svc-upload-btn">+ Upload service levels</button>
+        </div>
+      </div>
+
+      <div id="hl-svc-page-body" style="margin-top:18px;">
+        <div class="hl-loading">Loading service levels…</div>
+      </div>
+    `;
+
     document.getElementById('hl-dist-svc-upload-btn').addEventListener('click', () => {
       document.getElementById('hl-dist-svc-upload').click();
     });
@@ -27242,42 +27259,15 @@ render();
       await openDistSvcUploadModal(file);
     });
 
-    document.getElementById('hl-dist-uploads-btn').addEventListener('click', () => {
-      openDistInvUploadsHistory();
+    document.getElementById('hl-svc-uploads-btn').addEventListener('click', () => {
+      openDistInvUploadsHistory('service-levels');
     });
 
-    document.querySelectorAll('.hl-dist-tab').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('.hl-dist-tab').forEach(b => {
-          b.classList.remove('active');
-          b.style.color = 'var(--ink-3)';
-          b.style.borderBottom = '';
-          b.style.fontWeight = '400';
-        });
-        btn.classList.add('active');
-        btn.style.color = 'var(--ink)';
-        btn.style.borderBottom = '2px solid var(--ink)';
-        btn.style.fontWeight = '600';
-        const tab = btn.dataset.distsubtab;
-        _distActiveSubTab = tab;
-        try { localStorage.setItem('keel_dist_subtab', tab); } catch (e) {}
-        showUploadButtonsForTab(tab);
-        if (tab === 'inventory') renderDistInventoryView();
-        else if (tab === 'service-levels') renderDistSvcView();
-      });
-    });
-
-    // Restore previously-active tab (read fresh from storage — module init may predate it)
-    let _restoreTab = _distActiveSubTab;
-    try { const s = localStorage.getItem('keel_dist_subtab'); if (s === 'inventory' || s === 'service-levels') _restoreTab = s; } catch (e) {}
-    _distActiveSubTab = _restoreTab;
-    showUploadButtonsForTab(_restoreTab);
-    if (_restoreTab === 'service-levels') {
-      document.querySelector('[data-distsubtab="service-levels"]')?.click();
-    } else {
-      renderDistInventoryView();
-    }
+    renderDistSvcView();
   }
+  let _svcShowAllHistory = false;  // service levels: false = last 12 weeks only
+  let _svcLinesCache = null;        // { key, lines } — session cache for the SL tab; cleared on SL upload/delete
+
 
   // ─── Distributor inventory: main view ─────────────────────────────
   // Top-level entry. Loads all uploads, then defers to either:
@@ -28635,7 +28625,7 @@ render();
   let _distSvcShowUnmatched = false;
 
   async function renderDistSvcView() {
-    const host = document.getElementById('hl-dist-body');
+    const host = document.getElementById('hl-svc-page-body');
     if (!host) return;
     host.innerHTML = '<div class="hl-loading">Loading service levels…</div>';
 
@@ -31546,7 +31536,7 @@ render();
     };
 
     // Default tab: use what's passed in, or the current Distributors sub-tab
-    let tab = initialTab || (typeof _distActiveSubTab !== 'undefined' ? _distActiveSubTab : 'inventory');
+    let tab = initialTab || 'inventory';
     if (tab === 'service-levels') tab = 'service-levels';
     else tab = 'inventory';
 
@@ -47252,6 +47242,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     'promos':          renderPromosPage,
     'sales-pacing':    renderSalesPacingPage,
     'distribution':    renderDistributionPage,
+    'service-levels':  renderServiceLevelsPage,
     'mrp':             renderMrpPage,
     'production':       renderProductionPage,
     'freight':          renderFreightPage,
