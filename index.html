@@ -5,11 +5,28 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Keel · Sales Operations</title>
 
-<!-- External libraries used by submission-docs (xlsx + jszip) -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<!-- Early connections: fonts + CDNs + Supabase API host. Preconnect opens
+     DNS/TLS in parallel with HTML parsing so the first real request on each
+     host skips the handshake. The font stylesheet moved here from a CSS
+     @import (which the browser couldn't even discover until it parsed its
+     way down to the <style> block). -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://cdnjs.cloudflare.com">
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link rel="preconnect" href="https://vbuccegsnlssilcyfzrp.supabase.co">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+
+<!-- External libraries used by submission-docs (xlsx + jszip).
+     `defer` = downloaded in parallel, executed after HTML parse, guaranteed
+     before DOMContentLoaded — so they no longer block first paint but are
+     always ready before any click/upload handler could need them. Only the
+     Supabase SDK stays synchronous: the boot IIFE at the end of <body> runs
+     at parse time and needs it immediately. -->
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <!-- Chart.js + date adapter, used by Insights -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <!-- Supabase JS SDK (auth + database for Timeline) -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 
@@ -19,7 +36,8 @@
    Shared design system
    ===================================================== */
 
-@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+/* Fonts load via <link> in <head> (was an @import here — render-blocking and
+   discovered late; moved 2026-07 perf pass). */
 
 :root {
   /* Colors — bone, ink, accents */
@@ -4384,6 +4402,33 @@ window.Auth = (function() {
   })();
   window.KeelCache = KeelCache;
 
+  // ---- sbPageAll: parallel paging past PostgREST's 1k-row cap --------------
+  // The old pattern fetched pages strictly one-after-another (N sequential
+  // round trips). This fetches page 1 with { count: 'exact' } to learn the
+  // total, then fires every remaining page in parallel — same rows, same
+  // order (pages are concatenated in offset order), ~Nx fewer serial waits.
+  // makeQuery(from, to, withCount) must build a FRESH query each call
+  // (supabase query builders are single-use).
+  window.sbPageAll = async function (makeQuery, PAGE) {
+    PAGE = PAGE || 1000;
+    const first = await makeQuery(0, PAGE - 1, true);
+    if (first.error) return { data: null, error: first.error };
+    let all = first.data || [];
+    const total = (typeof first.count === 'number' && first.count != null) ? first.count : all.length;
+    if (total > PAGE) {
+      const jobs = [];
+      for (let from = PAGE; from < total; from += PAGE) {
+        jobs.push(makeQuery(from, from + PAGE - 1, false));
+      }
+      const pages = await Promise.all(jobs);
+      for (const p of pages) {
+        if (p.error) return { data: null, error: p.error };
+        all = all.concat(p.data || []);
+      }
+    }
+    return { data: all, error: null };
+  };
+
   // Look up the user's brand_id from the user_profiles table.
   // We need this for every signed-in session because RLS keys off it.
   async function fetchProfile(userId) {
@@ -4407,36 +4452,42 @@ window.Auth = (function() {
     // On every login (cheap query), check if there's a pending brand_invites row matching
     // this user's email. If yes, create the user_brand_access row + mark the invite accepted.
     // This is what links a new user's signup to the role the admin chose for them.
-    try {
-      const userEmail = (sbSession.user.email || '').toLowerCase();
-      if (userEmail) {
-        const c = client();
-        const { data: pendingInvites, error: invErr } = await c.from('brand_invites')
-          .select('*')
-          .eq('email', userEmail)
-          .is('accepted_at', null);
-        if (!invErr && Array.isArray(pendingInvites) && pendingInvites.length > 0) {
-          for (const inv of pendingInvites) {
-            // Skip expired invites
-            if (new Date(inv.expires_at) < new Date()) continue;
-            // Create or upgrade the access row
-            await c.from('user_brand_access').upsert({
-              user_id: sbSession.user.id,
-              brand_id: inv.brand_id,
-              role: inv.role,
-              granted_by: inv.invited_by,
-            }, { onConflict: 'user_id,brand_id' });
-            // Mark the invite as accepted
-            await c.from('brand_invites').update({ accepted_at: new Date().toISOString() }).eq('id', inv.id);
-            console.log(`[Auth] Claimed invite for ${userEmail} → ${inv.brand_id} as ${inv.role}`);
+    // PERF (2026-07): the claim and the profile fetch are independent, so they
+    // run in parallel — one round trip of boot latency instead of two. The
+    // claim is still fully awaited before the access-row read further down.
+    const claimPromise = (async () => {
+      try {
+        const userEmail = (sbSession.user.email || '').toLowerCase();
+        if (userEmail) {
+          const c = client();
+          const { data: pendingInvites, error: invErr } = await c.from('brand_invites')
+            .select('*')
+            .eq('email', userEmail)
+            .is('accepted_at', null);
+          if (!invErr && Array.isArray(pendingInvites) && pendingInvites.length > 0) {
+            for (const inv of pendingInvites) {
+              // Skip expired invites
+              if (new Date(inv.expires_at) < new Date()) continue;
+              // Create or upgrade the access row
+              await c.from('user_brand_access').upsert({
+                user_id: sbSession.user.id,
+                brand_id: inv.brand_id,
+                role: inv.role,
+                granted_by: inv.invited_by,
+              }, { onConflict: 'user_id,brand_id' });
+              // Mark the invite as accepted
+              await c.from('brand_invites').update({ accepted_at: new Date().toISOString() }).eq('id', inv.id);
+              console.log(`[Auth] Claimed invite for ${userEmail} → ${inv.brand_id} as ${inv.role}`);
+            }
           }
         }
+      } catch (e) {
+        console.warn('[Auth] Invite auto-claim failed (non-blocking):', e);
       }
-    } catch (e) {
-      console.warn('[Auth] Invite auto-claim failed (non-blocking):', e);
-    }
+    })();
 
-    let profile = await fetchProfile(sbSession.user.id);
+    let profile;
+    [, profile] = await Promise.all([claimPromise, fetchProfile(sbSession.user.id)]);
     if (!profile) {
       // New invited user: auth.users row exists but no profile yet.
       // The invite carried brand_id + role_label in user_metadata.
@@ -4470,29 +4521,38 @@ window.Auth = (function() {
     // whether the profile is brand-new or pre-existed (from an earlier test), so
     // the invited user always lands in the admin member list with the right
     // role + department (access matrix).
-    try {
-      const meta = sbSession.user.user_metadata || {};
-      const grantBrandId = meta.brand_id || (profile && profile.brandId);
-      if (grantBrandId) {
-        const c = client();
-        const { data: existingAccess } = await c.from('user_brand_access')
-          .select('id').eq('user_id', sbSession.user.id).eq('brand_id', grantBrandId).maybeSingle();
-        if (!existingAccess) {
-          await c.from('user_brand_access').upsert({
-            user_id: sbSession.user.id,
-            brand_id: grantBrandId,
-            role: meta.access_role || 'editor',
-            department: meta.access_dept || 'all',
-            granted_by: meta.invited_by || null,
-          }, { onConflict: 'user_id,brand_id' });
+    // PERF (2026-07): runs as a promise so the contact auto-link and the access
+    // read can proceed in parallel. Resolves true only if it actually wrote a
+    // row — in that (rare, first-login) case the access row is re-read below.
+    const grantPromise = (async () => {
+      try {
+        const meta = sbSession.user.user_metadata || {};
+        const grantBrandId = meta.brand_id || (profile && profile.brandId);
+        if (grantBrandId) {
+          const c = client();
+          const { data: existingAccess } = await c.from('user_brand_access')
+            .select('id').eq('user_id', sbSession.user.id).eq('brand_id', grantBrandId).maybeSingle();
+          if (!existingAccess) {
+            await c.from('user_brand_access').upsert({
+              user_id: sbSession.user.id,
+              brand_id: grantBrandId,
+              role: meta.access_role || 'editor',
+              department: meta.access_dept || 'all',
+              granted_by: meta.invited_by || null,
+            }, { onConflict: 'user_id,brand_id' });
+            return true; // wrote a new access row
+          }
         }
+      } catch (e) {
+        console.warn('Auto-grant brand access failed:', e);
       }
-    } catch (e) {
-      console.warn('Auto-grant brand access failed:', e);
-    }
+      return false;
+    })();
 
     if (!profile) {
       // Profile still missing — sign them out so we don't render a half-broken app.
+      // (Await the grant first so the write still lands for their next login.)
+      try { await grantPromise; } catch (e) {}
       console.warn('Signed-in user has no profile row, signing out');
       await client().auth.signOut();
       return null;
@@ -4500,42 +4560,52 @@ window.Auth = (function() {
     // Auto-link this user to their Brand Contact row (matched by email).
     // This is the bridge between auth.users and brand_contacts so the approval
     // flow can recognize "who's logged in" via the contact-side identity.
-    try {
-      if (profile.brand_id && profile.email) {
-        const c = client();
-        const { data: matchingContact } = await c.from('brand_contacts')
-          .select('id, linked_user_id')
-          .eq('brand_id', profile.brand_id)
-          .ilike('email', profile.email)
-          .maybeSingle();
-        if (matchingContact) {
-          // Link the contact to this auth user if not already linked
-          if (!matchingContact.linked_user_id) {
-            await c.from('brand_contacts')
-              .update({ linked_user_id: sbSession.user.id })
-              .eq('id', matchingContact.id);
-          }
-          // Reflect that link in the profile too (so approval logic can see it)
-          if (!profile.linked_contact_id) {
-            await c.from('user_profiles')
-              .update({ linked_contact_id: matchingContact.id })
-              .eq('user_id', sbSession.user.id);
-            profile.linked_contact_id = matchingContact.id;
+    const linkPromise = (async () => {
+      try {
+        if (profile.brand_id && profile.email) {
+          const c = client();
+          const { data: matchingContact } = await c.from('brand_contacts')
+            .select('id, linked_user_id')
+            .eq('brand_id', profile.brand_id)
+            .ilike('email', profile.email)
+            .maybeSingle();
+          if (matchingContact) {
+            // Link the contact to this auth user if not already linked
+            if (!matchingContact.linked_user_id) {
+              await c.from('brand_contacts')
+                .update({ linked_user_id: sbSession.user.id })
+                .eq('id', matchingContact.id);
+            }
+            // Reflect that link in the profile too (so approval logic can see it)
+            if (!profile.linked_contact_id) {
+              await c.from('user_profiles')
+                .update({ linked_contact_id: matchingContact.id })
+                .eq('user_id', sbSession.user.id);
+              profile.linked_contact_id = matchingContact.id;
+            }
           }
         }
+      } catch (e) {
+        console.warn('Auto-link failed (non-fatal):', e);
       }
-    } catch (e) {
-      console.warn('Auto-link failed (non-fatal):', e);
-    }
+    })();
     // Pull the user's access row (role + department) so the app knows their
     // access level. This is the row the admin member list also reads from.
+    // Runs in parallel with the grant + auto-link; if the grant actually wrote
+    // a new row (rare first-login path), re-read once so the fresh role lands.
+    const readAccess = async () => {
+      try {
+        const cc = client();
+        const { data: acc } = await cc.from('user_brand_access')
+          .select('role, department').eq('user_id', sbSession.user.id).eq('brand_id', profile.brand_id).maybeSingle();
+        return acc || null;
+      } catch (e) { return null; /* non-fatal */ }
+    };
     let accessRole = null, accessDept = null;
-    try {
-      const cc = client();
-      const { data: acc } = await cc.from('user_brand_access')
-        .select('role, department').eq('user_id', sbSession.user.id).eq('brand_id', profile.brand_id).maybeSingle();
-      if (acc) { accessRole = acc.role; accessDept = acc.department; }
-    } catch (e) { /* non-fatal */ }
+    const [grantWrote, , accFirst] = await Promise.all([grantPromise, linkPromise, readAccess()]);
+    let acc = accFirst;
+    if (grantWrote) acc = await readAccess();
+    if (acc) { accessRole = acc.role; accessDept = acc.department; }
 
     return {
       email: profile.email,
@@ -8622,8 +8692,8 @@ async function upsertParsedProductsToDb(parsed, productHeaders) {
 
   // Upsert in chunks of 100
   let upserted = 0;
-  for (let i = 0; i < records.length; i += 100) {
-    const chunk = records.slice(i, i + 100);
+  for (let i = 0; i < records.length; i += 500) {
+    const chunk = records.slice(i, i + 500);
     const { error } = await sb.from('products').upsert(chunk, {
       onConflict: 'brand_id,unit_upc',
       ignoreDuplicates: false,
@@ -16938,8 +17008,8 @@ render();
           }
           if (toInsert.length > 0) {
             // Insert in chunks of 100
-            for (let i = 0; i < toInsert.length; i += 100) {
-              const chunk = toInsert.slice(i, i + 100);
+            for (let i = 0; i < toInsert.length; i += 500) {
+              const chunk = toInsert.slice(i, i + 500);
               const { error } = await sb.from('forecast_distribution_overrides').insert(chunk);
               if (error) throw error;
             }
@@ -16955,8 +17025,8 @@ render();
             const { id, created_at, updated_at, ...rest } = p;
             return { ...rest, scenario_id: newScenario.id };
           });
-          for (let i = 0; i < toInsert.length; i += 100) {
-            const chunk = toInsert.slice(i, i + 100);
+          for (let i = 0; i < toInsert.length; i += 500) {
+            const chunk = toInsert.slice(i, i + 500);
             const { error } = await sb.from('forecast_promo_lines').insert(chunk);
             if (error) throw error;
           }
@@ -16970,8 +17040,8 @@ render();
             const { id, created_at, updated_at, ...rest } = s;
             return { ...rest, scenario_id: newScenario.id };
           });
-          for (let i = 0; i < toInsert.length; i += 100) {
-            const chunk = toInsert.slice(i, i + 100);
+          for (let i = 0; i < toInsert.length; i += 500) {
+            const chunk = toInsert.slice(i, i + 500);
             const { error } = await sb.from('forecast_seasonality_lines').insert(chunk);
             if (error) throw error;
           }
@@ -16985,8 +17055,8 @@ render();
             const { id, created_at, updated_at, ...rest } = l;
             return { ...rest, scenario_id: newScenario.id };
           });
-          for (let i = 0; i < toInsert.length; i += 100) {
-            const chunk = toInsert.slice(i, i + 100);
+          for (let i = 0; i < toInsert.length; i += 500) {
+            const chunk = toInsert.slice(i, i + 500);
             const { error } = await sb.from('forecast_load_ins').insert(chunk);
             if (error) throw error;
           }
@@ -19624,8 +19694,8 @@ render();
       }
       if (toInsert.length) {
         // Insert in chunks to avoid timeouts
-        for (let i = 0; i < toInsert.length; i += 100) {
-          const chunk = toInsert.slice(i, i + 100);
+        for (let i = 0; i < toInsert.length; i += 500) {
+          const chunk = toInsert.slice(i, i + 500);
           await sb.from('forecast_distribution_lines').insert(chunk);
         }
       }
@@ -22490,8 +22560,8 @@ render();
 
     setStatus('Importing…');
     let inserted = 0, errored = 0;
-    for (let i = 0; i < toInsert.length; i += 100) {
-      const chunk = toInsert.slice(i, i + 100);
+    for (let i = 0; i < toInsert.length; i += 500) {
+      const chunk = toInsert.slice(i, i + 500);
       const { error } = await sb.from('forecast_load_ins').insert(chunk);
       if (error) { errored += chunk.length; console.error(error); } else { inserted += chunk.length; }
     }
@@ -23224,8 +23294,8 @@ render();
 
     setStatus('Importing…');
     let inserted = 0, errored = 0;
-    for (let i = 0; i < toInsert.length; i += 100) {
-      const chunk = toInsert.slice(i, i + 100);
+    for (let i = 0; i < toInsert.length; i += 500) {
+      const chunk = toInsert.slice(i, i + 500);
       const { error } = await sb.from('forecast_promo_lines').insert(chunk);
       if (error) { errored += chunk.length; console.error(error); } else { inserted += chunk.length; }
     }
@@ -24103,16 +24173,14 @@ render();
     ];
     let rows = [];
     for (const cols of colSets) {
-      const PAGE = 1000; let all = []; let ok = true;
-      for (let from = 0; ; from += PAGE) {
-        const { data, error } = await sb.from('sales_actuals').select(cols)
+      // Parallel paging (was one sequential round trip per 1k rows).
+      const res = await window.sbPageAll((from, to, withCount) =>
+        sb.from('sales_actuals')
+          .select(cols, withCount ? { count: 'exact' } : undefined)
           .eq('brand_id', brandId).eq('dimension', 'product')
-          .order('id', { ascending: true }).range(from, from + PAGE - 1);
-        if (error) { ok = false; break; }
-        all = all.concat(data || []);
-        if (!data || data.length < PAGE) break;
-      }
-      if (ok) { rows = all; break; }
+          .order('id', { ascending: true }).range(from, to)
+      );
+      if (!res.error) { rows = res.data || []; break; }
     }
     const byUpc = new Map();
     const byName = new Map();
@@ -26705,6 +26773,9 @@ render();
         ${siblings.map((s,i)=>{ const cur = String(s.id)===String(promoId); return `<button class="hl-pc-navchip" data-id="${esc(s.id)}" ${cur?'disabled':''} style="${chipBtn}${cur?'background:var(--ink);color:var(--paper);border-color:var(--ink);font-weight:600;':''}">${esc(sibLabel(s,i))}</button>`; }).join('')}
         <button id="hl-pc-nav-next" title="Next event" style="${navBtn}${sibIdx>=siblings.length-1?'opacity:0.4;cursor:default;':''}">Next ▶</button>
       </div>` : '';
+    // Footer "Next promo" button — jumps to the next event in the group (wraps at the end).
+    const nextPromoBtnHtml = (promoId && siblings.length > 1)
+      ? `<button id="hl-pc-next-promo" class="hl-btn-secondary" title="Go to the next event in this retailer + group">Next promo →</button>` : '';
 
     const inp = (id, val, ph, step) => `<input id="${id}" type="number" step="${step||'any'}" value="${val===''?'':esc(val)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" />`;
     // Percent-display input: shows the decimal value ×100 (e.g. 0.35 → 35) with a %
@@ -26798,7 +26869,7 @@ render();
         <div id="hl-pc-calc-row2" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px;"></div>
 
         <div style="display:flex;justify-content:space-between;gap:10px;padding-top:14px;border-top:1px solid var(--rule-soft);">
-          <div>${promoId ? `<button id="hl-pc-delete" style="background:transparent;border:1px solid var(--lost);color:var(--lost);border-radius:6px;padding:9px 16px;font-family:var(--sans);font-size:13px;cursor:pointer;">Delete</button>` : ''}</div>
+          <div style="display:flex;gap:10px;align-items:center;">${promoId ? `<button id="hl-pc-delete" style="background:transparent;border:1px solid var(--lost);color:var(--lost);border-radius:6px;padding:9px 16px;font-family:var(--sans);font-size:13px;cursor:pointer;">Delete</button>` : ''}${nextPromoBtnHtml}</div>
           <div style="display:flex;gap:10px;">
             <button id="hl-pc-cancel" class="hl-btn-secondary">Cancel</button>
             <button id="hl-pc-replicate" class="hl-btn-secondary" title="Save this event, then open a pre-filled copy to build a variant that differs">Save &amp; replicate</button>
@@ -26823,6 +26894,8 @@ render();
     if (prevBtn) prevBtn.addEventListener('click', () => { if (sibIdx > 0) goTo(siblings[sibIdx-1].id); });
     if (nextBtn) nextBtn.addEventListener('click', () => { if (sibIdx < siblings.length-1) goTo(siblings[sibIdx+1].id); });
     document.querySelectorAll('.hl-pc-navchip').forEach(btn => btn.addEventListener('click', () => goTo(btn.dataset.id)));
+    const nextPromoBtn = document.getElementById('hl-pc-next-promo');
+    if (nextPromoBtn && siblings.length > 1) nextPromoBtn.addEventListener('click', () => goTo(siblings[(sibIdx + 1) % siblings.length].id));
 
     // ── Items step: load carried items for retailer that map to the chosen group ──
     let carriedItems = [];  // [{id, name, upc, product_line, product_id}]
@@ -27267,21 +27340,16 @@ render();
   async function getInventoryLines(uploadIds, cacheKey) {
     if (_invLinesCache.has(cacheKey)) return _invLinesCache.get(cacheKey);
     const sb = window.Auth.getClient();
-    const PAGE = 1000;
-    let lines = [];
-    // One query with .in() across all uploads, paginated — far fewer round-trips
-    // than the old per-upload loop.
-    let from = 0;
-    while (true) {
-      const { data: page, error } = await sb.from('distributor_inventory_lines')
-        .select('*').in('upload_id', uploadIds)
-        .range(from, from + PAGE - 1).order('id', { ascending: true });
-      if (error) { console.error('Inventory fetch error:', error); break; }
-      if (!page || page.length === 0) break;
-      lines = lines.concat(page);
-      if (page.length < PAGE) break;
-      from += PAGE;
-    }
+    // One query with .in() across all uploads, parallel-paginated past the 1k
+    // cap (was one sequential round trip per page).
+    const res = await window.sbPageAll((from, to, withCount) =>
+      sb.from('distributor_inventory_lines')
+        .select('*', withCount ? { count: 'exact' } : undefined)
+        .in('upload_id', uploadIds)
+        .order('id', { ascending: true }).range(from, to)
+    );
+    if (res.error) console.error('Inventory fetch error:', res.error);
+    const lines = res.data || [];
     _invLinesCache.set(cacheKey, lines);
     return lines;
   }
@@ -29747,8 +29815,8 @@ render();
 
         const recs = parsed.lineRows.map(r => ({ ...r, upload_id: up.id, brand_id: brandId }));
         let saved = 0;
-        for (let i = 0; i < recs.length; i += 200) {
-          const chunk = recs.slice(i, i + 200);
+        for (let i = 0; i < recs.length; i += 500) {
+          const chunk = recs.slice(i, i + 500);
           const { error: lErr } = await sb.from('distributor_service_level_lines').insert(chunk);
           if (lErr) throw lErr;
           saved += chunk.length;
@@ -31265,8 +31333,8 @@ render();
             if (distStripped) delete rest.distributor;
             return rest;
           });
-          for (let i = 0; i < recs.length; i += 200) {
-            const chunk = recs.slice(i, i + 200);
+          for (let i = 0; i < recs.length; i += 500) {
+            const chunk = recs.slice(i, i + 500);
             let toInsert = stripCols(chunk);
             let { error: lErr } = await sb.from('distributor_inventory_lines').insert(toInsert);
             // Retry once, stripping whichever column the DB says is missing.
@@ -38762,17 +38830,21 @@ render();
         'dimension, entity, upc, month, amount',
         'dimension, entity, month, amount',
       ];
-      for (let from = 0; ; from += PAGE) {
-        let q = { error: { message: 'init' }, data: null };
-        for (const cols of colSets) {
-          q = await sb.from('sales_actuals').select(cols)
+      // Resolve the richest working column set once (the old loop re-probed
+      // every column set on every page), then parallel-page with it.
+      for (const cols of colSets) {
+        const res = await window.sbPageAll((from, to, withCount) =>
+          sb.from('sales_actuals')
+            .select(cols, withCount ? { count: 'exact' } : undefined)
             .eq('brand_id', brandId).eq('source', 'upload')
-            .order('id', { ascending: true }).range(from, from + PAGE - 1);
-          if (!q.error) break;
+            .order('id', { ascending: true }).range(from, to)
+        , PAGE);
+        if (!res.error) {
+          (res.data || []).forEach(r => { existing[keyOf(r)] = r; });
+          break;
         }
-        if (q.error) break;  // table new/empty — nothing to merge
-        (q.data || []).forEach(r => { existing[keyOf(r)] = r; });
-        if (!q.data || q.data.length < PAGE) break;
+        // else: try the next leaner column set; if all fail, table is
+        // new/empty — nothing to merge (same as before).
       }
     }
 
@@ -39490,17 +39562,16 @@ render();
   }
 
   async function _cwFetchWeekly(sb, brandId) {
-    const PAGE = 1000; let all = [];
-    for (let from = 0; ; from += PAGE) {
-      const { data, error } = await sb.from('distributor_customer_sales')
-        .select('distributor,region,whs,chain_name,item_description,category,product_id,product_line,week_starting,sales,quantity')
+    // Parallel paging (was one sequential round trip per 1k rows — this is
+    // the biggest table behind Sales Pacing's customer detail view).
+    const res = await window.sbPageAll((from, to, withCount) =>
+      sb.from('distributor_customer_sales')
+        .select('distributor,region,whs,chain_name,item_description,category,product_id,product_line,week_starting,sales,quantity', withCount ? { count: 'exact' } : undefined)
         .eq('brand_id', brandId).eq('report_type', 'weekly')
-        .order('id', { ascending: true }).range(from, from + PAGE - 1);
-      if (error) throw new Error(error.message);
-      all = all.concat(data || []);
-      if (!data || data.length < PAGE) break;
-    }
-    return all;
+        .order('id', { ascending: true }).range(from, to)
+    );
+    if (res.error) throw new Error(res.error.message);
+    return res.data || [];
   }
 
   // ─── Weekly customer detail: search+checkbox multi-select (same pattern as Distributors › Sales) ───
@@ -39774,18 +39845,15 @@ render();
   // Without this, a brand with >1,000 monthly cells loads only a truncated
   // (and order-dependent) subset — which silently undercounts totals.
   async function spFetchAll(sb, brandId, cols) {
-    const PAGE = 1000;
-    let all = [];
-    for (let from = 0; ; from += PAGE) {
-      const { data, error } = await sb.from('sales_actuals')
-        .select(cols).eq('brand_id', brandId)
+    // Parallel paging: page 1 returns an exact count, remaining pages fetch
+    // concurrently (was strictly sequential — one round trip per 1k rows).
+    return window.sbPageAll((from, to, withCount) =>
+      sb.from('sales_actuals')
+        .select(cols, withCount ? { count: 'exact' } : undefined)
+        .eq('brand_id', brandId)
         .order('id', { ascending: true })
-        .range(from, from + PAGE - 1);
-      if (error) return { data: null, error };
-      all = all.concat(data || []);
-      if (!data || data.length < PAGE) break;  // last page
-    }
-    return { data: all, error: null };
+        .range(from, to)
+    );
   }
 
   async function loadAndRenderSalesPacing(brandId, sb) {
@@ -43845,8 +43913,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
       // Upsert by (brand_id, unit_upc)
       let upserted = 0;
-      for (let i = 0; i < records.length; i += 100) {
-        const chunk = records.slice(i, i + 100);
+      for (let i = 0; i < records.length; i += 500) {
+        const chunk = records.slice(i, i + 500);
         const { error: upErr } = await sb.from('products').upsert(chunk, {
           onConflict: 'brand_id,unit_upc',
           ignoreDuplicates: false,
@@ -44358,8 +44426,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           reset_date:         r.reset_date,
           source_upload_id:   uploadRow?.id || null,
         }));
-        for (let i = 0; i < payload.length; i += 100) {
-          const chunk = payload.slice(i, i + 100);
+        for (let i = 0; i < payload.length; i += 500) {
+          const chunk = payload.slice(i, i + 500);
           const { error } = await sb.from('master_deadlines').insert(chunk);
           if (error) throw new Error('Insert failed: ' + error.message);
           insertedCount += chunk.length;
