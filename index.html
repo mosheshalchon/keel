@@ -47561,10 +47561,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   // ─── Historical OH tab ────────────────────────────────────────────────
   // FG on-hand cases over time from fg_onhand_history (filled by
   // sync-fg-onhand from the FGAvailable file's dated blocks — weekly cadence).
-  // Default view: last 8 weekly snapshots + the 10 months before them
-  // (monthly = LAST snapshot within each month, same convention as the
-  // Ingredient Costs tab). Toggle collapses to a pure 12-month view.
-  let _fgHistState = { sel: [], search: '', weekly: true };
+  // Default view: last 12 months; the 2 most recent months start expanded to
+  // weekly columns (≈ last 8 snapshots). Every month header is a toggle —
+  // collapsed shows the month-end snapshot with a "+", expanded shows each
+  // weekly snapshot with a "−" on the last week (same pattern as the
+  // Distributor snapshot time-series expander).
+  let _fgHistState = { sel: [], search: '', expanded: null };
   let _fgHistChart = null;
 
   async function _fgHistFetch(brandId) {
@@ -47588,7 +47590,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][mo - 1] + ' ' + dy;
   }
 
-  function _fgHistPivot(rows, weeklyMode) {
+  function _fgHistPivot(rows) {
     const byItemDate = new Map();
     const dateSet = new Set();
     for (const r of rows) {
@@ -47600,17 +47602,24 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
     const allDates = [...dateSet].sort();
     const lastOfMonth = new Map();
-    for (const d of allDates) { const mo = d.slice(0, 7); const cur = lastOfMonth.get(mo); if (!cur || d > cur) lastOfMonth.set(mo, d); }
-    const monthsAll = [...lastOfMonth.keys()].sort();
-    let cols;
-    if (weeklyMode) {
-      const weekly = allDates.slice(-8);
-      const firstWeeklyMonth = weekly.length ? weekly[0].slice(0, 7) : '9999-99';
-      const priorMonths = monthsAll.filter(mo => mo < firstWeeklyMonth).slice(-10);
-      cols = priorMonths.map(mo => ({ key: lastOfMonth.get(mo), label: _mrpCostMonthLabel(mo), kind: 'month' }))
-        .concat(weekly.map(d => ({ key: d, label: _fgHistWkLabel(d), kind: 'week' })));
-    } else {
-      cols = monthsAll.slice(-12).map(mo => ({ key: lastOfMonth.get(mo), label: _mrpCostMonthLabel(mo), kind: 'month' }));
+    const datesByMonth = new Map();
+    for (const d of allDates) {
+      const mo = d.slice(0, 7);
+      const cur = lastOfMonth.get(mo); if (!cur || d > cur) lastOfMonth.set(mo, d);
+      let arr = datesByMonth.get(mo); if (!arr) { arr = []; datesByMonth.set(mo, arr); }
+      arr.push(d);
+    }
+    const months = [...lastOfMonth.keys()].sort().slice(-12);
+    // First render: expand the 2 most recent months (≈ last 8 weekly snapshots)
+    if (!_fgHistState.expanded) _fgHistState.expanded = new Set(months.slice(-2));
+    const cols = [];
+    for (const mo of months) {
+      if (_fgHistState.expanded.has(mo)) {
+        const ds = datesByMonth.get(mo) || [];
+        ds.forEach((d, i) => cols.push({ key: d, label: _fgHistWkLabel(d), kind: 'week', month: mo, last: i === ds.length - 1 }));
+      } else {
+        cols.push({ key: lastOfMonth.get(mo), label: _mrpCostMonthLabel(mo), kind: 'month', month: mo });
+      }
     }
     const items = [...byItemDate.keys()].sort((a, b) => a.localeCompare(b));
     const cell = (item, key) => { const m = byItemDate.get(item); const v = m && m.get(key); return v == null ? null : v; };
@@ -47638,7 +47647,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div>`;
       return;
     }
-    const piv = _fgHistPivot(rows, _fgHistState.weekly);
+    const piv = _fgHistPivot(rows);
 
     host.innerHTML = `
       <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
@@ -47660,7 +47669,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             <div id="hl-fgh-ms-opts" style="max-height:280px;overflow-y:auto;"></div>
           </div>
         </div>
-        <button type="button" id="hl-fgh-mode" style="padding:5px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink-2);cursor:pointer;" title="${_fgHistState.weekly ? 'Collapse the weekly columns into their months' : 'Expand the most recent 8 snapshots as weekly columns'}">${_fgHistState.weekly ? '▦ Monthly view' : '⊞ 8 weeks + monthly'}</button>
         <span id="hl-fgh-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
       </div>
       <div style="background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;padding:16px;margin-bottom:16px;">
@@ -47668,7 +47676,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <div style="position:relative;height:300px;"><canvas id="hl-fgh-chart"></canvas></div>
       </div>
       <div id="hl-fgh-grid" style="overflow-x:auto;"></div>
-      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Cases summed across ATG locations. Monthly columns show the last snapshot within that month; weekly columns are the most recent 8 file snapshots. History accrues from the FGAvailable Dropbox file on each sync (daily cron).</p>
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Cases summed across ATG locations. Monthly columns show the last snapshot within that month &mdash; click a month’s <b>+</b> to expand it into its weekly snapshots, or the last week’s <b>&minus;</b> to collapse back. The 2 most recent months start expanded. History accrues from the FGAvailable Dropbox file on each sync (daily cron).</p>
     `;
 
     const msBtn = document.getElementById('hl-fgh-ms-btn');
@@ -47708,7 +47716,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
     const renderGrid = () => {
       const list = applied();
-      const head = piv.cols.map(c => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;color:${c.kind === 'week' ? 'var(--ink-2)' : 'var(--ink-3)'};text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);${c.kind === 'week' ? 'background:var(--bone-2);' : ''}">${c.label}</th>`).join('');
+      const head = piv.cols.map(c => {
+        const toggle = (c.kind === 'month')
+          ? { attr: `data-fgh-toggle="${c.month}"`, mark: ' <span style="color:var(--accent,#8a7320);font-weight:700;">+</span>', tip: 'Expand to weekly snapshots' }
+          : (c.last ? { attr: `data-fgh-toggle="${c.month}"`, mark: ' <span style="color:var(--accent,#8a7320);font-weight:700;">&minus;</span>', tip: 'Collapse to month-end only' } : null);
+        return `<th ${toggle ? toggle.attr + ` title="${toggle.tip}"` : ''} style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;color:${c.kind === 'week' ? 'var(--ink-2)' : 'var(--ink-3)'};text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);${c.kind === 'week' ? 'background:var(--bone-2);' : ''}${toggle ? 'cursor:pointer;' : ''}">${c.label}${toggle ? toggle.mark : ''}</th>`;
+      }).join('');
       const trs = list.map(item => {
         const tds = piv.cols.map(c => {
           const v = piv.cell(item, c.key);
@@ -47730,6 +47743,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             <td style="padding:8px 10px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;position:sticky;left:0;background:var(--paper);">Total</td>${totTds}
           </tr></tfoot>
         </table>`;
+      document.querySelectorAll('#hl-fgh-grid th[data-fgh-toggle]').forEach(th => th.addEventListener('click', () => {
+        const mo = th.dataset.fghToggle;
+        if (_fgHistState.expanded.has(mo)) _fgHistState.expanded.delete(mo);
+        else _fgHistState.expanded.add(mo);
+        _prodRenderHistory(host);
+      }));
     };
 
     const renderChart = () => {
@@ -47795,11 +47814,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       _fgHistState.sel = [];
       renderOptions(); updateView();
     });
-    document.getElementById('hl-fgh-mode').addEventListener('click', () => {
-      _fgHistState.weekly = !_fgHistState.weekly;
-      _prodRenderHistory(host);
-    });
-
     renderOptions();
     updateView();
   }
