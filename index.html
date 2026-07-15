@@ -7831,6 +7831,182 @@ function renderDashboardPage() {
   }
 }
 
+// ─── Ops briefing (Dashboard section for the Ops department) ──────────────
+// Shown when the user's department is 'ops' (and 'all', so admins see it).
+// Three action-oriented cards, each loaded independently and cached 5 min:
+//   Trucks    — freight_approvals statuses (ready to book / awaiting buyer / hold)
+//   Ingredients — mrp_ingredients out at plant + open POs (full reorder math
+//                 lives in Procurement › Planning; this is the headline)
+//   DC inventory — items under 4 weeks of supply at distributor DCs (UNFI
+//                  velocity; KeHE reports no velocity so it can't be flagged)
+const _OPS_LOW_WEEKS = 4;
+
+function _opsBriefingHtml(session) {
+  const dept = (session && session.department) || 'all';
+  if (dept !== 'ops' && dept !== 'all') return '';
+  const card = (route, title) => `
+    <div class="hl-ops-card" data-opsnav="${route}" style="flex:1;min-width:250px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;padding:16px 18px;cursor:pointer;">
+      <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px;">${title} →</div>
+      <div id="hl-ops-${route}" style="min-height:64px;"><span style="font-family:var(--serif);font-style:italic;color:var(--ink-3);">Loading…</span></div>
+    </div>`;
+  return `
+    <section class="section" style="margin-top:10px;">
+      <div class="section-head">
+        <div>
+          <h2 class="section-title">Ops briefing</h2>
+          <p class="section-desc">What needs action today across freight, procurement, and distributor inventory.</p>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;">
+        ${card('freight', 'Trucks')}
+        ${card('mrp', 'Ingredients')}
+        ${card('production', 'Production')}
+        ${card('distribution', 'DC inventory')}
+      </div>
+    </section>`;
+}
+
+function _opsHeadline(n, label, tone) {
+  const color = tone === 'good' ? '#3a7a3a' : (n > 0 ? 'var(--ink)' : '#3a7a3a');
+  return `<div><span style="font-family:var(--serif);font-size:34px;line-height:1;color:${color};">${Number(n).toLocaleString()}</span>
+    <span style="font-family:var(--sans);font-size:13px;color:var(--ink-2);margin-left:6px;">${label}</span></div>`;
+}
+function _opsSub(html) {
+  return `<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:8px;line-height:1.7;">${html}</div>`;
+}
+function _opsErr(el, e) {
+  el.innerHTML = `<span style="font-family:var(--serif);font-style:italic;color:var(--ink-3);">Couldn't load — ${String((e && e.message) || e).slice(0, 80)}</span>`;
+}
+
+function _opsBriefingLoad(session) {
+  const shell = document.querySelector('.hl-ops-card');
+  if (!shell) return;
+  const sb = window.Auth.getClient();
+  const brandId = session.brandId;
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  document.querySelectorAll('.hl-ops-card').forEach(c => c.addEventListener('click', () => {
+    window.location.hash = '#' + c.dataset.opsnav;
+  }));
+
+  // ── Trucks to book (freight_approvals) ──
+  (async () => {
+    const el = document.getElementById('hl-ops-freight');
+    if (!el) return;
+    try {
+      const stats = await window.KeelCache.get('opsBrief:freight:' + brandId, async () => {
+        const { data, error } = await sb.from('freight_approvals').select('status').eq('brand_id', brandId);
+        if (error) throw error;
+        const c = { ready: 0, buyer: 0, hold: 0, change: 0 };
+        for (const r of (data || [])) {
+          if (r.status === 'approved' || r.status === 'buyer_approved') c.ready++;
+          else if (r.status === 'buyer') c.buyer++;
+          else if (r.status === 'hold') c.hold++;
+          else if (r.status === 'change') c.change++;
+        }
+        return c;
+      }, 5 * 60 * 1000);
+      el.innerHTML = _opsHeadline(stats.ready, stats.ready === 1 ? 'truck ready to book' : 'trucks ready to book')
+        + _opsSub(`${stats.buyer} awaiting buyer approval · ${stats.hold} on hold · ${stats.change} need changes`);
+    } catch (e) { _opsErr(el, e); }
+  })();
+
+  // ── Ingredients to order (mrp_ingredients + open POs) ──
+  (async () => {
+    const el = document.getElementById('hl-ops-mrp');
+    if (!el) return;
+    try {
+      const s = await window.KeelCache.get('opsBrief:mrp:' + brandId, async () => {
+        const [ingR, ordR] = await Promise.all([
+          sb.from('mrp_ingredients').select('ingredient, on_hand').eq('brand_id', brandId),
+          sb.from('mrp_orders').select('id, status').eq('brand_id', brandId),
+        ]);
+        if (ingR.error) throw ingR.error;
+        const out = (ingR.data || []).filter(i => (Number(i.on_hand) || 0) <= 0).map(i => i.ingredient);
+        const pos = ((ordR.data) || []).filter(o => o.status === 'on_order').length;
+        return { out, pos };
+      }, 5 * 60 * 1000);
+      const names = s.out.slice(0, 3).map(esc).join(', ') + (s.out.length > 3 ? ` +${s.out.length - 3} more` : '');
+      el.innerHTML = _opsHeadline(s.out.length, s.out.length === 1 ? 'ingredient out at plant' : 'ingredients out at plant')
+        + _opsSub(`${s.out.length ? names + '<br>' : ''}${s.pos} PO${s.pos === 1 ? '' : 's'} on order · full reorder grid in Planning`);
+    } catch (e) { _opsErr(el, e); }
+  })();
+
+  // ── Cases to produce (real Coverage pipeline, run headless) ──
+  // Reuses _prodLoad → _prodComputeForecast → _prodComputeRows, the exact math
+  // behind the Coverage tab's "Produce" column (_prodRenderBody no-ops here
+  // since #hl-prod-body doesn't exist on the dashboard). Both loaders have
+  // in-flight guards that return early, so we bounded-wait on the shared
+  // module state instead of assuming one awaited call completes it.
+  (async () => {
+    const el = document.getElementById('hl-ops-production');
+    if (!el) return;
+    try {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      if (!_prodLoaded && !_prodLoading) _prodLoad();
+      for (let i = 0; i < 40 && !(_prodLoaded && _prodFc); i++) {
+        if (_prodLoaded && !_prodFc && !_prodFcLoading) _prodComputeForecast();
+        await sleep(250);
+      }
+      if (!_prodLoaded) { _opsErr(el, _prodErr || new Error('inventory still loading')); return; }
+      const rows = _prodComputeRows();
+      const total = rows.reduce((s, r) => s + (r.produce || 0), 0);
+      if (!_prodFc) {
+        el.innerHTML = _opsHeadline(0, 'cases to produce')
+          + _opsSub('Demand forecast unavailable — open Production › Coverage to pick a scenario');
+        return;
+      }
+      const top = rows.filter(r => (r.produce || 0) > 0).sort((a, b) => b.produce - a.produce).slice(0, 3)
+        .map(r => `${esc(r.item)} — <b>${Math.round(r.produce).toLocaleString()}</b>`).join('<br>');
+      el.innerHTML = _opsHeadline(Math.round(total), 'cases to produce')
+        + _opsSub(top ? top + '<br>to reach target coverage' : 'All items at or above target coverage');
+    } catch (e) { _opsErr(el, e); }
+  })();
+
+  // ── Low inventory at distributor DCs ──
+  (async () => {
+    const el = document.getElementById('hl-ops-distribution');
+    if (!el) return;
+    try {
+      // Same cache key as the Distributor Inventory tab → shared, invalidated together
+      const uploads = await window.KeelCache.get('distInv:uploads:' + brandId, async () => {
+        const { data, error } = await sb.from('distributor_inventory_uploads')
+          .select('*').eq('brand_id', brandId).order('report_date', { ascending: false });
+        if (error) throw error;
+        return data || [];
+      }, 5 * 60 * 1000);
+      if (!uploads.length) { el.innerHTML = _opsHeadline(0, 'DCs flagged') + _opsSub('No inventory uploads yet'); return; }
+      // Latest snapshot per distributor (same convention as the snapshot view)
+      const latestByDist = new Map();
+      for (const u of uploads) {
+        const cur = latestByDist.get(u.distributor);
+        if (!cur || String(u.report_date) > String(cur.report_date)) latestByDist.set(u.distributor, u);
+      }
+      const ups = [...latestByDist.values()];
+      const ids = ups.map(u => u.id);
+      const distByUpload = new Map(ups.map(u => [u.id, u.distributor]));
+      const lines = await getInventoryLines(ids, 'dash:' + ids.slice().sort().join(','));
+      const byDc = new Map();   // "UNFI · Sarasota FL" → { low, out }
+      for (const l of lines) {
+        const vel = Number(l.avg_weekly_sales) || 0;
+        if (vel <= 0) continue;   // KeHE reports no velocity — can't assess
+        const oh = Number(l.qty_on_hand) || 0;
+        const wks = oh / vel;
+        if (wks >= _OPS_LOW_WEEKS) continue;
+        const key = (distByUpload.get(l.upload_id) || '?') + ' · ' + (l.dc_code || '(No DC)');
+        const b = byDc.get(key) || { low: 0, out: 0 };
+        b.low++; if (oh <= 0) b.out++;
+        byDc.set(key, b);
+      }
+      const totalLow = [...byDc.values()].reduce((s, b) => s + b.low, 0);
+      const top = [...byDc.entries()].sort((a, b) => b[1].low - a[1].low).slice(0, 4)
+        .map(([k, b]) => `${esc(k)} — <b>${b.low}</b> under ${_OPS_LOW_WEEKS} wks${b.out ? ` (${b.out} out)` : ''}`).join('<br>');
+      el.innerHTML = _opsHeadline(totalLow, `item-DC${totalLow === 1 ? '' : 's'} under ${_OPS_LOW_WEEKS} wks supply`)
+        + _opsSub(top || 'All DCs above threshold (UNFI velocity basis)');
+    } catch (e) { _opsErr(el, e); }
+  })();
+}
+
 // Extracted render so we can call it multiple times (initial + after data loads)
 function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, velocity, brand, liveTodos) {
 
@@ -8011,6 +8187,9 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
       ${pending.length} reviews awaiting decision
     </p>
 
+    <!-- ─── Ops briefing (ops + all departments) ─── -->
+    ${_opsBriefingHtml(session)}
+
     <!-- ─── 01 · To-Do (approval-driven) ─── -->
     ${todoSectionHtml()}
 
@@ -8101,6 +8280,10 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
       </div>
     </section>
   `;
+
+  // Fill the Ops briefing cards (no-op when the section isn't rendered);
+  // loads are KeelCache-backed so doRender re-runs are instant.
+  _opsBriefingLoad(session);
 
   // ─── Render decisions ───
   function renderDecisions(filter = 'all') {
