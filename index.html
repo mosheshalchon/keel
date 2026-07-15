@@ -4550,9 +4550,18 @@ window.Auth = (function() {
     })();
 
     if (!profile) {
-      // Profile still missing — sign them out so we don't render a half-broken app.
-      // (Await the grant first so the write still lands for their next login.)
+      // Profile still missing — normally sign out so we don't render a
+      // half-broken app. EXCEPTION: mid password-set (invite/recovery
+      // landing). Signing out there destroys the one-time link's session
+      // before the user can set a password, bricking the invite. Keep the
+      // auth session alive; profile creation is retried after the password
+      // is saved (refreshSession → buildCachedSession runs again).
       try { await grantPromise; } catch (e) {}
+      const _h = window.location.hash || '';
+      if (_h.includes('mode=setpw') || _h.includes('mode=recovery')) {
+        console.warn('No profile yet — deferring sign-out until password is set');
+        return null;
+      }
       console.warn('Signed-in user has no profile row, signing out');
       await client().auth.signOut();
       return null;
