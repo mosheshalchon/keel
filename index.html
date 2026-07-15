@@ -4645,14 +4645,20 @@ window.Auth = (function() {
             ? 'That sign-in link has expired or was already used. Ask for a fresh invite link and click it within the hour.'
             : 'There was a problem with that sign-in link. Please request a new one.';
           window.location.hash = '#login';
-        } else if (h.includes('access_token=') && (h.includes('type=magiclink') || h.includes('type=invite') || h.includes('type=signup'))) {
+        } else if (h.includes('access_token=') && (h.includes('type=magiclink') || h.includes('type=invite') || h.includes('type=signup') || h.includes('type=recovery'))) {
           const hp = new URLSearchParams(h.replace(/^#/, ''));
           const at = hp.get('access_token');
           const rt = hp.get('refresh_token');
+          const isRecovery = h.includes('type=recovery');
           if (at && rt) {
             await c.auth.setSession({ access_token: at, refresh_token: rt });
-            // Clean the tokens out of the URL and send them into the app.
-            window.location.hash = '#dashboard';
+            // Land on the "create your password" form rather than silently
+            // entering the app: invited users get a proper registration step,
+            // and recovery links (previously clobbered by the router before
+            // the tokens could be consumed) reach the reset form with a live
+            // session. The mode flag keeps dispatch() from bouncing this
+            // signed-in user off #login.
+            window.location.hash = isRecovery ? '#login?mode=recovery' : '#login?mode=setpw';
           }
         }
       } catch (e) { console.warn('Magic-link consume failed:', e); }
@@ -7410,10 +7416,10 @@ window.SpinsConverter = (function() {
     (function detectRecoveryHash() {
       try {
         const h = window.location.hash || '';
-        // Password-reset links land here and need the "set new password" UI.
-        // (Magic-link invites are consumed at boot and log the user straight in,
-        // so they never reach this login screen.)
-        if (h.includes('type=recovery')) {
+        // Post-consume landings from boot (invite → mode=setpw, password
+        // reset → mode=recovery) and, as a fallback, a raw recovery token
+        // hash — all get the "set your password" UI.
+        if (h.includes('mode=setpw') || h.includes('mode=recovery') || h.includes('type=recovery')) {
           mode = 'recovery';
         }
       } catch {}
@@ -48058,8 +48064,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       window.location.hash = '#login';
       return;
     }
-    // If already signed in and on #login, send to dashboard
-    if (session && route === 'login') {
+    // If already signed in and on #login, send to dashboard — unless they're
+    // mid password-set (invite/recovery landing), which needs the login page.
+    if (session && route === 'login'
+        && !window.location.hash.includes('mode=setpw')
+        && !window.location.hash.includes('mode=recovery')) {
       window.location.hash = '#dashboard';
       return;
     }
