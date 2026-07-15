@@ -45732,8 +45732,19 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     let rows = gq ? allRows.filter(r => (r.ing || '').toLowerCase().includes(gq)) : allRows;
     if (_mrpStatusFilter === 'stockout') rows = rows.filter(r => r.firstStockout >= 0);
     else if (_mrpStatusFilter === 'reorder') rows = rows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0);
+    else if (_mrpStatusFilter === 'ok') rows = rows.filter(r => r.firstStockout < 0 && r.firstBreach < 0);
+    // Sort: Stockout (red) first, then Reorder (orange), then OK (green);
+    // within each status by recommended-order VALUE (qty x avg cost) desc,
+    // tie-broken by on-hand value desc so greens have a sensible order too.
+    const _rankOf = (r) => r.firstStockout >= 0 ? 0 : (r.firstBreach >= 0 ? 1 : 2);
+    const _ovMap = new Map(rows.map(r => [r, ((_mrpRecOrder(r).qty || 0) * (r.avgCost || 0))]));
+    rows = rows.slice().sort((a, b) =>
+      _rankOf(a) - _rankOf(b)
+      || _ovMap.get(b) - _ovMap.get(a)
+      || (b.onHand * (b.avgCost || 0)) - (a.onHand * (a.avgCost || 0))
+      || String(a.ing).localeCompare(String(b.ing)));
     const cellVal = (r, v) => dollars ? (r.avgCost ? '$' + _mrpFmt(v * r.avgCost, 0) : '—') : _mrpFmt(v, 0);
-    const counts = { stockout: allRows.filter(r => r.firstStockout >= 0).length, reorder: allRows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length };
+    const counts = { stockout: allRows.filter(r => r.firstStockout >= 0).length, reorder: allRows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length, ok: allRows.filter(r => r.firstStockout < 0 && r.firstBreach < 0).length };
     const headWeeks = weeks.map(w => `<th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${_mrpWeekLabel(w)}</th>`).join('');
     const body = rows.map(r => {
       const status = r.firstStockout >= 0
@@ -45803,8 +45814,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         </div>
         <div style="display:flex;align-items:center;gap:10px;">
           <span style="font-family:var(--mono);font-size:12px;color:var(--ink-3);">${(gq || _mrpStatusFilter!=='all') ? rows.length + ' of ' + allRows.length : allRows.length} ingredients</span>
-          <button data-mrpstatusfilter="stockout" style="cursor:pointer;border:1px solid ${_mrpStatusFilter==='stockout'?'#a8381f':'transparent'};background:${_mrpStatusFilter==='stockout'?'#a8381f':'rgba(168,56,31,0.1)'};color:${_mrpStatusFilter==='stockout'?'#fff':'#a8381f'};font-family:var(--mono);font-size:12px;padding:4px 10px;border-radius:4px;">${counts.stockout} stockout</button>
-          <button data-mrpstatusfilter="reorder" style="cursor:pointer;border:1px solid ${_mrpStatusFilter==='reorder'?'#b8860b':'transparent'};background:${_mrpStatusFilter==='reorder'?'#b8860b':'rgba(184,134,11,0.12)'};color:${_mrpStatusFilter==='reorder'?'#fff':'#8a6410'};font-family:var(--mono);font-size:12px;padding:4px 10px;border-radius:4px;">${counts.reorder} reorder</button>
+          <select id="hl-mrp-statusfilter" style="padding:5px 8px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;color:${_mrpStatusFilter==='stockout'?'#a8381f':_mrpStatusFilter==='reorder'?'#8a6410':_mrpStatusFilter==='ok'?'#3d7a4e':'var(--ink-2)'};">
+            <option value="all" ${_mrpStatusFilter==='all'?'selected':''}>All statuses (${allRows.length})</option>
+            <option value="stockout" ${_mrpStatusFilter==='stockout'?'selected':''}>Stockout — order now (${counts.stockout})</option>
+            <option value="reorder" ${_mrpStatusFilter==='reorder'?'selected':''}>Reorder (${counts.reorder})</option>
+            <option value="ok" ${_mrpStatusFilter==='ok'?'selected':''}>OK (${counts.ok})</option>
+          </select>
         </div>
       </div>
       ${pendBanner}
@@ -46190,6 +46205,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     body.addEventListener('change', (e) => {
       const yi = e.target.closest('[data-yield-code]');
       if (yi) _mrpSaveYield(yi.dataset.yieldCode, yi.value);
+      if (e.target.id === 'hl-mrp-statusfilter') { _mrpStatusFilter = e.target.value || 'all'; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-grid-start')   { _mrpGridStart = e.target.value || null; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-grid-horizon') { _mrpGridHorizon = Number(e.target.value); _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-scenario')     { _mrpScenarioId = e.target.value; _mrpFcKey = null; _mrpRenderBody(); }
