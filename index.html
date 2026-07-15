@@ -44675,7 +44675,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   const _mrpEsc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const _mrpNorm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
-  let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes' || s === 'vendors') ? s : 'planning'; } catch (e) { return 'planning'; } })();            // 'planning' | 'recipes' | 'ingredients' | 'vendors'
+  let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes' || s === 'vendors' || s === 'costs') ? s : 'planning'; } catch (e) { return 'planning'; } })();            // 'planning' | 'recipes' | 'ingredients' | 'vendors'
   let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
   let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [];
   let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false, _mrpStatusFilter = 'all', _mrpVendors = [];
@@ -44807,6 +44807,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return;
     }
     if (!_mrpLoaded) { body.innerHTML = `<div class="hl-loading">Loading…</div>`; return; }
+    if (_mrpSubTab === 'costs') { _mrpRenderCostsTab(body); return; }
     body.innerHTML = _mrpSubTab === 'ingredients' ? _mrpIngredientsHtml()
                    : _mrpSubTab === 'planning'    ? _mrpGridHtml()
                    : _mrpSubTab === 'vendors'     ? _mrpVendorsHtml()
@@ -45074,6 +45075,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         : 'Sync ran but returned: ' + JSON.stringify(data);
       alert(msg);
       _mrpLoaded = false; _mrpFcKey = null;
+      clearMrpCostCache();   // sync also writes mrp_ingredient_cost_history
       await _mrpLoad();
     } catch (err) {
       alert('Sync failed: ' + (err && err.message ? err.message : String(err)) + '\n\nIf the function isn\'t deployed yet, deploy sync-mrp-onhand first.');
@@ -45712,6 +45714,236 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     _mrpVendors = _mrpVendors.filter(x => String(x.id) !== String(id)); _mrpRenderBody();
   }
 
+  // ─── Ingredient Costs tab ──────────────────────────────────────────────
+  // Monthly cost history from the IngredientsAvailable Dropbox file (Date /
+  // Item / Average Cost columns). The sync Edge Function upserts dated rows
+  // into mrp_ingredient_cost_history; this tab shows, per ingredient, the
+  // cost at the LAST snapshot date within each of the last 12 months, plus a
+  // trend chart. Filter = search + checkbox multi-select (empty = all).
+  let _mrpCostState = { sel: [], search: '' };
+  let _mrpCostChart = null;
+
+  function clearMrpCostCache() { try { window.KeelCache.invalidate(/^mrpCosts:/); } catch (e) {} }
+  window.clearMrpCostCache = clearMrpCostCache;
+
+  async function _mrpFetchCostHistory(brandId) {
+    return window.KeelCache.get('mrpCosts:' + brandId, async () => {
+      const sb = window.Auth.getClient();
+      const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 430);   // ~14 months back
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+      const res = await window.sbPageAll((from, to, withCount) =>
+        sb.from('mrp_ingredient_cost_history')
+          .select('snapshot_date, ingredient, location, avg_cost', withCount ? { count: 'exact' } : undefined)
+          .eq('brand_id', brandId).gte('snapshot_date', cutoffStr)
+          .order('id', { ascending: true }).range(from, to)
+      );
+      if (res.error) throw res.error;
+      return res.data || [];
+    }, 10 * 60 * 1000);
+  }
+
+  function _mrpCostMonthLabel(m) {   // '2025-08' → 'Aug 25'
+    const [y, mo] = m.split('-').map(Number);
+    return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][mo - 1] + ' ' + String(y).slice(2);
+  }
+  function _mrpCostFmt(v) { return v == null ? '—' : '$' + (v >= 1 ? v.toFixed(2) : v.toFixed(4)); }
+
+  // rows → { months: ['YYYY-MM' ×12], ingredients: [names], cell(ing, m) → cost|null }
+  // Per ingredient+month the cost is taken from the LATEST snapshot_date within
+  // that month (robust whether the file carries daily, month-start, or
+  // month-end dates); multiple locations on that date are averaged.
+  function _mrpCostPivot(rows) {
+    let maxMonth = null;
+    for (const r of rows) { const m = String(r.snapshot_date).slice(0, 7); if (!maxMonth || m > maxMonth) maxMonth = m; }
+    const anchor = maxMonth || new Date().toISOString().slice(0, 7);
+    const [ay, am] = anchor.split('-').map(Number);
+    const months = [];
+    for (let k = 11; k >= 0; k--) months.push(new Date(Date.UTC(ay, am - 1 - k, 1)).toISOString().slice(0, 7));
+    const byIngMonth = new Map();
+    for (const r of rows) {
+      const m = String(r.snapshot_date).slice(0, 7);
+      if (m < months[0] || m > months[11]) continue;
+      const cost = (r.avg_cost == null) ? null : Number(r.avg_cost);
+      if (cost == null || !isFinite(cost)) continue;
+      let mm = byIngMonth.get(r.ingredient);
+      if (!mm) { mm = new Map(); byIngMonth.set(r.ingredient, mm); }
+      const d = String(r.snapshot_date);
+      const cur = mm.get(m);
+      if (!cur || d > cur.date) mm.set(m, { date: d, sum: cost, n: 1 });
+      else if (d === cur.date) { cur.sum += cost; cur.n += 1; }
+    }
+    const ingredients = [...byIngMonth.keys()].sort((a, b) => a.localeCompare(b));
+    const cell = (ing, m) => { const mm = byIngMonth.get(ing); const c = mm && mm.get(m); return c ? c.sum / c.n : null; };
+    return { months, ingredients, cell };
+  }
+
+  const _MRP_COST_COLORS = ['#8a7320','#a8381f','#3a7a3a','#2f5d8a','#7a4b8a','#b8742a','#4a8a80','#8a2f55','#5d6b2f','#274156','#996633','#666666'];
+  const _MRP_COST_CHART_CAP = 12;
+
+  async function _mrpRenderCostsTab(body) {
+    body.innerHTML = `<div class="hl-loading">Loading cost history…</div>`;
+    const brandId = BrandLibrary.getSession().brandId;
+    let rows;
+    try {
+      rows = await _mrpFetchCostHistory(brandId);
+    } catch (err) {
+      const missing = /relation .* does not exist|could not find the table|schema cache/i.test(err.message || '');
+      body.innerHTML = `<div style="padding:24px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;">
+        <div style="font-family:var(--serif);font-size:18px;margin-bottom:6px;">Couldn't load cost history.</div>
+        <div style="font-family:var(--serif);color:var(--ink-3);font-size:15px;">${missing
+          ? 'The <b>mrp_ingredient_cost_history</b> table isn\u2019t there yet — run the SQL for this tab in Supabase, then reload.'
+          : _mrpEsc(err.message || String(err))}</div></div>`;
+      return;
+    }
+    if (!rows.length) {
+      body.innerHTML = `<div style="text-align:center;padding:48px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
+        No cost history yet. Run <strong>↻ Sync from Dropbox</strong> on the Ingredients tab once the sync function has been updated to record history — the file\u2019s dated rows backfill past months automatically.
+      </div>`;
+      return;
+    }
+    const piv = _mrpCostPivot(rows);
+
+    body.innerHTML = `
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;">Ingredients:</span>
+        <div id="hl-mrpcost-ms" style="position:relative;display:inline-block;">
+          <button type="button" id="hl-mrpcost-ms-btn" style="padding:5px 10px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;min-width:160px;max-width:280px;text-align:left;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+            <span id="hl-mrpcost-ms-summary" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+            <span style="color:var(--ink-3);">▾</span>
+          </button>
+          <div id="hl-mrpcost-ms-panel" style="display:none;position:absolute;top:100%;left:0;z-index:50;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.12);min-width:280px;">
+            <div style="padding:8px 10px;border-bottom:1px solid var(--rule-soft);">
+              <input type="text" id="hl-mrpcost-ms-search" placeholder="Search ingredients…" style="width:100%;padding:5px 8px;font-family:var(--sans);font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;box-sizing:border-box;" />
+            </div>
+            <div style="padding:6px 10px;border-bottom:1px solid var(--rule-soft);display:flex;gap:12px;">
+              <button type="button" id="hl-mrpcost-ms-all" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select visible</button>
+              <button type="button" id="hl-mrpcost-ms-none" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;padding:0;">Clear</button>
+            </div>
+            <div id="hl-mrpcost-ms-opts" style="max-height:280px;overflow-y:auto;"></div>
+          </div>
+        </div>
+        <span id="hl-mrpcost-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
+      </div>
+      <div style="background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;padding:16px;margin-bottom:16px;">
+        <div id="hl-mrpcost-chart-note" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px;"></div>
+        <div style="position:relative;height:300px;"><canvas id="hl-mrpcost-chart"></canvas></div>
+      </div>
+      <div id="hl-mrpcost-grid" style="overflow-x:auto;"></div>
+    `;
+
+    const msBtn = document.getElementById('hl-mrpcost-ms-btn');
+    const msPanel = document.getElementById('hl-mrpcost-ms-panel');
+    const msOpts = document.getElementById('hl-mrpcost-ms-opts');
+    const msSearch = document.getElementById('hl-mrpcost-ms-search');
+
+    const visibleOptions = () => {
+      const q = (_mrpCostState.search || '').toLowerCase();
+      return q ? piv.ingredients.filter(i => i.toLowerCase().includes(q)) : piv.ingredients;
+    };
+    const applied = () => _mrpCostState.sel.length ? piv.ingredients.filter(i => _mrpCostState.sel.includes(i)) : piv.ingredients;
+
+    const renderOptions = () => {
+      const sel = new Set(_mrpCostState.sel);
+      msOpts.innerHTML = visibleOptions().map(o => `
+        <label style="display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;font-family:var(--sans);font-size:13px;white-space:nowrap;">
+          <input type="checkbox" data-costval="${_mrpEsc(o)}" ${sel.has(o) ? 'checked' : ''} style="cursor:pointer;"> ${_mrpEsc(o)}
+        </label>`).join('') || `<div style="padding:10px;font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No matches.</div>`;
+      msOpts.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', () => {
+        const v = cb.dataset.costval;
+        if (cb.checked) { if (!_mrpCostState.sel.includes(v)) _mrpCostState.sel.push(v); }
+        else _mrpCostState.sel = _mrpCostState.sel.filter(x => x !== v);
+        updateView();
+      }));
+    };
+
+    const updateSummary = () => {
+      const n = _mrpCostState.sel.length;
+      document.getElementById('hl-mrpcost-ms-summary').textContent =
+        n === 0 ? 'All ingredients' : n === 1 ? _mrpCostState.sel[0] : `${n} selected`;
+      document.getElementById('hl-mrpcost-count').textContent = `${applied().length} of ${piv.ingredients.length} ingredients`;
+    };
+
+    const renderGrid = () => {
+      const list = applied();
+      const head = piv.months.map(m => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);">${_mrpCostMonthLabel(m)}</th>`).join('');
+      const trs = list.map(ing => {
+        const vals = piv.months.map(m => piv.cell(ing, m));
+        const nonNull = vals.filter(v => v != null);
+        let delta = '';
+        if (nonNull.length >= 2 && nonNull[0] > 0) {
+          const pct = (nonNull[nonNull.length - 1] - nonNull[0]) / nonNull[0] * 100;
+          const col = pct > 0.5 ? '#a8381f' : pct < -0.5 ? '#3a7a3a' : 'var(--ink-3)';
+          delta = `<span style="color:${col};">${pct > 0 ? '+' : ''}${pct.toFixed(1)}%</span>`;
+        }
+        const tds = vals.map(v => `<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;white-space:nowrap;">${_mrpCostFmt(v)}</td>`).join('');
+        return `<tr style="border-bottom:1px solid var(--rule-soft);">
+          <td style="padding:7px 10px;font-family:var(--sans);font-size:13px;white-space:nowrap;position:sticky;left:0;background:var(--paper);">${_mrpEsc(ing)}</td>
+          ${tds}
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;white-space:nowrap;">${delta}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('hl-mrpcost-grid').innerHTML = `
+        <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+          <thead><tr>
+            <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule-soft);position:sticky;left:0;background:var(--paper);">Ingredient</th>
+            ${head}
+            <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule-soft);" title="Change from the earliest to the latest month with a cost in this window">Δ 12mo</th>
+          </tr></thead><tbody>${trs}</tbody></table>`;
+    };
+
+    const renderChart = () => {
+      const note = document.getElementById('hl-mrpcost-chart-note');
+      const canvas = document.getElementById('hl-mrpcost-chart');
+      if (_mrpCostChart) { try { _mrpCostChart.destroy(); } catch (e) {} _mrpCostChart = null; }
+      if (typeof Chart === 'undefined') { note.textContent = 'Chart library not loaded — refresh the page.'; return; }
+      const list = applied();
+      const plotted = list.slice(0, _MRP_COST_CHART_CAP);
+      note.textContent = list.length > _MRP_COST_CHART_CAP
+        ? `Cost trend — showing first ${_MRP_COST_CHART_CAP} of ${list.length}; narrow the selection to chart others`
+        : `Cost trend — ${plotted.length} ingredient${plotted.length === 1 ? '' : 's'}`;
+      const datasets = plotted.map((ing, i) => ({
+        label: ing,
+        data: piv.months.map(m => piv.cell(ing, m)),
+        borderColor: _MRP_COST_COLORS[i % _MRP_COST_COLORS.length],
+        backgroundColor: _MRP_COST_COLORS[i % _MRP_COST_COLORS.length],
+        spanGaps: true, tension: 0.2, pointRadius: 2.5, borderWidth: 2,
+      }));
+      _mrpCostChart = new Chart(canvas.getContext('2d'), {
+        type: 'line',
+        data: { labels: piv.months.map(_mrpCostMonthLabel), datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          interaction: { mode: 'nearest', intersect: false },
+          plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } },
+            tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${_mrpCostFmt(c.parsed.y)}` } } },
+          scales: { y: { ticks: { callback: (v) => _mrpCostFmt(Number(v)) } } },
+        },
+      });
+    };
+
+    const updateView = () => { updateSummary(); renderGrid(); renderChart(); };
+
+    msBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      msPanel.style.display = msPanel.style.display === 'block' ? 'none' : 'block';
+      if (msPanel.style.display === 'block') msSearch.focus();
+    });
+    msPanel.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => { msPanel.style.display = 'none'; });
+    msSearch.addEventListener('input', () => { _mrpCostState.search = msSearch.value; renderOptions(); });
+    document.getElementById('hl-mrpcost-ms-all').addEventListener('click', () => {
+      for (const o of visibleOptions()) if (!_mrpCostState.sel.includes(o)) _mrpCostState.sel.push(o);
+      renderOptions(); updateView();
+    });
+    document.getElementById('hl-mrpcost-ms-none').addEventListener('click', () => {
+      _mrpCostState.sel = [];
+      renderOptions(); updateView();
+    });
+
+    renderOptions();
+    updateView();
+  }
+
   function renderMrpPage() {
     const session = HL.mountPage('mrp');
     if (!session) return;
@@ -45726,7 +45958,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         </div>
       </div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:18px 0 0;">
-        ${tab('planning','Planning')}${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}${tab('vendors','Vendors')}
+        ${tab('planning','Planning')}${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}${tab('vendors','Vendors')}${tab('costs','Ingredient Costs')}
       </div>
       <div id="hl-mrp-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
     `;
