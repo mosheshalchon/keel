@@ -30841,6 +30841,10 @@ render();
     //
     // Grouped by buyer so a single email per buyer can cover all their problematic items.
     function renderLowStockSection(filteredLines, onlyHP = false) {
+      // Distributor per line: lines carry upload_id; the distributor name
+      // lives on the upload row (uploads is in closure from renderDistInventoryUI).
+      const _distByUpload = new Map((uploads || []).map(u => [u.id, u.distributor]));
+      const _distOf = (l) => _distByUpload.get(l.upload_id) || '—';
       const fmtDec = (n) => n == null || !isFinite(n) ? '—' : Number(n).toFixed(1);
       const fmtNum = (n) => n == null || !isFinite(n) ? '—' : Math.round(n).toLocaleString();
       const escLocal = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -30875,6 +30879,7 @@ render();
         // High Inventory: completely separate flow
         if (sumWks > 20) {
           highInvCandidates.push({
+            distributor: _distOf(l),
             buyer: (l.buyer_name || '(no buyer)').trim() || '(no buyer)',
             item_description: l.item_description,
             unit_upc: l.unit_upc,
@@ -30895,6 +30900,7 @@ render();
         else if (wOH < 4 && sumWks < 7) status = 'watch';
         if (!status) continue;
         candidates.push({
+          distributor: _distOf(l),
           buyer: (l.buyer_name || '(no buyer)').trim() || '(no buyer)',
           item_description: l.item_description,
           unit_upc: l.unit_upc,
@@ -30924,6 +30930,7 @@ render();
         unit_upc: c.unit_upc || '',
         category: c.category || '',
         product_line: c.product_line || '',
+        distributor: c.distributor || '',
         dc_code: c.dc_code,
         division_code: c.division_code,
         qty_on_hand: c.qty_on_hand,
@@ -30953,6 +30960,7 @@ render();
             <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">
               ${escLocal(c.category || '—')}${c.product_line ? ' / ' + escLocal(c.product_line) : ''}
             </td>
+            <td style="padding:6px 10px;font-family:var(--mono);font-size:11px;">${escLocal(c.distributor || '—')}</td>
             <td style="padding:6px 10px;font-family:var(--mono);font-size:11px;">${escLocal(c.dc_code)}${c.division_code ? ' · ' + escLocal(c.division_code) : ''}</td>
             <td style="padding:6px 10px;font-size:11px;">${escLocal(c.buyer)}</td>
             <td style="padding:6px 10px;text-align:right;font-family:var(--mono);">${fmtNum(c.qty_on_hand)}</td>
@@ -30982,6 +30990,7 @@ render();
                     <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Status</th>
                     <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Item</th>
                     <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Cat / Line</th>
+                    <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Distributor</th>
                     <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">DC</th>
                     <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Buyer</th>
                     <th style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">OH</th>
@@ -31052,6 +31061,7 @@ render();
           <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">
             ${escLocal(c.category || '—')}${c.product_line ? ' / ' + escLocal(c.product_line) : ''}
           </td>
+          <td style="padding:6px 10px;font-family:var(--mono);font-size:11px;">${escLocal(c.distributor || '—')}</td>
           <td style="padding:6px 10px;font-family:var(--mono);font-size:11px;">${escLocal(c.dc_code)}${c.division_code ? ' · ' + escLocal(c.division_code) : ''}</td>
           <td style="padding:6px 10px;text-align:right;font-family:var(--mono);">${fmtNum(c.qty_on_hand)}</td>
           <td style="padding:6px 10px;text-align:right;font-family:var(--mono);">${fmtNum(c.qty_on_order)}</td>
@@ -31082,6 +31092,7 @@ render();
                   <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Status</th>
                   <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Item</th>
                   <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Cat / Line</th>
+                  <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Distributor</th>
                   <th style="text-align:left;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">DC</th>
                   <th style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">OH</th>
                   <th style="text-align:right;padding:8px 10px;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">OO</th>
@@ -31276,7 +31287,7 @@ render();
     }
     const detailHeader = [
       'Buyer', 'Status', 'Item Description', 'UPC', 'Category', 'Product Line',
-      'DC', 'Division',
+      'Distributor', 'DC', 'Division',
       'Qty on Hand', 'Qty on Order', 'Total Qty',
       'Avg Wkly Sales', 'Wks OH', 'Wks OO', 'Total Weeks',
     ];
@@ -31287,6 +31298,7 @@ render();
       r.unit_upc,
       r.category,
       r.product_line,
+      r.distributor,
       r.dc_code,
       r.division_code,
       r.qty_on_hand,
@@ -31334,7 +31346,7 @@ render();
     }
     const header = [
       'Buyer', 'Item Description', 'UPC', 'Category', 'Product Line',
-      'DC', 'Division',
+      'Distributor', 'DC', 'Division',
       'Qty on Hand', 'Qty on Order', 'Total Qty',
       'Avg Wkly Sales', 'Wks OH', 'Wks OO', 'Total Weeks',
     ];
@@ -31344,6 +31356,7 @@ render();
       r.unit_upc || '',
       r.category || '',
       r.product_line || '',
+      r.distributor || '',
       r.dc_code,
       r.division_code,
       r.qty_on_hand,
