@@ -45573,7 +45573,22 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const expanded = _mrpIngExpanded.has(norm);
       const moqRef = sup ? (sup.order_qty || sup.supply_levels || '') : '';
 
-      const detailCells = `
+      const costUnit = i.avg_cost != null ? ((Number(i.avg_cost) || 0) / (Number(i.cost_pack_size) || 1)) : null;
+      const supCell = (v, extra) => `<td style="padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${extra || ''}" title="${_mrpEsc(v || '')}">${_mrpEsc(v || '—')}</td>`;
+      const supplierCells = `
+        ${supCell(sup?.supplier)}
+        ${supCell(sup?.lead_time)}
+        ${supCell(sup?.order_cadence)}
+        ${supCell(sup?.delivery_dates)}
+        ${supCell(moqRef)}
+        ${supCell(sup?.order_multiples)}
+        ${supCell(sup?.supply_levels)}
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${i.avg_cost != null ? '$' + _mrpFmt(i.avg_cost, 2) : '—'}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${i.cost_pack_size != null ? _mrpFmt(i.cost_pack_size, 0) : '—'}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${costUnit != null ? '$' + _mrpFmt(costUnit, 4) : '—'}</td>
+        ${supCell(sup?.notes)}`;
+      const main = `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;"><span data-ingexp="${_mrpEsc(norm)}" style="cursor:pointer;color:var(--ink-3);margin-right:6px;">${expanded ? '▾' : '▸'}</span>${_mrpEsc(i.ingredient)}</td>
         <td style="padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_mrpEsc(i.uom || '')}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${num(oh, 0)}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${onOrder ? num(onOrder, 0) : '—'}</td>
@@ -45585,13 +45600,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'target_hold_weeks', target)}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${targetOrder != null ? num(targetOrder, 1) : '—'}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'moq_base', moqBase)}</td>
-        <td data-ingcalc="moq" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${moqWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}">${moqWeeks != null ? num(moqWeeks, 1) : '—'}</td>`;
-      const main = `<tr style="border-top:1px solid var(--rule-soft);">
-        <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;"><span data-ingexp="${_mrpEsc(norm)}" style="cursor:pointer;color:var(--ink-3);margin-right:6px;">${expanded ? '▾' : '▸'}</span>${_mrpEsc(i.ingredient)}</td>
+        <td data-ingcalc="moq" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${moqWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}">${moqWeeks != null ? num(moqWeeks, 1) : '—'}</td>
         <td style="padding:7px 8px;white-space:nowrap;">${flag}${conflict ? ' ' + conflict : ''}</td>
-        ${_mrpIngColsExpanded ? detailCells : ''}
+        ${_mrpIngColsExpanded ? supplierCells : ''}
       </tr>`;
-      const detail = expanded ? `<tr style="background:#faf6ef;"><td colspan="${_mrpIngColsExpanded ? 14 : 2}" style="padding:10px 16px 14px 32px;">
+      const detail = expanded ? `<tr style="background:#faf6ef;"><td colspan="${_mrpIngColsExpanded ? 25 : 14}" style="padding:10px 16px 14px 32px;">
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px 24px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">
           <div><span style="text-transform:uppercase;font-size:9px;">Supplier</span><br><span style="font-family:var(--serif);font-size:13px;color:var(--ink);">${_mrpEsc(sup?.supplier || '—')}</span></div>
           <div><span style="text-transform:uppercase;font-size:9px;">Lead time (text)</span><br>${_mrpEsc(sup?.lead_time || '—')}</div>
@@ -45608,17 +45621,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return main + detail;
     }).join('');
 
-    const detailHeads = ['UOM', 'On hand', 'On order', 'Total', 'Wkly demand', 'OH+OR (wks)', 'Shelf (wks)', 'Lead (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)'];
-    const heads = _mrpIngColsExpanded ? ['Ingredient', 'Flag', ...detailHeads] : ['Ingredient', 'Flag'];
-    const rightCols = new Set([3,4,5,6,7,8,9,10,11,12,13]);   // detail numerics (UOM at 2 stays left)
-    const colsToggle = `<button data-mrpcolstoggle="1" title="${_mrpIngColsExpanded ? 'Hide the parameter columns' : 'Show on hand, demand, lead, MOQ and other parameter columns'}" style="margin-left:8px;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--accent,#8a7320);cursor:pointer;text-transform:uppercase;">${_mrpIngColsExpanded ? '◂ Hide details' : 'Details ▸'}</button>`;
+    const supplierHeads = ['Supplier', 'Lead (text)', 'Cadence', 'Delivery dates', 'MOQ / order qty', 'Multiples', 'Supply levels', 'Avg cost', 'Pack size', 'Cost / unit', 'Notes'];
+    const heads = ['Ingredient', 'UOM', 'On hand', 'On order', 'Total', 'Wkly demand', 'OH+OR (wks)', 'Shelf (wks)', 'Lead (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)', 'Flag', ...(_mrpIngColsExpanded ? supplierHeads : [])];
+    const rightCols = new Set([2,3,4,5,6,7,8,9,10,11,12,21,22,23]);   // original numerics + Avg cost / Pack size / Cost per unit
+    const colsToggle = `<button data-mrpcolstoggle="1" title="${_mrpIngColsExpanded ? 'Hide the supplier columns' : 'Show supplier terms (supplier, cadence, MOQ, costs, notes) as columns'}" style="margin-left:8px;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--accent,#8a7320);cursor:pointer;text-transform:uppercase;">${_mrpIngColsExpanded ? '◂ Hide supplier' : 'Supplier ▸'}</button>`;
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
         <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
         <button id="hl-mrp-sync" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:8px 14px;cursor:pointer;border-radius:6px;color:var(--ink-3);white-space:nowrap;">↻ Sync on-hand</button>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · demand from ${srcLabel}</div>
       </div>
-      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;${_mrpIngColsExpanded ? 'min-width:1100px;' : ''}">
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;min-width:1100px;">
         <thead><tr>${heads.map((h,idx)=>`<th style="padding:8px 8px;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;text-align:${rightCols.has(idx)?'right':'left'};white-space:nowrap;">${h}${h === 'Flag' ? colsToggle : ''}</th>`).join('')}</tr></thead>
         <tbody>${rows || `<tr><td colspan="${heads.length}" style="padding:24px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No matches.</td></tr>`}</tbody>
       </table></div>
