@@ -30589,6 +30589,7 @@ render();
     let groupBy = 'product_line';
     let onlyHighPriority = false;
     let _lowStockExportData = [];
+    let _lowStockEmailGroups = [];
     let _highInvExportData = [];
     // Avail multi-select state. Starts pre-populated with the four "active" codes (A, IN, MO, NA).
     // User can check/uncheck individual codes to include/exclude them. If nothing in the file has
@@ -30820,6 +30821,9 @@ render();
           exportLowStockToExcel(_lowStockExportData, selectedUpload);
         });
       }
+      document.querySelectorAll('.hl-ls-emailbuyer').forEach(b => b.addEventListener('click', () => {
+        emailBuyerLowStock(_lowStockEmailGroups[parseInt(b.dataset.lsb, 10)], selectedUpload);
+      }));
       // Wire the high-inventory export button (only present when there are HI candidates)
       const hiExportBtn = document.getElementById('hl-dist-highinv-export');
       if (hiExportBtn) {
@@ -31073,7 +31077,8 @@ render();
         </tr>
       `;
 
-      const buyerSectionsHtml = sortedBuyers.map(([buyer, items]) => {
+      _lowStockEmailGroups = sortedBuyers.map(([buyer, items]) => ({ buyer, items }));
+      const buyerSectionsHtml = sortedBuyers.map(([buyer, items], _bi) => {
         const buyerHP = items.filter(x => x.isHP).length;
         return `
           <div style="margin-top:14px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:4px;overflow:hidden;">
@@ -31084,6 +31089,7 @@ render();
               <div style="display:flex;gap:14px;align-items:center;">
                 <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);letter-spacing:0.04em;">${items.length} line${items.length === 1 ? '' : 's'} flagged</span>
                 ${buyerHP > 0 ? `<span style="font-family:var(--mono);font-size:10px;color:var(--lost);font-weight:600;letter-spacing:0.04em;">${buyerHP} HIGH PRIORITY</span>` : ''}
+                <button class="hl-ls-emailbuyer" data-lsb="${_bi}" title="Email this buyer their low-stock lines (downloads their Excel + opens a prefilled email)" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border:1px solid #7c3aed;border-radius:4px;background:transparent;cursor:pointer;color:#7c3aed;letter-spacing:0.04em;text-transform:uppercase;">✉ Email buyer</button>
               </div>
             </div>
             <table style="width:100%;border-collapse:collapse;font-size:12px;">
@@ -31280,6 +31286,92 @@ render();
   // Produces a .xlsx file with one row per (buyer × item × DC) flagged. Includes Wks OH and Wks OO
   // straight from the file (not derived). Buyer is the grouping field so users can quickly filter
   // to one buyer when composing an email.
+  // ─── Email a buyer their low-stock lines ─────────────────────────────────
+  // Same mechanism as the Freight buyer/quote emails (mailto: compose window —
+  // browsers can't attach files to mailto, so the per-buyer Excel downloads in
+  // the same click and the email body says to attach it). Address resolution,
+  // in order: Freight › Customers contact whose name matches the buyer → any
+  // contact on one of the buyer's DCs → manual prompt.
+  async function emailBuyerLowStock(group, selectedUpload) {
+    if (!group || !group.items || !group.items.length) return;
+    const brandId = window.BrandLibrary?.getSession()?.brandId;
+    const normKey = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    let contacts = [];
+    try {
+      contacts = await window.KeelCache.get('frCustContacts:' + brandId, async () => {
+        const { data, error } = await window.Auth.getClient()
+          .from('freight_customers')
+          .select('customer, dc_name, contact_name, contact_email')
+          .eq('brand_id', brandId);
+        if (error) throw error;
+        return data || [];
+      }, 10 * 60 * 1000);
+    } catch (e) { console.warn('[LowStockEmail] contacts fetch failed:', e); }
+
+    const bKey = normKey(group.buyer);
+    const dcKeys = new Set(group.items.map(i => normKey(i.dc_code)));
+    const emails = new Set();
+    if (bKey && bKey !== 'nobuyer') {
+      for (const c of contacts) {
+        const nKey = normKey(c.contact_name);
+        if (!c.contact_email || !nKey) continue;
+        if (nKey === bKey || nKey.includes(bKey) || bKey.includes(nKey)) emails.add(c.contact_email);
+      }
+    }
+    if (!emails.size) {
+      for (const c of contacts) {
+        if (!c.contact_email || !c.dc_name) continue;
+        if (dcKeys.has(normKey(c.dc_name))) emails.add(c.contact_email);
+      }
+    }
+    let to = [...emails].join(',');
+    if (!to) {
+      const entered = prompt(`No contact found for "${group.buyer}" in Freight › Customers.\nEnter their email address (or leave blank to fill it in manually):`, '');
+      if (entered === null) return;   // cancelled
+      to = entered || '';
+    }
+
+    // Per-buyer Excel — downloads now; the user drags it into the compose window.
+    const exportRows = group.items.map(c => ({
+      buyer: c.buyer, status: c.isHP ? 'HIGH PRIORITY' : 'WATCH',
+      item_description: c.item_description, unit_upc: c.unit_upc || '',
+      category: c.category || '', product_line: c.product_line || '',
+      distributor: c.distributor || '', dc_code: c.dc_code, division_code: c.division_code,
+      qty_on_hand: c.qty_on_hand, qty_on_order: c.qty_on_order,
+      total_qty: c.qty_on_hand + c.qty_on_order, avg_weekly_sales: c.avg_weekly_sales,
+      weeks_on_hand: c.weeks_on_hand, weeks_on_order: c.weeks_on_order, total_weeks: c.total_weeks,
+    }));
+    const safeBuyer = String(group.buyer).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'buyer';
+    const reportDate = selectedUpload?.report_date || new Date().toISOString().slice(0, 10);
+    const fname = `low-stock_${safeBuyer}_${reportDate}.xlsx`;
+    try { exportLowStockToExcel(exportRows, { distributor: safeBuyer, report_date: reportDate }); }
+    catch (e) { console.warn('[LowStockEmail] export failed:', e); }
+
+    const nice = (s) => String(s || '').toLowerCase().replace(/\b\w/g, ch => ch.toUpperCase());
+    const dists = [...new Set(group.items.map(i => i.distributor).filter(Boolean))].join(' / ') || 'distributor';
+    const hp = group.items.filter(i => i.isHP).length;
+    const fmt1 = (n) => (n == null || !isFinite(n)) ? '0.0' : Number(n).toFixed(1);
+    const lines = group.items.map(i =>
+      `  - ${i.item_description}${i.unit_upc ? ' (' + i.unit_upc + ')' : ''} @ ${i.dc_code}: ${Math.round(i.qty_on_hand)} OH / ${Math.round(i.qty_on_order)} OO -> ${fmt1(i.total_weeks)} wks total${i.isHP ? '  [HIGH PRIORITY]' : ''}`);
+    const bodyArr = [
+      group.buyer === '(no buyer)' ? 'Hello,' : `Hello ${nice(group.buyer)},`,
+      '',
+      `Flagging low stock on our items at your ${dists} DCs (as of ${reportDate}) — ${group.items.length} line${group.items.length === 1 ? '' : 's'}${hp ? `, ${hp} high priority` : ''}:`,
+      '',
+      ...lines,
+      '',
+      `Full detail is in the attached file (${fname} — it just downloaded on my end, attaching here).`,
+      '',
+      'Could you review and place replenishment orders where needed?',
+      '',
+      'Thank you!',
+    ];
+    const subject = `Low stock — ${dists} — ${group.items.length} item${group.items.length === 1 ? '' : 's'} (as of ${reportDate})`;
+    setTimeout(() => {
+      window.location.href = `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(bodyArr.join('\n'))}`;
+    }, 400);
+  }
+
   function exportLowStockToExcel(rows, upload) {
     if (!rows || rows.length === 0) {
       alert('No low-stock items to export.');
