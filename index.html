@@ -39970,6 +39970,303 @@ render();
     const m2 = document.getElementById('hl-cw-pmore'); if (m2) m2.addEventListener('click', () => { _cdState.periods += (_cdState.grain === 'month' ? 6 : 8); _cwRender(); });
   }
 
+  // ─── Kroger weekly sales (84.51/Stratum export) ─────────────────────────
+  // File shape: items as rows; (PD Month, Week) blocks across columns with 14
+  // metrics repeating per block. Row 0 = "PD 1…PD 13" (forward-filled),
+  // row 1 = fiscal week 1–52 (forward-filled), row 2 = metric names,
+  // rows 3+ = "UPC - DESC" + values. Stored long: one row per
+  // (fiscal_year, week, upc) with the 14 metrics as columns. The view shows
+  // weeks as ROWS and the 14 metrics as columns, per Moshe's spec.
+  const _KR_METRICS = {
+    'ty revenue': 'ty_revenue', 'ly revenue': 'ly_revenue',
+    'ty units': 'ty_units', 'ly units': 'ly_units',
+    'ty arp': 'ty_arp', 'ly arp': 'ly_arp',
+    'ty $/s/w (pog)': 'ty_dsw_pog', 'ly $/s/w (pog)': 'ly_dsw_pog',
+    'ty u/s/w (pog)': 'ty_usw_pog', 'ly u/s/w (pog)': 'ly_usw_pog',
+    'ty $/s/w (ss)': 'ty_dsw_ss', 'ly $/s/w (ss)': 'ly_dsw_ss',
+    'ty u/s/w (ss)': 'ty_usw_ss', 'ly u/s/w (ss)': 'ly_usw_ss',
+  };
+  // Display order + formatting (matches the file's column order)
+  const _KR_COLS = [
+    { key: 'ty_revenue', label: 'TY Revenue', fmt: 'usd0', agg: 'sum' },
+    { key: 'ly_revenue', label: 'LY Revenue', fmt: 'usd0', agg: 'sum' },
+    { key: 'ty_units',   label: 'TY Units',   fmt: 'int',  agg: 'sum' },
+    { key: 'ly_units',   label: 'LY Units',   fmt: 'int',  agg: 'sum' },
+    { key: 'ty_arp',     label: 'TY ARP',     fmt: 'usd2', agg: 'arp_ty' },
+    { key: 'ly_arp',     label: 'LY ARP',     fmt: 'usd2', agg: 'arp_ly' },
+    { key: 'ty_dsw_pog', label: 'TY $/S/W (POG)', fmt: 'usd2', agg: 'wavg_ty' },
+    { key: 'ly_dsw_pog', label: 'LY $/S/W (POG)', fmt: 'usd2', agg: 'wavg_ly' },
+    { key: 'ty_usw_pog', label: 'TY U/S/W (POG)', fmt: 'num2', agg: 'wavg_ty' },
+    { key: 'ly_usw_pog', label: 'LY U/S/W (POG)', fmt: 'num2', agg: 'wavg_ly' },
+    { key: 'ty_dsw_ss',  label: 'TY $/S/W (SS)',  fmt: 'usd2', agg: 'wavg_ty' },
+    { key: 'ly_dsw_ss',  label: 'LY $/S/W (SS)',  fmt: 'usd2', agg: 'wavg_ly' },
+    { key: 'ty_usw_ss',  label: 'TY U/S/W (SS)',  fmt: 'num2', agg: 'wavg_ty' },
+    { key: 'ly_usw_ss',  label: 'LY U/S/W (SS)',  fmt: 'num2', agg: 'wavg_ly' },
+  ];
+  let _krState = { year: null, sel: [], search: '' };
+
+  function clearKrogerCache() { try { window.KeelCache.invalidate(/^krSales:/); } catch (e) {} }
+  window.clearKrogerCache = clearKrogerCache;
+
+  async function handleKrogerSalesUpload(file, brandId, sb, fiscalYear, onProgress) {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+    if (aoa.length < 4) throw new Error('File too short — expected PD Month / Week / metric header rows plus data');
+    const [r0, r1, r2] = aoa;
+    // Column map with forward-filled period + week (merged header cells arrive
+    // as value-then-nulls).
+    let lastP = null, lastW = null;
+    const colmap = [];
+    for (let c = 1; c < r2.length; c++) {
+      const pRaw = r0 ? r0[c] : null, wRaw = r1 ? r1[c] : null;
+      if (pRaw != null && String(pRaw).trim() !== '') { const m = String(pRaw).match(/(\d+)/); if (m) lastP = parseInt(m[1], 10); }
+      if (wRaw != null && String(wRaw).trim() !== '') { const n = parseInt(wRaw, 10); if (!isNaN(n)) lastW = n; }
+      const met = _KR_METRICS[String(r2[c] || '').trim().toLowerCase()];
+      if (met && lastP != null && lastW != null) colmap.push({ c, p: lastP, w: lastW, met });
+    }
+    if (!colmap.length) throw new Error('No recognizable metric columns (expected TY Revenue, LY Units, TY $/S/W (POG), …)');
+    const byKey = new Map();
+    for (let ri = 3; ri < aoa.length; ri++) {
+      const label = String((aoa[ri] || [])[0] || '').trim();
+      if (!label || /^total/i.test(label)) continue;
+      const dash = label.indexOf(' - ');
+      const upc = ((dash > 0 ? label.slice(0, dash) : label).replace(/[^0-9]/g, '')) || label;
+      const desc = dash > 0 ? label.slice(dash + 3).trim() : '';
+      for (const cm of colmap) {
+        const v = aoa[ri][cm.c];
+        if (v == null || v === '') continue;
+        const num = Number(v);
+        if (isNaN(num)) continue;
+        const key = upc + '|' + cm.w;
+        let rec = byKey.get(key);
+        if (!rec) { rec = { brand_id: brandId, fiscal_year: fiscalYear, period: cm.p, week: cm.w, upc, item_desc: desc }; byKey.set(key, rec); }
+        rec[cm.met] = num;
+      }
+    }
+    const rows = [...byKey.values()];
+    if (!rows.length) throw new Error('Parsed 0 data rows — check that this is the Stratum weekly export');
+    let done = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await sb.from('kroger_sales').upsert(chunk, { onConflict: 'brand_id,fiscal_year,week,upc' });
+      if (error) throw error;
+      done += chunk.length;
+      if (onProgress) onProgress(done, rows.length);
+    }
+    return { rows: rows.length, weeks: new Set(rows.map(r => r.week)).size, items: new Set(rows.map(r => r.upc)).size, fiscal_year: fiscalYear };
+  }
+
+  async function _krFetch(brandId) {
+    return window.KeelCache.get('krSales:' + brandId, async () => {
+      const sb = window.Auth.getClient();
+      const res = await window.sbPageAll((from, to, withCount) =>
+        sb.from('kroger_sales')
+          .select('*', withCount ? { count: 'exact' } : undefined)
+          .eq('brand_id', brandId)
+          .order('id', { ascending: true }).range(from, to)
+      );
+      if (res.error) throw res.error;
+      return res.data || [];
+    }, 10 * 60 * 1000);
+  }
+
+  function _krFmt(v, fmt) {
+    if (v == null || !isFinite(v)) return '—';
+    if (fmt === 'usd0') return '$' + Math.round(v).toLocaleString();
+    if (fmt === 'usd2') return '$' + v.toFixed(2);
+    if (fmt === 'int')  return Math.round(v).toLocaleString();
+    return v.toFixed(2);   // num2
+  }
+
+  // Aggregate one week's rows (the selected items) into the 14 display values.
+  // Sums for revenue/units; ARP recomputed from the sums; per-store-per-week
+  // rates use a revenue-weighted average (TY rates weighted by TY revenue,
+  // LY by LY revenue) — a plain sum of rates would be meaningless. With a
+  // single item selected this reduces to the item's exact values.
+  function _krAggWeek(rows) {
+    const out = {};
+    const sum = (k) => rows.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+    out.ty_revenue = sum('ty_revenue'); out.ly_revenue = sum('ly_revenue');
+    out.ty_units = sum('ty_units');     out.ly_units = sum('ly_units');
+    out.ty_arp = out.ty_units > 0 ? out.ty_revenue / out.ty_units : null;
+    out.ly_arp = out.ly_units > 0 ? out.ly_revenue / out.ly_units : null;
+    for (const col of _KR_COLS) {
+      if (col.agg !== 'wavg_ty' && col.agg !== 'wavg_ly') continue;
+      const wKey = col.agg === 'wavg_ty' ? 'ty_revenue' : 'ly_revenue';
+      let num = 0, den = 0, plain = 0, n = 0;
+      for (const r of rows) {
+        const rate = r[col.key];
+        if (rate == null) continue;
+        const w = Number(r[wKey]) || 0;
+        plain += Number(rate); n++;
+        if (w > 0) { num += Number(rate) * w; den += w; }
+      }
+      out[col.key] = den > 0 ? num / den : (n > 0 ? plain / n : null);
+    }
+    return out;
+  }
+
+  async function renderKrogerView(brandId, sb) {
+    const host = document.getElementById('hl-kr-section');
+    if (!host) return;
+    host.innerHTML = `<div class="hl-loading">Loading Kroger sales…</div>`;
+    let rows;
+    try {
+      rows = await _krFetch(brandId);
+    } catch (err) {
+      const missing = /relation .* does not exist|could not find the table|schema cache/i.test(err.message || '');
+      host.innerHTML = `<div style="padding:24px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;">
+        <div style="font-family:var(--serif);font-size:18px;margin-bottom:6px;">Couldn't load Kroger sales.</div>
+        <div style="font-family:var(--serif);color:var(--ink-3);font-size:15px;">${missing
+          ? 'The <b>kroger_sales</b> table isn\u2019t there yet — run the SQL for this tab in Supabase, then reload.'
+          : escapeHtml(err.message || String(err))}</div></div>`;
+      return;
+    }
+    if (!rows.length) {
+      host.innerHTML = `<div style="text-align:center;padding:48px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
+        No Kroger data yet. Click <strong>+ Upload Kroger weekly</strong> above with the 84.51/Stratum export.
+      </div>`;
+      return;
+    }
+
+    const years = [...new Set(rows.map(r => r.fiscal_year))].sort((a, b) => b - a);
+    if (!_krState.year || !years.includes(_krState.year)) _krState.year = years[0];
+    const yearRows = rows.filter(r => r.fiscal_year === _krState.year);
+    const itemsMap = new Map();
+    for (const r of yearRows) if (!itemsMap.has(r.upc)) itemsMap.set(r.upc, r.item_desc || r.upc);
+    const itemKeys = [...itemsMap.keys()].sort((a, b) => String(itemsMap.get(a)).localeCompare(String(itemsMap.get(b))));
+    const itemLabel = (upc) => itemsMap.get(upc) || upc;
+
+    host.innerHTML = `
+      <div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:12px;">Kroger &middot; Weekly sales (84.51 Stratum)</div>
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;">Fiscal year:</span>
+        <select id="hl-kr-year" style="padding:5px 8px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;">
+          ${years.map(y => `<option value="${y}" ${y === _krState.year ? 'selected' : ''}>${y}</option>`).join('')}
+        </select>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;">Items:</span>
+        <div style="position:relative;display:inline-block;">
+          <button type="button" id="hl-kr-ms-btn" style="padding:5px 10px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;min-width:160px;max-width:280px;text-align:left;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+            <span id="hl-kr-ms-summary" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+            <span style="color:var(--ink-3);">▾</span>
+          </button>
+          <div id="hl-kr-ms-panel" style="display:none;position:absolute;top:100%;left:0;z-index:50;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.12);min-width:300px;">
+            <div style="padding:8px 10px;border-bottom:1px solid var(--rule-soft);">
+              <input type="text" id="hl-kr-ms-search" placeholder="Search items…" style="width:100%;padding:5px 8px;font-family:var(--sans);font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;box-sizing:border-box;" />
+            </div>
+            <div style="padding:6px 10px;border-bottom:1px solid var(--rule-soft);display:flex;gap:12px;">
+              <button type="button" id="hl-kr-ms-allall" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select all</button>
+              <button type="button" id="hl-kr-ms-all" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select visible</button>
+              <button type="button" id="hl-kr-ms-none" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;padding:0;">Clear</button>
+            </div>
+            <div id="hl-kr-ms-opts" style="max-height:280px;overflow-y:auto;"></div>
+          </div>
+        </div>
+        <span id="hl-kr-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
+      </div>
+      <div id="hl-kr-grid" style="overflow-x:auto;"></div>
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:860px;line-height:1.6;">Weeks as rows, metrics as columns. With multiple items selected: Revenue and Units are summed, ARP is recomputed from the sums, and the per-store-per-week rates are revenue-weighted averages (TY rates by TY revenue, LY by LY). Select a single item for its exact export values.</p>
+    `;
+
+    document.getElementById('hl-kr-year').addEventListener('change', (e) => {
+      _krState.year = parseInt(e.target.value, 10);
+      _krState.sel = [];
+      renderKrogerView(brandId, sb);
+    });
+
+    const msBtn = document.getElementById('hl-kr-ms-btn');
+    const msPanel = document.getElementById('hl-kr-ms-panel');
+    const msOpts = document.getElementById('hl-kr-ms-opts');
+    const msSearch = document.getElementById('hl-kr-ms-search');
+    msSearch.value = _krState.search || '';
+
+    const visibleOptions = () => {
+      const q = (_krState.search || '').toLowerCase();
+      return q ? itemKeys.filter(k => (itemLabel(k) + ' ' + k).toLowerCase().includes(q)) : itemKeys;
+    };
+    const applied = () => _krState.sel.length ? itemKeys.filter(k => _krState.sel.includes(k)) : itemKeys;
+
+    const renderOptions = () => {
+      const sel = new Set(_krState.sel);
+      msOpts.innerHTML = visibleOptions().map(k => `
+        <label style="display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;font-family:var(--sans);font-size:13px;white-space:nowrap;">
+          <input type="checkbox" data-krval="${escapeHtml(k)}" ${sel.has(k) ? 'checked' : ''} style="cursor:pointer;"> ${escapeHtml(itemLabel(k))} <span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">${escapeHtml(k)}</span>
+        </label>`).join('') || `<div style="padding:10px;font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No matches.</div>`;
+      msOpts.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', () => {
+        const v = cb.dataset.krval;
+        if (cb.checked) { if (!_krState.sel.includes(v)) _krState.sel.push(v); }
+        else _krState.sel = _krState.sel.filter(x => x !== v);
+        updateView();
+      }));
+    };
+
+    const updateSummary = () => {
+      const n = _krState.sel.length;
+      document.getElementById('hl-kr-ms-summary').textContent =
+        n === 0 ? 'All items' : n === 1 ? itemLabel(_krState.sel[0]) : `${n} selected`;
+      document.getElementById('hl-kr-count').textContent = `${applied().length} of ${itemKeys.length} items · ${_krState.year}`;
+    };
+
+    const renderGrid = () => {
+      const selSet = new Set(applied());
+      const byWeek = new Map();   // week → rows[]
+      for (const r of yearRows) {
+        if (!selSet.has(r.upc)) continue;
+        let arr = byWeek.get(r.week); if (!arr) { arr = []; byWeek.set(r.week, arr); }
+        arr.push(r);
+      }
+      const weeks = [...byWeek.keys()].sort((a, b) => a - b);
+      const head = _KR_COLS.map(c => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);">${c.label}</th>`).join('');
+      const trs = weeks.map(w => {
+        const wr = byWeek.get(w);
+        const agg = _krAggWeek(wr);
+        const period = wr[0].period;
+        const tds = _KR_COLS.map(c => `<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;white-space:nowrap;">${_krFmt(agg[c.key], c.fmt)}</td>`).join('');
+        return `<tr style="border-bottom:1px solid var(--rule-soft);">
+          <td style="padding:7px 10px;font-family:var(--mono);font-size:12px;white-space:nowrap;position:sticky;left:0;background:var(--paper);">P${period} W${w}</td>${tds}
+        </tr>`;
+      }).join('');
+      const allSelRows = yearRows.filter(r => selSet.has(r.upc));
+      const tot = _krAggWeek(allSelRows);
+      const totTds = _KR_COLS.map(c => `<td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:700;white-space:nowrap;">${_krFmt(tot[c.key], c.fmt)}</td>`).join('');
+      document.getElementById('hl-kr-grid').innerHTML = `
+        <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+          <thead><tr>
+            <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule-soft);position:sticky;left:0;background:var(--paper);">Week</th>
+            ${head}
+          </tr></thead>
+          <tbody>${trs}</tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            <td style="padding:8px 10px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;position:sticky;left:0;background:var(--paper);">Total</td>${totTds}
+          </tr></tfoot>
+        </table>`;
+    };
+
+    const updateView = () => { updateSummary(); renderGrid(); };
+
+    msBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      msPanel.style.display = msPanel.style.display === 'block' ? 'none' : 'block';
+      if (msPanel.style.display === 'block') msSearch.focus();
+    });
+    msPanel.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => { msPanel.style.display = 'none'; });
+    msSearch.addEventListener('input', () => { _krState.search = msSearch.value; renderOptions(); });
+    document.getElementById('hl-kr-ms-allall').addEventListener('click', () => { _krState.sel = itemKeys.slice(); renderOptions(); updateView(); });
+    document.getElementById('hl-kr-ms-all').addEventListener('click', () => {
+      for (const o of visibleOptions()) if (!_krState.sel.includes(o)) _krState.sel.push(o);
+      renderOptions(); updateView();
+    });
+    document.getElementById('hl-kr-ms-none').addEventListener('click', () => { _krState.sel = []; renderOptions(); updateView(); });
+
+    renderOptions();
+    updateView();
+  }
+
+  let _spSubTab = (() => { try { const s = localStorage.getItem('keel_sp_subtab'); return (s === 'pacing' || s === 'dist' || s === 'kroger') ? s : 'pacing'; } catch (e) { return 'pacing'; } })();
+
   async function renderSalesPacingPage() {
     const session = HL.mountPage('sales-pacing');
     if (!session) return;
@@ -39989,14 +40286,28 @@ render();
           <input type="file" id="hl-cd-upload" accept=".xlsx,.xls" style="display:none;" />
           <input type="file" id="hl-cw-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <input type="file" id="hl-kw-upload" accept=".xlsx,.xls" multiple style="display:none;" />
-          <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI L52 total</button>
-          <button class="hl-btn-primary" id="hl-cw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI weekly</button>
-          <button class="hl-btn-primary" id="hl-kw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload KeHe weekly</button>
-          <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
+          <input type="file" id="hl-kr-upload" accept=".xlsx,.xls" style="display:none;" />
+          <span id="hl-sp-btns-dist" style="display:none;gap:8px;flex-wrap:wrap;">
+            <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI L52 total</button>
+            <button class="hl-btn-primary" id="hl-cw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI weekly</button>
+            <button class="hl-btn-primary" id="hl-kw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload KeHe weekly</button>
+          </span>
+          <span id="hl-sp-btns-kroger" style="display:none;">
+            <button class="hl-btn-primary" id="hl-kr-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload Kroger weekly</button>
+          </span>
+          <span id="hl-sp-btns-pacing" style="display:none;">
+            <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
+          </span>
         </div>
       </div>
+      <div style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin-top:22px;">
+        <button class="hl-sp-tab" data-sptab="pacing" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;">Pacing</button>
+        <button class="hl-sp-tab" data-sptab="dist" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;">UNFI / KeHE weekly</button>
+        <button class="hl-sp-tab" data-sptab="kroger" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;">Kroger weekly</button>
+      </div>
       <div id="hl-sp-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
-      <div id="hl-cd-section" style="margin-top:48px;padding-top:36px;border-top:1px solid var(--rule-soft);"><div class="hl-loading">Loading customer detail…</div></div>
+      <div id="hl-cd-section" style="margin-top:18px;display:none;"><div class="hl-loading">Loading customer detail…</div></div>
+      <div id="hl-kr-section" style="margin-top:18px;display:none;"><div class="hl-loading">Loading Kroger sales…</div></div>
     `;
 
     const uploadInput = document.getElementById('hl-sp-upload');
@@ -40099,8 +40410,57 @@ render();
       uploadInput.value = '';
     });
 
-    await loadAndRenderSalesPacing(brandId, sb);
-    renderCustomerDetailView(brandId, sb);
+    // ─── Kroger weekly upload ───
+    const krInput = document.getElementById('hl-kr-upload');
+    document.getElementById('hl-kr-upload-btn').addEventListener('click', () => krInput.click());
+    krInput.addEventListener('change', async (e) => {
+      const file = (e.target.files || [])[0];
+      krInput.value = '';
+      if (!file) return;
+      const fy = prompt('Fiscal year for this Kroger file (the "TY" year):', String(new Date().getFullYear()));
+      if (!fy) return;
+      const fyNum = parseInt(fy, 10);
+      if (!fyNum || fyNum < 2020 || fyNum > 2040) { alert('Enter a valid year, e.g. 2026'); return; }
+      const body = document.getElementById('hl-kr-section');
+      body.innerHTML = `<div class="hl-loading">Parsing “${escapeHtml(file.name)}”…</div>`;
+      try {
+        const res = await handleKrogerSalesUpload(file, brandId, sb, fyNum, (d, total) => {
+          body.innerHTML = `<div class="hl-loading">Saving Kroger sales… ${d.toLocaleString()} / ${total.toLocaleString()} rows</div>`;
+        });
+        console.log('[KrogerSales]', res);
+        clearKrogerCache();
+        body.innerHTML = `<div class="hl-loading">Loaded ${res.rows.toLocaleString()} rows · ${res.weeks} weeks · ${res.items} items. Refreshing…</div>`;
+        await renderKrogerView(brandId, sb);
+      } catch (err) {
+        console.error('[KrogerSales upload]', err);
+        body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Upload failed: ${escapeHtml(err.message || 'unknown error')}</div>`;
+      }
+    });
+
+    // ─── Tabs: Pacing | UNFI / KeHE weekly | Kroger weekly ───
+    // One section at a time (was stacked vertically); heavy sections load
+    // lazily on first activation and stay warm after.
+    let _pacingInited = false, _cdInited = false, _krInited = false;
+    const PANES = { pacing: 'hl-sp-body', dist: 'hl-cd-section', kroger: 'hl-kr-section' };
+    const BTNS  = { pacing: 'hl-sp-btns-pacing', dist: 'hl-sp-btns-dist', kroger: 'hl-sp-btns-kroger' };
+    const showTab = (t) => {
+      if (!PANES[t]) t = 'pacing';
+      _spSubTab = t;
+      try { localStorage.setItem('keel_sp_subtab', t); } catch (e) {}
+      for (const [tab, id] of Object.entries(PANES)) document.getElementById(id).style.display = (tab === t) ? '' : 'none';
+      for (const [tab, id] of Object.entries(BTNS)) document.getElementById(id).style.display = (tab === t) ? (tab === 'dist' ? 'inline-flex' : 'inline-block') : 'none';
+      document.querySelectorAll('.hl-sp-tab').forEach(b => {
+        const on = b.dataset.sptab === t;
+        b.style.borderBottomColor = on ? 'var(--ink)' : 'transparent';
+        b.style.color = on ? 'var(--ink)' : 'var(--ink-3)';
+        b.style.fontWeight = on ? '600' : '400';
+      });
+      if (t === 'pacing' && !_pacingInited) { _pacingInited = true; loadAndRenderSalesPacing(brandId, sb); }
+      if (t === 'dist'   && !_cdInited)     { _cdInited = true;     renderCustomerDetailView(brandId, sb); }
+      if (t === 'kroger' && !_krInited)     { _krInited = true;     renderKrogerView(brandId, sb); }
+    };
+    document.querySelectorAll('.hl-sp-tab').forEach(b => b.addEventListener('click', () => showTab(b.dataset.sptab)));
+    showTab(_spSubTab);
   }
 
   // Fetch ALL rows for a query, paging past Supabase's default 1,000-row cap.
