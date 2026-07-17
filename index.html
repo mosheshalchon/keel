@@ -45562,9 +45562,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
 
   function _mrpIngredientsHtml() {
-    const q = _mrpIngSearch.trim().toLowerCase();
     let list = _mrpIngs;
-    if (q) list = list.filter(i => (i.ingredient || '').toLowerCase().includes(q) || (_mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '').toLowerCase().includes(q));
     const vendOf = (i) => _mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '(No vendor)';
     if (_mrpIngSel.length) { const s = new Set(_mrpIngSel); list = list.filter(i => s.has(i.ingredient)); }
     if (_mrpVendSel.length) { const s = new Set(_mrpVendSel); list = list.filter(i => s.has(vendOf(i))); }
@@ -45631,6 +45629,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (shelf != null && ((moqWeeks != null && moqWeeks > shelf) || (target != null && target > shelf))) conflict = badge('Conflict', '#7b4397');
       const moqRef = sup ? (sup.order_qty || sup.supply_levels || '') : '';
 
+      // Avg cost: same single source of truth as Recipes — most recent
+      // Ingredient Costs history row, falling back to mrp_ingredients.avg_cost.
+      const dispCost = _mrpCostHistLatest.has(norm) ? _mrpCostHistLatest.get(norm)
+        : ((i.avg_cost != null && i.avg_cost !== '') ? Number(i.avg_cost) : null);
       const supCell = (v, extra) => `<td style="padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${extra || ''}" title="${_mrpEsc(v || '')}">${_mrpEsc(v || '—')}</td>`;
       const supplierCells = `
         ${supCell(sup?.supplier)}
@@ -45639,7 +45641,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         ${supCell(moqRef)}
         ${supCell(sup?.order_multiples)}
         ${supCell(sup?.supply_levels)}
-        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${i.avg_cost != null ? '$' + _mrpFmt(i.avg_cost, 2) : '—'}</td>
+        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;" title="Most recent cost from the Ingredient Costs tab">${dispCost != null ? '$' + _mrpFmt(dispCost, 2) : '—'}</td>
         ${supCell(sup?.notes)}`;
       const main = `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(i.ingredient)}</td>
@@ -45667,7 +45669,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const colsToggle = `<button data-mrpcolstoggle="1" title="${_mrpIngColsExpanded ? 'Hide the additional supplier/cost columns' : 'Show supplier terms, costs and notes as columns'}" style="margin-left:8px;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);font-weight:600;cursor:pointer;text-transform:uppercase;white-space:nowrap;">${_mrpIngColsExpanded ? '&minus; Additional info' : '+ Additional info'}</button>`;
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
-        <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:180px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
         ${filtersHtml}
         <button id="hl-mrp-sync" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:8px 14px;cursor:pointer;border-radius:6px;color:var(--ink-3);white-space:nowrap;">↻ Sync on-hand</button>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · demand from ${srcLabel}</div>
@@ -46801,13 +46802,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (venF) _mrpSaveVendorField(venF.dataset.vendorid, venF.dataset.vendorfield, venF.value);
     });
     body.addEventListener('input', (e) => {
-      if (e.target.id === 'hl-mrp-ing-search') {
-        _mrpIngSearch = e.target.value;
-        const pos = e.target.selectionStart;
-        _mrpRenderBody();
-        const again = document.getElementById('hl-mrp-ing-search');
-        if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch(_){} }
-      }
       if (e.target.dataset && e.target.dataset.mrpmsQ) {
         const w = e.target.dataset.mrpmsQ;
         if (w === 'ing') _mrpIngMsQ = e.target.value; else _mrpVendMsQ = e.target.value;
