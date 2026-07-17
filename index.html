@@ -47385,6 +47385,65 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   const _frNum = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : null; };
   const _frDate = (v) => { if (v == null || v === '') return null; if (v instanceof Date) return v.toISOString().slice(0, 10); const s = String(v); let m = s.match(/(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`; m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`; return null; };
 
+  // ─── Freight items: Brand Library as the single source of truth ─────────
+  // Field-level merge: for every pallet/case attribute, the Brand Library
+  // product value wins when present; blanks fall back to the legacy
+  // freight_items row (worst case = identical behavior to before). Matching:
+  // normalized UPC first, then normalized description. Products with no
+  // legacy freight row are included too, so a new item added in the Brand
+  // Library flows into freight with zero extra setup. Cached under the
+  // products: prefix so product upserts auto-refresh it (invalidateProducts).
+  async function _frLoadItemsMerged(sb, brandId) {
+    return window.KeelCache.get('products:fritems:' + brandId, async () => {
+      const [fiR, pR] = await Promise.all([
+        sb.from('freight_items').select('*').eq('brand_id', brandId),
+        sb.from('products').select('item_description, unit_upc, units_per_case, case_pack, ti, hi, cases_per_pallet, case_l_in, case_w_in, case_h_in, case_gross_weight_lbs').eq('brand_id', brandId),
+      ]);
+      if (fiR.error) throw fiR.error;
+      const fi = fiR.data || [], prods = (pR.data || []);
+      const digits = (s) => String(s || '').replace(/[^0-9]/g, '');
+      const nk = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const co = (a, b) => (a != null && a !== '' ? a : (b != null && b !== '' ? b : null));
+      const pByUpc = new Map(), pByDesc = new Map();
+      for (const pr of prods) {
+        const u = digits(pr.unit_upc); if (u && !pByUpc.has(u)) pByUpc.set(u, pr);
+        const d = nk(pr.item_description); if (d && !pByDesc.has(d)) pByDesc.set(d, pr);
+      }
+      const shape = (pr) => ({
+        unit_upc: pr.unit_upc, units_per_case: co(pr.units_per_case, pr.case_pack),
+        case_length: pr.case_l_in, case_width: pr.case_w_in, case_height: pr.case_h_in,
+        case_weight: pr.case_gross_weight_lbs, pallet_ti: pr.ti, pallet_hi: pr.hi,
+        cases_per_pallet: pr.cases_per_pallet,
+      });
+      const out = []; const claimed = new Set();
+      for (const f of fi) {
+        const pr = pByUpc.get(digits(f.unit_upc)) || pByDesc.get(nk(f.item_description)) || null;
+        if (pr) claimed.add(pr);
+        const b = pr ? shape(pr) : {};
+        out.push({
+          id: f.id, brand_id: brandId,
+          item_description: f.item_description,     // canonical key for order matching — unchanged
+          unit_upc: co(b.unit_upc, f.unit_upc),
+          units_per_case: co(b.units_per_case, f.units_per_case),
+          case_length: co(b.case_length, f.case_length),
+          case_width: co(b.case_width, f.case_width),
+          case_height: co(b.case_height, f.case_height),
+          case_weight: co(b.case_weight, f.case_weight),
+          pallet_ti: co(b.pallet_ti, f.pallet_ti),
+          pallet_hi: co(b.pallet_hi, f.pallet_hi),
+          cases_per_pallet: co(b.cases_per_pallet, f.cases_per_pallet),
+          _src: pr ? 'Library' : 'Legacy',
+        });
+      }
+      for (const pr of prods) {
+        if (claimed.has(pr) || !pr.item_description) continue;
+        out.push({ brand_id: brandId, item_description: pr.item_description, ...shape(pr), _src: 'Library' });
+      }
+      out.sort((a, b) => String(a.item_description || '').localeCompare(String(b.item_description || '')));
+      return out;
+    }, 5 * 60 * 1000);
+  }
+
   function renderFreightPage() {
     const session = HL.mountPage('freight');
     if (!session) return;
@@ -47473,11 +47532,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           inp.addEventListener('change', async () => { const upd = {}; upd[inp.dataset.field] = inp.value || null; const { error } = await sb.from('freight_customers').update(upd).eq('id', inp.dataset.id); if (error) alert('Could not save contact: ' + error.message); });
         });
       } else if (_frSubTab === 'items') {
-        const { data } = await sb.from('freight_items').select('*').eq('brand_id', brandId).order('item_description');
+        const data = await _frLoadItemsMerged(sb, brandId);
         if (!data || !data.length) { body.innerHTML = empty('items'); return; }
-        const head = ['Item', 'UPC', 'Units/Case', 'Case L', 'Case W', 'Case H', 'Case Wt', 'Ti', 'Hi', 'Cases/Pallet'].map((h, i) => th(h, i >= 2)).join('');
-        const trs = data.map(r => `<tr data-frow data-f-item="${escapeHtml((r.item_description || '').toLowerCase())}">${td(r.item_description)}${td(r.unit_upc)}${td(r.units_per_case, true)}${td(r.case_length, true)}${td(r.case_width, true)}${td(r.case_height, true)}${td(r.case_weight, true)}${td(r.pallet_ti, true)}${td(r.pallet_hi, true)}${td(r.cases_per_pallet, true)}</tr>`).join('');
-        body.innerHTML = _frFilterBar([{ key: 'item', label: 'Item', options: _frDistinct(data, r => r.item_description) }]) + wrap(head, trs, `${data.length} items`);
+        const head = ['Item', 'UPC', 'Units/Case', 'Case L', 'Case W', 'Case H', 'Case Wt', 'Ti', 'Hi', 'Cases/Pallet', 'Source'].map((h, i) => th(h, i >= 2 && i <= 9)).join('');
+        const trs = data.map(r => `<tr data-frow data-f-item="${escapeHtml((r.item_description || '').toLowerCase())}">${td(r.item_description)}${td(r.unit_upc)}${td(r.units_per_case, true)}${td(r.case_length, true)}${td(r.case_width, true)}${td(r.case_height, true)}${td(r.case_weight, true)}${td(r.pallet_ti, true)}${td(r.pallet_hi, true)}${td(r.cases_per_pallet, true)}${td(r._src)}</tr>`).join('');
+        body.innerHTML = _frFilterBar([{ key: 'item', label: 'Item', options: _frDistinct(data, r => r.item_description) }]) + wrap(head, trs, `${data.length} items &middot; Brand Library is the source of truth &mdash; Library values win, legacy freight values fill blanks; “Legacy” rows have no matching Library product`);
         _frWireFilters(body);
       } else if (_frSubTab === 'orders') {
         const [ordRes, custRes] = await Promise.all([
@@ -47507,9 +47566,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.innerHTML = splitLine + _frOrderSummaryHtml(data, th, td, wrap, false, null, catOf) + filters + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
         _frWireFilters(body);
       } else if (_frSubTab === 'test') {
-        const [{ data }, { data: items }] = await Promise.all([
+        const [{ data }, items] = await Promise.all([
           sb.from('freight_orders_test').select('*').eq('brand_id', brandId).order('projected_ship_date', { ascending: false }).limit(1000),
-          sb.from('freight_items').select('item_description,cases_per_pallet,pallet_ti').eq('brand_id', brandId)
+          _frLoadItemsMerged(sb, brandId)
         ]);
         const rows = data || [];
         const _mo = {}; _frDefaultItemMap().forEach(p => _mo[_frNorm(p[0])] = p[1]);
@@ -47531,7 +47590,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const src = 'freight_orders';
         const [{ data: orders }, { data: items }, { data: mapRows }, { data: customers }, { data: lanes }, { data: apprv }, { data: ovrRows }, { data: distRows }, { data: avoidRows }] = await Promise.all([
           sb.from(src).select('*').eq('brand_id', brandId),
-          sb.from('freight_items').select('item_description,cases_per_pallet,case_weight,unit_upc,pallet_ti').eq('brand_id', brandId),
+          _frLoadItemsMerged(sb, brandId).then(d => ({ data: d })),
           sb.from('freight_item_map').select('order_item,item_description').eq('brand_id', brandId),
           sb.from('freight_customers').select('customer,dc_name,address,service_type,contact_name,contact_email,contact_phone').eq('brand_id', brandId),
           sb.from('freight_lanes').select('kind,lane_no,lane_name,states').eq('brand_id', brandId),
@@ -48254,6 +48313,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const recs = [];
       for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const d = _frClean(r[c.desc]); if (!d) continue; recs.push({ brand_id: brandId, unit_upc: _frClean(r[c.upc]), item_description: d, units_per_case: _frNum(r[c.upc2]), case_length: _frNum(r[c.cl]), case_width: _frNum(r[c.cw]), case_height: _frNum(r[c.ch]), case_weight: _frNum(r[c.wt]), pallet_ti: _frNum(r[c.ti]), pallet_hi: _frNum(r[c.hi2]), cases_per_pallet: _frNum(r[c.cpp]) }); }
       await wipe('freight_items'); await insertAll('freight_items', recs); out.items = recs.length;
+      try { window.KeelCache.invalidate(/^products:fritems:/); } catch (e) {}
     }
     // 3pl Info
     rows = sheet('3pl Info');
