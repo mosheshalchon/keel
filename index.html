@@ -45566,6 +45566,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const vendOf = (i) => _mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '(No vendor)';
     if (_mrpIngSel.length) { const s = new Set(_mrpIngSel); list = list.filter(i => s.has(i.ingredient)); }
     if (_mrpVendSel.length) { const s = new Set(_mrpVendSel); list = list.filter(i => s.has(vendOf(i))); }
+    // Sort by inventory VALUE (on hand × unified cost — same source as Recipes
+    // and the Avg cost column) descending; alphabetical tie-break.
+    {
+      const _costMap = _mrpCostByName();
+      const _valOf = (i) => (Number(i.on_hand) || 0) * (_costMap.get(_mrpNorm(i.ingredient)) || 0);
+      list = list.slice().sort((a, b) => _valOf(b) - _valOf(a) || String(a.ingredient).localeCompare(String(b.ingredient)));
+    }
     const _allIngNames = _mrpIngs.map(i => i.ingredient);
     const _allVendors = [...new Set(_mrpIngs.map(vendOf))].sort((a, b) => a.localeCompare(b));
     const msDD = (which, label, options, sel, mq) => {
@@ -45668,10 +45675,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const rightCols = new Set([2,3,4,5,6,7,8,9,10,11,12,20]);   // original numerics + Avg cost
     const colsToggle = `<button data-mrpcolstoggle="1" title="${_mrpIngColsExpanded ? 'Hide the additional supplier/cost columns' : 'Show supplier terms, costs and notes as columns'}" style="margin-left:8px;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);font-weight:600;cursor:pointer;text-transform:uppercase;white-space:nowrap;">${_mrpIngColsExpanded ? '&minus; Additional info' : '+ Additional info'}</button>`;
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
-    return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
+    return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
         ${filtersHtml}
         <button id="hl-mrp-sync" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:8px 14px;cursor:pointer;border-radius:6px;color:var(--ink-3);white-space:nowrap;">↻ Sync on-hand</button>
-        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · demand from ${srcLabel}</div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-left:auto;">${list.length} of ${_mrpIngs.length} · demand from ${srcLabel}</div>
       </div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;min-width:1100px;">
         <thead><tr>${heads.map((h,idx)=>`<th style="padding:8px 8px;font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;text-align:${rightCols.has(idx)?'right':'left'};white-space:nowrap;">${h}${h === 'Flag' ? colsToggle : ''}</th>`).join('')}</tr></thead>
@@ -46543,6 +46550,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return;
     }
     const piv = _mrpCostPivot(rows);
+    // Order by inventory value (on hand × latest cost) desc — matches the
+    // Ingredients tab's ordering. History-only names with no on-hand sort last.
+    try {
+      const ohByNorm = new Map(_mrpIngs.map(i => [_mrpNorm(i.ingredient), Number(i.on_hand) || 0]));
+      const latestCost = (ing) => { for (let k = piv.months.length - 1; k >= 0; k--) { const v = piv.cell(ing, piv.months[k]); if (v != null) return v; } return 0; };
+      piv.ingredients.sort((a, b) =>
+        ((ohByNorm.get(_mrpNorm(b)) || 0) * latestCost(b)) - ((ohByNorm.get(_mrpNorm(a)) || 0) * latestCost(a))
+        || a.localeCompare(b));
+    } catch (e) {}
 
     body.innerHTML = `
       <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
