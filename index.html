@@ -45354,9 +45354,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _mrpGridSearch = '';
   let _mrpLastWeeks = [], _mrpRowByIng = new Map();
   let _mrpIngExpanded = new Set();
+  let _mrpCostHistLatest = new Map();   // norm(ingredient) → most recent history cost
   let _mrpLinesByCode = new Map(), _mrpSupByIng = new Map();
   let _mrpExpanded = new Set();           // expanded BOM codes
   let _mrpIngSearch = '';
+  // Ingredients tab dropdown filters (same pattern as the Ingredient Costs
+  // tab): ingredient + vendor search-checkbox multi-selects. Empty = all.
+  // _mrpMsOpen keeps the active panel open across the tab's full re-renders.
+  let _mrpIngSel = [], _mrpIngMsQ = '';
+  let _mrpVendSel = [], _mrpVendMsQ = '';
+  let _mrpMsOpen = null;   // null | 'ing' | 'vend'
   // Ingredients table: parameter columns collapsed by default (Ingredient +
   // Flag only); one click on the header toggle expands the 12 detail columns
   // to the right of Flag. Cosmetic only — no calc changes.
@@ -45378,12 +45385,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const m = new Map();
     for (const i of _mrpIngs) {
       const k = _mrpNorm(i.ingredient);
-      if (k && i.avg_cost != null && i.avg_cost !== '') {
-        // Normalize to a per-base-unit cost: avg_cost covers `cost_pack_size`
-        // base units (lbs/eaches). e.g. a 42-lb cheese case price ÷ 42 = $/lb.
-        const pack = Number(i.cost_pack_size) || 1;
-        m.set(k, (Number(i.avg_cost) || 0) / (pack > 0 ? pack : 1));
-      }
+      if (!k) continue;
+      // Prefer the MOST RECENT cost from the Ingredient Costs history (what
+      // the Ingredient Costs tab shows); fall back to mrp_ingredients.avg_cost
+      // for ingredients with no history row. Same pack-size normalization for
+      // both (a 42-lb cheese case price ÷ 42 = $/lb; pack blank = ÷1).
+      const hist = _mrpCostHistLatest.get(k);
+      const raw = hist != null ? hist : ((i.avg_cost != null && i.avg_cost !== '') ? Number(i.avg_cost) : null);
+      if (raw == null) continue;
+      const pack = Number(i.cost_pack_size) || 1;
+      m.set(k, (raw || 0) / (pack > 0 ? pack : 1));
     }
     return m;
   }
@@ -45442,6 +45453,23 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const arr = _mrpLinesByCode.get(l.bom_code) || [];
         arr.push(l); _mrpLinesByCode.set(l.bom_code, arr);
       }
+      // Most recent cost per ingredient from mrp_ingredient_cost_history (the
+      // Ingredient Costs tab's data; KeelCache-shared with it, so usually free).
+      // Recipe costing prefers this over mrp_ingredients.avg_cost so Cost/case
+      // is explicitly tied to the visible cost history. Failure → empty map →
+      // avg_cost fallback in _mrpCostByName.
+      _mrpCostHistLatest = new Map();
+      try {
+        const histRows = await _mrpFetchCostHistory(brandId);
+        const latestDate = new Map();
+        for (const r of (histRows || [])) {
+          const k = _mrpNorm(r.ingredient);
+          if (!k || r.avg_cost == null) continue;
+          const d = String(r.snapshot_date);
+          const cur = latestDate.get(k);
+          if (!cur || d > cur) { latestDate.set(k, d); _mrpCostHistLatest.set(k, Number(r.avg_cost)); }
+        }
+      } catch (e) { console.warn('[MRP] cost history unavailable for recipe costing:', e); }
       _mrpSupByIng = new Map();
       for (const s of _mrpSuppliers) {
         const k = _mrpNorm(s.ingredient);
@@ -45529,7 +45557,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <tbody>${rows}</tbody>
       </table>
       <div style="margin-top:10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;">
-        Per-case = grams × ${_mrpSettings.g_to_lb} ÷ yield (Dough only). Packaging rows are eaches/case, no conversion. Cost / case = Σ (per-case quantity × ingredient avg cost) from the Ingredients tab; a <span style="color:#a8381f;">*</span> means one or more ingredients have no cost on file, so the shown cost is partial. Edit a yield to recompute that recipe.</div>
+        Per-case = grams × ${_mrpSettings.g_to_lb} ÷ yield (Dough only). Packaging rows are eaches/case, no conversion. Cost / case = Σ (per-case quantity × the ingredient's most recent cost from the <b>Ingredient Costs</b> tab, falling back to the Ingredients tab's avg cost when no history exists); a <span style="color:#a8381f;">*</span> means one or more ingredients have no cost on file, so the shown cost is partial. Edit a yield to recompute that recipe.</div>
     </div>`;
   }
 
@@ -45537,6 +45565,37 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const q = _mrpIngSearch.trim().toLowerCase();
     let list = _mrpIngs;
     if (q) list = list.filter(i => (i.ingredient || '').toLowerCase().includes(q) || (_mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '').toLowerCase().includes(q));
+    const vendOf = (i) => _mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '(No vendor)';
+    if (_mrpIngSel.length) { const s = new Set(_mrpIngSel); list = list.filter(i => s.has(i.ingredient)); }
+    if (_mrpVendSel.length) { const s = new Set(_mrpVendSel); list = list.filter(i => s.has(vendOf(i))); }
+    const _allIngNames = _mrpIngs.map(i => i.ingredient);
+    const _allVendors = [...new Set(_mrpIngs.map(vendOf))].sort((a, b) => a.localeCompare(b));
+    const msDD = (which, label, options, sel, mq) => {
+      const q2 = (mq || '').toLowerCase();
+      const vis = q2 ? options.filter(o => o.toLowerCase().includes(q2)) : options;
+      const selSet = new Set(sel);
+      const summary = sel.length === 0 ? `All ${label.toLowerCase()}s` : sel.length === 1 ? sel[0] : `${sel.length} selected`;
+      return `<div data-mrpms-root="${which}" style="position:relative;display:inline-block;">
+        <button type="button" data-mrpms-btn="${which}" style="padding:7px 10px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:6px;background:var(--paper);cursor:pointer;min-width:150px;max-width:240px;text-align:left;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${_mrpEsc(summary)}</span><span style="color:var(--ink-3);">▾</span>
+        </button>
+        <div style="display:${_mrpMsOpen === which ? 'block' : 'none'};position:absolute;top:100%;left:0;z-index:50;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.12);min-width:280px;">
+          <div style="padding:8px 10px;border-bottom:1px solid var(--rule-soft);">
+            <input type="text" id="hl-mrpms-q-${which}" data-mrpms-q="${which}" placeholder="Search…" value="${_mrpEsc(mq || '')}" style="width:100%;padding:5px 8px;font-family:var(--sans);font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;box-sizing:border-box;" />
+          </div>
+          <div style="padding:6px 10px;border-bottom:1px solid var(--rule-soft);display:flex;gap:12px;">
+            <button type="button" data-mrpms-act="allall" data-mrpms-which="${which}" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select all</button>
+            <button type="button" data-mrpms-act="all" data-mrpms-which="${which}" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select visible</button>
+            <button type="button" data-mrpms-act="none" data-mrpms-which="${which}" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;padding:0;">Clear</button>
+          </div>
+          <div style="max-height:280px;overflow-y:auto;">${vis.map(o => `
+            <label style="display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;font-family:var(--sans);font-size:13px;white-space:nowrap;">
+              <input type="checkbox" data-mrpms-val="${_mrpEsc(o)}" data-mrpms-which="${which}" ${selSet.has(o) ? 'checked' : ''} style="cursor:pointer;"> ${_mrpEsc(o)}
+            </label>`).join('') || `<div style="padding:10px;font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No matches.</div>`}</div>
+        </div>
+      </div>`;
+    };
+    const filtersHtml = msDD('ing', 'Ingredient', _allIngNames, _mrpIngSel, _mrpIngMsQ) + msDD('vend', 'Vendor', _allVendors, _mrpVendSel, _mrpVendMsQ);
     // weekly demand from current source/scenario/horizon
     if (_mrpDemandSource === 'forecast') _mrpComputeForecast();
     const weekly = _mrpWeeklyDemandMap();
@@ -45572,19 +45631,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (shelf != null && ((moqWeeks != null && moqWeeks > shelf) || (target != null && target > shelf))) conflict = badge('Conflict', '#7b4397');
       const moqRef = sup ? (sup.order_qty || sup.supply_levels || '') : '';
 
-      const costUnit = i.avg_cost != null ? ((Number(i.avg_cost) || 0) / (Number(i.cost_pack_size) || 1)) : null;
       const supCell = (v, extra) => `<td style="padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${extra || ''}" title="${_mrpEsc(v || '')}">${_mrpEsc(v || '—')}</td>`;
       const supplierCells = `
         ${supCell(sup?.supplier)}
-        ${supCell(sup?.lead_time)}
         ${supCell(sup?.order_cadence)}
         ${supCell(sup?.delivery_dates)}
         ${supCell(moqRef)}
         ${supCell(sup?.order_multiples)}
         ${supCell(sup?.supply_levels)}
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${i.avg_cost != null ? '$' + _mrpFmt(i.avg_cost, 2) : '—'}</td>
-        <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'cost_pack_size', i.cost_pack_size)}</td>
-        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${costUnit != null ? '$' + _mrpFmt(costUnit, 4) : '—'}</td>
         ${supCell(sup?.notes)}`;
       const main = `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:7px 10px;font-family:var(--serif);font-size:13px;">${_mrpEsc(i.ingredient)}</td>
@@ -45606,13 +45661,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return main;
     }).join('');
 
-    const supplierHeads = ['Supplier', 'Lead (text)', 'Cadence', 'Delivery dates', 'MOQ / order qty', 'Multiples', 'Supply levels', 'Avg cost', 'Pack size', 'Cost / unit', 'Notes'];
+    const supplierHeads = ['Supplier', 'Cadence', 'Delivery dates', 'MOQ / order qty', 'Multiples', 'Supply levels', 'Avg cost', 'Notes'];
     const heads = ['Ingredient', 'UOM', 'On hand', 'On order', 'Total', 'Wkly demand', 'OH+OR (wks)', 'Shelf (wks)', 'Lead (wks)', 'Target hold (wks)', 'Target order (wks)', 'MOQ (units)', 'MOQ (wks)', 'Flag', ...(_mrpIngColsExpanded ? supplierHeads : [])];
-    const rightCols = new Set([2,3,4,5,6,7,8,9,10,11,12,21,22,23]);   // original numerics + Avg cost / Pack size / Cost per unit
+    const rightCols = new Set([2,3,4,5,6,7,8,9,10,11,12,20]);   // original numerics + Avg cost
     const colsToggle = `<button data-mrpcolstoggle="1" title="${_mrpIngColsExpanded ? 'Hide the additional supplier/cost columns' : 'Show supplier terms, costs and notes as columns'}" style="margin-left:8px;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);font-weight:600;cursor:pointer;text-transform:uppercase;white-space:nowrap;">${_mrpIngColsExpanded ? '&minus; Additional info' : '+ Additional info'}</button>`;
     const srcLabel = _mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan';
     return `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
-        <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:220px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
+        <input id="hl-mrp-ing-search" placeholder="Search ingredient or supplier…" value="${_mrpEsc(_mrpIngSearch)}" style="flex:1;min-width:180px;font-family:var(--serif);font-size:14px;padding:8px 12px;border:1px solid var(--rule-soft);border-radius:6px;" />
+        ${filtersHtml}
         <button id="hl-mrp-sync" style="background:transparent;border:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;padding:8px 14px;cursor:pointer;border-radius:6px;color:var(--ink-3);white-space:nowrap;">↻ Sync on-hand</button>
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${list.length} of ${_mrpIngs.length} · demand from ${srcLabel}</div>
       </div>
@@ -46683,6 +46739,34 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (ordC) { _mrpShowOrderCalc(ordC.dataset.ordercalc); }
       const ordBtn = e.target.closest('[data-mrporder]');
       if (ordBtn) { _mrpShowOrderCalc(ordBtn.dataset.mrporder, true); }
+      const msBtn = e.target.closest('[data-mrpms-btn]');
+      if (msBtn) {
+        const w = msBtn.dataset.mrpmsBtn;
+        _mrpMsOpen = (_mrpMsOpen === w) ? null : w;
+        _mrpRenderBody();
+        if (_mrpMsOpen) { const qi = document.getElementById('hl-mrpms-q-' + _mrpMsOpen); if (qi) qi.focus(); }
+        return;
+      }
+      const msAct = e.target.closest('[data-mrpms-act]');
+      if (msAct) {
+        const w = msAct.dataset.mrpmsWhich, act = msAct.dataset.mrpmsAct;
+        const vendOf = (i) => _mrpSupByIng.get(_mrpNorm(i.ingredient))?.supplier || '(No vendor)';
+        const all = w === 'ing' ? _mrpIngs.map(i => i.ingredient) : [...new Set(_mrpIngs.map(vendOf))];
+        const mq = (w === 'ing' ? _mrpIngMsQ : _mrpVendMsQ).toLowerCase();
+        const vis = mq ? all.filter(o => o.toLowerCase().includes(mq)) : all;
+        let sel = w === 'ing' ? _mrpIngSel : _mrpVendSel;
+        if (act === 'none') sel = [];
+        else if (act === 'allall') sel = all.slice();
+        else { for (const o of vis) if (!sel.includes(o)) sel.push(o); }
+        if (w === 'ing') _mrpIngSel = sel; else _mrpVendSel = sel;
+        _mrpRenderBody();
+        return;
+      }
+      if (_mrpMsOpen && !e.target.closest('[data-mrpms-root]')) {
+        _mrpMsOpen = null;
+        _mrpRenderBody();
+        // fall through — the click may also be on another control
+      }
       const colsT = e.target.closest('[data-mrpcolstoggle]');
       if (colsT) {
         _mrpIngColsExpanded = !_mrpIngColsExpanded;
@@ -46696,6 +46780,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     body.addEventListener('change', (e) => {
       const yi = e.target.closest('[data-yield-code]');
       if (yi) _mrpSaveYield(yi.dataset.yieldCode, yi.value);
+      if (e.target.dataset && e.target.dataset.mrpmsVal !== undefined) {
+        const w = e.target.dataset.mrpmsWhich, v = e.target.dataset.mrpmsVal;
+        let sel = w === 'ing' ? _mrpIngSel : _mrpVendSel;
+        if (e.target.checked) { if (!sel.includes(v)) sel.push(v); }
+        else sel = sel.filter(x => x !== v);
+        if (w === 'ing') _mrpIngSel = sel; else _mrpVendSel = sel;
+        _mrpRenderBody();
+        return;
+      }
       if (e.target.id === 'hl-mrp-statusfilter') { _mrpStatusFilter = e.target.value || 'all'; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-grid-start')   { _mrpGridStart = e.target.value || null; _mrpRenderBody(); }
       if (e.target.id === 'hl-mrp-grid-horizon') { _mrpGridHorizon = Number(e.target.value); _mrpRenderBody(); }
@@ -46713,6 +46806,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const pos = e.target.selectionStart;
         _mrpRenderBody();
         const again = document.getElementById('hl-mrp-ing-search');
+        if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch(_){} }
+      }
+      if (e.target.dataset && e.target.dataset.mrpmsQ) {
+        const w = e.target.dataset.mrpmsQ;
+        if (w === 'ing') _mrpIngMsQ = e.target.value; else _mrpVendMsQ = e.target.value;
+        const pos = e.target.selectionStart;
+        _mrpRenderBody();
+        const again = document.getElementById('hl-mrpms-q-' + w);
         if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch(_){} }
       }
       if (e.target.id === 'hl-mrp-grid-search') {
