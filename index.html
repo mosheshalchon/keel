@@ -47383,7 +47383,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _frSubTab = (() => { try { const s = localStorage.getItem('keel_fr_subtab'); return (!s || s === 'test') ? 'output' : s; } catch (e) { return 'output'; } })();
   const _frClean = (v) => { if (v == null) return null; let s = String(v).replace(/_x000D_/g, ' ').replace(/[\r\n]+/g, ' ').replace(/\u00a0/g, ' ').trim(); return s === '' ? null : s; };
   const _frNum = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : null; };
-  const _frDate = (v) => { if (v == null || v === '') return null; if (v instanceof Date) return v.toISOString().slice(0, 10); const s = String(v); let m = s.match(/(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`; m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`; return null; };
+  const _frDate = (v) => { if (v == null || v === '') return null; if (v instanceof Date) return v.toISOString().slice(0, 10); if (typeof v === 'number' && v > 20000 && v < 80000) { const d = new Date(Math.round((v - 25569) * 86400000)); return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10); } const s = String(v); let m = s.match(/(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`; m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`; return null; };
+  // Sales-order column matcher: "NetSuite SO #", "SO #", "SO#", or a column titled exactly "SO"
+  const _frSoCol = (h) => { const low = (h || []).map(x => String(x).trim().toLowerCase()); const f = (n) => low.findIndex(x => x.includes(n)); let i = f('netsuite so'); if (i < 0) i = f('so #'); if (i < 0) i = f('so#'); if (i < 0) i = low.findIndex(x => x === 'so'); return i; };
 
   // ─── Freight items: Brand Library as the single source of truth ─────────
   // Field-level merge: for every pallet/case attribute, the Brand Library
@@ -48271,7 +48273,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const rows = XLSX.utils.sheet_to_json(wb.Sheets[key], { header: 1, defval: '' });
     const h = (rows[0] || []).map(x => String(x).trim().toLowerCase());
     const col = n => h.findIndex(x => x.includes(n));
-    const ci = { so: col('netsuite so'), po: col('customer po'), cust: h.findIndex(x => x === 'customer'), dc: col('customer dc'), pod: col('po order date'), psd: col('projected ship'), sku: col('sku'), cases: col('cases ordered'), uom: col('uom'), sales: col('sales'), loc: col('location'), status: col('status'), qf: col('fulfilled') };
+    const ci = { so: _frSoCol(h), po: col('customer po'), cust: h.findIndex(x => x === 'customer'), dc: col('customer dc'), pod: col('po order date'), psd: col('projected ship'), sku: col('sku'), cases: col('cases ordered'), uom: col('uom'), sales: col('sales'), loc: col('location'), status: col('status'), qf: col('fulfilled') };
     const recs = [];
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i]; const status = _frClean(r[ci.status]);
@@ -48286,7 +48288,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
   async function _frUploadWorkbook(file, brandId, sb, onMsg) {
     const ab = await file.arrayBuffer();
-    const wb = XLSX.read(ab, { type: 'array' });
+    const wb = XLSX.read(ab, { type: 'array', cellDates: true });
     const sheet = (name) => { const key = wb.SheetNames.find(n => n.trim().toLowerCase() === name.trim().toLowerCase()); return key ? XLSX.utils.sheet_to_json(wb.Sheets[key], { header: 1, defval: '' }) : null; };
     const hrow = (rows, needles) => { for (let i = 0; i < Math.min(rows.length, 12); i++) { const low = (rows[i] || []).map(c => String(c).trim().toLowerCase()); if (needles.every(n => low.some(c => c.includes(n)))) return i; } return -1; };
     const col = (hdr, name) => hdr.findIndex(h => String(h).trim().toLowerCase().includes(name));
@@ -48333,9 +48335,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const n = _frClean(r[c.n]); if (!n) continue; recs.push({ brand_id: brandId, name: n, address: _frClean(r[c.a]), shipping_hours: _frClean(r[c.sh]) }); }
       await wipe('freight_ship_from'); await insertAll('freight_ship_from', recs); out.ship_from = recs.length;
     }
-    // KeHe Dock Hours (day columns)
+    // Dock Hours (day columns) — any sheet name containing "dock hours" (or "doc hours")
     const dockKey = wb.SheetNames.find(n => n.toLowerCase().includes('doc hour') || n.toLowerCase().includes('dock hour'));
-    if (dockKey && dockKey.toLowerCase().includes('kehe')) {
+    if (dockKey) {
+      const dockSrc = dockKey.replace(/(dock|doc)\s*hours?/i, '').trim() || 'Upload';
       onMsg('Loading dock hours…');
       const dr = XLSX.utils.sheet_to_json(wb.Sheets[dockKey], { header: 1, defval: '' });
       // find the row that has DC + day names
@@ -48350,19 +48353,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const r = dr[i]; const name = _frClean(r[1]); if (!name) continue;
         const hours = {};
         for (const d of days) { const cIdx = dayCol[d]; if (cIdx == null) continue; const s = _frClean(r[cIdx]); const e = _frClean(r[cIdx + 1]); if (s || e) hours[d] = { start: s, end: e }; }
-        recs.push({ brand_id: brandId, source: 'KeHE', dc_name: name, time_zone: _frClean(r[2]), hours });
+        recs.push({ brand_id: brandId, source: dockSrc, dc_name: name, time_zone: _frClean(r[2]), hours });
       }
       await wipe('freight_dock_hours'); await insertAll('freight_dock_hours', recs); out.dock_hours = recs.length;
-    }
-    // HMB LTL Rates
-    rows = sheet('HMB Rates');
-    if (rows) {
-      const hi = hrow(rows, ['destination', 'pallet']); const h = rows[hi];
-      const palletCols = []; h.forEach((c, idx) => { const m = String(c).match(/(\d+)\s*pallet/i); if (m) palletCols.push({ n: Number(m[1]), idx }); });
-      const dIdx = col(h, 'destination');
-      const recs = [];
-      for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const dest = _frClean(r[dIdx]); if (!dest) continue; const rates = {}; palletCols.forEach(pc => { const v = _frNum(r[pc.idx]); if (v != null) rates[pc.n] = v; }); recs.push({ brand_id: brandId, destination: dest, rates }); }
-      await wipe('freight_ltl_rates'); await insertAll('freight_ltl_rates', recs); out.ltl_rates = recs.length;
     }
     // Route Logic (route rows only; keep the seeded lanes)
     rows = sheet('Route Logic');
@@ -48378,7 +48371,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     rows = sheet('Ordering Data');
     if (rows) {
       const hi = hrow(rows, ['customer', 'sku', 'cases ordered']); const h = rows[hi];
-      const c = { iid: col(h, 'internal id'), so: col(h, 'netsuite so'), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled') };
+      const c = { iid: col(h, 'internal id'), so: _frSoCol(h), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled') };
       const cust2 = c.cust; // 'Customer' (not 'Customer DC') — findIndex picks first match; 'customer dc' handled separately
       const recs = [];
       for (let i = hi + 1; i < rows.length; i++) {
