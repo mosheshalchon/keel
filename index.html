@@ -45369,14 +45369,21 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   // to the right of Flag. Cosmetic only — no calc changes.
   let _mrpIngColsExpanded = (() => { try { return localStorage.getItem('keel_mrp_ing_cols') === '1'; } catch (e) { return false; } })();
 
-  function _mrpLbsPerCase(line, doughYield) {
+  // 'Each'-count lines: Packaging component (legacy) or any line with uom='ea'.
+  function _mrpIsEach(line) { return line.component === 'Packaging' || String(line.uom || '').trim().toLowerCase() === 'ea'; }
+  // Yield modes on the recipe (mrp_boms.yield_mode): null/'dough' = yield divides
+  // Dough-component lines only (legacy ATG behavior); 'all' = yield divides every
+  // weighed line (whole-recipe yield loss); 'none' = no yield adjustment.
+  function _mrpLbsPerCase(line, bom) {
     const g = Number(line.grams) || 0;
-    if (line.component === 'Packaging') return g;            // eaches/case, no conversion
-    const y = (line.component === 'Dough') ? (Number(doughYield) || 1) : 1;
+    if (_mrpIsEach(line)) return g;                          // eaches/case, no conversion, no yield
+    const mode = (bom && bom.yield_mode) || 'dough';
+    const dy = Number(bom && bom.dough_yield) || 1;
+    const y = (mode === 'all') ? dy : (mode === 'none') ? 1 : (line.component === 'Dough' ? dy : 1);
     return (g * (Number(_mrpSettings.g_to_lb) || 0.00220462)) / y;
   }
   function _mrpLineUom(line) {
-    return (line.component === 'Packaging') ? 'ea' : 'lbs';
+    return _mrpIsEach(line) ? 'ea' : 'lbs';
   }
   // Recipe costing: per-case ingredient quantity × that ingredient's avg cost,
   // mirroring the planning grid's convention (lbs/eaches per case × $/unit).
@@ -45398,17 +45405,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
     return m;
   }
-  function _mrpLineCost(line, doughYield, costByName) {
+  function _mrpLineCost(line, bom, costByName) {
     const c = costByName.get(_mrpNorm(line.ingredient));
     if (c == null) return null;
-    return _mrpLbsPerCase(line, doughYield) * c;
+    return _mrpLbsPerCase(line, bom) * c;
   }
   function _mrpRecipeCost(bom, costByName) {
     const lines = _mrpLinesByCode.get(bom.code) || [];
     let cost = 0, missing = 0, priced = 0;
     for (const l of lines) {
-      const lc = _mrpLineCost(l, bom.dough_yield, costByName);
-      if (lc == null) { if (_mrpLbsPerCase(l, bom.dough_yield) > 0) missing++; continue; }
+      const lc = _mrpLineCost(l, bom, costByName);
+      if (lc == null) { if (_mrpLbsPerCase(l, bom) > 0) missing++; continue; }
       cost += lc; priced++;
     }
     return { cost, missing, priced, lines: lines.length };
@@ -45510,7 +45517,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
 
   function _mrpRecipesHtml() {
-    if (!_mrpBoms.length) return `<div class="hl-loading">No recipes yet. Run mrp_seed.sql to load BOMs.</div>`;
+    if (!_mrpBoms.length) return `<div class="hl-loading">No recipes yet — click "+ Upload procurement workbook" above to load them.</div>`;
     const canEdit = window.Auth.canEdit();
     const costByName = _mrpCostByName();
     const rows = _mrpBoms.map(b => {
@@ -45518,7 +45525,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const comps = [...new Set(lines.map(l => l.component))];
       const open = _mrpExpanded.has(b.code);
       const totalLbs = lines.filter(l => l.component !== 'Packaging')
-        .reduce((s, l) => s + _mrpLbsPerCase(l, b.dough_yield), 0);
+        .reduce((s, l) => s + _mrpLbsPerCase(l, b), 0);
       const rc = _mrpRecipeCost(b, costByName);
       const head = `<tr class="hl-mrp-bomrow" data-code="${_mrpEsc(b.code)}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
         <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;color:var(--ink);">${open ? '▾' : '▸'} ${_mrpEsc(b.code)}</td>
@@ -45535,7 +45542,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       let detail = '';
       if (open) {
         const lineRows = lines.map(l => {
-          const per = _mrpLbsPerCase(l, b.dough_yield);
+          const per = _mrpLbsPerCase(l, b);
           const isDough = l.component === 'Dough';
           return `<tr style="border-top:1px solid var(--rule-soft);background:#faf6ef;">
             <td style="padding:5px 10px 5px 28px;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">${_mrpEsc(l.component || '')}</td>
@@ -45543,7 +45550,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${l.component === 'Packaging' ? _mrpFmt(l.grams,0)+' ea' : _mrpFmt(l.grams,1)+' g'}</td>
             <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:12px;${isDough?'color:#7a5c1e;':''}">${_mrpFmt(per, 3)} ${_mrpLineUom(l)}/cs</td>
             <td></td>
-            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${(() => { const lc = _mrpLineCost(l, b.dough_yield, costByName); return lc == null ? '—' : '$' + _mrpFmt(lc, 2); })()}</td></tr>`;
+            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${(() => { const lc = _mrpLineCost(l, b, costByName); return lc == null ? '—' : '$' + _mrpFmt(lc, 2); })()}</td></tr>`;
         }).join('');
         detail = lineRows;
       }
@@ -45838,7 +45845,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const contrib = [];
     for (const b of _mrpBoms) {
       let per = 0;
-      for (const l of (_mrpLinesByCode.get(b.code) || [])) if (_mrpNorm(l.ingredient) === norm) per += _mrpLbsPerCase(l, b.dough_yield);
+      for (const l of (_mrpLinesByCode.get(b.code) || [])) if (_mrpNorm(l.ingredient) === norm) per += _mrpLbsPerCase(l, b);
       if (per <= 0) continue;
       let totCases = 0;
       for (const wk of weeks) totCases += _mrpCasesFor(b.code, wk);
@@ -46031,7 +46038,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const contrib = [];
     for (const b of _mrpBoms) {
       let per = 0;
-      for (const l of (_mrpLinesByCode.get(b.code) || [])) if (_mrpNorm(l.ingredient) === tn) per += _mrpLbsPerCase(l, b.dough_yield);
+      for (const l of (_mrpLinesByCode.get(b.code) || [])) if (_mrpNorm(l.ingredient) === tn) per += _mrpLbsPerCase(l, b);
       if (per <= 0) continue;
       const cases = _mrpCasesFor(b.code, weekISO);
       if (cases <= 0) continue;
@@ -46105,7 +46112,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     for (const b of _mrpBoms) {
       const im = new Map();
       for (const l of (_mrpLinesByCode.get(b.code) || [])) {
-        const per = _mrpLbsPerCase(l, b.dough_yield);   // lbs (weighed) or eaches (packaging) per case
+        const per = _mrpLbsPerCase(l, b);   // lbs (weighed) or eaches ('ea'/packaging) per case
         if (l.ingredient) im.set(l.ingredient, (im.get(l.ingredient) || 0) + per);
       }
       m.set(b.code, im);
@@ -46706,6 +46713,135 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     updateView();
   }
 
+  // ─── Procurement workbook upload: Recipes, Recipe Lines, Ingredients, Vendors,
+  // Vendor Assignments. Wipe-and-reload per included sheet; omitted sheets are
+  // skipped. Weight UOMs converted to grams at import; uom='ea' lines stay counts.
+  async function _mrpUploadWorkbook(file, brandId, sb, onMsg) {
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type: 'array', cellDates: true });
+    const out = {}; const warns = [];
+    const sheet = (name) => { const k = wb.SheetNames.find(n => n.trim().toLowerCase() === name.toLowerCase()); return k ? XLSX.utils.sheet_to_json(wb.Sheets[k], { header: 1, defval: '' }) : null; };
+    const hrow = (rows, needles) => { for (let i = 0; i < Math.min(rows.length, 12); i++) { const low = rows[i].map(c => String(c).trim().toLowerCase()); if (needles.every(n => low.some(c => c.includes(n)))) return i; } return -1; };
+    const col = (h, name) => h.findIndex(x => String(x).trim().toLowerCase().includes(name));
+    const clean = (v) => { const s = String(v == null ? '' : v).trim(); return s === '' ? null : s; };
+    const num = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[$,%\s]/g, '')); return isNaN(n) ? null : n; };
+    const wipe = async (t) => { const { error } = await sb.from(t).delete().eq('brand_id', brandId); if (error) throw new Error(t + ' wipe: ' + error.message); };
+    const insertAll = async (t, recs) => { for (let i = 0; i < recs.length; i += 400) { const { error } = await sb.from(t).insert(recs.slice(i, i + 400)); if (error) throw new Error(t + ' insert: ' + error.message); } };
+    const G = { g: 1, gram: 1, grams: 1, kg: 1000, kgs: 1000, lb: 453.59237, lbs: 453.59237, oz: 28.3495 };
+
+    // Recipes + Recipe Lines travel together
+    const rRows = sheet('Recipes'), lRows = sheet('Recipe Lines');
+    if ((rRows && !lRows) || (lRows && !rRows)) {
+      warns.push('Recipes and Recipe Lines must both be present — both were skipped.');
+    } else if (rRows && lRows) {
+      onMsg && onMsg('Loading recipes…');
+      const rh = hrow(rRows, ['recipe name', 'yield']);
+      const lh = hrow(lRows, ['recipe code', 'ingredient', 'qty']);
+      if (rh < 0 || lh < 0) { warns.push('Recipes / Recipe Lines header row not found — both skipped.'); }
+      else {
+        const h = rRows[rh];
+        const c = { code: col(h, 'code'), name: col(h, 'recipe name'), yld: col(h, 'yield'), mode: col(h, 'applies'), cpb: col(h, 'cases per batch'), basis: col(h, 'basis'), sort: col(h, 'sort') };
+        const boms = []; const meta = new Map();
+        for (let i = rh + 1; i < rRows.length; i++) {
+          const r = rRows[i]; const code = clean(r[c.code]); if (!code) continue;
+          let y = num(r[c.yld]); if (y != null && y > 1.5) y = y / 100;
+          const mRaw = String(c.mode >= 0 ? r[c.mode] : '').toLowerCase();
+          const mode = /entire|all|recipe/.test(mRaw) ? 'all' : /dough/.test(mRaw) ? 'dough' : /none|^no/.test(mRaw.trim()) ? 'none' : 'all';
+          const cpb = c.cpb >= 0 ? num(r[c.cpb]) : null;
+          const basis = String(c.basis >= 0 ? r[c.basis] : '').toLowerCase().includes('batch') ? 'batch' : 'case';
+          meta.set(code.toLowerCase(), { cpb, basis });
+          boms.push({ brand_id: brandId, code, name: clean(r[c.name]), dough_yield: y, yield_mode: mode, cases_per_batch: cpb, sort: (c.sort >= 0 ? num(r[c.sort]) : null) ?? boms.length + 1 });
+        }
+        const h2 = lRows[lh];
+        const c2 = { code: col(h2, 'recipe code'), comp: col(h2, 'component'), ing: col(h2, 'ingredient'), qty: col(h2, 'qty'), uom: col(h2, 'uom'), sort: col(h2, 'sort') };
+        const lines = [];
+        for (let i = lh + 1; i < lRows.length; i++) {
+          const r = lRows[i]; const code = clean(r[c2.code]); const ing = clean(r[c2.ing]);
+          if (!code || !ing) continue;
+          const q = num(r[c2.qty]);
+          if (q == null) { warns.push('Recipe Lines row ' + (i + 1) + ' (' + ing + '): missing qty — skipped.'); continue; }
+          const u = String(c2.uom >= 0 ? r[c2.uom] : '').trim().toLowerCase();
+          let grams, uom = null;
+          if (u === 'ea' || u === 'each' || u === 'eaches') { grams = q; uom = 'ea'; }
+          else { const f = (u === '' ? 1 : G[u]); if (f == null) { warns.push('Recipe Lines row ' + (i + 1) + ' (' + ing + '): unknown UOM "' + u + '" — treated as grams.'); grams = q; } else grams = q * f; }
+          const m = meta.get(code.toLowerCase());
+          if (!m) { warns.push('Recipe Lines row ' + (i + 1) + ': recipe code "' + code + '" not on the Recipes sheet — skipped.'); continue; }
+          if (m.basis === 'batch') { if (m.cpb > 0) grams = grams / m.cpb; else warns.push('Recipe "' + code + '" is per-batch but has no Cases per Batch — qty left unscaled.'); }
+          lines.push({ brand_id: brandId, bom_code: code, component: clean(r[c2.comp]) || 'Ingredient', ingredient: ing, grams, uom, sort: (c2.sort >= 0 ? num(r[c2.sort]) : null) ?? lines.length + 1 });
+        }
+        await wipe('mrp_bom_lines'); await wipe('mrp_boms');
+        await insertAll('mrp_boms', boms); await insertAll('mrp_bom_lines', lines);
+        out.recipes = boms.length; out.recipe_lines = lines.length;
+      }
+    }
+
+    // Ingredients
+    let rows = sheet('Ingredients');
+    if (rows) {
+      onMsg && onMsg('Loading ingredients…');
+      const hi = hrow(rows, ['ingredient', 'on hand']);
+      if (hi < 0) { warns.push('Ingredients header row not found — skipped.'); }
+      else {
+        const h = rows[hi];
+        const c = { ing: col(h, 'ingredient'), uom: col(h, 'uom'), oh: col(h, 'on hand'), oo: col(h, 'on order'), lead: col(h, 'lead'), shelf: col(h, 'shelf'), tgt: col(h, 'target'), moq: col(h, 'moq'), cost: col(h, 'avg cost'), pack: col(h, 'cost pack') };
+        const recs = [];
+        for (let i = hi + 1; i < rows.length; i++) {
+          const r = rows[i]; const ing = clean(r[c.ing]); if (!ing) continue;
+          recs.push({ brand_id: brandId, ingredient: ing, uom: c.uom >= 0 ? clean(r[c.uom]) : null,
+            on_hand: c.oh >= 0 ? num(r[c.oh]) : null, on_order: c.oo >= 0 ? num(r[c.oo]) : null,
+            lead_time_weeks: c.lead >= 0 ? num(r[c.lead]) : null, shelf_life_weeks: c.shelf >= 0 ? num(r[c.shelf]) : null,
+            target_hold_weeks: c.tgt >= 0 ? num(r[c.tgt]) : null, moq_base: c.moq >= 0 ? num(r[c.moq]) : null,
+            avg_cost: c.cost >= 0 ? num(r[c.cost]) : null, cost_pack_size: c.pack >= 0 ? num(r[c.pack]) : null });
+        }
+        await wipe('mrp_ingredients'); await insertAll('mrp_ingredients', recs); out.ingredients = recs.length;
+      }
+    }
+
+    // Vendors
+    rows = sheet('Vendors');
+    if (rows) {
+      onMsg && onMsg('Loading vendors…');
+      const hi = hrow(rows, ['vendor', 'payment']);
+      if (hi < 0) { warns.push('Vendors header row not found — skipped.'); }
+      else {
+        const h = rows[hi];
+        const c = { v: col(h, 'vendor'), cn: col(h, 'contact'), em: col(h, 'email'), ph: col(h, 'phone'), acct: col(h, 'account'), pay: col(h, 'payment'), moq: col(h, 'default moq'), lead: col(h, 'default lead'), pack: col(h, 'default pack'), com: col(h, 'comment') };
+        const recs = [];
+        for (let i = hi + 1; i < rows.length; i++) {
+          const r = rows[i]; const v = clean(r[c.v]); if (!v) continue;
+          recs.push({ brand_id: brandId, vendor_name: v, contact_name: c.cn >= 0 ? clean(r[c.cn]) : null,
+            email: c.em >= 0 ? clean(r[c.em]) : null, phone: c.ph >= 0 ? clean(r[c.ph]) : null,
+            account_number: c.acct >= 0 ? clean(r[c.acct]) : null, payment_terms: c.pay >= 0 ? clean(r[c.pay]) : null,
+            default_moq: c.moq >= 0 ? num(r[c.moq]) : null, default_lead_weeks: c.lead >= 0 ? num(r[c.lead]) : null,
+            default_pack_size: c.pack >= 0 ? clean(r[c.pack]) : null, comments: c.com >= 0 ? clean(r[c.com]) : null });
+        }
+        await wipe('mrp_vendors'); await insertAll('mrp_vendors', recs); out.vendors = recs.length;
+      }
+    }
+
+    // Vendor Assignments → mrp_suppliers
+    rows = sheet('Vendor Assignments');
+    if (rows) {
+      onMsg && onMsg('Loading vendor assignments…');
+      const hi = hrow(rows, ['ingredient', 'vendor']);
+      if (hi < 0) { warns.push('Vendor Assignments header row not found — skipped.'); }
+      else {
+        const h = rows[hi];
+        const c = { ing: col(h, 'ingredient'), v: col(h, 'vendor'), em: col(h, 'email'), lead: col(h, 'lead'), oq: col(h, 'order qty'), sl: col(h, 'supply'), cost: col(h, 'avg cost') };
+        const recs = [];
+        for (let i = hi + 1; i < rows.length; i++) {
+          const r = rows[i]; const ing = clean(r[c.ing]); const v = clean(r[c.v]);
+          if (!ing || !v) continue;
+          recs.push({ brand_id: brandId, ingredient: ing, supplier: v, email: c.em >= 0 ? clean(r[c.em]) : null,
+            lead_time_weeks: c.lead >= 0 ? num(r[c.lead]) : null, order_qty: c.oq >= 0 ? clean(r[c.oq]) : null,
+            supply_levels: c.sl >= 0 ? clean(r[c.sl]) : null, avg_cost: c.cost >= 0 ? num(r[c.cost]) : null });
+        }
+        await wipe('mrp_suppliers'); await insertAll('mrp_suppliers', recs); out.vendor_assignments = recs.length;
+      }
+    }
+    return { out, warns };
+  }
+
   function renderMrpPage() {
     const session = HL.mountPage('mrp');
     if (!session) return;
@@ -46718,6 +46854,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           <h1 class="page-title">Procurement.</h1>
           <p class="page-meta">Recipes, ingredient on-hand, and (next) the weekly material-requirements grid: demand → on-hand → reorder.</p>
         </div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input type="file" id="hl-mrp-upload" accept=".xlsx,.xls" style="display:none;" />
+          <button class="hl-btn-primary" id="hl-mrp-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload procurement workbook</button>
+        </div>
       </div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:18px 0 0;">
         ${tab('planning','Planning')}${tab('recipes','Recipes')}${tab('ingredients','Ingredients')}${tab('vendors','Vendors')}${tab('costs','Ingredient Costs')}
@@ -46728,6 +46868,21 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     main.querySelectorAll('.hl-mrp-tab').forEach(btn => btn.addEventListener('click', () => {
       _mrpSubTab = btn.dataset.mrpsubtab; try { localStorage.setItem('keel_mrp_subtab', _mrpSubTab); } catch (e) {} renderMrpPage();
     }));
+    const mrpFi = document.getElementById('hl-mrp-upload');
+    document.getElementById('hl-mrp-upload-btn').addEventListener('click', () => mrpFi.click());
+    mrpFi.addEventListener('change', async (e) => {
+      const file = (e.target.files || [])[0]; if (!file) return;
+      const sb = window.Auth.getClient(); const brandId = BrandLibrary.getSession().brandId;
+      const uploadBody = document.getElementById('hl-mrp-body');
+      uploadBody.innerHTML = `<div class="hl-loading">Reading “${escapeHtml(file.name)}”…</div>`;
+      try {
+        const res = await _mrpUploadWorkbook(file, brandId, sb, (m) => { uploadBody.innerHTML = `<div class="hl-loading">${escapeHtml(m)}</div>`; });
+        const parts = Object.entries(res.out).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`).join(' · ');
+        alert('Procurement workbook loaded.\n' + (parts || 'No recognized sheets found — expected: Recipes, Recipe Lines, Ingredients, Vendors, Vendor Assignments.') + (res.warns.length ? '\n\nWarnings:\n- ' + res.warns.join('\n- ') : ''));
+      } catch (err) { alert('Upload failed: ' + err.message); }
+      _mrpLoaded = false; _mrpFcKey = null; clearMrpCostCache();
+      renderMrpPage();
+    });
     // delegated events on body
     const body = document.getElementById('hl-mrp-body');
     body.addEventListener('click', (e) => {
