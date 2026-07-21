@@ -47768,13 +47768,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const wireSrc = () => {};
         if (!orders || !orders.length) { body.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No pending orders yet — the daily sync runs each morning, or trigger it manually.</div>`; wireSrc(); return; }
         // Manual order moves: hold → pulled from the plan entirely; own → packs alone; with:<SO> → adopts that SO's ship date so the packer can co-load them.
-        const heldOrders = orders.filter(o => moveMap[o.so_num] === 'hold');
-        orders = orders.filter(o => moveMap[o.so_num] !== 'hold');
+        const heldOrders = (orders || []).filter(o => moveMap[o.so_num] === 'hold');
+        const planOrders = (orders || []).filter(o => moveMap[o.so_num] !== 'hold');
         const ownSet = new Set(Object.keys(moveMap).filter(k => moveMap[k] === 'own'));
-        const shipOf = so => ovrMap[so] || (orders.find(o => o.so_num === so) || {}).projected_ship_date || null;
+        const shipOf = so => ovrMap[so] || (planOrders.find(o => o.so_num === so) || {}).projected_ship_date || null;
         const ovrMap2 = Object.assign({}, ovrMap);
         Object.keys(moveMap).forEach(so => { const tg = moveMap[so]; if (tg && tg.startsWith('with:')) { const d = shipOf(tg.slice(5)); if (d) ovrMap2[so] = d; } });
-        const P = _frPlan(orders, items, mapRows, s, customers, lanes, ovrMap2, avoidRows, { own: ownSet });
+        const P = _frPlan(planOrders, items, mapRows, s, customers, lanes, ovrMap2, avoidRows, { own: ownSet });
         const _mo2 = {}; _frDefaultItemMap().forEach(p => _mo2[_frNorm(p[0])] = p[1]); (mapRows || []).forEach(m => _mo2[_frNorm(m.order_item)] = m.item_description);
         const _du = {}; (items || []).forEach(it => _du[_frNorm(it.item_description)] = it.unit_upc);
         const _di = {}; (items || []).forEach(it => _di[_frNorm(it.item_description)] = it);
