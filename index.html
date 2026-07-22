@@ -47814,17 +47814,36 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const dcell = (v, r) => `<td style="font-size:11px;color:var(--ink);padding:3px 9px;${r ? 'text-align:right;font-family:var(--mono);' : ''}">${v == null || v === '' ? '' : v}</td>`;
         const moveSelFor = (so, cur) => {
           const curTg = moveMap[so] || '';
-          const opts = [`<option value="" ${!curTg ? 'selected' : ''}>Truck #${cur._num} (planned)</option>`];
+          // The order's own footprint (pallets/weight) and destination, for fit + relevance checks
+          const myStop = cur.stops.find(st => (st.ships || []).includes(so)) || {};
+          const myDc = _frDcKey(myStop.dc || '');
+          const myShip = ovrMap2[so] || myStop.ship || cur.minShip;
+          const soPlt = (() => { let p = 0; (linesBySo[so] || []).forEach(ln => { const cfg = skuCfg(ln.sku); if (cfg && cfg.cases_per_pallet) p += ln.cases / Number(cfg.cases_per_pallet); }); return Math.ceil(p * 100) / 100; })();
+          const dd = (a, b) => (!a || !b) ? 999 : Math.round((new Date(a) - new Date(b)) / 86400000);
+          const oppWin = Number(s.opp_window_days) || 7;
+          const cands = [];
           allTrucks.forEach(u => {
-            if (u === cur || u.mode === 'Dedicated' || (apprOf(sigOf(u)).booked_at)) return;
+            if (u === cur || u.mode === 'Dedicated' || apprOf(sigOf(u)).booked_at || stOf(sigOf(u)) === 'buyer') return;
             if (cur.lane && u.lane && cur.lane.no !== u.lane.no) return;
+            const sameDc = myDc && u.stops.some(x => _frDcKey(x.dc) === myDc);
+            const gap = dd(u.minShip, myShip);
+            if (!sameDc && Math.abs(gap) > oppWin) return;                       // relevant window only
+            if (u.plan + soPlt > (s.max_pallets || 28)) return;                   // must actually fit
+            if (!sameDc && u.stops.length >= (s.max_stops || 3)) return;         // new stop must be legal
             const anchor = (u.stops[0] && (u.stops[0].ships || [])[0]) || null; if (!anchor) return;
-            const v = 'with:' + anchor;
-            opts.push(`<option value="${escapeHtml(v)}" ${curTg === v ? 'selected' : ''}>→ Truck #${u._num} · ${escapeHtml([...new Set(u.stops.map(x => x.dc || _frCustShort(x.customer)))].join('/'))} · ${u.minShip} · ${u.plan} plt</option>`);
+            cands.push({ u, sameDc, gap, anchor });
+          });
+          cands.sort((a, b) => (b.sameDc - a.sameDc) || (Math.abs(a.gap) - Math.abs(b.gap)));
+          const opts = [`<option value="" ${!curTg ? 'selected' : ''}>Truck #${cur._num} (planned)</option>`];
+          cands.slice(0, 6).forEach(c => {
+            const v = 'with:' + c.anchor;
+            const when = c.gap === 0 ? 'same day' : Math.abs(c.gap) + 'd ' + (c.gap > 0 ? 'later' : 'earlier');
+            const dest = c.sameDc ? 'same DC' : escapeHtml([...new Set(c.u.stops.map(x => x.dc || _frCustShort(x.customer)))].join('/'));
+            opts.push(`<option value="${escapeHtml(v)}" ${curTg === v ? 'selected' : ''}>→ #${c.u._num} · ${dest} · ${when} · ${c.u.plan}+${soPlt} plt</option>`);
           });
           opts.push(`<option value="own" ${curTg === 'own' ? 'selected' : ''}>Own truck</option>`);
           opts.push(`<option value="hold" ${curTg === 'hold' ? 'selected' : ''}>Hold from plan</option>`);
-          return `<select class="fr-move-sel" data-so="${escapeHtml(so)}" style="font-family:var(--mono);font-size:10px;padding:2px 4px;border:1px solid ${curTg ? '#7c3aed' : 'var(--rule-soft)'};border-radius:4px;background:var(--paper);color:${curTg ? '#7c3aed' : 'var(--ink-3)'};max-width:230px;cursor:pointer;">${opts.join('')}</select>`;
+          return `<select class="fr-move-sel" data-so="${escapeHtml(so)}" title="Move this order to another truck (same lane, within ${oppWin}d, must fit), its own truck, or hold it out of the plan" style="font-family:var(--mono);font-size:10px;padding:2px 4px;border:1px solid ${curTg ? '#7c3aed' : 'var(--rule-soft)'};border-radius:4px;background:var(--paper);color:${curTg ? '#7c3aed' : 'var(--ink-3)'};max-width:230px;cursor:pointer;">${opts.join('')}</select>`;
         };
         const truckTable = (trucks) => {
           const head = ['#', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan plt', 'Weight (lb)', 'Util', 'Mode', 'Flags', 'Status', 'Quote $', 'Pickup', ''].map((h, i) => th(h, i >= 5 && i <= 7)).join('');
