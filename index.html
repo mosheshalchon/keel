@@ -47848,24 +47848,39 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const oppWin = Number(s.opp_window_days) || 7, mP = s.max_pallets || 28, mW = s.max_weight || 40000, mS = s.max_stops || 3, autoWin = s.date_window_days || 1;
           const dd = (a, b) => (!a || !b) ? 999 : Math.abs((new Date(a) - new Date(b)) / 86400000);
           const oppExempt = t => dismSet.has('trk:' + sigOf(t));
-          const seenPairs = new Set();
+          // Group by lane + DC: the earliest truck anchors; every later truck to that DC that
+          // fits joins the group as its own approve-or-dismiss candidate.
+          const groups = {};
           allTrucks.forEach(t => {
             if (t.mode === 'Dedicated' || oppExempt(t)) return;
-            const myDcs = new Set(t.stops.map(x => _frDcKey(x.dc)).filter(Boolean));
-            const cands = [];
-            allTrucks.forEach(u => {
-              if (u === t || u.mode === 'Dedicated' || u.plan < t.plan || oppExempt(u)) return;
-              const uDcs = new Set(u.stops.map(x => _frDcKey(x.dc)).filter(Boolean));
-              if (![...myDcs].some(d => uDcs.has(d))) return;
-              const gap = dd(t.minShip, u.minShip);
-              if (gap <= autoWin || gap > oppWin) return;
-              if (u.plan + t.plan <= mP && u.weight + t.weight <= mW && u.stops.length <= mS) cands.push(u);
+            [...new Set(t.stops.map(x => _frDcKey(x.dc)).filter(Boolean))].forEach(dk => {
+              const key = (t.lane ? t.lane.no : '?') + '|' + dk;
+              (groups[key] = groups[key] || { dk, trucks: [] }).trucks.push(t);
             });
-            cands.sort((a, b) => b.plan - a.plan);
-            const best = cands[0] || null;
-            if (best) { const earlyShip = (t.minShip < best.minShip) ? t.minShip : best.minShip; const lateTruck = (t.minShip < best.minShip) ? best : t; const keepTruck = (t.minShip < best.minShip) ? t : best; const pairSig = sigOf(lateTruck) + '>>' + sigOf(keepTruck); if (dismSet.has(pairSig) || seenPairs.has(pairSig)) return; seenPairs.add(pairSig); t.opp = { ship: earlyShip, daysEarly: Math.round(dd(lateTruck.minShip, earlyShip)), sum: best.plan + t.plan, dc: [...new Set(t.stops.map(x => x.dc).filter(Boolean))][0] || '', moveNum: lateTruck._num, keepNum: keepTruck._num, moveSos: [...new Set(lateTruck.stops.flatMap(st => st.ships || []))], tsos: [...new Set(keepTruck.stops.flatMap(st => st.ships || []))], moveTruck: lateTruck, keepTruck: keepTruck, pairSig }; }
           });
-          allTrucks.forEach(t => { if (t.opp) { t.opp.moveTruck._oppHold = true; t.opp.keepTruck._oppHold = true; } });
+          window._frOppGroups = [];
+          const seenPairs = new Set();
+          Object.values(groups).forEach(g => {
+            if (g.trucks.length < 2) return;
+            g.trucks.sort((a, b) => (a.minShip || '9999').localeCompare(b.minShip || '9999'));
+            const anchor = g.trucks[0];
+            const cands = [];
+            g.trucks.slice(1).forEach(u => {
+              const gap = Math.round(dd(u.minShip, anchor.minShip));
+              if (gap <= autoWin || gap > oppWin) return;
+              if (anchor.plan + u.plan > mP || anchor.weight + u.weight > mW) return;
+              const mergedStops = new Set([...anchor.stops, ...u.stops].map(x => _frDcKey(x.dc) || _frNorm(x.customer)));
+              if (mergedStops.size > mS) return;
+              const pairSig = sigOf(u) + '>>' + sigOf(anchor);
+              if (dismSet.has(pairSig) || seenPairs.has(pairSig)) return;
+              seenPairs.add(pairSig);
+              cands.push({ truck: u, gap, pairSig, sum: anchor.plan + u.plan });
+            });
+            if (!cands.length) return;
+            const dcName = [...new Set([...anchor.stops].map(x => x.dc).filter(x => _frDcKey(x) === g.dk))][0] || g.dk;
+            window._frOppGroups.push({ dcName, anchor, cands });
+            anchor._oppHold = true; cands.forEach(c => { c.truck._oppHold = true; });
+          });
         })();
         Object.keys(moveMap).forEach(so => {
           const tg = moveMap[so]; if (!tg || !tg.startsWith('with:')) return;
@@ -47881,26 +47896,25 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const pendingAccept = visibleAll.filter(t => !_isOwnT(t) && t.stops.length > 1 && !apprMap[sigOf(t)]);
         const visibleTrucks = visibleAll.filter(t => !_isOwnT(t) && !pendingAccept.includes(t));
         const indepTrucks = visibleAll.filter(_isOwnT);
-        const oppCount = allTrucks.filter(t => t.opp).length;
-        const oppList = allTrucks.filter(t => t.opp);
+        const oppGroups = window._frOppGroups || [];
+        const oppCount = oppGroups.reduce((a, g) => a + g.cands.length, 0);
         const nOvr = Object.keys(ovrMap).length;
         const oppPanel = (oppCount || nOvr) ? `<div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:12px 14px;margin-bottom:16px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:15px;">&#9889; Consolidation opportunities${oppCount ? ` (${oppCount})` : ''}</div>${nOvr ? `<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);">Reset all consolidations (${nOvr})</button>` : ''}</div>
           <div style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">A small order ships to the same DC as another truck within ${s.opp_window_days || 7} days and fits on it. <b>Combine</b> ships both on the <b>earlier</b> date — the later order moves earlier so nothing is ever late (early delivery only). Needs buyer sign-off on the date change.</div>
-          ${oppCount ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['', '# (move → keep)', 'DC', 'Order to move', 'Pallets', 'Weight (lb)', 'Ship window', 'Result', 'Action'].map((h, i) => th(h, i === 4 || i === 5 || i === 7)).join('')}</tr></thead><tbody>${oppList.map((t, oi) => {
-            const summRow = (u, label) => `<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${label}</td><td style="padding:4px 8px;font-weight:600;">#${u._num}</td><td style="padding:4px 8px;">${modeBadge(u.mode)}</td><td style="padding:4px 8px;">${escapeHtml(u.stops.map(x => x.dc || _frCustShort(x.customer)).join(' → '))}</td><td style="padding:4px 8px;">${u.minShip}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.plan} plt</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.cases} cs</td></tr>`;
-            const optionRows = (o, ai) => {
-              const id = 'opp' + oi + (ai ? 'a' + ai : '');
-              const mv = o.moveTruck, kp = o.keepTruck;
-              const primary = ai === 0;
-              const labelCell = td('#' + o.moveNum + ' → #' + o.keepNum);
-              const combineBtn = `<button class="fr-combine" data-sos="${o.moveSos.join(',')}" data-tsos="${o.tsos.join(',')}" data-ship="${o.ship}" data-pair="${escapeHtml(o.pairSig)}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:${primary ? '#7c3aed' : 'transparent'};color:${primary ? '#fff' : '#7c3aed'};cursor:pointer;">Combine</button>`;
-              const keepBtn = primary ? ` <button class="fr-keepsep" data-pair="${escapeHtml(t.opp.pairSig)}" data-mv="${sigOf(t.opp.moveTruck)}" data-kp="${sigOf(t.opp.keepTruck)}" title="Ship separately and stop suggesting pairings for these trucks" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Keep separate</button>` : '';
-              const main = `<tr${primary ? '' : ' style="background:rgba(124,58,237,0.03);"'}><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td>${labelCell}${td(o.dc)}${td(custOf(mv))}${td(mv.plan, true)}${td(money(mv.weight), true)}${td(mv.minShip + ' → ' + o.ship + ' (' + o.daysEarly + 'd early)')}${td(o.sum + ' plt', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;">${combineBtn}${keepBtn}</td></tr>`;
-              const det = `<tr class="fr-oppdet-${id}" style="display:none;background:rgba(124,58,237,0.05);"><td></td><td colspan="8" style="padding:8px 9px;"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-bottom:4px;">${primary ? 'Consolidating these two' : 'Alternative pairing'} → ${o.sum} plt on ${o.ship} · never late (later order moves ${o.daysEarly}d early)</div><table style="border-collapse:collapse;">${summRow(mv, 'Move ↓ earlier →')}${summRow(kp, 'Keep →')}<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">Full route →</td><td colspan="6" style="padding:4px 8px;font-weight:600;">${(() => { const seen = new Set(); const r = [...mv.stops, ...kp.stops].map(x => x.dc || _frCustShort(x.customer)).filter(n => n && !seen.has(n) && seen.add(n)); return escapeHtml(['Brattleboro, VT', ...r].join(' → ')); })()}</td></tr></table></td></tr>`;
+          ${oppCount ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['', '# (move → keep)', 'DC', 'Order to move', 'Pallets', 'Weight (lb)', 'Ship window', 'Result', 'Action'].map((h, i) => th(h, i === 4 || i === 5 || i === 7)).join('')}</tr></thead><tbody>${oppGroups.map((g, gi) => {
+            const a = g.anchor;
+            const summRow = (u, label) => `<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">${label}</td><td style="padding:4px 8px;font-weight:600;">#${u._num}</td><td style="padding:4px 8px;">${modeBadge(u.mode)}</td><td style="padding:4px 8px;">${escapeHtml(u.stops.map(x => x.dc || _frCustShort(x.customer)).join(' → '))}</td><td style="padding:4px 8px;">${u.minShip}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.plan} plt</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.cases} cs</td></tr>`;
+            const head = `<tr style="background:rgba(124,58,237,0.10);"><td colspan="9" style="padding:7px 9px;border-top:1px solid rgba(124,58,237,0.3);font-family:var(--mono);font-size:11px;"><b style="font-size:12px;">${escapeHtml(g.dcName)}</b> · ${escapeHtml(laneName(a.lane))} · anchor <b>#${a._num}</b> ${modeBadge(a.mode)} · ships ${a.minShip} · ${a.plan} plt of ${s.max_pallets || 28} — ${g.cands.length} truck${g.cands.length > 1 ? 's' : ''} could join (each needs its own approval)</td></tr>`;
+            const rows = g.cands.map((c, ci) => {
+              const u = c.truck; const id = 'opp' + gi + '_' + ci;
+              const usos = [...new Set(u.stops.flatMap(st => st.ships || []))];
+              const asos = [...new Set(a.stops.flatMap(st => st.ships || []))];
+              const main = `<tr><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td>${td('#' + u._num + ' → #' + a._num)}${td(g.dcName)}${td(custOf(u))}${td(u.plan, true)}${td(money(u.weight), true)}${td(u.minShip + ' → ' + a.minShip + ' (' + c.gap + 'd early)')}${td(c.sum + ' plt', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-combine" data-sos="${usos.join(',')}" data-tsos="${asos.join(',')}" data-ship="${a.minShip}" data-pair="${escapeHtml(c.pairSig)}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Combine</button> <button class="fr-keepsep" data-pair="${escapeHtml(c.pairSig)}" data-mv="${sigOf(u)}" data-kp="" title="Ship this truck separately and stop suggesting it for this group" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Keep separate</button></td></tr>`;
+              const det = `<tr class="fr-oppdet-${id}" style="display:none;background:rgba(124,58,237,0.05);"><td></td><td colspan="8" style="padding:8px 9px;"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-bottom:4px;">Consolidating → ${c.sum} plt on ${a.minShip} · never late (this order moves ${c.gap}d early)</div><table style="border-collapse:collapse;">${summRow(u, 'Move ↓ earlier →')}${summRow(a, 'Keep (anchor) →')}<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">Full route →</td><td colspan="6" style="padding:4px 8px;font-weight:600;">${(() => { const seen = new Set(); const r = [...u.stops, ...a.stops].map(x => x.dc || _frCustShort(x.customer)).filter(n => n && !seen.has(n) && seen.add(n)); return escapeHtml(['Brattleboro, VT', ...r].join(' → ')); })()}</td></tr></table></td></tr>`;
               return main + det;
-            };
-            return optionRows(t.opp, 0);
+            }).join('');
+            return head + rows;
           }).join('')}</tbody></table></div>` : `<div style="font-family:var(--mono);font-size:11px;color:#2e7d32;">${nOvr} active consolidation${nOvr === 1 ? '' : 's'} applied. No further opportunities.</div>`}
         </div>` : '';
         const modesPresent = [...new Set(allTrucks.map(t => t.mode))];
@@ -48142,7 +48156,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.querySelectorAll('.fr-keepsep').forEach(btn => btn.addEventListener('click', async () => {
           btn.disabled = true;
           try {
-            const rows = [{ brand_id: brandId, pair_sig: btn.dataset.pair }, { brand_id: brandId, pair_sig: 'trk:' + btn.dataset.mv }, { brand_id: brandId, pair_sig: 'trk:' + btn.dataset.kp }];
+            const rows = [{ brand_id: brandId, pair_sig: btn.dataset.pair }, { brand_id: brandId, pair_sig: 'trk:' + btn.dataset.mv }].concat(btn.dataset.kp ? [{ brand_id: brandId, pair_sig: 'trk:' + btn.dataset.kp }] : []);
             const { error } = await sb.from('freight_opp_dismissals').upsert(rows, { onConflict: 'brand_id,pair_sig' }); if (error) throw error;
             _frRenderTab(brandId, sb);
           } catch (e) { alert('Could not dismiss — ' + (e.message || e) + '\n\n(If the table is missing, run the freight_opp_dismissals SQL in Supabase.)'); btn.disabled = false; }
@@ -48248,7 +48262,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const stLabel = { approved: 'Approved', rejected: 'Rejected', buyer: 'Awaiting buyer' };
           allTrucks.forEach((t, i) => {
             const sig = sigOf(t); const ap = apprOf(sig); const status = ap.booked_at ? 'Booked' : (stLabel[stOf(sig)] || 'Pending');
-            const opp = t.opp ? `combine #${t.opp.moveNum} into #${t.opp.keepNum} (${t.opp.ship}, ${t.opp.daysEarly}d early) -> ${t.opp.sum} plt` : '';
+            const opp = (() => { for (const g of (window._frOppGroups || [])) { if (g.anchor === t) return `anchor of ${g.dcName} group (${g.cands.length} could join)`; const c = g.cands.find(x => x.truck === t); if (c) return `could join #${g.anchor._num} at ${g.dcName} (${g.anchor.minShip}, ${c.gap}d early) -> ${c.sum} plt`; } return ''; })();
             const util = Math.round(t.plan / (s.max_pallets || 28) * 100);
             lines.push(['Truck', i + 1, t.mode, laneName(t.lane), custOf(t), t.stops.map(x => x.dc || _frCustShort(x.customer)).join(' > '), '', shipWin(t), t.cases, t.plan, Math.round(t.weight), util, '', t.flags.join('; '), opp, status, ap.quote_cost != null ? ap.quote_cost : '', ap.pickup_date || '', ''].map(esc).join(','));
             t.stops.forEach(st => (st.ships || []).forEach(so => { const moved = ovrMap[so] ? 'yes' : ''; (linesBySo[so] || []).forEach(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)).toFixed(2) : ''; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; lines.push(['Item', i + 1, '', '', _frCustShort(st.customer), (st.dc || '') + ' · ' + skuName(ln.sku), skuUpc(ln.sku), st.ship || '', ln.cases, lp, '', '', ll, '', '', '', '', '', moved].map(esc).join(',')); }); }));
