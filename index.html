@@ -47954,7 +47954,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             </tbody></table></div>
           </div>` : ''}
           ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — these orders are missing a DC value in the feed.</div>` : ''}
-          <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Truck plan (${allTrucks.length})</div>
+          <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Get a Quote (${visibleTrucks.length})</div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Orders combine onto one truck only when their projected ship dates fall within ${s.date_window_days || 1} day(s) of each other, and never exceed ${s.max_pallets || 28} pallets / ${money(s.max_weight || 40000)} lb / ${s.max_stops || 3} stops. Mode: <b>LTL</b> ≤ ${s.ltl_max_pallets || 4} plt, otherwise <b>FTL</b> (consolidated toward the ${s.max_pallets || 28}-pallet max) · <b>Dedicated</b> = C&amp;S / Target. Expand multi-stop trucks with the ▸ toggle.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
           ${visibleTrucks.length ? truckTable(visibleTrucks) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (proposed multi-stop / undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
@@ -48157,7 +48157,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const r1 = await sb.from('freight_overrides').upsert(sos.map(so => ({ brand_id: brandId, so_num: so, ship_date: ship, note: 'consolidated (date change)', updated_at: new Date().toISOString() })), { onConflict: 'brand_id,so_num' });
             if (r1.error) throw r1.error;
             if (pair) { const rd = await sb.from('freight_opp_dismissals').upsert({ brand_id: brandId, pair_sig: pair }, { onConflict: 'brand_id,pair_sig' }); if (rd.error && !/does not exist/i.test(rd.error.message || '')) throw rd.error; }
-            const mergedSig = [...new Set([...sos, ...tsos])].sort().join('|');
+            // Predicting the merged signature fails when the packer adds other same-window
+            // riders — so re-run the plan with the new dates and read the real signature.
+            let mergedSig = [...new Set([...sos, ...tsos])].sort().join('|');
+            try {
+              const ovrNext = Object.assign({}, ovrMap2); sos.forEach(so => { ovrNext[so] = ship; });
+              const P2 = _frPlan(planOrders, items, mapRows, s, customers, lanes, ovrNext, avoidRows, { own: ownSet, laneOf: laneOfMap, withMap });
+              const all2 = P2.trucks.concat(P2.dedicated, P2.ltl);
+              const anchor = (tsos[0] || sos[0]);
+              const mt = all2.find(x => x.stops.some(st => (st.ships || []).includes(anchor)));
+              if (mt) mergedSig = [...new Set(mt.stops.flatMap(st => st.ships || []))].sort().join('|');
+            } catch (e2) { /* fall back to the predicted signature */ }
             if (needsBuyer) {
               const r2 = await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: mergedSig, status: 'buyer', updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' });
               if (r2.error) throw r2.error;
