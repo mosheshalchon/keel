@@ -47822,10 +47822,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const id = 'r' + i; const sig = sigOf(t); const ap = apprOf(sig); const st8 = stOf(sig);
             const nLines = t.stops.reduce((a, st) => a + (st.ships || []).reduce((b, so) => b + (linesBySo[so] || []).length, 0), 0);
             const caret = `<button class="fr-exp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:11px;padding:0 5px 0 0;">&#9656; ${t.stops.length > 1 ? t.stops.length + ' stops · ' : ''}${nLines} items</button>`;
-            const stColor = st8 === 'approved' ? '#2e7d32' : st8 === 'rejected' ? 'var(--lost)' : 'var(--ink-3)';
+            const stColor = st8 === 'approved' ? '#2e7d32' : st8 === 'rejected' ? 'var(--lost)' : st8 === 'buyer' ? '#7c3aed' : 'var(--ink-3)';
+            const stOpts = st8 === 'buyer' ? [['buyer', 'Needs buyer approval'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['', 'Pending']] : [['', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected']];
+            const tSos = [...new Set(t.stops.flatMap(st => st.ships || []))].join(',');
             const consolidated = t.stops.some(st => (st.ships || []).some(so => ovrMap[so]));
             const buyerBtn = consolidated ? `<button class="fr-buyer" data-idx="${i}" title="Email the buyer (customer) to approve the date change" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid #7c3aed;border-radius:4px;background:transparent;cursor:pointer;color:#7c3aed;margin-left:5px;">✉ Buyer</button>` : '';
-            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${[['', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected']].map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select>${buyerBtn}<button class="fr-quote" data-idx="${i}" title="Request a freight quote (needs Approved)" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);margin-left:5px;">✉ Quote</button></td>`;
+            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" data-sos="${tSos}" data-prev="${st8}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${stOpts.map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select>${buyerBtn}<button class="fr-quote" data-idx="${i}" title="Request a freight quote (needs Approved)" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);margin-left:5px;">✉ Quote</button></td>`;
             const quoteCell = `<td style="padding:6px 6px;border-top:1px solid var(--rule-soft);"><input type="number" step="any" min="0" class="fr-cost" data-sig="${sig}" value="${ap.quote_cost != null ? ap.quote_cost : ''}" placeholder="—" style="width:74px;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);text-align:right;"></td>`;
             const dateCell = `<td style="padding:6px 6px;border-top:1px solid var(--rule-soft);"><input type="date" class="fr-pickup" data-sig="${sig}" value="${ap.pickup_date || ''}" style="font-family:var(--mono);font-size:10px;padding:3px 4px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);"></td>`;
             const canBook = st8 === 'approved' && ap.quote_cost != null && ap.pickup_date;
@@ -47872,16 +47874,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           if (a && b && a !== b) a.flags.push('manual move: ' + so + ' did not fit with ' + target + ' (capacity/lane) — packed separately');
           if (a && !b) a.flags.push('manual move: target order ' + target + ' is no longer in the plan');
         });
-        const awaitingBuyer = allTrucks.filter(t => stOf(sigOf(t)) === 'buyer');
         const bookedTrucks = allTrucks.filter(t => apprOf(sigOf(t)).booked_at && !t._oppHold);
-        const visibleAll = allTrucks.filter(t => !t._oppHold && stOf(sigOf(t)) !== 'buyer' && !apprOf(sigOf(t)).booked_at);
+        const visibleAll = allTrucks.filter(t => !t._oppHold && !apprOf(sigOf(t)).booked_at);
         const _isOwnT = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
-        const visibleTrucks = visibleAll.filter(t => !_isOwnT(t));
+        const pendingAccept = visibleAll.filter(t => !_isOwnT(t) && t.stops.length > 1 && !apprMap[sigOf(t)]);
+        const visibleTrucks = visibleAll.filter(t => !_isOwnT(t) && !pendingAccept.includes(t));
         const indepTrucks = visibleAll.filter(_isOwnT);
         const oppCount = allTrucks.filter(t => t.opp).length;
         const oppList = allTrucks.filter(t => t.opp);
         const nOvr = Object.keys(ovrMap).length;
-        const oppPanel = (oppCount || nOvr || awaitingBuyer.length) ? `<div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:12px 14px;margin-bottom:16px;">
+        const oppPanel = (oppCount || nOvr) ? `<div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:12px 14px;margin-bottom:16px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:15px;">&#9889; Consolidation opportunities${oppCount ? ` (${oppCount})` : ''}</div>${nOvr ? `<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);">Reset all consolidations (${nOvr})</button>` : ''}</div>
           <div style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">A small order ships to the same DC as another truck within ${s.opp_window_days || 7} days and fits on it. <b>Combine</b> ships both on the <b>earlier</b> date — the later order moves earlier so nothing is ever late (early delivery only). Needs buyer sign-off on the date change.</div>
           ${oppCount ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['', '# (move → keep)', 'DC', 'Order to move', 'Pallets', 'Weight (lb)', 'Ship window', 'Result', 'Action'].map((h, i) => th(h, i === 4 || i === 5 || i === 7)).join('')}</tr></thead><tbody>${oppList.map((t, oi) => {
@@ -47900,7 +47902,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const opts = [t.opp, ...(t.opp.alts || [])];
             return opts.map(optionRows).join('');
           }).join('')}</tbody></table></div>` : `<div style="font-family:var(--mono);font-size:11px;color:#2e7d32;">${nOvr} active consolidation${nOvr === 1 ? '' : 's'} applied. No further opportunities.</div>`}
-          ${awaitingBuyer.length ? `<div style="margin-top:12px;border-top:1px solid rgba(124,58,237,0.3);padding-top:10px;"><div style="font-family:var(--serif);font-size:14px;margin-bottom:6px;">Awaiting buyer approval (${awaitingBuyer.length})</div>${awaitingBuyer.map(t => `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;padding:4px 0;"><b>#${t._num}</b> ${escapeHtml([...new Set(t.stops.map(x => x.dc || _frCustShort(x.customer)))].join(' → '))} · ${t.plan} plt · ship ${t.minShip}<button class="fr-buyer-ok" data-sig="${sigOf(t)}" style="font-family:var(--mono);font-size:10px;padding:3px 10px;border:1px solid #2e7d32;border-radius:4px;background:#2e7d32;color:#fff;cursor:pointer;">✓ Buyer approved</button><button class="fr-buyer-no" data-sig="${sigOf(t)}" data-sos="${[...new Set(t.stops.flatMap(st => st.ships || []))].join(',')}" style="font-family:var(--mono);font-size:10px;padding:3px 10px;border:1px solid var(--lost);border-radius:4px;background:transparent;color:var(--lost);cursor:pointer;">✗ Buyer rejected</button><button class="fr-buyer" data-idx="${t._num - 1}" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid #7c3aed;border-radius:4px;background:transparent;cursor:pointer;color:#7c3aed;">✉ Resend email</button></div>`).join('')}</div>` : ''}
         </div>` : '';
         const modesPresent = [...new Set(allTrucks.map(t => t.mode))];
         const allShips = allTrucks.flatMap(t => t.stops).concat(P.manual, P.needsDc);
@@ -47945,11 +47946,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           </div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:12px;line-height:1.6;">Cases reconciliation — pending <b style="color:var(--ink);">${P.totals.cases.toLocaleString()}</b> = FTL ${P.totals.casesFTL.toLocaleString()} · LTL ${P.totals.casesLTL.toLocaleString()} · Dedicated ${P.totals.casesDed.toLocaleString()} · Manual ${P.totals.casesManual.toLocaleString()} · Needs-DC ${P.totals.casesNeed.toLocaleString()}${P.totals.casesMissing ? ` &nbsp;|&nbsp; <span style="color:#b8860b;">⚠ ${P.totals.casesMissing.toLocaleString()} cases with no item config</span>` : ''}${P.totals.cases3pl ? ` &nbsp;|&nbsp; <span style="color:var(--ink-3);">Excluded ${P.totals.cases3pl.toLocaleString()} cases (pickup / 3PL / not-serviced — not ATG-booked)</span>` : ''}</div>
           ${oppPanel}
+          ${pendingAccept.length ? `<div style="background:rgba(46,125,50,0.05);border:1px solid rgba(46,125,50,0.3);border-radius:8px;padding:14px 18px;margin-bottom:18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div style="font-family:var(--serif);font-size:16px;">🚚 Proposed multi-stop trucks (${pendingAccept.length})</div><button id="fr-accept-all" style="font-family:var(--mono);font-size:11px;padding:5px 14px;border:1px solid #2e7d32;border-radius:4px;background:#2e7d32;color:#fff;cursor:pointer;">Accept all (${pendingAccept.length})</button></div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:8px;">The optimizer combined these same-lane orders (ship dates within ${s.date_window_days || 1}d) onto shared trucks. Accept to move a truck into the plan below — or accept, then expand it there to uncheck POs you want out.</div>
+            ${pendingAccept.map(t => `<div style="border-top:1px solid rgba(46,125,50,0.2);padding:7px 0;font-family:var(--mono);font-size:11px;"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;"><b>#${t._num}</b> ${escapeHtml(laneName(t.lane))} · ${modeBadge(t.mode)} · ${t.stops.length} stops · ${shipWin(t)} · ${t.cases} cs · ${t.plan} plt · ${Math.round(t.plan / (s.max_pallets || 28) * 100)}%<button class="fr-accept" data-sig="${sigOf(t)}" style="font-family:var(--mono);font-size:11px;padding:4px 14px;border:1px solid #2e7d32;border-radius:4px;background:transparent;color:#2e7d32;cursor:pointer;">Accept</button></div><div style="color:var(--ink-3);margin-top:2px;">${t.stops.map(x => `${escapeHtml(x.dc || _frCustShort(x.customer))} (${(x.ships || []).length} PO · ${Math.ceil((x.pallets || 0) * 100) / 100} plt)`).join(' → ')}</div></div>`).join('')}
+          </div>` : ''}
           ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — these orders are missing a DC value in the feed.</div>` : ''}
           <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Truck plan (${allTrucks.length})</div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Orders combine onto one truck only when their projected ship dates fall within ${s.date_window_days || 1} day(s) of each other, and never exceed ${s.max_pallets || 28} pallets / ${money(s.max_weight || 40000)} lb / ${s.max_stops || 3} stops. Mode: <b>LTL</b> ≤ ${s.ltl_max_pallets || 4} plt, otherwise <b>FTL</b> (consolidated toward the ${s.max_pallets || 28}-pallet max) · <b>Dedicated</b> = C&amp;S / Target. Expand multi-stop trucks with the ▸ toggle.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
-          ${visibleTrucks.length ? truckTable(visibleTrucks) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
+          ${visibleTrucks.length ? truckTable(visibleTrucks) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (proposed multi-stop / undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
           ${indepTrucks.length ? `<div style="margin-top:16px;"><div style="font-family:var(--serif);font-size:15px;margin-bottom:6px;">Independent POs (${indepTrucks.length}) <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">— split out by hand; each ships on its own. ↩ Rejoin returns one to the plan.</span></div>${truckTable(indepTrucks)}</div>` : ''}
           ${(() => {
             const moveEntries = Object.keys(moveMap).sort();
@@ -48017,7 +48023,18 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         }));
         body.querySelectorAll('.fr-status-sel').forEach(sel => sel.addEventListener('change', async () => {
           const sig = sel.dataset.sig; const val = sel.value;
-          const colors = { approved: '#2e7d32', rejected: 'var(--lost)' };
+          const colors = { approved: '#2e7d32', rejected: 'var(--lost)', buyer: '#7c3aed' };
+          if (sel.dataset.prev === 'buyer' && val === 'rejected') {
+            if (!confirm('Buyer rejected the date change?\n\nThis undoes the consolidation (original ship dates restored) and returns the trucks to the plan separately. The pairing will not be re-suggested.')) { sel.value = 'buyer'; return; }
+            sel.disabled = true;
+            try {
+              const sos2 = (sel.dataset.sos || '').split(',').filter(Boolean);
+              const d1 = await sb.from('freight_overrides').delete().eq('brand_id', brandId).in('so_num', sos2); if (d1.error) throw d1.error;
+              const d2 = await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', sig); if (d2.error) throw d2.error;
+              _frRenderTab(brandId, sb);
+            } catch (e) { alert(e.message || e); sel.disabled = false; }
+            return;
+          }
           sel.disabled = true;
           try {
             const ap = apprOf(sig); const hasExtra = ap.quote_cost != null || ap.pickup_date || ap.booked_at;
@@ -48026,7 +48043,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             else { r = await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: sig, status: val || 'pending', updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' }); }
             if (r && r.error) throw r.error;
             apprMap[sig] = Object.assign({}, ap, { signature: sig, status: val || 'pending' });
-            sel.style.color = colors[val] || 'var(--ink-3)';
+            sel.style.color = colors[val] || 'var(--ink-3)'; sel.dataset.prev = val;
             const bookBtn = body.querySelector(`.fr-book[data-sig="${sig}"]`);
             if (bookBtn) { const a2 = apprOf(sig); const can = val === 'approved' && a2.quote_cost != null && a2.pickup_date; bookBtn.disabled = !can; bookBtn.style.cssText = `font-family:var(--mono);font-size:10px;padding:3px 10px;border:1px solid ${can ? '#2e7d32' : 'var(--rule-soft)'};border-radius:4px;background:${can ? '#2e7d32' : 'transparent'};color:${can ? '#fff' : 'var(--ink-3)'};cursor:${can ? 'pointer' : 'not-allowed'};`; }
           } catch (e) { alert('Could not save status — ' + (e.message || e) + '\n\n(If the table is missing, run the freight_approvals SQL in Supabase.)'); }
@@ -48051,6 +48068,21 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.querySelectorAll('.fr-unbook').forEach(btn => btn.addEventListener('click', async () => {
           if (await saveApprField(btn.dataset.sig, { booked_at: null })) _frRenderTab(brandId, sb);
         }));
+        const acceptSigs = async sigs => {
+          const rows = sigs.map(sig => ({ brand_id: brandId, signature: sig, status: 'pending', updated_at: new Date().toISOString() }));
+          const { error } = await sb.from('freight_approvals').upsert(rows, { onConflict: 'brand_id,signature' });
+          if (error) { alert('Could not accept — ' + error.message); return false; }
+          return true;
+        };
+        body.querySelectorAll('.fr-accept').forEach(btn => btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          if (await acceptSigs([btn.dataset.sig])) _frRenderTab(brandId, sb); else btn.disabled = false;
+        }));
+        const accAll = document.getElementById('fr-accept-all');
+        if (accAll) accAll.addEventListener('click', async () => {
+          accAll.disabled = true;
+          if (await acceptSigs(pendingAccept.map(t => sigOf(t)))) _frRenderTab(brandId, sb); else accAll.disabled = false;
+        });
         const adjTgl = document.getElementById('fr-adj-tgl');
         if (adjTgl) adjTgl.addEventListener('click', () => { const b2 = document.getElementById('fr-adj-body'); const open = b2.style.display !== 'none'; b2.style.display = open ? 'none' : 'block'; adjTgl.textContent = (open ? '▸' : '▾') + adjTgl.textContent.slice(1); });
         const bkTgl = document.getElementById('fr-booked-tgl');
@@ -48102,23 +48134,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             _frRenderTab(brandId, sb);
           } catch (e) { alert('Could not dismiss — ' + (e.message || e) + '\n\n(If the table is missing, run the freight_opp_dismissals SQL in Supabase.)'); btn.disabled = false; }
         }));
-        body.querySelectorAll('.fr-buyer-ok').forEach(btn => btn.addEventListener('click', async () => {
-          btn.disabled = true;
-          if (await saveApprField(btn.dataset.sig, { status: 'approved' })) _frRenderTab(brandId, sb);
-        }));
-        body.querySelectorAll('.fr-buyer-no').forEach(btn => btn.addEventListener('click', async () => {
-          if (!confirm('Buyer rejected the date change?\n\nThis undoes the consolidation (original ship dates restored), stops suggesting this pairing, and returns both trucks to the plan below.')) return;
-          btn.disabled = true;
-          try {
-            const sos = (btn.dataset.sos || '').split(',').filter(Boolean);
-            const d1 = await sb.from('freight_overrides').delete().eq('brand_id', brandId).in('so_num', sos); if (d1.error) throw d1.error;
-            const d2 = await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', btn.dataset.sig); if (d2.error) throw d2.error;
-            _frRenderTab(brandId, sb);
-          } catch (e) { alert(e.message || e); btn.disabled = false; }
-        }));
         body.querySelectorAll('.fr-combine').forEach(btn => btn.addEventListener('click', async () => {
           const sos = (btn.dataset.sos || '').split(',').filter(Boolean); const tsos = (btn.dataset.tsos || '').split(',').filter(Boolean); const ship = btn.dataset.ship; const pair = btn.dataset.pair;
-          const needsBuyer = confirm('Combine these trucks (later order ships ' + ship + ').\n\nDoes this date change need BUYER approval?\n\nOK = yes — a pre-filled approval email opens and the truck waits up here until the buyer answers.\nCancel = no — merge now and send it straight to the plan below.');
+          const ans = await _frAsk3('Combine these trucks?', 'The later order ships ' + ship + ' (earlier, never late).\n\nDoes this date change need BUYER approval?\n\nYes — a pre-filled approval email opens; the truck moves to the plan below marked "Needs buyer approval".\nNo — merge and move it below as Approved, ready to quote.', 'Yes — email buyer', 'No — approve');
+          if (ans === null) return;
+          const needsBuyer = ans === 'yes';
           btn.disabled = true; btn.textContent = 'Combining…';
           try {
             const r1 = await sb.from('freight_overrides').upsert(sos.map(so => ({ brand_id: brandId, so_num: so, ship_date: ship, note: 'consolidated (date change)', updated_at: new Date().toISOString() })), { onConflict: 'brand_id,so_num' });
@@ -48142,7 +48162,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                 } else { alert('No buyer email on file for the moved order — add a contact on the Customers tab, then use ✉ Resend email.'); }
               }
             } else {
-              const rr = await sb.from('freight_approvals').delete().eq('brand_id', brandId).eq('signature', mergedSig);
+              const rr = await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: mergedSig, status: 'approved', updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' });
               if (rr.error) throw rr.error;
             }
             _frRenderTab(brandId, sb);
@@ -48616,6 +48636,22 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return { pending_loaded: recs.length };
   }
 
+  function _frAsk3(title, msg, yesLabel, noLabel) {
+    return new Promise(resolve => {
+      const ov = document.createElement('div');
+      ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center;';
+      ov.innerHTML = `<div style="background:var(--paper,#fff);border-radius:10px;max-width:460px;width:92%;padding:22px 26px;box-shadow:0 12px 40px rgba(0,0,0,0.25);">
+        <div style="font-family:var(--serif,serif);font-size:17px;margin-bottom:10px;">${title}</div>
+        <div style="font-size:13px;line-height:1.55;color:var(--ink,#222);white-space:pre-line;">${msg}</div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px;">
+          <button data-v="cancel" style="font-family:var(--mono,monospace);font-size:12px;padding:7px 16px;border:1px solid var(--rule-soft,#ccc);border-radius:5px;background:transparent;color:var(--ink,#222);cursor:pointer;">Cancel</button>
+          <button data-v="no" style="font-family:var(--mono,monospace);font-size:12px;padding:7px 16px;border:1px solid var(--ink,#222);border-radius:5px;background:transparent;color:var(--ink,#222);cursor:pointer;">${noLabel}</button>
+          <button data-v="yes" style="font-family:var(--mono,monospace);font-size:12px;padding:7px 18px;border:1px solid #7c3aed;border-radius:5px;background:#7c3aed;color:#fff;cursor:pointer;">${yesLabel}</button>
+        </div></div>`;
+      ov.addEventListener('click', e => { const b = e.target.closest('button[data-v]'); if (b) { document.body.removeChild(ov); resolve(b.dataset.v === 'cancel' ? null : b.dataset.v); } else if (e.target === ov) { document.body.removeChild(ov); resolve(null); } });
+      document.body.appendChild(ov);
+    });
+  }
   async function _frUploadWorkbook(file, brandId, sb, onMsg) {
     const ab = await file.arrayBuffer();
     const wb = XLSX.read(ab, { type: 'array', cellDates: true });
