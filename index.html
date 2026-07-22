@@ -47654,7 +47654,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   async function _frRenderTab(brandId, sb) {
     const body = document.getElementById('hl-fr-body');
     if (!body) return;
-    body.innerHTML = `<div class="hl-loading">Loading…</div>`;
+    const _view = 'fr:' + _frSubTab;
+    const _soft = window._frLastView === _view && body.childElementCount > 0 && !body.querySelector('.hl-loading');
+    window._frLastView = _view;
+    const _sc = _soft ? (document.scrollingElement || document.documentElement).scrollTop : null;
+    if (!_soft) body.innerHTML = `<div class="hl-loading">Loading…</div>`;
     const th = (h, r) => `<th style="padding:7px 9px;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;text-align:${r ? 'right' : 'left'};border-bottom:2px solid var(--rule-soft);white-space:nowrap;">${escapeHtml(h)}</th>`;
     const td = (v, r) => `<td style="padding:6px 9px;font-family:var(--sans);font-size:12px;text-align:${r ? 'right' : 'left'};border-top:1px solid var(--rule-soft);">${v == null || v === '' ? '<span style="color:var(--ink-3);">—</span>' : escapeHtml(String(v))}</td>`;
     const wrap = (headHtml, rowsHtml, note) => `${note ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:8px;">${note}</div>` : ''}<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${headHtml}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
@@ -48427,6 +48431,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       }
     } catch (err) {
       body.innerHTML = `<div class="hl-empty" style="padding:24px;color:var(--lost);">Could not load: ${escapeHtml(err.message || 'error')}</div>`;
+    } finally {
+      if (_sc != null) requestAnimationFrame(() => { (document.scrollingElement || document.documentElement).scrollTop = _sc; });
     }
   }
   let _frShowPickup = true;
