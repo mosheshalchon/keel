@@ -47848,6 +47848,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const oppWin = Number(s.opp_window_days) || 7, mP = s.max_pallets || 28, mW = s.max_weight || 40000, mS = s.max_stops || 3, autoWin = s.date_window_days || 1;
           const dd = (a, b) => (!a || !b) ? 999 : Math.abs((new Date(a) - new Date(b)) / 86400000);
           const oppExempt = t => dismSet.has('trk:' + sigOf(t));
+          const seenPairs = new Set();
           allTrucks.forEach(t => {
             if (t.mode === 'Dedicated' || oppExempt(t)) return;
             const myDcs = new Set(t.stops.map(x => _frDcKey(x.dc)).filter(Boolean));
@@ -47862,7 +47863,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             });
             cands.sort((a, b) => b.plan - a.plan);
             const best = cands[0] || null;
-            if (best) { const earlyShip = (t.minShip < best.minShip) ? t.minShip : best.minShip; const lateTruck = (t.minShip < best.minShip) ? best : t; const keepTruck = (t.minShip < best.minShip) ? t : best; const pairSig = sigOf(lateTruck) + '>>' + sigOf(keepTruck); if (dismSet.has(pairSig)) return; t.opp = { ship: earlyShip, daysEarly: Math.round(dd(lateTruck.minShip, earlyShip)), sum: best.plan + t.plan, dc: [...new Set(t.stops.map(x => x.dc).filter(Boolean))][0] || '', moveNum: lateTruck._num, keepNum: keepTruck._num, moveSos: [...new Set(lateTruck.stops.flatMap(st => st.ships || []))], tsos: [...new Set(keepTruck.stops.flatMap(st => st.ships || []))], moveTruck: lateTruck, keepTruck: keepTruck, pairSig }; }
+            if (best) { const earlyShip = (t.minShip < best.minShip) ? t.minShip : best.minShip; const lateTruck = (t.minShip < best.minShip) ? best : t; const keepTruck = (t.minShip < best.minShip) ? t : best; const pairSig = sigOf(lateTruck) + '>>' + sigOf(keepTruck); if (dismSet.has(pairSig) || seenPairs.has(pairSig)) return; seenPairs.add(pairSig); t.opp = { ship: earlyShip, daysEarly: Math.round(dd(lateTruck.minShip, earlyShip)), sum: best.plan + t.plan, dc: [...new Set(t.stops.map(x => x.dc).filter(Boolean))][0] || '', moveNum: lateTruck._num, keepNum: keepTruck._num, moveSos: [...new Set(lateTruck.stops.flatMap(st => st.ships || []))], tsos: [...new Set(keepTruck.stops.flatMap(st => st.ships || []))], moveTruck: lateTruck, keepTruck: keepTruck, pairSig }; }
           });
           allTrucks.forEach(t => { if (t.opp) { t.opp.moveTruck._oppHold = true; t.opp.keepTruck._oppHold = true; } });
         })();
