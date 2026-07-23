@@ -47760,14 +47760,23 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           sb.from('freight_distributors').select('*').eq('brand_id', brandId).order('company'),
           sb.from('freight_avoid_lanes').select('state_a,state_b,note').eq('brand_id', brandId)
         ]);
-        const [{ data: dismRows }, { data: moveRows }] = await Promise.all([
+        const [{ data: dismRows }, { data: moveRows }, { data: costRows }] = await Promise.all([
           sb.from('freight_opp_dismissals').select('pair_sig').eq('brand_id', brandId),
-          sb.from('freight_order_moves').select('so_num,target').eq('brand_id', brandId)
+          sb.from('freight_order_moves').select('so_num,target').eq('brand_id', brandId),
+          sb.from('freight_costs').select('*').eq('brand_id', brandId)
         ]);
         const s = await _frLoadSettings(brandId, sb);
         const ovrMap = {}; (ovrRows || []).forEach(o => { ovrMap[o.so_num] = o.ship_date; });
         const dismSet = new Set((dismRows || []).map(d => d.pair_sig));
         const moveMap = {}; (moveRows || []).forEach(m => { moveMap[m.so_num] = m.target; });
+        // Freight cost matrix: dest_key → bracket rates. costOf returns estimated shipment total.
+        const costMap = {}; let costDefault = null;
+        (costRows || []).forEach(cr => { if (cr.dest_key === 'DEFAULT') costDefault = cr; else costMap[cr.dest_key] = cr; });
+        const haveCosts = !!((costRows || []).length);
+        const _rateOf = (row, plt) => { if (!row) return null; const k = plt < 3 ? 'r_1_2' : plt < 5 ? 'r_3_4' : plt < 9 ? 'r_5_8' : plt < 13 ? 'r_9_12' : plt < 21 ? 'r_13_20' : 'r_21_28'; return row[k] != null ? Number(row[k]) : null; };
+        const costRowFor = t => { let best = null, bp = -1; t.stops.forEach(st => { const r = costMap[_frDcKey(st.dc || '')]; if (r && (st.pallets || 0) > bp) { best = r; bp = st.pallets || 0; } }); return best || costDefault; };
+        const truckCost = (t, pltOverride) => { const row = costRowFor(t); if (!row) return null; const plt = pltOverride != null ? pltOverride : t.plan; const rate = _rateOf(row, plt); if (rate == null) return null; const raw = rate * plt; return Math.max(raw, Number(row.min_charge) || 0); };
+        const combineSavings = (anchor, cand) => { const a = truckCost(anchor), c = truckCost(cand); if (a == null || c == null) return null; const comb = truckCost(anchor, anchor.plan + cand.plan); if (comb == null) return null; return Math.round(a + c - comb); };
         const srcToggle = '';
         const wireSrc = () => {};
         if (!orders || !orders.length) { body.innerHTML = `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No pending orders yet — the daily sync runs each morning, or trigger it manually.</div>`; wireSrc(); return; }
@@ -47821,7 +47830,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const isOwnTruck = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
         const splitDesc = full => { const i = String(full || '').lastIndexOf(' - '); return i > 0 ? { name: full.slice(0, i), pack: full.slice(i + 3) } : { name: full || '', pack: '' }; };
         const truckTable = (trucks) => {
-          const head = ['#', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan plt', 'Weight (lb)', 'Util', 'Mode', 'Flags', 'Status', 'Quote $', 'Pickup', ''].map((h, i) => th(h, i >= 5 && i <= 7)).join('');
+          const head = ['#', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan plt', 'Weight (lb)', 'Util', 'Mode', 'Flags', 'Status'].concat(haveCosts ? ['Est. $'] : []).concat(['Quote $', 'Pickup', '']).map((h, i) => th(h, i >= 5 && i <= 7)).join('');
           const rows = trucks.map((t) => {
             const i = t._num - 1;
             const id = 'r' + i; const sig = sigOf(t); const ap = apprOf(sig); const st8 = stOf(sig);
@@ -47840,8 +47849,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const rejNote = st8 === 'rejected' ? `<div style="color:var(--lost);">✗ rejected — reassign its orders below (expand ▸)</div>` : '';
             const ownNote = isOwnTruck(t) ? `<button class="fr-rejoin" data-so="${escapeHtml([...new Set(t.stops.flatMap(st => st.ships || []))][0])}" title="Return this PO to the optimizer's plan" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid #7c3aed;border-radius:4px;background:transparent;color:#7c3aed;cursor:pointer;">↩ Rejoin plan</button>` : '';
             const consNote = consolidated ? `<div style="color:#7c3aed;">&#10003; consolidated · date changed to ${t.minShip}</div>` : '';
-            const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(t._num)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}${ownNote}${rejNote}${consNote}</td>${statusCell}${quoteCell}${dateCell}${bookCell}</tr>`;
-            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => { const moved = !!ovrMap[so]; const laneMoved = (moveMap[so] || '').startsWith('lane:'); return (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; const dsc = splitDesc(skuName(ln.sku)); const chk = (isOwnTruck(t) || [...new Set(t.stops.flatMap(x => x.ships || []))].length < 2) ? '' : `<input type="checkbox" class="fr-po-chk" data-so="${escapeHtml(so)}" checked title="On this truck — uncheck to split ${escapeHtml(so)} out as an independent PO" style="vertical-align:middle;cursor:pointer;">`; const sp = (w, txt, color) => `<span style="display:inline-block;width:${w}px;vertical-align:top;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${color ? 'color:' + color + ';' : ''}">${txt}</span>`; const info = `<div style="font-family:var(--mono);font-size:10px;white-space:nowrap;">&#8627; ${sp(140, escapeHtml(st.dc || ''))}${sp(100, escapeHtml(skuUpc(ln.sku) || ''), 'var(--ink-3)')}${sp(190, escapeHtml(dsc.name))}${sp(84, escapeHtml(dsc.pack), 'var(--ink-3)')}${sp(104, escapeHtml(so))}${ll ? sp(70, escapeHtml(ll), 'var(--ink-3)') : ''}${moved ? `<span style="color:#7c3aed;font-weight:700;"> ⚡ date changed</span>` : ''}${laneMoved ? `<span style="color:#7c3aed;font-weight:700;"> lane moved</span>` : ''}</div>`; return `<tr class="fr-det-${id}" style="display:none;background:${moved ? 'rgba(124,58,237,0.09)' : 'rgba(0,0,0,0.02)'};">${dcell(chk, true)}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell(info)}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}</tr>`; }); })).join('');
+            const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(t._num)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}${ownNote}${rejNote}${consNote}</td>${statusCell}${haveCosts ? `<td style=\"padding:6px 6px;border-top:1px solid var(--rule-soft);text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);\" title=\"Benchmark from the cost matrix — compare quotes against it\">${(() => { const ec = truckCost(t); return ec != null ? '$' + Math.round(ec).toLocaleString() : '—'; })()}</td>` : ''}${quoteCell}${dateCell}${bookCell}</tr>`;
+            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => { const moved = !!ovrMap[so]; const laneMoved = (moveMap[so] || '').startsWith('lane:'); return (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; const dsc = splitDesc(skuName(ln.sku)); const chk = (isOwnTruck(t) || [...new Set(t.stops.flatMap(x => x.ships || []))].length < 2) ? '' : `<input type="checkbox" class="fr-po-chk" data-so="${escapeHtml(so)}" checked title="On this truck — uncheck to split ${escapeHtml(so)} out as an independent PO" style="vertical-align:middle;cursor:pointer;">`; const sp = (w, txt, color) => `<span style="display:inline-block;width:${w}px;vertical-align:top;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${color ? 'color:' + color + ';' : ''}">${txt}</span>`; const info = `<div style="font-family:var(--mono);font-size:10px;white-space:nowrap;">&#8627; ${sp(140, escapeHtml(st.dc || ''))}${sp(100, escapeHtml(skuUpc(ln.sku) || ''), 'var(--ink-3)')}${sp(190, escapeHtml(dsc.name))}${sp(84, escapeHtml(dsc.pack), 'var(--ink-3)')}${sp(104, escapeHtml(so))}${ll ? sp(70, escapeHtml(ll), 'var(--ink-3)') : ''}${moved ? `<span style="color:#7c3aed;font-weight:700;"> ⚡ date changed</span>` : ''}${laneMoved ? `<span style="color:#7c3aed;font-weight:700;"> lane moved</span>` : ''}</div>`; return `<tr class="fr-det-${id}" style="display:none;background:${moved ? 'rgba(124,58,237,0.09)' : 'rgba(0,0,0,0.02)'};">${dcell(chk, true)}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell(info)}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${haveCosts ? dcell('') : ''}</tr>`; }); })).join('');
             return main + det;
           }).join('');
           return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -47867,24 +47876,35 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           Object.values(groups).forEach(g => {
             if (g.trucks.length < 2) return;
             g.trucks.sort((a, b) => (a.minShip || '9999').localeCompare(b.minShip || '9999'));
-            const anchor = g.trucks[0];
-            const cands = [];
-            g.trucks.slice(1).forEach(u => {
-              const gap = Math.round(dd(u.minShip, anchor.minShip));
-              if (gap <= autoWin || gap > oppWin) return;
-              if (anchor.plan + u.plan > mP || anchor.weight + u.weight > mW) return;
-              const mergedStops = new Set([...anchor.stops, ...u.stops].map(x => _frDcKey(x.dc) || _frNorm(x.customer)));
-              if (mergedStops.size > mS) return;
-              const pairSig = sigOf(u) + '>>' + sigOf(anchor);
-              if (dismSet.has(pairSig) || seenPairs.has(pairSig)) return;
-              seenPairs.add(pairSig);
-              cands.push({ truck: u, gap, pairSig, sum: anchor.plan + u.plan });
-            });
-            if (!cands.length) return;
-            const dcName = [...new Set([...anchor.stops].map(x => x.dc).filter(x => _frDcKey(x) === g.dk))][0] || g.dk;
-            window._frOppGroups.push({ dcName, anchor, cands });
-            anchor._oppHold = true; cands.forEach(c => { c.truck._oppHold = true; });
+            // Cascading anchors: any truck can anchor the later trucks within ITS window
+            // that no earlier anchor already claimed — so a late-tail order still gets an
+            // offer via the nearest earlier truck, with every hop ≤ the opp window.
+            const claimed = new Set();
+            for (let ai = 0; ai < g.trucks.length - 1; ai++) {
+              const anchor = g.trucks[ai];
+              const cands = [];
+              for (let bi = ai + 1; bi < g.trucks.length; bi++) {
+                const u = g.trucks[bi];
+                if (claimed.has(u)) continue;
+                const gap = Math.round(dd(u.minShip, anchor.minShip));
+                if (gap <= autoWin || gap > oppWin) continue;
+                if (anchor.plan + u.plan > mP || anchor.weight + u.weight > mW) continue;
+                const mergedStops = new Set([...anchor.stops, ...u.stops].map(x => _frDcKey(x.dc) || _frNorm(x.customer)));
+                if (mergedStops.size > mS) continue;
+                const pairSig = sigOf(u) + '>>' + sigOf(anchor);
+                if (dismSet.has(pairSig) || seenPairs.has(pairSig)) continue;
+                seenPairs.add(pairSig);
+                cands.push({ truck: u, gap, pairSig, sum: anchor.plan + u.plan, save: combineSavings(anchor, u) });
+                claimed.add(u);
+              }
+              if (!cands.length) continue;
+              cands.sort((x, y) => (y.save || 0) - (x.save || 0));
+              const dcName = [...new Set([...anchor.stops].map(x => x.dc).filter(x => _frDcKey(x) === g.dk))][0] || g.dk;
+              window._frOppGroups.push({ dcName, anchor, cands, totSave: cands.reduce((a2, c2) => a2 + (c2.save || 0), 0) });
+              anchor._oppHold = true; cands.forEach(c => { c.truck._oppHold = true; });
+            }
           });
+          window._frOppGroups.sort((a2, b2) => (b2.totSave || 0) - (a2.totSave || 0));
         })();
         Object.keys(moveMap).forEach(so => {
           const tg = moveMap[so]; if (!tg || !tg.startsWith('with:')) return;
@@ -47914,7 +47934,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
               const u = c.truck; const id = 'opp' + gi + '_' + ci;
               const usos = [...new Set(u.stops.flatMap(st => st.ships || []))];
               const asos = [...new Set(a.stops.flatMap(st => st.ships || []))];
-              const main = `<tr><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td>${td('#' + u._num + ' → #' + a._num)}${td(g.dcName)}${td(custOf(u))}${td(u.plan, true)}${td(money(u.weight), true)}${td(u.minShip + ' → ' + a.minShip + ' (' + c.gap + 'd early)')}${td(c.sum + ' plt', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-combine" data-sos="${usos.join(',')}" data-tsos="${asos.join(',')}" data-ship="${a.minShip}" data-pair="${escapeHtml(c.pairSig)}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Combine</button> <button class="fr-keepsep" data-pair="${escapeHtml(c.pairSig)}" data-mv="${sigOf(u)}" data-kp="" title="Ship this truck separately and stop suggesting it for this group" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Keep separate</button></td></tr>`;
+              const main = `<tr><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td>${td('#' + u._num + ' → #' + a._num)}${td(g.dcName)}${td(custOf(u))}${td(u.plan, true)}${td(money(u.weight), true)}${td(u.minShip + ' → ' + a.minShip + ' (' + c.gap + 'd early)')}${td(c.sum + ' plt' + (c.save != null ? (c.save > 0 ? ` · <b style=\"color:#2e7d32;\">save $${c.save.toLocaleString()}</b>` : ' · <span style=\"color:var(--ink-3);\">$0 saved</span>') : ''), true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-combine" data-sos="${usos.join(',')}" data-tsos="${asos.join(',')}" data-ship="${a.minShip}" data-pair="${escapeHtml(c.pairSig)}" data-save="${c.save != null ? c.save : ''}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Combine</button> <button class="fr-keepsep" data-pair="${escapeHtml(c.pairSig)}" data-mv="${sigOf(u)}" data-kp="" title="Ship this truck separately and stop suggesting it for this group" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Keep separate</button></td></tr>`;
               const det = `<tr class="fr-oppdet-${id}" style="display:none;background:rgba(124,58,237,0.05);"><td></td><td colspan="8" style="padding:8px 9px;"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-bottom:4px;">Consolidating → ${c.sum} plt on ${a.minShip} · never late (this order moves ${c.gap}d early)</div><table style="border-collapse:collapse;">${summRow(u, 'Move ↓ earlier →')}${summRow(a, 'Keep (anchor) →')}<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">Full route →</td><td colspan="6" style="padding:4px 8px;font-weight:600;">${(() => { const seen = new Set(); const r = [...u.stops, ...a.stops].map(x => x.dc || _frCustShort(x.customer)).filter(n => n && !seen.has(n) && seen.add(n)); return escapeHtml(['Brattleboro, VT', ...r].join(' → ')); })()}</td></tr></table></td></tr>`;
               return main + det;
             }).join('');
@@ -48167,7 +48187,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         }));
         body.querySelectorAll('.fr-combine').forEach(btn => btn.addEventListener('click', async () => {
           const sos = (btn.dataset.sos || '').split(',').filter(Boolean); const tsos = (btn.dataset.tsos || '').split(',').filter(Boolean); const ship = btn.dataset.ship; const pair = btn.dataset.pair;
-          const ans = await _frAsk3('Combine these trucks?', 'The later order ships ' + ship + ' (earlier, never late).\n\nDoes this date change need BUYER approval?\n\nYes — a pre-filled approval email opens; the truck moves to the plan below marked "Needs buyer approval".\nNo — merge and move it below as Approved, ready to quote.', 'Yes — email buyer', 'No — approve');
+          const saveTxt = btn.dataset.save !== '' && btn.dataset.save != null ? 'Estimated savings: $' + Number(btn.dataset.save).toLocaleString() + '.\n\n' : '';
+          const ans = await _frAsk3('Combine these trucks?', saveTxt + 'The later order ships ' + ship + ' (earlier, never late).\n\nDoes this date change need BUYER approval?\n\nYes — a pre-filled approval email opens; the truck moves to the plan below marked "Needs buyer approval".\nNo — merge and move it below as Approved, ready to quote.', 'Yes — email buyer', 'No — approve');
           if (ans === null) return;
           const needsBuyer = ans === 'yes';
           btn.disabled = true; btn.textContent = 'Combining…';
@@ -48357,6 +48378,30 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         let mapMetric = 'sales'; let curAgg = {};
         const mapSVG = (agg, metric) => { const U = _frUS; const val = a => metric === 'sales' ? a.sales : metric === 'freight' ? a.freight : a.ship; const maxV = Math.max(1, ...Object.values(agg).map(val)); const states = Object.entries(U.paths).map(([st, d]) => `<path d="${d}" fill="${agg[st] ? '#d7e2f2' : '#edf1f6'}" stroke="#c3ccd9" stroke-width="0.7"/>`).join(''); const arcs = Object.entries(agg).map(([st, a]) => { const p = U.xy[st]; if (!p) return ''; const w = 1 + val(a) / maxV * 9; const mx = (U.bratt[0] + p[0]) / 2, my = Math.min(U.bratt[1], p[1]) - 60; return `<path d="M${U.bratt[0]},${U.bratt[1]} Q${mx.toFixed(0)},${my.toFixed(0)} ${p[0]},${p[1]}" fill="none" stroke="rgba(14,116,144,0.5)" stroke-width="${w.toFixed(1)}" stroke-linecap="round"/>`; }).join(''); const dots = Object.entries(agg).map(([st, a]) => { const p = U.xy[st]; if (!p) return ''; const rr = 5 + val(a) / maxV * 20; return `<circle cx="${p[0]}" cy="${p[1]}" r="${rr.toFixed(1)}" fill="#1d4ed8" opacity="0.75"><title>${st} — sales ${money(a.sales)} · freight ${money(a.freight)} · ${a.ship} shipments</title></circle>`; }).join(''); return `<svg viewBox="0 0 ${U.W} ${U.H}" width="100%" style="display:block;background:#f6f8fc;border:1px solid var(--rule-soft);border-radius:8px;">${states}${arcs}${dots}<circle cx="${U.bratt[0]}" cy="${U.bratt[1]}" r="6" fill="#eab308" stroke="#fff" stroke-width="1.6"/><text x="${U.bratt[0]}" y="${U.bratt[1] - 13}" text-anchor="middle" font-family="var(--mono)" font-size="13" fill="#b8860b" font-weight="700">Brattleboro, VT</text></svg>`; };
         const donutSVG = (ftl, ltl) => { const tot = ftl + ltl || 1, r = 64, cx = 84, cy = 84, sw = 24, circ = 2 * Math.PI * r; const seg = (frac, off, c) => `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${c}" stroke-width="${sw}" stroke-dasharray="${(frac * circ).toFixed(1)} ${circ.toFixed(1)}" stroke-dashoffset="${(-off * circ).toFixed(1)}" transform="rotate(-90 ${cx} ${cy})"/>`; const fF = ftl / tot; return `<svg viewBox="0 0 168 168" width="150" height="150">${seg(fF, 0, '#2f4b7c')}${seg(ltl / tot, fF, '#d9822b')}<text x="${cx}" y="${cy - 2}" text-anchor="middle" font-family="var(--serif)" font-size="20" fill="var(--ink)">${Math.round(fF * 100)}%</text><text x="${cx}" y="${cy + 15}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="var(--ink-3)">FTL</text></svg>`; };
+
+        // Shipments by size bracket: trucks grouped by freight PO (multi-stop = one truck)
+        const bracketSVG = (F) => {
+          const BR = ['1-2', '3-4', '5-8', '9-12', '13-20', '21-28'];
+          const bOf = p => p < 3 ? 0 : p < 5 ? 1 : p < 9 ? 2 : p < 13 ? 3 : p < 21 ? 4 : 5;
+          const tr = {};
+          F.forEach(r => { const k = r.fpo || r.so_num || r.id; (tr[k] = tr[k] || { p: 0, f: 0 }).p += (+r.pallets || 0); tr[k].f += (+r.freight || 0); });
+          const agg = BR.map(() => ({ n: 0, f: 0 }));
+          Object.values(tr).forEach(t => { if (t.p <= 0 || t.p > 30) return; const ppp = t.f / t.p; if (ppp < 20 || ppp > 1500) return; const b = agg[bOf(t.p)]; b.n++; b.f += t.f; });
+          const totF = agg.reduce((a, b) => a + b.f, 0) || 1;
+          const maxN = Math.max(1, ...agg.map(b => b.n));
+          const W = 340, H = 210, mt = 26, mb = 26, ih = H - mt - mb, gw = W / 6, bw = 16;
+          const NB = '#2f4b7c', OB = '#d9822b';
+          const bars = agg.map((b, i) => {
+            const cx = gw * i + gw / 2;
+            const hN = b.n / maxN * ih, pct = b.f / totF * 100, hP = pct / 100 * ih;
+            return `<rect x="${(cx - bw - 2).toFixed(1)}" y="${(mt + ih - hN).toFixed(1)}" width="${bw}" height="${hN.toFixed(1)}" fill="${NB}" rx="2"/>` +
+              `<rect x="${(cx + 2).toFixed(1)}" y="${(mt + ih - hP).toFixed(1)}" width="${bw}" height="${hP.toFixed(1)}" fill="${OB}" rx="2"/>` +
+              `<text x="${(cx - bw / 2 - 2).toFixed(1)}" y="${(mt + ih - hN - 4).toFixed(1)}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="var(--ink)">${b.n}</text>` +
+              `<text x="${(cx + bw / 2 + 2).toFixed(1)}" y="${(mt + ih - hP - 4).toFixed(1)}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="${OB}">${Math.round(pct)}%</text>` +
+              `<text x="${cx.toFixed(1)}" y="${H - 10}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="var(--ink-3)">${BR[i]}</text>`;
+          }).join('');
+          return `<svg viewBox="0 0 ${W} ${H}" width="100%">${bars}</svg>`;
+        };
         const trendSVG = (months, sBy, fBy) => { const W = 680, H = 285, ml = 66, mr = 66, mt = 24, mb = 34, iw = W - ml - mr, ih = H - mt - mb; const pctOf = m => sBy[m] ? fBy[m] / sBy[m] * 100 : 0; const maxS = Math.max(1, ...months.map(m => sBy[m])), maxP = Math.max(1, ...months.map(pctOf)) * 1.15; const n = months.length || 1, bw = Math.min(48, iw / n * 0.5), xOf = i => ml + iw * (i + 0.5) / n; const yS = v => mt + ih - v / maxS * ih, yP = v => mt + ih - v / maxP * ih; const kfmt = v => v >= 1000 ? '$' + Math.round(v / 1000) + 'k' : '$' + Math.round(v); const ticks = 4; const grid = Array.from({ length: ticks + 1 }, (_, t) => { const y = mt + ih - (ih * t / ticks); return `<line x1="${ml}" y1="${y.toFixed(1)}" x2="${W - mr}" y2="${y.toFixed(1)}" stroke="var(--rule-soft)" stroke-width="0.5"/><text x="${ml - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end" font-family="var(--mono)" font-size="8" fill="#5b64b5">${kfmt(maxS * t / ticks)}</text><text x="${W - mr + 6}" y="${(y + 3).toFixed(1)}" text-anchor="start" font-family="var(--mono)" font-size="8" fill="#d9822b">${(maxP * t / ticks).toFixed(1)}%</text>`; }).join(''); const bars = months.map((m, i) => { const y = yS(sBy[m]); const h = mt + ih - y; return `<rect x="${(xOf(i) - bw / 2).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="#7c86e0" rx="2"/><text x="${xOf(i).toFixed(1)}" y="${(y - 4).toFixed(1)}" text-anchor="middle" font-family="var(--mono)" font-size="8" fill="#5b64b5">${kfmt(sBy[m])}</text>`; }).join(''); const pts = months.map((m, i) => `${xOf(i).toFixed(1)},${yP(pctOf(m)).toFixed(1)}`).join(' '); const dots = months.map((m, i) => `<circle cx="${xOf(i).toFixed(1)}" cy="${yP(pctOf(m)).toFixed(1)}" r="3" fill="#d9822b"/><text x="${xOf(i).toFixed(1)}" y="${(yP(pctOf(m)) - 7).toFixed(1)}" text-anchor="middle" font-family="var(--mono)" font-size="8" fill="#d9822b">${pctOf(m).toFixed(1)}%</text>`).join(''); const xl = months.map((m, i) => `<text x="${xOf(i).toFixed(1)}" y="${H - 8}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="var(--ink-3)">${m}</text>`).join(''); return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;">${grid}${bars}<polyline points="${pts}" fill="none" stroke="#d9822b" stroke-width="2"/>${dots}${xl}<text x="16" y="${(mt + ih / 2).toFixed(1)}" transform="rotate(-90 16 ${(mt + ih / 2).toFixed(1)})" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="#5b64b5">Total sales</text><text x="${W - 12}" y="${(mt + ih / 2).toFixed(1)}" transform="rotate(90 ${W - 12} ${(mt + ih / 2).toFixed(1)})" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="#d9822b">Freight % of sales</text></svg>`; };
         const drawMap = () => { const el = document.getElementById('fr-an-map'); if (el) el.innerHTML = mapSVG(curAgg, mapMetric); };
         let curF = [], custSel = null, carrSel = null, chartMonths = [];
@@ -48372,9 +48417,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           curF = F; chartMonths = months; custSel = null; carrSel = null;
           const pick = m => `<option value="${m}" ${mapMetric === m ? 'selected' : ''}>${m === 'sales' ? 'Total sales' : m === 'freight' ? 'Freight cost' : 'Shipments'}</option>`;
           container.innerHTML = `<div style="display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:12px;margin-bottom:18px;">${card('Total sales', money(totalSales))}${card('Freight cost', money(spend))}${card('Freight % of sales', (totalSales ? spend / totalSales * 100 : 0).toFixed(2) + '%')}${card('Shipments', num(F.length))}${card('Pallets', num(pallets))}${card('Avg pallets', (F.length ? pallets / F.length : 0).toFixed(1), 'per shipment')}${card('Avg $/pallet', money(pallets ? spend / pallets : 0))}${card('Avg $/case', '$' + (cases ? spend / cases : 0).toFixed(2))}</div>
-            <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px;align-items:stretch;">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;align-items:stretch;">
               <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="font-family:var(--serif);font-size:14px;margin-bottom:8px;">Monthly trend — total sales vs freight cost</div><div style="flex:1;display:flex;align-items:center;">${trendSVG(months, sBy, fBy)}</div></div>
-              <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="font-family:var(--serif);font-size:14px;margin-bottom:8px;">Mode split</div><div style="flex:1;display:flex;align-items:center;justify-content:center;gap:16px;">${donutSVG(ftl, ltl)}<div style="font-family:var(--mono);font-size:11px;line-height:1.9;"><div><span style="display:inline-block;width:10px;height:10px;background:#2f4b7c;border-radius:2px;margin-right:6px;"></span>FTL · ${ftl} (${Math.round(ftl / (ftl + ltl || 1) * 100)}%)</div><div><span style="display:inline-block;width:10px;height:10px;background:#d9822b;border-radius:2px;margin-right:6px;"></span>LTL · ${ltl} (${Math.round(ltl / (ftl + ltl || 1) * 100)}%)</div></div></div></div>
+              <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="font-family:var(--serif);font-size:14px;margin-bottom:2px;">Shipments by size — count vs freight spend</div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:6px;"><span style="color:#2f4b7c;font-size:13px;">■</span> trucks (count) &nbsp;&nbsp; <span style="color:#d9822b;font-size:13px;">■</span> % of freight spend · pallets per truck, multi-stop grouped by freight PO · FTL ${Math.round(ftl / (ftl + ltl || 1) * 100)}% / LTL ${Math.round(ltl / (ftl + ltl || 1) * 100)}%</div><div style="flex:1;display:flex;align-items:center;">${bracketSVG(F)}</div></div></div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;align-items:stretch;">
               <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:14px;">$/pallet &amp; avg pallets — by customer</div><div id="fr-cust-dd">${_frMsBox('cust', 'Customers', _frDistinct(F, r => r.customer))}</div></div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin:4px 0 8px;"><span style="color:#7c86e0;font-size:13px;">■</span> $/pallet (left axis) &nbsp;&nbsp; <span style="color:#d9822b;font-size:13px;">■</span> avg pallets (right axis)</div><div id="fr-an-custchart" style="flex:1;"></div></div>
@@ -48746,6 +48791,27 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const recs = [];
       for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const n = _frClean(r[c.n]); if (!n) continue; recs.push({ brand_id: brandId, name: n, address: _frClean(r[c.a]), shipping_hours: _frClean(r[c.sh]) }); }
       await wipe('freight_ship_from'); await insertAll('freight_ship_from', recs); out.ship_from = recs.length;
+    }
+    // Freight costs — any sheet name containing "cost" (onboarding "Freight Costs" or the cost matrix "DC Costs")
+    const costKey = wb.SheetNames.find(n => n.toLowerCase().includes('cost'));
+    if (costKey) {
+      const crows = XLSX.utils.sheet_to_json(wb.Sheets[costKey], { header: 1, defval: '' });
+      const hi = hrow(crows, ['dc name', 'min charge']);
+      if (hi >= 0) {
+        onMsg('Loading freight costs…');
+        const h = crows[hi];
+        const cc = (needle, alt) => { let ix = h.findIndex(x => String(x).toLowerCase().replace(/–/g, '-').includes(needle)); if (ix < 0 && alt) ix = h.findIndex(x => String(x).toLowerCase().includes(alt)); return ix; };
+        const c = { dc: cc('dc name', 'destination'), city: cc('city'), st: cc('state'), b1: cc('1-2'), b2: cc('3-4'), b3: cc('5-8'), b4: cc('9-12'), b5: cc('13-20'), b6: cc('21-28'), min: cc('min charge'), notes: cc('notes') };
+        const recs = [];
+        for (let i = hi + 1; i < crows.length; i++) {
+          const r = crows[i]; const dcName = _frClean(r[c.dc]); if (!dcName) continue;
+          const rates = [c.b1, c.b2, c.b3, c.b4, c.b5, c.b6].map(ix => { const v = _frNum(r[ix]); return v && v > 0 ? v : null; });
+          if (!rates.some(v => v != null)) continue;
+          const isDefault = /unlisted|default/i.test(dcName);
+          recs.push({ brand_id: brandId, dest_key: isDefault ? 'DEFAULT' : _frDcKey(dcName), dc_name: isDefault ? 'DEFAULT' : dcName, city: _frClean(r[c.city]), state: _frClean(r[c.st]), r_1_2: rates[0], r_3_4: rates[1], r_5_8: rates[2], r_9_12: rates[3], r_13_20: rates[4], r_21_28: rates[5], min_charge: _frNum(r[c.min]) || null });
+        }
+        if (recs.length) { await wipe('freight_costs'); await insertAll('freight_costs', recs); out.costs = recs.length; }
+      }
     }
     // Dock Hours (day columns) — any sheet name containing "dock hours" (or "doc hours")
     const dockKey = wb.SheetNames.find(n => n.toLowerCase().includes('doc hour') || n.toLowerCase().includes('dock hour'));
