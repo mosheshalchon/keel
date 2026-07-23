@@ -47776,6 +47776,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const _rateOf = (row, plt) => { if (!row) return null; const k = plt < 3 ? 'r_1_2' : plt < 5 ? 'r_3_4' : plt < 9 ? 'r_5_8' : plt < 13 ? 'r_9_12' : plt < 21 ? 'r_13_20' : 'r_21_28'; return row[k] != null ? Number(row[k]) : null; };
         const costRowFor = t => { let best = null, bp = -1; t.stops.forEach(st => { const r = costMap[_frDcKey(st.dc || '')]; if (r && (st.pallets || 0) > bp) { best = r; bp = st.pallets || 0; } }); return best || costDefault; };
         const truckCost = (t, pltOverride) => { const row = costRowFor(t); if (!row) return null; const plt = pltOverride != null ? pltOverride : t.plan; const rate = _rateOf(row, plt); if (rate == null) return null; const raw = rate * plt; return Math.max(raw, Number(row.min_charge) || 0); };
+        const saveChip = sv => sv == null ? '' : sv > 0 ? ` · <b style="color:#2e7d32;">save $${sv.toLocaleString()}</b>` : sv < 0 ? ` · <span style="color:#b8860b;" title="Per your rate matrix this combination costs more than shipping separately — fewer trucks, higher freight">adds $${Math.abs(sv).toLocaleString()}</span>` : ' · <span style="color:var(--ink-3);">$0</span>';
         const stopCost = st2 => { const row = costMap[_frDcKey(st2.dc || '')] || costDefault; if (!row) return null; const p = Math.max(1, Math.ceil(st2.pallets || 0)); const rate = _rateOf(row, p); if (rate == null) return null; return Math.max(rate * p, Number(row.min_charge) || 0); };
         const multiStopSavings = t => { const cs = t.stops.map(stopCost); if (cs.some(c2 => c2 == null)) return null; const whole = truckCost(t); if (whole == null) return null; return Math.round(cs.reduce((a2, c2) => a2 + c2, 0) - whole); };
         const combineSavings = (anchor, cand) => { const a = truckCost(anchor), c = truckCost(cand); if (a == null || c == null) return null; const comb = truckCost(anchor, anchor.plan + cand.plan); if (comb == null) return null; return Math.round(a + c - comb); };
@@ -47786,12 +47787,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const heldOrders = (orders || []).filter(o => moveMap[o.so_num] === 'hold');
         const planOrders = (orders || []).filter(o => moveMap[o.so_num] !== 'hold');
         const ownSet = new Set(Object.keys(moveMap).filter(k => moveMap[k] === 'own'));
+        const ownGroupMap = {}; Object.keys(moveMap).forEach(k => { const tg = moveMap[k]; if (tg && tg.startsWith('own:')) ownGroupMap[k] = tg.slice(4); });
         const laneOfMap = {}; Object.keys(moveMap).forEach(k => { const tg = moveMap[k]; if (tg && tg.startsWith('lane:')) laneOfMap[k] = tg.slice(5); });
         const shipOf = so => ovrMap[so] || (planOrders.find(o => o.so_num === so) || {}).projected_ship_date || null;
         const ovrMap2 = Object.assign({}, ovrMap);
         Object.keys(moveMap).forEach(so => { const tg = moveMap[so]; if (tg && tg.startsWith('with:')) { const d = shipOf(tg.slice(5)); if (d) ovrMap2[so] = d; } });
         const withMap = {}; Object.keys(moveMap).forEach(k => { const tg = moveMap[k]; if (tg && tg.startsWith('with:')) withMap[k] = tg.slice(5); });
-        const P = _frPlan(planOrders, items, mapRows, s, customers, lanes, ovrMap2, avoidRows, { own: ownSet, laneOf: laneOfMap, withMap });
+        const P = _frPlan(planOrders, items, mapRows, s, customers, lanes, ovrMap2, avoidRows, { own: ownSet, laneOf: laneOfMap, withMap, ownGroup: ownGroupMap });
         const _mo2 = {}; _frDefaultItemMap().forEach(p => _mo2[_frNorm(p[0])] = p[1]); (mapRows || []).forEach(m => _mo2[_frNorm(m.order_item)] = m.item_description);
         const _du = {}; (items || []).forEach(it => _du[_frNorm(it.item_description)] = it.unit_upc);
         const _di = {}; (items || []).forEach(it => _di[_frNorm(it.item_description)] = it);
@@ -47829,10 +47831,30 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const dcList = t => [...new Set(t.stops.map(x => x.dc || '').filter(Boolean))].join('|').toLowerCase();
         const modeBadge = m => { const c = m === 'FTL' ? '#2e7d32' : m === 'LTL' ? 'var(--ink-3)' : m === 'Dedicated' ? '#5b4bb0' : '#b8860b'; return `<span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${c};">${m}</span>`; };
         const dcell = (v, r) => `<td style="font-size:11px;color:var(--ink);padding:3px 9px;${r ? 'text-align:right;font-family:var(--mono);' : ''}">${v == null || v === '' ? '' : v}</td>`;
+        window._frShowWhy = window._frShowWhy || false;
+        const rationaleFor = t => {
+          const sig = sigOf(t);
+          const consolidated2 = t.stops.some(st => (st.ships || []).some(so => ovrMap[so]));
+          if (consolidated2) return 'Consolidated — later orders pulled to ' + t.minShip + '.';
+          if (t.stops.length > 1) return 'Accepted multi-stop route (' + t.stops.length + ' stops, ' + Math.round(t.plan / (s.max_pallets || 28) * 100) + '% full).';
+          const sos0 = [...new Set(t.stops.flatMap(st => st.ships || []))];
+          if (sos0.some(so => (moveMap[so] || '').startsWith('own'))) return 'Split out by hand — ships on its own by your choice.';
+          if (dismSet.has('trk:' + sig)) return 'You chose Keep separate — not re-suggested until orders change or reset.';
+          const mP2 = s.max_pallets || 28;
+          if (t.plan >= mP2 - 2) return 'Near capacity (' + Math.round(t.plan / mP2 * 100) + '%) — no meaningful room to add.';
+          const myDc = _frDcKey((t.stops[0] || {}).dc || '');
+          const others = allTrucks.filter(u => u !== t && u.mode !== 'Dedicated' && !apprOf(sigOf(u)).booked_at && u.stops.some(x => _frDcKey(x.dc) === myDc));
+          if (!myDc || !others.length) return 'Only truck to this destination in the plan — nothing to combine with.';
+          const win = others.filter(u => Math.abs(Math.round((new Date(u.minShip) - new Date(t.minShip)) / 86400000)) <= (Number(s.opp_window_days) || 28));
+          if (!win.length) return 'Other trucks go there, but outside the ' + (Number(s.opp_window_days) || 28) + 'd window.';
+          const fits = win.filter(u => u.plan + t.plan <= mP2);
+          if (!fits.length) return 'Others go there in the window, but combining would exceed ' + mP2 + ' plt.';
+          return 'A compatible partner exists — check the proposals up top or kept-separate choices.';
+        };
         const isOwnTruck = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
         const splitDesc = full => { const i = String(full || '').lastIndexOf(' - '); return i > 0 ? { name: full.slice(0, i), pack: full.slice(i + 3) } : { name: full || '', pack: '' }; };
         const truckTable = (trucks) => {
-          const head = ['#', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan plt', 'Weight (lb)', 'Util', 'Mode', 'Flags', 'Status'].concat(haveCosts ? ['Est. $'] : []).concat(['Quote $', 'Pickup', '']).map((h, i) => th(h, i >= 5 && i <= 7)).join('');
+          const head = ['#', 'Lane', 'Customer', 'Route', 'Ship window', 'Cases', 'Plan plt', 'Weight (lb)', 'Util', 'Mode', 'Flags', 'Status'].concat(haveCosts ? ['Est. $'] : []).concat(['Quote $', 'Pickup', '']).map((h, i) => th(h, i >= 5 && i <= 7)).join('') + `<th class="fr-why" style="display:${window._frShowWhy ? 'table-cell' : 'none'};text-align:left;padding:6px 9px;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule-soft);max-width:220px;">Why not combined</th>`;
           const rows = trucks.map((t) => {
             const i = t._num - 1;
             const id = 'r' + i; const sig = sigOf(t); const ap = apprOf(sig); const st8 = stOf(sig);
@@ -47851,8 +47873,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const rejNote = st8 === 'rejected' ? `<div style="color:var(--lost);">✗ rejected — reassign its orders below (expand ▸)</div>` : '';
             const ownNote = isOwnTruck(t) ? `<button class="fr-rejoin" data-so="${escapeHtml([...new Set(t.stops.flatMap(st => st.ships || []))][0])}" title="Return this PO to the optimizer's plan" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid #7c3aed;border-radius:4px;background:transparent;color:#7c3aed;cursor:pointer;">↩ Rejoin plan</button>` : '';
             const consNote = consolidated ? `<div style="color:#7c3aed;">&#10003; consolidated · date changed to ${t.minShip}</div>` : '';
-            const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(t._num)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}${ownNote}${rejNote}${consNote}</td>${statusCell}${haveCosts ? `<td style=\"padding:6px 6px;border-top:1px solid var(--rule-soft);text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);\" title=\"Benchmark from the cost matrix — compare quotes against it\">${(() => { const ec = truckCost(t); return ec != null ? '$' + Math.round(ec).toLocaleString() : '—'; })()}</td>` : ''}${quoteCell}${dateCell}${bookCell}</tr>`;
-            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => { const moved = !!ovrMap[so]; const laneMoved = (moveMap[so] || '').startsWith('lane:'); return (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; const dsc = splitDesc(skuName(ln.sku)); const chk = (isOwnTruck(t) || [...new Set(t.stops.flatMap(x => x.ships || []))].length < 2) ? '' : `<input type="checkbox" class="fr-po-chk" data-so="${escapeHtml(so)}" checked title="On this truck — uncheck to split ${escapeHtml(so)} out as an independent PO" style="vertical-align:middle;cursor:pointer;">`; const sp = (w, txt, color) => `<span style="display:inline-block;width:${w}px;vertical-align:top;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${color ? 'color:' + color + ';' : ''}">${txt}</span>`; const info = `<div style="font-family:var(--mono);font-size:10px;white-space:nowrap;">&#8627; ${sp(140, escapeHtml(st.dc || ''))}${sp(100, escapeHtml(skuUpc(ln.sku) || ''), 'var(--ink-3)')}${sp(190, escapeHtml(dsc.name))}${sp(84, escapeHtml(dsc.pack), 'var(--ink-3)')}${sp(104, escapeHtml(so))}${ll ? sp(70, escapeHtml(ll), 'var(--ink-3)') : ''}${moved ? `<span style="color:#7c3aed;font-weight:700;"> ⚡ date changed</span>` : ''}${laneMoved ? `<span style="color:#7c3aed;font-weight:700;"> lane moved</span>` : ''}</div>`; return `<tr class="fr-det-${id}" style="display:none;background:${moved ? 'rgba(124,58,237,0.09)' : 'rgba(0,0,0,0.02)'};">${dcell(chk, true)}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell(info)}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${haveCosts ? dcell('') : ''}</tr>`; }); })).join('');
+            const main = `<tr data-s="${sTag(t)}" data-mode="${t.mode}" data-cust="${custList(t)}" data-dc="${dcList(t)}" data-sig="${sig}">${td(t._num)}${td(laneName(t.lane))}${td(custOf(t))}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-size:11px;">${caret}${routeOf(t)}</td>${td(shipWin(t))}${td(t.cases, true)}${td(t.plan, true)}${td(money(t.weight), true)}${td(Math.round(t.plan / (s.max_pallets || 28) * 100) + '%', true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${modeBadge(t.mode)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:#b8860b;">${escapeHtml(t.flags.join(' · '))}${ownNote}${rejNote}${consNote}</td>${statusCell}${haveCosts ? `<td style=\"padding:6px 6px;border-top:1px solid var(--rule-soft);text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);\" title=\"Benchmark from the cost matrix — compare quotes against it\">${(() => { const ec = truckCost(t); return ec != null ? '$' + Math.round(ec).toLocaleString() : '—'; })()}</td>` : ''}${quoteCell}${dateCell}${bookCell}<td class="fr-why" style="display:${window._frShowWhy ? 'table-cell' : 'none'};padding:6px 9px;border-top:1px solid var(--rule-soft);font-family:var(--mono);font-size:10px;color:var(--ink-3);max-width:220px;">${escapeHtml(rationaleFor(t))}</td></tr>`;
+            const det = t.stops.flatMap(st => (st.ships || []).flatMap(so => { const moved = !!ovrMap[so]; const laneMoved = (moveMap[so] || '').startsWith('lane:'); return (linesBySo[so] || []).map(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)) : null; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; const dsc = splitDesc(skuName(ln.sku)); const chk = (isOwnTruck(t) || [...new Set(t.stops.flatMap(x => x.ships || []))].length < 2) ? '' : `<input type="checkbox" class="fr-po-chk" data-so="${escapeHtml(so)}" checked title="On this truck — uncheck to split ${escapeHtml(so)} out as an independent PO" style="vertical-align:middle;cursor:pointer;">`; const sp = (w, txt, color) => `<span style="display:inline-block;width:${w}px;vertical-align:top;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${color ? 'color:' + color + ';' : ''}">${txt}</span>`; const info = `<div style="font-family:var(--mono);font-size:10px;white-space:nowrap;">&#8627; ${sp(140, escapeHtml(st.dc || ''))}${sp(100, escapeHtml(skuUpc(ln.sku) || ''), 'var(--ink-3)')}${sp(190, escapeHtml(dsc.name))}${sp(84, escapeHtml(dsc.pack), 'var(--ink-3)')}${sp(104, escapeHtml(so))}${ll ? sp(70, escapeHtml(ll), 'var(--ink-3)') : ''}${moved ? `<span style="color:#7c3aed;font-weight:700;"> ⚡ date changed</span>` : ''}${laneMoved ? `<span style="color:#7c3aed;font-weight:700;"> lane moved</span>` : ''}</div>`; return `<tr class="fr-det-${id}" style="display:none;background:${moved ? 'rgba(124,58,237,0.09)' : 'rgba(0,0,0,0.02)'};">${dcell(chk, true)}${dcell('')}${dcell(escapeHtml(_frCustShort(st.customer)))}${dcell(info)}${dcell(st.ship || '—')}${dcell(ln.cases, true)}${dcell(lp != null ? lp.toFixed(2) : '', true)}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${dcell('')}${haveCosts ? dcell('') : ''}<td class="fr-why" style="display:${window._frShowWhy ? 'table-cell' : 'none'};"></td></tr>`; }); })).join('');
             return main + det;
           }).join('');
           return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -47937,7 +47959,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const parts = [g.anchor, ...g.members.map(m => m.truck)];
             const label = parts.map(t => '#' + t._num).join(' + ');
             const custs = [...new Set(parts.map(t => custOf(t)))].join(', ');
-            const saveTxt = g.save != null ? (g.save > 0 ? ` · <b style="color:#2e7d32;">save $${g.save.toLocaleString()}</b>` : ' · <span style="color:var(--ink-3);">$0 saved</span>') : '';
+            const saveTxt = saveChip(g.save);
             const mvSos = [...new Set(g.members.flatMap(m => m.truck.stops.flatMap(st => st.ships || [])))];
             const aSos = [...new Set(g.anchor.stops.flatMap(st => st.ships || []))];
             const summRow = (u, label2, gap) => `<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">${label2}</td><td style="padding:4px 8px;font-weight:600;">#${u._num}</td><td style="padding:4px 8px;">${modeBadge(u.mode)}</td><td style="padding:4px 8px;">${escapeHtml(u.stops.map(x => x.dc || _frCustShort(x.customer)).join(' → '))}</td><td style="padding:4px 8px;">${u.minShip}${gap ? ' → ' + g.ship + ' (' + gap + 'd early)' : ''}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.plan} plt</td><td style="padding:4px 8px;">${gap ? `<button class="fr-keepsep" data-pair="x" data-mv="${sigOf(u)}" data-kp="" title="Leave this truck out — ships as planned, not re-suggested" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Leave out</button>` : ''}</td></tr>`;
@@ -47947,8 +47969,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           }).join('')}${acceptRows.map((ar, ai) => {
             const t = ar.t; const id = 'acc' + ai;
             const dcs = [...new Set(t.stops.map(x => x.dc || _frCustShort(x.customer)))];
-            const saveTxt = ar.save != null ? (ar.save > 0 ? ` · <b style="color:#2e7d32;">save $${ar.save.toLocaleString()}</b>` : ' · <span style="color:var(--ink-3);">$0 saved</span>') : '';
-            const main = `<tr><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-weight:700;white-space:nowrap;">#${t._num} <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);font-weight:400;">auto</span></td>${td(dcs.join(' → '))}${td(custOf(t))}${td(t.stops.length + ' stops', true)}${td(money(t.weight), true)}${td('ship ' + t.minShip)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);text-align:right;white-space:nowrap;">${t.plan} plt${saveTxt}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-accept" data-sig="${sigOf(t)}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Accept</button></td></tr>`;
+            const saveTxt = saveChip(ar.save);
+            const main = `<tr><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);font-weight:700;white-space:nowrap;">#${t._num} <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);font-weight:400;">auto</span></td>${td(dcs.join(' → '))}${td(custOf(t))}${td(t.stops.length + ' stops', true)}${td(money(t.weight), true)}${td('ship ' + t.minShip)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);text-align:right;white-space:nowrap;">${t.plan} plt${saveTxt}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-accept" data-sig="${sigOf(t)}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Accept</button> <button class="fr-splitstops" data-stops="${t.stops.map(x => (x.ships || []).join('~')).join('|')}" title="Don't build this route — ship each stop as its own truck" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Keep separate</button></td></tr>`;
             const det = `<tr class="fr-oppdet-${id}" style="display:none;background:rgba(124,58,237,0.05);"><td></td><td colspan="8" style="padding:8px 9px;"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-bottom:4px;">Auto-built multi-stop truck · same-lane orders within ${s.date_window_days || 1}d packed together${ar.save != null && ar.save > 0 ? ' · est. save $' + ar.save.toLocaleString() + ' vs shipping each stop alone' : ''}</div><table style="border-collapse:collapse;">${t.stops.map(x => `<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">Stop →</td><td style="padding:4px 8px;font-weight:600;">${escapeHtml(x.dc || _frCustShort(x.customer))}</td><td style="padding:4px 8px;">${(x.ships || []).length} PO</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${Math.ceil((x.pallets || 0) * 100) / 100} plt</td><td style="padding:4px 8px;">${x.ship || ''}</td></tr>`).join('')}<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">Full route →</td><td colspan="4" style="padding:4px 8px;font-weight:600;">${(() => { const seen = new Set(); const r = t.stops.map(x => x.dc || _frCustShort(x.customer)).filter(n => n && !seen.has(n) && seen.add(n)); return escapeHtml(['Brattleboro, VT', ...r].join(' → ')); })()}</td></tr></table></td></tr>`;
             return main + det;
           }).join('')}</tbody></table></div>` : `<div style="font-family:var(--mono);font-size:11px;color:#2e7d32;">${nOvr} active consolidation${nOvr === 1 ? '' : 's'} applied. No further opportunities.</div>`}
@@ -48000,12 +48022,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — these orders are missing a DC value in the feed.</div>` : ''}
           <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Get a Quote (${visibleTrucks.length})</div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Orders combine onto one truck only when their projected ship dates fall within ${s.date_window_days || 1} day(s) of each other, and never exceed ${s.max_pallets || 28} pallets / ${money(s.max_weight || 40000)} lb / ${s.max_stops || 3} stops. Mode: <b>LTL</b> ≤ ${s.ltl_max_pallets || 4} plt, otherwise <b>FTL</b> (consolidated toward the ${s.max_pallets || 28}-pallet max) · <b>Dedicated</b> = C&amp;S / Target. Expand multi-stop trucks with the ▸ toggle.</div>
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="fr-why-tgl" style="font-family:var(--mono);font-size:11px;padding:7px 14px;border:1px solid var(--rule-soft);border-radius:4px;background:${window._frShowWhy ? 'var(--ink)' : 'transparent'};color:${window._frShowWhy ? 'var(--paper)' : 'var(--ink)'};cursor:pointer;margin-right:8px;">💬 Why not combined</button><button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
           ${visibleTrucks.length ? truckTable(visibleTrucks) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (proposed multi-stop / undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
           ${indepTrucks.length ? `<div style="margin-top:16px;"><div style="font-family:var(--serif);font-size:15px;margin-bottom:6px;">Independent POs (${indepTrucks.length}) <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">— split out by hand; each ships on its own. ↩ Rejoin returns one to the plan.</span></div>${truckTable(indepTrucks)}</div>` : ''}
           ${(() => {
             const moveEntries = Object.keys(moveMap).sort();
-            const labelOf = tg => tg === 'own' ? 'own truck' : tg === 'hold' ? 'held from plan' : tg.startsWith('lane:') ? ('lane → ' + (((lanes || []).find(l => l.kind === 'lane' && String(l.lane_no) === tg.slice(5)) || {}).lane_name || tg.slice(5))) : tg.startsWith('with:') ? ('→ truck carrying ' + tg.slice(5)) : tg;
+            const labelOf = tg => tg === 'own' ? 'own truck' : tg.startsWith('own:') ? 'ships separately (split from auto route)' : tg === 'hold' ? 'held from plan' : tg.startsWith('lane:') ? ('lane → ' + (((lanes || []).find(l => l.kind === 'lane' && String(l.lane_no) === tg.slice(5)) || {}).lane_name || tg.slice(5))) : tg.startsWith('with:') ? ('→ truck carrying ' + tg.slice(5)) : tg;
             const openIt = moveEntries.length > 0;
             return `<div style="border:1px solid var(--rule-soft);border-radius:6px;padding:10px 14px;margin-top:14px;">
               <button id="fr-adj-tgl" style="background:none;border:none;cursor:pointer;font-family:var(--serif);font-size:14px;color:var(--ink);padding:0;">${openIt ? '▾' : '▸'} Manual adjustments${moveEntries.length ? ` (${moveEntries.length} active)` : ''}</button>
@@ -48121,6 +48143,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           if (error) { alert('Could not accept — ' + error.message); return false; }
           return true;
         };
+        body.querySelectorAll('.fr-splitstops').forEach(btn => btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          try {
+            const stops2 = (btn.dataset.stops || '').split('|').filter(Boolean).map(x => x.split('~').filter(Boolean));
+            const rows2 = stops2.flatMap(sos2 => sos2.map(so2 => ({ brand_id: brandId, so_num: so2, target: 'own:' + sos2[0], updated_at: new Date().toISOString() })));
+            const { error } = await sb.from('freight_order_moves').upsert(rows2, { onConflict: 'brand_id,so_num' }); if (error) throw error;
+            _frRenderTab(brandId, sb);
+          } catch (e) { alert('Could not split — ' + (e.message || e)); btn.disabled = false; }
+        }));
         body.querySelectorAll('.fr-accept').forEach(btn => btn.addEventListener('click', async () => {
           btn.disabled = true;
           if (await acceptSigs([btn.dataset.sig])) _frRenderTab(brandId, sb); else btn.disabled = false;
@@ -48130,6 +48161,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           accAll.disabled = true;
           if (await acceptSigs(acceptRows.map(ar => sigOf(ar.t)))) _frRenderTab(brandId, sb); else accAll.disabled = false;
         });
+        const whyTgl = document.getElementById('fr-why-tgl');
+        if (whyTgl) whyTgl.addEventListener('click', () => { window._frShowWhy = !window._frShowWhy; _frRenderTab(brandId, sb); });
         const adjTgl = document.getElementById('fr-adj-tgl');
         if (adjTgl) adjTgl.addEventListener('click', () => { const b2 = document.getElementById('fr-adj-body'); const open = b2.style.display !== 'none'; b2.style.display = open ? 'none' : 'block'; adjTgl.textContent = (open ? '▸' : '▾') + adjTgl.textContent.slice(1); });
         const bkTgl = document.getElementById('fr-booked-tgl');
@@ -48208,7 +48241,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             let mergedSig = [...new Set([...sos, ...tsos])].sort().join('|');
             try {
               const ovrNext = Object.assign({}, ovrMap2); sos.forEach(so => { ovrNext[so] = ship; });
-              const P2 = _frPlan(planOrders, items, mapRows, s, customers, lanes, ovrNext, avoidRows, { own: ownSet, laneOf: laneOfMap, withMap });
+              const P2 = _frPlan(planOrders, items, mapRows, s, customers, lanes, ovrNext, avoidRows, { own: ownSet, laneOf: laneOfMap, withMap, ownGroup: ownGroupMap });
               const all2 = P2.trucks.concat(P2.dedicated, P2.ltl);
               const anchor = (tsos[0] || sos[0]);
               const mt = all2.find(x => x.stops.some(st => (st.ships || []).includes(anchor)));
@@ -48585,6 +48618,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _frPlan(orders, items, mapRows, settings, customers, lanes, overrides, avoidRules, moves) {
     overrides = overrides || {};
     const _ownSet = (moves && moves.own) || new Set();
+    const _ownGrp = (moves && moves.ownGroup) || {};
     const _deliv = new Set(), _excl = new Set();
     (customers || []).forEach(c => { const k = _frNorm(_frCustShort(c.customer)); const sv = (c.service_type || '').toLowerCase(); if (sv.includes('deliver')) _deliv.add(k); else if (sv.includes('pickup') || sv.includes('not servic') || sv.includes('3pl')) _excl.add(k); });
     let cases3pl = 0;
@@ -48664,7 +48698,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       });
       return out;
     }
-    const poolTrucks = packShipments(pool, sh => _ownSet.has(sh.so) ? 'OWN:' + sh.so : 'L' + sh.lane.no);
+    const poolTrucks = packShipments(pool, sh => _ownGrp[sh.so] ? 'OWN:' + _ownGrp[sh.so] : _ownSet.has(sh.so) ? 'OWN:' + sh.so : 'L' + sh.lane.no);
     const dedTrucks = packShipments(dedShips, sh => 'C' + _frNorm(_frCustShort(sh.customer)));
     const ftl = [], ltl = [];
     poolTrucks.forEach(t => { const flags = []; if (t._miss) flags.push('missing item config'); t.flags = flags; t.mode = (t.plan <= ltlMax) ? 'LTL' : 'FTL'; if (t.mode === 'LTL') ltl.push(t); else ftl.push(t); });
