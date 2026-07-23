@@ -47622,7 +47622,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       </div>
       <div style="margin-top:20px;"></div>
       <div class="hl-tab-row" style="display:flex;gap:0;border-bottom:1px solid var(--rule-soft);margin:6px 0 0;flex-wrap:wrap;">
-        ${tab('output', 'Book')}${tab('analytics', 'Analytics')}<span style="border-left:1px solid var(--rule-soft);margin:0 4px;"></span>${tab('orders', 'Order Data')}${tab('distributors', 'Carriers')}${tab('customers', 'Customers')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('items', 'Items')}${tab('assumptions', 'Assumptions')}
+        ${tab('output', 'Book')}${tab('analytics', 'Analytics')}<span style="border-left:1px solid var(--rule-soft);margin:0 4px;"></span>${tab('orders', 'Order Data')}${tab('distributors', 'Carriers')}${tab('customers', 'Customers')}${tab('dock', 'Dock Hours')}${tab('lanes', 'Lanes & Routes')}${tab('items', 'Items')}${tab('rates', 'Freight Rates')}${tab('assumptions', 'Assumptions')}
       </div>
       <div id="hl-fr-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>`;
 
@@ -47872,39 +47872,38 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             });
           });
           window._frOppGroups = [];
-          const seenPairs = new Set();
           Object.values(groups).forEach(g => {
             if (g.trucks.length < 2) return;
             g.trucks.sort((a, b) => (a.minShip || '9999').localeCompare(b.minShip || '9999'));
-            // Cascading anchors: any truck can anchor the later trucks within ITS window
-            // that no earlier anchor already claimed — so a late-tail order still gets an
-            // offer via the nearest earlier truck, with every hop ≤ the opp window.
-            const claimed = new Set();
-            for (let ai = 0; ai < g.trucks.length - 1; ai++) {
-              const anchor = g.trucks[ai];
-              const cands = [];
-              for (let bi = ai + 1; bi < g.trucks.length; bi++) {
-                const u = g.trucks[bi];
-                if (claimed.has(u)) continue;
-                const gap = Math.round(dd(u.minShip, anchor.minShip));
+            const pool = g.trucks.filter(t => !oppExempt(t));
+            if (pool.length < 2) return;
+            // Greedy date-ordered partition: each truck joins the first proposed bin whose
+            // anchor date is within the window and whose capacity still fits it.
+            const bins = [];
+            pool.forEach(t => {
+              let placed = false;
+              for (const b of bins) {
+                const gap = Math.round(dd(t.minShip, b.anchor.minShip));
                 if (gap <= autoWin || gap > oppWin) continue;
-                if (anchor.plan + u.plan > mP || anchor.weight + u.weight > mW) continue;
-                const mergedStops = new Set([...anchor.stops, ...u.stops].map(x => _frDcKey(x.dc) || _frNorm(x.customer)));
-                if (mergedStops.size > mS) continue;
-                const pairSig = sigOf(u) + '>>' + sigOf(anchor);
-                if (dismSet.has(pairSig) || seenPairs.has(pairSig)) continue;
-                seenPairs.add(pairSig);
-                cands.push({ truck: u, gap, pairSig, sum: anchor.plan + u.plan, save: combineSavings(anchor, u) });
-                claimed.add(u);
+                if (b.plan + t.plan > mP || b.weight + t.weight > mW) continue;
+                const stopsSet = new Set([...b.stops, ...t.stops.map(x => _frDcKey(x.dc) || _frNorm(x.customer))]);
+                if (stopsSet.size > mS) continue;
+                b.members.push({ truck: t, gap }); b.plan += t.plan; b.weight += t.weight; b.stops = [...stopsSet];
+                placed = true; break;
               }
-              if (!cands.length) continue;
-              cands.sort((x, y) => (y.save || 0) - (x.save || 0));
-              const dcName = [...new Set([...anchor.stops].map(x => x.dc).filter(x => _frDcKey(x) === g.dk))][0] || g.dk;
-              window._frOppGroups.push({ dcName, anchor, cands, totSave: cands.reduce((a2, c2) => a2 + (c2.save || 0), 0) });
-              anchor._oppHold = true; cands.forEach(c => { c.truck._oppHold = true; });
-            }
+              if (!placed) bins.push({ anchor: t, members: [], plan: t.plan, weight: t.weight, stops: t.stops.map(x => _frDcKey(x.dc) || _frNorm(x.customer)) });
+            });
+            bins.filter(b => b.members.length).forEach(b => {
+              const dcName = [...new Set(b.anchor.stops.map(x => x.dc).filter(x => _frDcKey(x) === g.dk))][0] || g.dk;
+              let save = null;
+              const parts = [b.anchor, ...b.members.map(m => m.truck)];
+              const costs = parts.map(t => truckCost(t));
+              if (costs.every(c2 => c2 != null)) { const comb = truckCost(b.anchor, b.plan); if (comb != null) save = Math.round(costs.reduce((a2, c2) => a2 + c2, 0) - comb); }
+              window._frOppGroups.push({ dcName, anchor: b.anchor, members: b.members, plan: b.plan, weight: b.weight, ship: b.anchor.minShip, save });
+              b.anchor._oppHold = true; b.members.forEach(m => { m.truck._oppHold = true; });
+            });
           });
-          window._frOppGroups.sort((a2, b2) => (b2.totSave || 0) - (a2.totSave || 0));
+          window._frOppGroups.sort((a2, b2) => ((b2.save || 0) - (a2.save || 0)) || (a2.ship || '').localeCompare(b2.ship || ''));
         })();
         Object.keys(moveMap).forEach(so => {
           const tg = moveMap[so]; if (!tg || !tg.startsWith('with:')) return;
@@ -47921,24 +47920,23 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const visibleTrucks = visibleAll.filter(t => !_isOwnT(t) && !pendingAccept.includes(t));
         const indepTrucks = visibleAll.filter(_isOwnT);
         const oppGroups = window._frOppGroups || [];
-        const oppCount = oppGroups.reduce((a, g) => a + g.cands.length, 0);
+        const oppCount = oppGroups.length;
         const nOvr = Object.keys(ovrMap).length;
         const oppPanel = (oppCount || nOvr) ? `<div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:12px 14px;margin-bottom:16px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:15px;">&#9889; Consolidation opportunities${oppCount ? ` (${oppCount})` : ''}</div>${nOvr ? `<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);">Reset all consolidations (${nOvr})</button>` : ''}</div>
-          <div style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">A small order ships to the same DC as another truck within ${s.opp_window_days || 7} days and fits on it. <b>Combine</b> ships both on the <b>earlier</b> date — the later order moves earlier so nothing is ever late (early delivery only). Needs buyer sign-off on the date change.</div>
-          ${oppCount ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['', '# (move → keep)', 'DC', 'Order to move', 'Pallets', 'Weight (lb)', 'Ship window', 'Result (anchor + this)', 'Action'].map((h, i) => th(h, i === 4 || i === 5 || i === 7)).join('')}</tr></thead><tbody>${oppGroups.map((g, gi) => {
-            const a = g.anchor;
-            const summRow = (u, label) => `<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">${label}</td><td style="padding:4px 8px;font-weight:600;">#${u._num}</td><td style="padding:4px 8px;">${modeBadge(u.mode)}</td><td style="padding:4px 8px;">${escapeHtml(u.stops.map(x => x.dc || _frCustShort(x.customer)).join(' → '))}</td><td style="padding:4px 8px;">${u.minShip}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.plan} plt</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.cases} cs</td></tr>`;
-            const head = `<tr style="background:rgba(124,58,237,0.10);"><td colspan="9" style="padding:7px 9px;border-top:1px solid rgba(124,58,237,0.3);font-family:var(--mono);font-size:11px;"><b style="font-size:12px;">${escapeHtml(g.dcName)}</b> · ${escapeHtml(laneName(a.lane))} · anchor <b>#${a._num}</b> ${modeBadge(a.mode)} · ships ${a.minShip} · ${a.plan} plt of ${s.max_pallets || 28} — ${g.cands.length} truck${g.cands.length > 1 ? 's' : ''} could join (each needs its own approval)${g.cands.length > 1 ? (() => { const tot = a.plan + g.cands.reduce((x, c) => x + c.truck.plan, 0); const cap = s.max_pallets || 28; return ` · all ${g.cands.length + 1} combined → <b>${tot} plt</b>${tot > cap ? ' <span style="color:#b8860b;">(over the ' + cap + '-plt cap — not all will fit)</span>' : ''}`; })() : ''}</td></tr>`;
-            const rows = g.cands.map((c, ci) => {
-              const u = c.truck; const id = 'opp' + gi + '_' + ci;
-              const usos = [...new Set(u.stops.flatMap(st => st.ships || []))];
-              const asos = [...new Set(a.stops.flatMap(st => st.ships || []))];
-              const main = `<tr><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td>${td('#' + u._num + ' → #' + a._num)}${td(g.dcName)}${td(custOf(u))}${td(u.plan, true)}${td(money(u.weight), true)}${td(u.minShip + ' → ' + a.minShip + ' (' + c.gap + 'd early)')}${td(c.sum + ' plt' + (c.save != null ? (c.save > 0 ? ` · <b style=\"color:#2e7d32;\">save $${c.save.toLocaleString()}</b>` : ' · <span style=\"color:var(--ink-3);\">$0 saved</span>') : ''), true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-combine" data-sos="${usos.join(',')}" data-tsos="${asos.join(',')}" data-ship="${a.minShip}" data-pair="${escapeHtml(c.pairSig)}" data-save="${c.save != null ? c.save : ''}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Combine</button> <button class="fr-keepsep" data-pair="${escapeHtml(c.pairSig)}" data-mv="${sigOf(u)}" data-kp="" title="Ship this truck separately and stop suggesting it for this group" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Keep separate</button></td></tr>`;
-              const det = `<tr class="fr-oppdet-${id}" style="display:none;background:rgba(124,58,237,0.05);"><td></td><td colspan="8" style="padding:8px 9px;"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-bottom:4px;">Consolidating → ${c.sum} plt on ${a.minShip} · never late (this order moves ${c.gap}d early)</div><table style="border-collapse:collapse;">${summRow(u, 'Move ↓ earlier →')}${summRow(a, 'Keep (anchor) →')}<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">Full route →</td><td colspan="6" style="padding:4px 8px;font-weight:600;">${(() => { const seen = new Set(); const r = [...u.stops, ...a.stops].map(x => x.dc || _frCustShort(x.customer)).filter(n => n && !seen.has(n) && seen.add(n)); return escapeHtml(['Brattleboro, VT', ...r].join(' → ')); })()}</td></tr></table></td></tr>`;
-              return main + det;
-            }).join('');
-            return head + rows;
+          <div style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Trucks to the same DC within the opportunity window are packed into proposed combined trucks — everything ships on the earliest member's date (early only, never late). Each proposal is one decision: Combine it, Keep separate, or expand ▸ to leave individual trucks out. <b>Combine</b> ships both on the <b>earlier</b> date — the later order moves earlier so nothing is ever late (early delivery only). Needs buyer sign-off on the date change.</div>
+          ${oppCount ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['', 'Proposed truck', 'DC', 'Customers', 'From', 'Weight (lb)', 'Ship date', 'Result', 'Action'].map((h, i) => th(h, i === 4 || i === 5 || i === 7)).join('')}</tr></thead><tbody>${oppGroups.map((g, gi) => {
+            const id = 'opp' + gi;
+            const parts = [g.anchor, ...g.members.map(m => m.truck)];
+            const label = parts.map(t => '#' + t._num).join(' + ');
+            const custs = [...new Set(parts.map(t => custOf(t)))].join(', ');
+            const saveTxt = g.save != null ? (g.save > 0 ? ` · <b style="color:#2e7d32;">save $${g.save.toLocaleString()}</b>` : ' · <span style="color:var(--ink-3);">$0 saved</span>') : '';
+            const mvSos = [...new Set(g.members.flatMap(m => m.truck.stops.flatMap(st => st.ships || [])))];
+            const aSos = [...new Set(g.anchor.stops.flatMap(st => st.ships || []))];
+            const summRow = (u, label2, gap) => `<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">${label2}</td><td style="padding:4px 8px;font-weight:600;">#${u._num}</td><td style="padding:4px 8px;">${modeBadge(u.mode)}</td><td style="padding:4px 8px;">${escapeHtml(u.stops.map(x => x.dc || _frCustShort(x.customer)).join(' → '))}</td><td style="padding:4px 8px;">${u.minShip}${gap ? ' → ' + g.ship + ' (' + gap + 'd early)' : ''}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);">${u.plan} plt</td><td style="padding:4px 8px;">${gap ? `<button class="fr-keepsep" data-pair="x" data-mv="${sigOf(u)}" data-kp="" title="Leave this truck out — ships as planned, not re-suggested" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Leave out</button>` : ''}</td></tr>`;
+            const main = `<tr><td style="padding:6px 4px;border-top:1px solid var(--rule-soft);"><button class="fr-oppexp" data-tid="${id}" style="background:none;border:none;cursor:pointer;color:var(--ink-3);font-family:var(--mono);font-size:12px;padding:0;">▸</button></td>${td('<b>' + label + '</b>')}${td(g.dcName)}${td(custs)}${td(parts.length + ' trucks', true)}${td(money(g.weight), true)}${td('ship ' + g.ship)}${td(g.plan + ' plt' + saveTxt, true)}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><button class="fr-combine" data-sos="${mvSos.join(',')}" data-tsos="${aSos.join(',')}" data-ship="${g.ship}" data-pair="" data-save="${g.save != null ? g.save : ''}" data-plt="${g.plan}" style="font-family:var(--mono);font-size:11px;padding:5px 16px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;">Combine</button> <button class="fr-keepsep" data-pair="x" data-mv="${sigOf(g.anchor)}" data-kp="${g.members.map(m => sigOf(m.truck)).join('|sep|')}" title="Ship all of these separately and stop suggesting this grouping" style="font-family:var(--mono);font-size:11px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Keep separate</button></td></tr>`;
+            const det = `<tr class="fr-oppdet-${id}" style="display:none;background:rgba(124,58,237,0.05);"><td></td><td colspan="8" style="padding:8px 9px;"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;margin-bottom:4px;">One truck → ${g.plan} plt on ${g.ship} · never late (later orders move earlier)${g.save != null && g.save > 0 ? ' · est. save $' + g.save.toLocaleString() : ''}</div><table style="border-collapse:collapse;">${summRow(g.anchor, 'Anchor (keeps date) →', 0)}${g.members.map(m => summRow(m.truck, 'Joins ↓ earlier →', m.gap)).join('')}<tr><td style="padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">Full route →</td><td colspan="6" style="padding:4px 8px;font-weight:600;">${(() => { const seen = new Set(); const r = parts.flatMap(t => t.stops).map(x => x.dc || _frCustShort(x.customer)).filter(n => n && !seen.has(n) && seen.add(n)); return escapeHtml(['Brattleboro, VT', ...r].join(' → ')); })()}</td></tr></table></td></tr>`;
+            return main + det;
           }).join('')}</tbody></table></div>` : `<div style="font-family:var(--mono);font-size:11px;color:#2e7d32;">${nOvr} active consolidation${nOvr === 1 ? '' : 's'} applied. No further opportunities.</div>`}
         </div>` : '';
         const modesPresent = [...new Set(allTrucks.map(t => t.mode))];
@@ -48180,14 +48178,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         body.querySelectorAll('.fr-keepsep').forEach(btn => btn.addEventListener('click', async () => {
           btn.disabled = true;
           try {
-            const rows = [{ brand_id: brandId, pair_sig: btn.dataset.pair }, { brand_id: brandId, pair_sig: 'trk:' + btn.dataset.mv }].concat(btn.dataset.kp ? [{ brand_id: brandId, pair_sig: 'trk:' + btn.dataset.kp }] : []);
+            const rows = [{ brand_id: brandId, pair_sig: 'trk:' + btn.dataset.mv }].concat((btn.dataset.kp || '').split('|sep|').filter(Boolean).map(k => ({ brand_id: brandId, pair_sig: 'trk:' + k })));
             const { error } = await sb.from('freight_opp_dismissals').upsert(rows, { onConflict: 'brand_id,pair_sig' }); if (error) throw error;
             _frRenderTab(brandId, sb);
           } catch (e) { alert('Could not dismiss — ' + (e.message || e) + '\n\n(If the table is missing, run the freight_opp_dismissals SQL in Supabase.)'); btn.disabled = false; }
         }));
         body.querySelectorAll('.fr-combine').forEach(btn => btn.addEventListener('click', async () => {
           const sos = (btn.dataset.sos || '').split(',').filter(Boolean); const tsos = (btn.dataset.tsos || '').split(',').filter(Boolean); const ship = btn.dataset.ship; const pair = btn.dataset.pair;
-          const saveTxt = btn.dataset.save !== '' && btn.dataset.save != null ? 'Estimated savings: $' + Number(btn.dataset.save).toLocaleString() + '.\n\n' : '';
+          const pltTxt = btn.dataset.plt ? 'Combined truck: ' + btn.dataset.plt + ' pallets total.\n' : '';
+          const saveTxt = pltTxt + (btn.dataset.save !== '' && btn.dataset.save != null ? 'Estimated savings: $' + Number(btn.dataset.save).toLocaleString() + '.\n\n' : (pltTxt ? '\n' : ''));
           const ans = await _frAsk3('Combine these trucks?', saveTxt + 'The later order ships ' + ship + ' (earlier, never late).\n\nDoes this date change need BUYER approval?\n\nYes — a pre-filled approval email opens; the truck moves to the plan below marked "Needs buyer approval".\nNo — merge and move it below as Approved, ready to quote.', 'Yes — email buyer', 'No — approve');
           if (ans === null) return;
           const needsBuyer = ans === 'yes';
@@ -48210,9 +48209,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             if (needsBuyer) {
               const r2 = await sb.from('freight_approvals').upsert({ brand_id: brandId, signature: mergedSig, status: 'buyer', updated_at: new Date().toISOString() }, { onConflict: 'brand_id,signature' });
               if (r2.error) throw r2.error;
-              const mv = allTrucks.find(x => x.stops.some(st => (st.ships || []).includes(sos[0])));
+              const mvTrucks = [...new Set(sos.map(s2 => allTrucks.find(x => x.stops.some(st => (st.ships || []).includes(s2)))).filter(Boolean))];
+              const mv = mvTrucks[0];
               if (mv) {
-                const contacts = mv.stops.map(contactFor).filter(Boolean);
+                const contacts = mvTrucks.flatMap(t2 => t2.stops.map(contactFor)).filter(Boolean);
                 const emails = [...new Set(contacts.map(c => c.email).filter(Boolean))];
                 if (emails.length) {
                   const named = contacts.find(c => c.name);
@@ -48287,7 +48287,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const stLabel = { approved: 'Approved', rejected: 'Rejected', buyer: 'Awaiting buyer' };
           allTrucks.forEach((t, i) => {
             const sig = sigOf(t); const ap = apprOf(sig); const status = ap.booked_at ? 'Booked' : (stLabel[stOf(sig)] || 'Pending');
-            const opp = (() => { for (const g of (window._frOppGroups || [])) { if (g.anchor === t) return `anchor of ${g.dcName} group (${g.cands.length} could join)`; const c = g.cands.find(x => x.truck === t); if (c) return `could join #${g.anchor._num} at ${g.dcName} (${g.anchor.minShip}, ${c.gap}d early) -> ${c.sum} plt`; } return ''; })();
+            const opp = (() => { for (const g of (window._frOppGroups || [])) { if (g.anchor === t) return `anchors proposed truck at ${g.dcName} (${g.plan} plt on ${g.ship}${g.save ? ', save $' + g.save : ''})`; const m = g.members.find(x => x.truck === t); if (m) return `proposed onto #${g.anchor._num} at ${g.dcName} (${g.ship}, ${m.gap}d early -> ${g.plan} plt${g.save ? ', save $' + g.save : ''})`; } return ''; })();
             const util = Math.round(t.plan / (s.max_pallets || 28) * 100);
             lines.push(['Truck', i + 1, t.mode, laneName(t.lane), custOf(t), t.stops.map(x => x.dc || _frCustShort(x.customer)).join(' > '), '', shipWin(t), t.cases, t.plan, Math.round(t.weight), util, '', t.flags.join('; '), opp, status, ap.quote_cost != null ? ap.quote_cost : '', ap.pickup_date || '', ''].map(esc).join(','));
             t.stops.forEach(st => (st.ships || []).forEach(so => { const moved = ovrMap[so] ? 'yes' : ''; (linesBySo[so] || []).forEach(ln => { const cfg = skuCfg(ln.sku); const lp = (cfg && cfg.cases_per_pallet) ? (ln.cases / Number(cfg.cases_per_pallet)).toFixed(2) : ''; const ll = (cfg && cfg.cases_per_pallet) ? _frLayerStr(ln.cases, cfg.cases_per_pallet, cfg.pallet_ti) : ''; lines.push(['Item', i + 1, '', '', _frCustShort(st.customer), (st.dc || '') + ' · ' + skuName(ln.sku), skuUpc(ln.sku), st.ship || '', ln.cases, lp, '', '', ll, '', '', '', '', '', moved].map(esc).join(',')); }); }));
@@ -48384,7 +48384,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const BR = ['1-2', '3-4', '5-8', '9-12', '13-20', '21-28'];
           const bOf = p => p < 3 ? 0 : p < 5 ? 1 : p < 9 ? 2 : p < 13 ? 3 : p < 21 ? 4 : 5;
           const tr = {};
-          F.forEach(r => { const k = r.fpo || r.so_num || r.id; (tr[k] = tr[k] || { p: 0, f: 0 }).p += (+r.pallets || 0); tr[k].f += (+r.freight || 0); });
+          F.forEach(r => { const k = r.fpo || r.so || r.id; (tr[k] = tr[k] || { p: 0, f: 0 }).p += (+r.pallets || 0); tr[k].f += (+r.freight || 0); });
           const agg = BR.map(() => ({ n: 0, f: 0 }));
           Object.values(tr).forEach(t => { if (t.p <= 0 || t.p > 30) return; const ppp = t.f / t.p; if (ppp < 20 || ppp > 1500) return; const b = agg[bOf(t.p)]; b.n++; b.f += t.f; });
           const totF = agg.reduce((a, b) => a + b.f, 0) || 1;
@@ -48419,7 +48419,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           container.innerHTML = `<div style="display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:12px;margin-bottom:18px;">${card('Total sales', money(totalSales))}${card('Freight cost', money(spend))}${card('Freight % of sales', (totalSales ? spend / totalSales * 100 : 0).toFixed(2) + '%')}${card('Shipments', num(F.length))}${card('Pallets', num(pallets))}${card('Avg pallets', (F.length ? pallets / F.length : 0).toFixed(1), 'per shipment')}${card('Avg $/pallet', money(pallets ? spend / pallets : 0))}${card('Avg $/case', '$' + (cases ? spend / cases : 0).toFixed(2))}</div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;align-items:stretch;">
               <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="font-family:var(--serif);font-size:14px;margin-bottom:8px;">Monthly trend — total sales vs freight cost</div><div style="flex:1;display:flex;align-items:center;">${trendSVG(months, sBy, fBy)}</div></div>
-              <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="font-family:var(--serif);font-size:14px;margin-bottom:2px;">Shipments by size — count vs freight spend</div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:6px;"><span style="color:#2f4b7c;font-size:13px;">■</span> trucks (count) &nbsp;&nbsp; <span style="color:#d9822b;font-size:13px;">■</span> % of freight spend · pallets per truck, multi-stop grouped by freight PO · FTL ${Math.round(ftl / (ftl + ltl || 1) * 100)}% / LTL ${Math.round(ltl / (ftl + ltl || 1) * 100)}%</div><div style="flex:1;display:flex;align-items:center;">${bracketSVG(F)}</div></div></div>
+              <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="font-family:var(--serif);font-size:14px;margin-bottom:2px;">Shipments by size — count vs freight spend</div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:6px;"><span style="color:#2f4b7c;font-size:13px;">■</span> trucks (count) &nbsp;&nbsp; <span style="color:#d9822b;font-size:13px;">■</span> % of freight spend · pallets per truck, multi-stop grouped by freight PO${(F.filter(r => r.fpo).length / (F.length || 1)) < 0.5 ? ' · <span style="color:#b8860b;">⚠ freight-PO column missing from history — rows shown per order, not per truck; re-upload with an FPO# column</span>' : ''} · FTL ${Math.round(ftl / (ftl + ltl || 1) * 100)}% / LTL ${Math.round(ltl / (ftl + ltl || 1) * 100)}%</div><div style="flex:1;display:flex;align-items:center;">${bracketSVG(F)}</div></div></div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;align-items:stretch;">
               <div style="border:1px solid var(--rule-soft);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:14px;">$/pallet &amp; avg pallets — by customer</div><div id="fr-cust-dd">${_frMsBox('cust', 'Customers', _frDistinct(F, r => r.customer))}</div></div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin:4px 0 8px;"><span style="color:#7c86e0;font-size:13px;">■</span> $/pallet (left axis) &nbsp;&nbsp; <span style="color:#d9822b;font-size:13px;">■</span> avg pallets (right axis)</div><div id="fr-an-custchart" style="flex:1;"></div></div>
@@ -48436,6 +48436,21 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         render(rows);
         _frWireFilters(document.getElementById('fr-an-top'), sel => { const F = rows.filter(r => { const chk = (k, v) => !sel || !sel[k] || sel[k].has((v || '').toString().toLowerCase()); return chk('cust', r.customer) && chk('vendor', r.vendor) && chk('state', r.state) && chk('mode', r.mode) && chk('month', monthOf(r)); }); render(F); });
         wireUp();
+      } else if (_frSubTab === 'rates') {
+        const { data: rrows } = await sb.from('freight_costs').select('*').eq('brand_id', brandId).order('dc_name');
+        const rows2 = rrows || [];
+        const dflt = rows2.find(r => r.dest_key === 'DEFAULT');
+        const rest = rows2.filter(r => r.dest_key !== 'DEFAULT');
+        const fmt = v => v != null ? '$' + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '<span style="color:var(--ink-3);">—</span>';
+        const rrow = (r, bold) => `<tr style="${bold ? 'background:rgba(124,58,237,0.06);font-weight:700;' : ''}"><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${escapeHtml(r.dc_name === 'DEFAULT' ? 'UNLISTED DESTINATION (default)' : r.dc_name)}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${escapeHtml(r.city || '')}</td><td style="padding:6px 9px;border-top:1px solid var(--rule-soft);">${escapeHtml(r.state || '')}</td>${['r_1_2', 'r_3_4', 'r_5_8', 'r_9_12', 'r_13_20', 'r_21_28'].map(k => `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);text-align:right;font-family:var(--mono);font-size:11px;">${fmt(r[k])}</td>`).join('')}<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);text-align:right;font-family:var(--mono);font-size:11px;">${fmt(r.min_charge)}</td></tr>`;
+        body.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">$ per pallet by destination and shipment size — powers the save-$ estimates and quote benchmarks in Book. Upload the Keel freight rates file (single sheet, same headers) to replace all rows.</div>
+            <div><button id="hl-fr-rates-btn" style="font-family:var(--mono);font-size:11px;padding:7px 16px;border:1px solid var(--ink);border-radius:4px;background:var(--ink);color:var(--paper);cursor:pointer;">⬆ Upload rates</button><input type="file" id="hl-fr-rates-file" accept=".xlsx,.xls,.csv" style="display:none;"><span id="hl-fr-rates-msg" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-left:10px;"></span></div>
+          </div>
+          ${rows2.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['DC Name', 'City', 'St', '$/plt @ 1–2', '@ 3–4', '@ 5–8', '@ 9–12', '@ 13–20', '@ 21–28', 'Min $'].map((hh, i2) => `<th style="text-align:${i2 >= 3 ? 'right' : 'left'};padding:6px 9px;font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule-soft);">${hh}</th>`).join('')}</tr></thead><tbody>${dflt ? rrow(dflt, true) : ''}${rest.map(r => rrow(r, false)).join('')}</tbody></table></div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;">${rows2.length} destinations${dflt ? ' (incl. default fallback)' : ' — <b style="color:#b8860b;">no default row: unlisted DCs get no cost estimate</b>'}</div>` : `<div class="hl-empty" style="padding:24px;text-align:center;color:var(--ink-3);">No freight rates loaded yet — upload the rates file to activate savings estimates in Book.</div>`}`;
+        const rb = document.getElementById('hl-fr-rates-btn'), rf = document.getElementById('hl-fr-rates-file'), rm = document.getElementById('hl-fr-rates-msg');
+        if (rb) { rb.addEventListener('click', () => rf.click()); rf.addEventListener('change', async e => { const f = (e.target.files || [])[0]; if (!f) return; rm.textContent = 'Reading…'; try { const res = await _frUploadCosts(f, brandId, sb, m2 => rm.textContent = m2); rm.textContent = res.loaded + ' loaded'; setTimeout(() => _frRenderTab(brandId, sb), 600); } catch (err) { rm.textContent = 'Failed: ' + (err.message || 'error'); } rf.value = ''; }); }
       } else if (_frSubTab === 'assumptions') {
         const s = await _frLoadSettings(brandId, sb);
         const field = (key, label, val, unit, hint) => `<div style="display:flex;flex-direction:column;gap:4px;">
@@ -48688,6 +48703,32 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return _frSettingsCache;
   }
 
+  async function _frUploadCosts(file, brandId, sb, onMsg) {
+    const ab = await file.arrayBuffer();
+    const wb = XLSX.read(ab, { type: 'array' });
+    const key = wb.SheetNames.find(n => n.toLowerCase().includes('cost') || n.toLowerCase().includes('rate')) || wb.SheetNames[0];
+    const crows = XLSX.utils.sheet_to_json(wb.Sheets[key], { header: 1, defval: '' });
+    let hi = -1;
+    for (let i = 0; i < Math.min(crows.length, 12); i++) { const low = (crows[i] || []).map(c => String(c).trim().toLowerCase()); if (low.some(c => c.includes('dc name') || c.includes('destination')) && low.some(c => c.includes('min charge'))) { hi = i; break; } }
+    if (hi < 0) throw new Error('Header row not found — need columns "DC Name" (or Destination) and "Min charge $".');
+    const h = crows[hi];
+    const cc = (needle, alt) => { let ix = h.findIndex(x => String(x).toLowerCase().replace(/–/g, '-').includes(needle)); if (ix < 0 && alt) ix = h.findIndex(x => String(x).toLowerCase().includes(alt)); return ix; };
+    const c = { dc: cc('dc name', 'destination'), city: cc('city'), st: cc('state'), b1: cc('1-2'), b2: cc('3-4'), b3: cc('5-8'), b4: cc('9-12'), b5: cc('13-20'), b6: cc('21-28'), min: cc('min charge') };
+    if (c.dc < 0 || c.b1 < 0) throw new Error('Rate columns not found — use the Keel freight rates template headers.');
+    const recs = [];
+    for (let i = hi + 1; i < crows.length; i++) {
+      const r = crows[i]; const dcName = _frClean(r[c.dc]); if (!dcName) continue;
+      const rates = [c.b1, c.b2, c.b3, c.b4, c.b5, c.b6].map(ix => { const v = ix >= 0 ? _frNum(r[ix]) : null; return v && v > 0 ? v : null; });
+      if (!rates.some(v => v != null)) continue;
+      const isDefault = /unlisted|default/i.test(dcName);
+      recs.push({ brand_id: brandId, dest_key: isDefault ? 'DEFAULT' : _frDcKey(dcName), dc_name: isDefault ? 'DEFAULT' : dcName, city: _frClean(r[c.city]), state: _frClean(r[c.st]), r_1_2: rates[0], r_3_4: rates[1], r_5_8: rates[2], r_9_12: rates[3], r_13_20: rates[4], r_21_28: rates[5], min_charge: c.min >= 0 ? (_frNum(r[c.min]) || null) : null });
+    }
+    if (!recs.length) throw new Error('No rate rows found (rows need a DC Name and at least one bracket value).');
+    if (onMsg) onMsg(`Loading ${recs.length} rate rows…`);
+    const dw = await sb.from('freight_costs').delete().eq('brand_id', brandId); if (dw.error) throw new Error(dw.error.message);
+    for (let i = 0; i < recs.length; i += 500) { const { error } = await sb.from('freight_costs').insert(recs.slice(i, i + 500)); if (error) throw new Error(error.message); }
+    return { loaded: recs.length };
+  }
   async function _frUploadHistory(file, brandId, sb, onMsg) {
     const ab = await file.arrayBuffer();
     const wb = XLSX.read(new Uint8Array(ab), { type: 'array', cellDates: true });
@@ -48696,7 +48737,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     let hi = 0; for (let i = 0; i < Math.min(rows.length, 20); i++) { const low = (rows[i] || []).map(x => String(x).trim().toLowerCase()); if (low.some(x => x.includes('customer')) && low.some(x => x.includes('freight') || x.includes('pallet') || x.includes('vendor') || x.includes('carrier'))) { hi = i; break; } }
     const H = (rows[hi] || []).map(x => String(x).trim().toLowerCase());
     const col = (...names) => { for (const n of names) { const idx = H.findIndex(h => h.includes(n)); if (idx >= 0) return idx; } return -1; };
-    const ci = { id: col('internal id', 'id'), date: col('date'), type: col('type'), number: col('number', 'invoice', 'document'), po: col('po#', 'po '), customer: H.findIndex(h => h === 'customer') >= 0 ? H.findIndex(h => h === 'customer') : col('customer'), city: col('city'), state: col('state', 'province'), total: col('total', 'amount', 'sales'), cases: col('case'), pallets: col('pallet'), weight: col('weight'), freightUnit: H.findIndex(h => h.includes('freight') && (h.includes('/') || h.includes('unit') || h.includes('per') || h.includes('case'))), freight: H.findIndex(h => h.includes('freight') && !(h.includes('/') || h.includes('unit') || h.includes('per') || h.includes('case'))), so: col('so#', 'sales order', 'so '), fpo: col('fpo', 'freight po'), mode: col('mode'), vendor: col('vendor', 'carrier') };
+    const ci = { id: col('internal id', 'id'), date: col('date'), type: col('type'), number: col('number', 'invoice', 'document'), po: col('po#', 'po '), customer: H.findIndex(h => h === 'customer') >= 0 ? H.findIndex(h => h === 'customer') : col('customer'), city: col('city'), state: col('state', 'province'), total: col('total', 'amount', 'sales'), cases: col('case'), pallets: col('pallet'), weight: col('weight'), freightUnit: H.findIndex(h => h.includes('freight') && (h.includes('/') || h.includes('unit') || h.includes('per') || h.includes('case'))), freight: H.findIndex(h => h.includes('freight') && !(h.includes('/') || h.includes('unit') || h.includes('per') || h.includes('case'))), so: col('so#', 'sales order', 'so '), fpo: col('fpo', 'freight po', 'freight order', 'booking', 'load #', 'load id', 'load no', 'shipment id', 'truck #', 'truck id'), mode: col('mode'), vendor: col('vendor', 'carrier') };
     if (ci.customer < 0 && ci.freight < 0 && ci.vendor < 0) throw new Error('Could not find freight columns (need at least Customer / Freight / Vendor). Headers seen: ' + H.filter(Boolean).join(', '));
     const g = (r, k) => ci[k] >= 0 ? r[ci[k]] : '';
     const recs = []; for (let i = hi + 1; i < rows.length; i++) { const r = rows[i]; const cust = _frClean(g(r, 'customer')); const freight = _frNum(g(r, 'freight')); const vendor = _frClean(g(r, 'vendor')); if (!cust && freight == null && !vendor) continue; recs.push({ brand_id: brandId, id: (ci.id >= 0 && r[ci.id]) ? String(r[ci.id]) : ('row' + i), date: _frDate(g(r, 'date')), type: _frClean(g(r, 'type')), number: _frClean(g(r, 'number')), po: _frClean(g(r, 'po')), customer: cust, city: _frClean(g(r, 'city')), state: _frClean(g(r, 'state')), total: _frNum(g(r, 'total')), cases: _frNum(g(r, 'cases')), pallets: _frNum(g(r, 'pallets')), weight: _frNum(g(r, 'weight')), freight_unit: _frNum(g(r, 'freightUnit')), freight: freight, so: _frClean(g(r, 'so')), fpo: _frClean(g(r, 'fpo')), mode: _frClean(g(r, 'mode')), vendor: vendor }); }
