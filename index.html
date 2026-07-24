@@ -47721,9 +47721,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (catTot['Not serviced'].c || catTot['Not serviced'].s) parts.push(chip('Not serviced', catTot['Not serviced']));
         parts.push(`Total pending: <b style="color:var(--ink);">${totC.toLocaleString()} cases · $${Math.round(totS).toLocaleString()}</b>`);
         const splitLine = `<div style="background:var(--bone-2);border:1px solid var(--rule-soft);border-radius:6px;padding:10px 14px;margin-bottom:16px;font-family:var(--mono);font-size:11px;line-height:1.9;color:var(--ink-3);">${parts.join(' &nbsp;·&nbsp; ')}</div>`;
-        const head = ['PO Date', 'Proj Ship', 'Customer', 'Item', 'Fulfillment', 'Cases', 'Case $', 'Total $'].map((h, i) => th(h, i >= 5)).join('');
-        const trs = data.map(r => `<tr data-frow data-f-cust="${escapeHtml((r.customer || '').toLowerCase())}" data-f-item="${escapeHtml((r.sku || '').toLowerCase())}" data-f-fulfill="${escapeHtml(catOf(r.customer).toLowerCase())}" data-f-month="${escapeHtml((r.projected_ship_date || '').slice(0, 7))}">${td(r.po_date)}${td(r.projected_ship_date)}${td(r.customer)}${td(r.sku)}${td(catOf(r.customer))}${td(r.cases_ordered, true)}${td(money(r.case_price, true), true)}${td(money(r.sales, false), true)}</tr>`).join('');
-        const filters = _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(data, r => r.customer) }, { key: 'month', label: 'Ship month', options: _frDistinct(data, r => (r.projected_ship_date || '').slice(0, 7)) }, { key: 'item', label: 'Item', options: _frDistinct(data, r => r.sku) }, { key: 'fulfill', label: 'Fulfillment', options: ['Delivered', '3PL', 'Pickup', 'Not serviced'] }]);
+        const head = ['PO Date', 'Proj Ship', 'PO #', 'Customer', 'Item', 'Fulfillment', 'Cases', 'Case $', 'Total $'].map((h, i) => th(h, i >= 6)).join('');
+        const trs = data.map(r => `<tr data-frow data-f-cust="${escapeHtml((r.customer || '').toLowerCase())}" data-f-po="${escapeHtml((r.so_num || '').toLowerCase())}" data-f-item="${escapeHtml((r.sku || '').toLowerCase())}" data-f-fulfill="${escapeHtml(catOf(r.customer).toLowerCase())}" data-f-month="${escapeHtml((r.projected_ship_date || '').slice(0, 7))}">${td(r.po_date)}${td(r.projected_ship_date)}${td(r.so_num)}${td(r.customer)}${td(r.sku)}${td(catOf(r.customer))}${td(r.cases_ordered, true)}${td(money(r.case_price, true), true)}${td(money(r.sales, false), true)}</tr>`).join('');
+        const filters = _frFilterBar([{ key: 'cust', label: 'Customer', options: _frDistinct(data, r => r.customer) }, { key: 'po', label: 'PO #', options: _frDistinct(data, r => r.so_num) }, { key: 'month', label: 'Ship month', options: _frDistinct(data, r => (r.projected_ship_date || '').slice(0, 7)) }, { key: 'item', label: 'Item', options: _frDistinct(data, r => r.sku) }, { key: 'fulfill', label: 'Fulfillment', options: ['Delivered', '3PL', 'Pickup', 'Not serviced'] }]);
         body.innerHTML = splitLine + _frOrderSummaryHtml(data, th, td, wrap, false, null, catOf) + filters + wrap(head, trs, `${data.length} pending-fulfillment order lines &middot; synced daily from Dropbox &middot; soonest projected ship first`);
         _frWireFilters(body);
       } else if (_frSubTab === 'test') {
@@ -47838,7 +47838,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           (linesBySo[so] || []).forEach(ln => { const cfg = skuCfg(ln.sku); if (cfg && cfg.cases_per_pallet) plt += ln.cases / Number(cfg.cases_per_pallet); cs += ln.cases; n++; });
           return { so, dc: st.dc || _frCustShort(st.customer || ''), n, plt: Math.ceil(plt * 100) / 100, cs };
         });
-        const poDetailRows = (u, indent) => { const sums = poSumOf(u); const multi = sums.length > 1; return sums.map(p => `<tr><td></td><td colspan="6" style="padding:2px 8px 2px ${indent}px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${multi ? `<input type="checkbox" class="fr-po-chk" data-so="${escapeHtml(p.so)}" checked title="On this truck — uncheck to pull ${escapeHtml(p.so)} out as an independent PO" style="vertical-align:middle;margin-right:5px;cursor:pointer;">` : '<span style="display:inline-block;width:18px;"></span>'}${escapeHtml(p.so)} · ${escapeHtml(p.dc)} · ${p.n} item${p.n === 1 ? '' : 's'} · ${p.plt} plt · ${p.cs} cs</td></tr>`).join(''); };
+        const poDetailRows = (u, indent) => { const sums = poSumOf(u); const multi = sums.length > 1; return sums.map(p => `<tr><td></td><td colspan="6" style="padding:2px 8px 2px ${indent}px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${`<input type="checkbox" class="fr-po-chk" data-so="${escapeHtml(p.so)}" checked title="${multi ? 'On this truck — uncheck to pull ' + escapeHtml(p.so) + ' out as its own quote row (pinned independent)' : 'Uncheck to pull ' + escapeHtml(p.so) + ' out of this proposal as its own quote row (pinned independent — won\'t be re-proposed)'}" style="vertical-align:middle;margin-right:5px;cursor:pointer;">`}${escapeHtml(p.so)} · ${escapeHtml(p.dc)} · ${p.n} item${p.n === 1 ? '' : 's'} · ${p.plt} plt · ${p.cs} cs</td></tr>`).join(''); };
         const rationaleFor = t => {
           const sig = sigOf(t);
           const consolidated2 = t.stops.some(st => (st.ships || []).some(so => ovrMap[so]));
@@ -47900,7 +47900,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           // fits joins the group as its own approve-or-dismiss candidate.
           const groups = {};
           allTrucks.forEach(t => {
-            if (t.mode === 'Dedicated' || oppExempt(t)) return;
+            if (t.mode === 'Dedicated' || oppExempt(t) || isOwnTruck(t)) return; // own = user split it out — never re-propose it
             [...new Set(t.stops.map(x => _frDcKey(x.dc)).filter(Boolean))].forEach(dk => {
               const key = (t.lane ? t.lane.no : '?') + '|' + dk;
               (groups[key] = groups[key] || { dk, trucks: [] }).trucks.push(t);
