@@ -47907,11 +47907,38 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             });
           });
           window._frOppGroups = [];
+          const sosOf = t => [...new Set(t.stops.flatMap(x => x.ships || []))];
+          const eligible = t => t.mode !== 'Dedicated' && !oppExempt(t) && !isOwnTruck(t) && !apprOf(sigOf(t)).booked_at && stOf(sigOf(t)) !== 'buyer';
+          if (!window._frFrozenBins) { try { const raw = localStorage.getItem('keel_fr_frozen_' + brandId); if (raw) { const p = JSON.parse(raw); if (p && p.src && Array.isArray(p.bins)) window._frFrozenBins = p; } } catch (e) {} }
+          const frozen = (window._frFrozenBins && window._frFrozenBins.src === src) ? window._frFrozenBins : null;
+          if (frozen) {
+            // PLAN FROZEN: rebuild proposals only from the snapshot taken at the last full run.
+            // Edits (uncheck / Leave out / Keep separate) shrink or dissolve their own proposal;
+            // nothing else reshuffles and NO new bins form until the user clicks ⟳ Rerun plan.
+            const assigned = new Set();
+            frozen.bins.forEach(fb => {
+              const set = new Set(fb.sos);
+              const parts = allTrucks.filter(t => eligible(t) && !assigned.has(t) && sosOf(t).length && sosOf(t).every(so => set.has(so)));
+              if (parts.length < 2) return;
+              parts.sort((a2, b2) => (a2.minShip || '9999').localeCompare(b2.minShip || '9999'));
+              parts.forEach(t => assigned.add(t));
+              const anchor = parts[0];
+              const members = parts.slice(1).map(t => ({ truck: t, gap: Math.round(dd(t.minShip, anchor.minShip)) }));
+              const plan = parts.reduce((a2, t) => a2 + t.plan, 0), weight = parts.reduce((a2, t) => a2 + t.weight, 0);
+              let save = null;
+              const costs = parts.map(t => truckCost(t));
+              if (costs.every(c2 => c2 != null)) { const comb = truckCost(anchor, plan); if (comb != null) save = Math.round(costs.reduce((a2, c2) => a2 + c2, 0) - comb); }
+              window._frOppGroups.push({ dcName: fb.dcName || [...new Set(anchor.stops.map(x => x.dc).filter(Boolean))][0] || '', anchor, members, plan, weight, ship: anchor.minShip, save });
+              parts.forEach(t => { t._oppHold = true; });
+            });
+            // snapshot order preserved — rows don't jump around mid-edit
+          } else {
           const seenBins = new Set();
+          const candidates = [];
           Object.values(groups).forEach(g => {
             if (g.trucks.length < 2) return;
             g.trucks.sort((a, b) => (a.minShip || '9999').localeCompare(b.minShip || '9999'));
-            const pool = g.trucks.filter(t => !oppExempt(t) && !apprOf(sigOf(t)).booked_at && stOf(sigOf(t)) !== 'buyer');
+            const pool = g.trucks.filter(eligible);
             if (pool.length < 2) return;
             // Greedy date-ordered partition: each truck joins the first proposed bin whose
             // anchor date is within the window and whose capacity still fits it.
@@ -47939,11 +47966,22 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
               const costs = parts.map(t => truckCost(t));
               if (costs.every(c2 => c2 != null)) { const comb = truckCost(b.anchor, b.plan); if (comb != null) save = Math.round(costs.reduce((a2, c2) => a2 + c2, 0) - comb); }
               if (save != null && save < 0) return; // matrix says separate is cheaper — trucks go straight to Get a Quote
-              window._frOppGroups.push({ dcName, anchor: b.anchor, members: b.members, plan: b.plan, weight: b.weight, ship: b.anchor.minShip, save });
-              b.anchor._oppHold = true; b.members.forEach(m => { m.truck._oppHold = true; });
+              candidates.push({ dcName, anchor: b.anchor, members: b.members, plan: b.plan, weight: b.weight, ship: b.anchor.minShip, save });
             });
           });
-          window._frOppGroups.sort((a2, b2) => ((b2.save || 0) - (a2.save || 0)) || (a2.ship || '').localeCompare(b2.ship || ''));
+          // Highest-savings bins claim their trucks first — every truck appears in AT MOST ONE proposal.
+          // (Multi-stop trucks belong to two lane|DC groups and used to surface in two rows.)
+          candidates.sort((a2, b2) => ((b2.save || 0) - (a2.save || 0)) || (a2.ship || '').localeCompare(b2.ship || ''));
+          const used = new Set();
+          candidates.forEach(c => {
+            const parts = [c.anchor, ...c.members.map(m => m.truck)];
+            if (parts.some(t => used.has(t))) return;
+            parts.forEach(t => { used.add(t); t._oppHold = true; });
+            window._frOppGroups.push(c);
+          });
+          window._frFrozenBins = { src, ts: new Date().toISOString(), bins: window._frOppGroups.map(gp => { const pts = [gp.anchor, ...gp.members.map(m => m.truck)]; return { dcName: gp.dcName, sos: [...new Set(pts.flatMap(t => sosOf(t)))] }; }) };
+          try { localStorage.setItem('keel_fr_frozen_' + brandId, JSON.stringify(window._frFrozenBins)); } catch (e) {}
+          }
         })();
         Object.keys(moveMap).forEach(so => {
           const tg = moveMap[so]; if (!tg || !tg.startsWith('with:')) return;
@@ -47964,8 +48002,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const nOvr = Object.keys(ovrMap).length;
         const acceptRows = pendingAccept.map(t => ({ t, save: multiStopSavings(t) })).sort((a2, b2) => ((b2.save || 0) - (a2.save || 0)) || (a2.t.minShip || '').localeCompare(b2.t.minShip || ''));
         const oppPanel = (oppCount || nOvr || acceptRows.length) ? `<div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:12px 14px;margin-bottom:16px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:15px;">&#9889; Consolidation opportunities${(oppCount + acceptRows.length) ? ` (${oppCount + acceptRows.length})` : ''}</div>${nOvr ? `${acceptRows.length ? `<button id="fr-accept-all" style="font-family:var(--mono);font-size:11px;padding:4px 12px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;margin-right:8px;">Combine all auto (${acceptRows.length})</button>` : ''}<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);">Reset all consolidations (${nOvr})</button>` : ''}</div>
-          <div style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Every row is a proposed truck, ranked by savings — <b>Combine</b> makes it one truck. Rows marked <i>auto</i> are pre-built routes with no date changes; all others move later orders to the earliest member's date (early only, never late) and ask whether the buyer needs to sign off. Expand ▸ for details or to leave a truck out.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--serif);font-size:15px;">&#9889; Consolidation opportunities${(oppCount + acceptRows.length) ? ` (${oppCount + acceptRows.length})` : ''}</div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><button id="fr-rerun-plan" title="Re-optimize proposals from scratch — until then, your edits never reshuffle other rows" style="font-family:var(--mono);font-size:11px;padding:4px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);">⟳ Rerun plan</button>${(window._frFrozenBins && window._frFrozenBins.ts) ? `<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Proposals have been frozen since this optimizer run — new orders won't be proposed until Rerun">frozen ${String(window._frFrozenBins.ts).slice(0, 10)}</span>` : ''}${nOvr ? `${acceptRows.length ? `<button id="fr-accept-all" style="font-family:var(--mono);font-size:11px;padding:4px 12px;border:1px solid #7c3aed;border-radius:4px;background:#7c3aed;color:#fff;cursor:pointer;margin-right:8px;">Combine all auto (${acceptRows.length})</button>` : ''}<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);">Reset all consolidations (${nOvr})</button>` : ''}</div></div>
+          <div style="font-family:var(--sans);font-size:12px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Every row is a proposed truck, ranked by savings — <b>Combine</b> makes it one truck. Rows marked <i>auto</i> are pre-built routes with no date changes; all others move later orders to the earliest member's date (early only, never late) and ask whether the buyer needs to sign off. Expand ▸ for details or to leave a truck out. Proposals are <b>frozen while you edit</b> — unchecking POs or leaving trucks out only affects that row; nothing regroups until <b>⟳ Rerun plan</b>.</div>
           ${(oppCount || acceptRows.length) ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['', 'Proposed truck', 'DC', 'Customers', 'From', 'Weight (lb)', 'Ship date', 'Result', 'Action'].map((h, i) => th(h, i === 4 || i === 5 || i === 7)).join('')}</tr></thead><tbody>${oppGroups.map((g, gi) => {
             const id = 'opp' + gi;
             const parts = [g.anchor, ...g.members.map(m => m.truck)];
@@ -48178,6 +48216,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           btn.disabled = true;
           if (await acceptSigs([btn.dataset.sig])) _frRenderTab(brandId, sb); else btn.disabled = false;
         }));
+        const rerunBtn = document.getElementById('fr-rerun-plan');
+        if (rerunBtn) rerunBtn.addEventListener('click', () => { window._frFrozenBins = null; try { localStorage.removeItem('keel_fr_frozen_' + brandId); } catch (e) {} _frRenderTab(brandId, sb); });
         const accAll = document.getElementById('fr-accept-all');
         if (accAll) accAll.addEventListener('click', async () => {
           accAll.disabled = true;
