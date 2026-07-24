@@ -47993,8 +47993,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const target = tg.slice(5);
           const truckOf = x => allTrucks.find(t => t.stops.some(st => (st.ships || []).includes(x)));
           const a = truckOf(so), b = truckOf(target);
-          if (a && b && a !== b) a.flags.push('manual move: ' + so + ' did not fit with ' + target + ' (capacity/lane) — packed separately');
-          if (a && !b) a.flags.push('manual move: target order ' + target + ' is no longer in the plan');
+          if (a && b && a !== b) a.flags.push('manual move: ' + so + ' did not fit with ' + target + (moveMap[target] === 'hold' ? ' (target is held from plan)' : ' (capacity or ship-date window)') + ' — packed separately');
+          if (a && !b) a.flags.push(moveMap[target] === 'hold' ? 'manual move: target order ' + target + ' is held from plan — clear its hold to combine' : 'manual move: target order ' + target + ' is no longer in the plan');
         });
         const bookedTrucks = allTrucks.filter(t => apprOf(sigOf(t)).booked_at && !t._oppHold);
         const visibleAll = allTrucks.filter(t => !t._oppHold && !apprOf(sigOf(t)).booked_at);
@@ -48079,7 +48079,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${(() => { const nHold = allTrucks.filter(t => t._oppHold).length; const nAuto = acceptRows.length; const sum = nHold + nAuto + visibleTrucks.length + bookedTrucks.length; const ok = sum === allTrucks.length; return `<div style="font-family:var(--mono);font-size:10px;color:${ok ? 'var(--ink-3)' : 'var(--lost)'};margin:-2px 0 8px;">${ok ? '✓' : '⚠'} All freight accounted for — ${allTrucks.length} trucks: ${nHold + nAuto} in proposals above (${nHold} combine · ${nAuto} auto) · ${visibleTrucks.length} here${indepTrucks.length ? ` (incl. ${indepTrucks.length} independent)` : ''} · ${bookedTrucks.length} booked${heldOrders.length ? ` · <span style="color:#b8860b;">${[...new Set(heldOrders.map(o => o.so_num))].length} POs held from plan (below)</span>` : ''}${ok ? '' : ` — MISMATCH: sections sum to ${sum}`}</div>`; })()}
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Orders combine onto one truck only when their projected ship dates fall within ${s.date_window_days || 1} day(s) of each other, and never exceed ${s.max_pallets || 28} pallets / ${money(s.max_weight || 40000)} lb / ${s.max_stops || 3} stops. Mode: <b>LTL</b> ≤ ${s.ltl_max_pallets || 4} plt, otherwise <b>FTL</b> (consolidated toward the ${s.max_pallets || 28}-pallet max) · <b>Dedicated</b> = C&amp;S / Target. Expand multi-stop trucks with the ▸ toggle.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="fr-why-tgl" style="font-family:var(--mono);font-size:11px;padding:7px 14px;border:1px solid var(--rule-soft);border-radius:4px;background:${window._frShowWhy ? 'var(--ink)' : 'transparent'};color:${window._frShowWhy ? 'var(--paper)' : 'var(--ink)'};cursor:pointer;margin-right:8px;">💬 Why not combined</button><button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
-          ${visibleTrucks.length ? truckTable(visibleTrucks) : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (proposed multi-stop / undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
+          ${visibleTrucks.length ? `<div style="background:rgba(46,125,50,0.05);border:1px solid rgba(46,125,50,0.25);border-radius:6px;padding:10px 12px;">${truckTable(visibleTrucks)}</div>` : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (proposed multi-stop / undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
           ${(() => {
             const moveEntries = Object.keys(moveMap).sort(); // incl. 'own' splits — the × here is how a pinned PO rejoins the plan
             const labelOf = tg => tg === 'own' ? 'own truck' : tg.startsWith('own:') ? 'ships separately (split from auto route)' : tg === 'hold' ? 'held from plan' : tg.startsWith('lane:') ? ('lane → ' + (((lanes || []).find(l => l.kind === 'lane' && String(l.lane_no) === tg.slice(5)) || {}).lane_name || tg.slice(5))) : tg.startsWith('with:') ? ('→ truck carrying ' + tg.slice(5)) : tg;
@@ -48765,7 +48765,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       });
       return out;
     }
-    const poolTrucks = packShipments(pool, sh => _ownGrp[sh.so] ? 'OWN:' + _ownGrp[sh.so] : _ownSet.has(sh.so) ? 'OWN:' + sh.so : 'L' + sh.lane.no);
+    const _grpKeyBase = sh => _ownGrp[sh.so] ? 'OWN:' + _ownGrp[sh.so] : _ownSet.has(sh.so) ? 'OWN:' + sh.so : 'L' + sh.lane.no;
+    const _poolBySo = {}; pool.forEach(sh => { _poolBySo[sh.so] = sh; });
+    // A "move to truck" rider packs in its TARGET's group — even a pinned (own) target: the pin
+    // keeps the optimizer out, never an explicit user instruction.
+    const poolTrucks = packShipments(pool, sh => { const tgt = _withMap[sh.so] ? _poolBySo[_withMap[sh.so]] : null; return tgt ? _grpKeyBase(tgt) : _grpKeyBase(sh); });
     const dedTrucks = packShipments(dedShips, sh => 'C' + _frNorm(_frCustShort(sh.customer)));
     const ftl = [], ltl = [];
     poolTrucks.forEach(t => { const flags = []; if (t._miss) flags.push('missing item config'); t.flags = flags; t.mode = (t.plan <= ltlMax) ? 'LTL' : 'FTL'; if (t.mode === 'LTL') ltl.push(t); else ftl.push(t); });
