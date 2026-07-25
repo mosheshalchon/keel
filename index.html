@@ -47913,7 +47913,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           });
           window._frOppGroups = [];
           const sosOf = t => [...new Set(t.stops.flatMap(x => x.ships || []))];
-          const eligible = t => t.mode !== 'Dedicated' && !oppExempt(t) && !isOwnTruck(t) && !apprOf(sigOf(t)).booked_at && stOf(sigOf(t)) !== 'buyer';
+          const eligible = t => t.mode !== 'Dedicated' && !oppExempt(t) && !isOwnTruck(t) && !sosOf(t).some(so => (moveMap[so] || '').startsWith('with:')) && !apprOf(sigOf(t)).booked_at && stOf(sigOf(t)) !== 'buyer'; // user-shaped trucks (pins + manual merges) never re-enter proposals
           if (!window._frFrozenBins) { try { const raw = localStorage.getItem('keel_fr_frozen_' + brandId); if (raw) { const p = JSON.parse(raw); if (p && p.src && Array.isArray(p.bins)) window._frFrozenBins = p; } } catch (e) {} }
           const frozen = (window._frFrozenBins && window._frFrozenBins.src === src) ? window._frFrozenBins : null;
           if (frozen) {
@@ -48097,12 +48097,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                   </select>
                   <input type="text" id="fr-adj-dest" placeholder="dest #" title="Destination truck number (for Move to truck)" style="font-family:var(--mono);font-size:11px;padding:6px 9px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);width:64px;">
                   <button id="fr-adj-apply" style="font-family:var(--mono);font-size:11px;padding:6px 14px;border:1px solid var(--ink);border-radius:4px;background:var(--ink);color:var(--paper);cursor:pointer;">Apply</button>
-                  <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Move a PO or a whole truck # onto an existing truck (rides its lane and date), split to its own truck, or hold it. Unchecking a PO splits it out as its own quote row above (marked independent); remove its entry here (×) to return it to the plan.</span>
+                  <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Move a PO or a whole truck # onto an existing truck (rides its lane and date), split to its own truck, or hold it. Results show as rows in the table above (independent / ⚡ moved) or in the Held strip below. To undo an edit, enter the PO or truck # and choose "Clear adjustment (back to plan)". Booked trucks are locked — unbook first.</span>
                 </div>
-                ${moveEntries.length ? moveEntries.map(so => { const o = (orders || []).find(x => x.so_num === so); return `<div style="font-family:var(--mono);font-size:11px;padding:2px 0;">${escapeHtml(so)}${o ? ' · ' + escapeHtml(_frCustShort(o.customer)) : ''} — <b style="color:#7c3aed;">${escapeHtml(labelOf(moveMap[so]))}</b><button class="fr-adj-del" data-so="${escapeHtml(so)}" title="Remove this adjustment" style="font-family:var(--mono);font-size:10px;padding:1px 7px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;margin-left:8px;">×</button></div>`; }).join('') : `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">No manual adjustments.</div>`}
+                ${''/* ledger removed — adjustments are commands only; results render as rows above, undo via "Clear adjustment" */}
               </div>
             </div>`;
           })()}
+          ${heldOrders.length ? `<div style="border:1px solid rgba(184,134,11,0.35);background:rgba(184,134,11,0.05);border-radius:6px;padding:10px 14px;margin-top:14px;"><button id="fr-held-tgl" style="background:none;border:none;cursor:pointer;font-family:var(--serif);font-size:14px;color:var(--ink);padding:0;">▸ Held from plan (${[...new Set(heldOrders.map(o => o.so_num))].length})</button><div id="fr-held-list" style="display:none;margin-top:8px;">${[...new Set(heldOrders.map(o => o.so_num))].map(so => { const o = heldOrders.find(x => x.so_num === so); return `<div style="font-family:var(--mono);font-size:11px;padding:3px 0;">${escapeHtml(so)}${o ? ' · ' + escapeHtml(_frCustShort(o.customer)) : ''}<button class="fr-unhold" data-so="${escapeHtml(so)}" title="Return this PO to the plan" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;margin-left:8px;">Unhold</button></div>`; }).join('')}</div></div>` : ''}
           ${bookedTrucks.length ? `<div style="border:1px solid rgba(124,58,237,0.3);background:rgba(124,58,237,0.04);border-radius:6px;padding:10px 14px;margin-top:14px;"><button id="fr-booked-tgl" style="background:none;border:none;cursor:pointer;font-family:var(--serif);font-size:14px;color:var(--ink);padding:0;">▸ Booked — awaiting pickup (${bookedTrucks.length})</button><div id="fr-booked-list" style="display:none;margin-top:8px;">${bookedTrucks.map(t => { const ap = apprOf(sigOf(t)); return `<div style="font-family:var(--mono);font-size:11px;padding:3px 0;"><b>#${t._num}</b> ${escapeHtml([...new Set(t.stops.map(x => x.dc || _frCustShort(x.customer)))].join(' → '))} · ${t.plan} plt · $${Number(ap.quote_cost || 0).toLocaleString()} · pickup ${ap.pickup_date || '—'}<button class="fr-unbook" data-sig="${sigOf(t)}" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;margin-left:8px;">Unbook</button></div>`; }).join('')}</div></div>` : ''}
           ${P.manual.length ? `<div style="font-family:var(--serif);font-size:16px;margin:24px 0 8px;">Manual review — over cap (${P.manual.length})</div><div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:8px;">Oversized orders are auto-split into full trucks + a remainder above; anything here still exceeds a single truck on weight and needs an analyst.</div>${listTable(manualRows, ['SO #', 'Customer', 'DC', 'Proj Ship', 'Cases', 'Plan plt', 'Weight (lb)', 'Reason'].map((h, i) => th(h, i >= 4 && i <= 6)).join(''))}` : ''}
           ${P.needsDc.length ? `<div style="font-family:var(--serif);font-size:16px;margin:24px 0 8px;">Needs ship-to DC (${P.needsDc.length})</div>${listTable(needRows, ['SO #', 'Customer', 'Proj Ship', 'Cases', 'Plan plt', 'Weight (lb)', 'Note'].map((h, i) => th(h, i >= 3 && i <= 5)).join(''))}` : ''}
@@ -48232,6 +48233,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         if (whyTgl) whyTgl.addEventListener('click', () => { window._frShowWhy = !window._frShowWhy; body.querySelectorAll('.fr-why').forEach(el => { el.style.display = window._frShowWhy ? 'table-cell' : 'none'; }); whyTgl.style.background = window._frShowWhy ? 'var(--ink)' : 'transparent'; whyTgl.style.color = window._frShowWhy ? 'var(--paper)' : 'var(--ink)'; });
         const adjTgl = document.getElementById('fr-adj-tgl');
         if (adjTgl) adjTgl.addEventListener('click', () => { const b2 = document.getElementById('fr-adj-body'); const open = b2.style.display !== 'none'; b2.style.display = open ? 'none' : 'block'; adjTgl.textContent = (open ? '▸' : '▾') + adjTgl.textContent.slice(1); });
+        const heldTgl = document.getElementById('fr-held-tgl');
+        if (heldTgl) heldTgl.addEventListener('click', () => { const l = document.getElementById('fr-held-list'); const open = l.style.display !== 'none'; l.style.display = open ? 'none' : 'block'; heldTgl.textContent = (open ? '▸' : '▾') + heldTgl.textContent.slice(1); });
+        body.querySelectorAll('.fr-unhold').forEach(btn => btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          if (await saveMove(btn.dataset.so, null)) _frRenderTab(brandId, sb); else btn.disabled = false;
+        }));
         const bkTgl = document.getElementById('fr-booked-tgl');
         if (bkTgl) bkTgl.addEventListener('click', () => { const l = document.getElementById('fr-booked-list'); const open = l.style.display !== 'none'; l.style.display = open ? 'none' : 'block'; bkTgl.textContent = (open ? '▸' : '▾') + bkTgl.textContent.slice(1); });
         const saveMove = async (so, target) => {
@@ -48274,6 +48281,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             if (hit) sos = [hit.so_num];
           }
           if (!sos.length) { alert(`"${ref}" doesn't match a truck # in the plan or a PO/SO on file.`); return; }
+          const bookedSo = sos.filter(so => allTrucks.some(x => apprOf(sigOf(x)).booked_at && x.stops.some(st => (st.ships || []).includes(so))));
+          if (bookedSo.length) { alert('Booked trucks are locked — ' + bookedSo.join(', ') + ' is on a booked truck. Unbook it first to make changes.'); return; }
           adjApply.disabled = true;
           let ok = true;
           for (const so of sos) { if (act === 'with:' + so) continue; if (!(await saveMove(so, act || null))) { ok = false; break; } }
