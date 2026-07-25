@@ -47916,6 +47916,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const eligible = t => t.mode !== 'Dedicated' && !oppExempt(t) && !isOwnTruck(t) && !sosOf(t).some(so => (moveMap[so] || '').startsWith('with:')) && !apprOf(sigOf(t)).booked_at && stOf(sigOf(t)) !== 'buyer'; // user-shaped trucks (pins + manual merges) never re-enter proposals
           if (!window._frFrozenBins) { try { const raw = localStorage.getItem('keel_fr_frozen_' + brandId); if (raw) { const p = JSON.parse(raw); if (p && p.src && Array.isArray(p.bins)) window._frFrozenBins = p; } } catch (e) {} }
           const frozen = (window._frFrozenBins && window._frFrozenBins.src === src) ? window._frFrozenBins : null;
+          // Avoid rules apply to PROPOSALS too, not just the packer: never propose combining trucks
+          // whose stop states form a forbidden pair (built-ins + Lanes & Routes "Lanes to avoid").
+          const _avPairs = (() => { const s2 = new Set(['FL|WA', 'CA|FL', 'FL|OR', 'AZ|FL', 'CA|TX', 'AZ|TX', 'OR|TX', 'TX|WA']); const pk2 = (a2, b2) => [a2, b2].sort().join('|'); (avoidRows || []).forEach(r => { const as = String(r.state_a || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean); const bs = String(r.state_b || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean); as.forEach(a2 => bs.forEach(b2 => { if (a2 !== b2) s2.add(pk2(a2, b2)); })); }); return s2; })();
+          const _statesOfT = t => [...new Set(t.stops.map(x => x.state).filter(Boolean))];
+          const _avoidOk = (aSt, bSt) => !aSt.some(a2 => bSt.some(b2 => a2 !== b2 && _avPairs.has([a2, b2].sort().join('|'))));
           if (frozen) {
             // PLAN FROZEN: rebuild proposals only from the snapshot taken at the last full run.
             // Edits (uncheck / Leave out / Keep separate) shrink or dissolve their own proposal;
@@ -47923,9 +47928,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const assigned = new Set();
             frozen.bins.forEach(fb => {
               const set = new Set(fb.sos);
-              const parts = allTrucks.filter(t => eligible(t) && !assigned.has(t) && sosOf(t).length && sosOf(t).every(so => set.has(so)));
+              const cand = allTrucks.filter(t => eligible(t) && !assigned.has(t) && sosOf(t).length && sosOf(t).every(so => set.has(so)));
+              cand.sort((a2, b2) => (a2.minShip || '9999').localeCompare(b2.minShip || '9999'));
+              const parts = []; let accSt = [];
+              cand.forEach(t => { const st2 = _statesOfT(t); if (_avoidOk(st2, accSt)) { parts.push(t); accSt = [...new Set([...accSt, ...st2])]; } });
               if (parts.length < 2) return;
-              parts.sort((a2, b2) => (a2.minShip || '9999').localeCompare(b2.minShip || '9999'));
               parts.forEach(t => assigned.add(t));
               const anchor = parts[0];
               const members = parts.slice(1).map(t => ({ truck: t, gap: Math.round(dd(t.minShip, anchor.minShip)) }));
@@ -47956,10 +47963,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                 if (b.plan + t.plan > mP || b.weight + t.weight > mW) continue;
                 const stopsSet = new Set([...b.stops, ...t.stops.map(x => _frDcKey(x.dc) || _frNorm(x.customer))]);
                 if (stopsSet.size > mS) continue;
-                b.members.push({ truck: t, gap }); b.plan += t.plan; b.weight += t.weight; b.stops = [...stopsSet];
+                if (!_avoidOk(_statesOfT(t), b.states)) continue; // forbidden state pairing (Lanes to avoid)
+                b.members.push({ truck: t, gap }); b.plan += t.plan; b.weight += t.weight; b.stops = [...stopsSet]; b.states = [...new Set([...b.states, ..._statesOfT(t)])];
                 placed = true; break;
               }
-              if (!placed) bins.push({ anchor: t, members: [], plan: t.plan, weight: t.weight, stops: t.stops.map(x => _frDcKey(x.dc) || _frNorm(x.customer)) });
+              if (!placed) bins.push({ anchor: t, members: [], plan: t.plan, weight: t.weight, stops: t.stops.map(x => _frDcKey(x.dc) || _frNorm(x.customer)), states: _statesOfT(t) });
             });
             bins.filter(b => b.members.length).forEach(b => {
               const binSig = [b.anchor, ...b.members.map(m => m.truck)].map(t => sigOf(t)).sort().join('&&');
@@ -48000,7 +48008,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const visibleAll = allTrucks.filter(t => !t._oppHold && !apprOf(sigOf(t)).booked_at);
         const _isOwnT = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
         const pendingAccept = visibleAll.filter(t => !_isOwnT(t) && t.stops.length > 1 && !apprMap[sigOf(t)]);
-        const visibleTrucks = visibleAll.filter(t => !pendingAccept.includes(t)); // own (split-out) trucks ride in the main Get a Quote table, marked independent
+        const _userShapedT = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return _isOwnT(t) || sos.some(so => String(moveMap[so] || '').startsWith('with:')); };
+        const adjTrucks = visibleAll.filter(t => !pendingAccept.includes(t) && _userShapedT(t)); // manual-adjustment results — shown under the Manual adjustments section
+        const visibleTrucks = visibleAll.filter(t => !pendingAccept.includes(t) && !_userShapedT(t));
         const indepTrucks = visibleAll.filter(_isOwnT);
         const oppGroups = window._frOppGroups || [];
         const oppCount = oppGroups.length;
@@ -48076,7 +48086,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
           ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — these orders are missing a DC value in the feed.</div>` : ''}
           <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Get a Quote (${visibleTrucks.length})</div>
-          ${(() => { const nHold = allTrucks.filter(t => t._oppHold).length; const nAuto = acceptRows.length; const sum = nHold + nAuto + visibleTrucks.length + bookedTrucks.length; const ok = sum === allTrucks.length; return `<div style="font-family:var(--mono);font-size:10px;color:${ok ? 'var(--ink-3)' : 'var(--lost)'};margin:-2px 0 8px;">${ok ? '✓' : '⚠'} All freight accounted for — ${allTrucks.length} trucks: ${nHold + nAuto} in proposals above (${nHold} combine · ${nAuto} auto) · ${visibleTrucks.length} here${indepTrucks.length ? ` (incl. ${indepTrucks.length} independent)` : ''} · ${bookedTrucks.length} booked${heldOrders.length ? ` · <span style="color:#b8860b;">${[...new Set(heldOrders.map(o => o.so_num))].length} POs held from plan (below)</span>` : ''}${ok ? '' : ` — MISMATCH: sections sum to ${sum}`}</div>`; })()}
+          ${(() => { const nHold = allTrucks.filter(t => t._oppHold).length; const nAuto = acceptRows.length; const sum = nHold + nAuto + visibleTrucks.length + adjTrucks.length + bookedTrucks.length; const ok = sum === allTrucks.length; return `<div style="font-family:var(--mono);font-size:10px;color:${ok ? 'var(--ink-3)' : 'var(--lost)'};margin:-2px 0 8px;">${ok ? '✓' : '⚠'} All freight accounted for — ${allTrucks.length} trucks: ${nHold + nAuto} in proposals above (${nHold} combine · ${nAuto} auto) · ${visibleTrucks.length} here${adjTrucks.length ? ` · <span style="color:#7c3aed;">${adjTrucks.length} adjusted (Manual adjustments below)</span>` : ''} · ${bookedTrucks.length} booked${heldOrders.length ? ` · <span style="color:#b8860b;">${[...new Set(heldOrders.map(o => o.so_num))].length} POs held from plan (below)</span>` : ''}${ok ? '' : ` — MISMATCH: sections sum to ${sum}`}</div>`; })()}
           <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;line-height:1.5;">Orders combine onto one truck only when their projected ship dates fall within ${s.date_window_days || 1} day(s) of each other, and never exceed ${s.max_pallets || 28} pallets / ${money(s.max_weight || 40000)} lb / ${s.max_stops || 3} stops. Mode: <b>LTL</b> ≤ ${s.ltl_max_pallets || 4} plt, otherwise <b>FTL</b> (consolidated toward the ${s.max_pallets || 28}-pallet max) · <b>Dedicated</b> = C&amp;S / Target. Expand multi-stop trucks with the ▸ toggle.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="fr-why-tgl" style="font-family:var(--mono);font-size:11px;padding:7px 14px;border:1px solid var(--rule-soft);border-radius:4px;background:${window._frShowWhy ? 'var(--ink)' : 'transparent'};color:${window._frShowWhy ? 'var(--paper)' : 'var(--ink)'};cursor:pointer;margin-right:8px;">💬 Why not combined</button><button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
           ${visibleTrucks.length ? `<div style="background:rgba(46,125,50,0.05);border:1px solid rgba(46,125,50,0.25);border-radius:6px;padding:10px 12px;">${truckTable(visibleTrucks)}</div>` : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (proposed multi-stop / undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
@@ -48099,7 +48109,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                   <button id="fr-adj-apply" style="font-family:var(--mono);font-size:11px;padding:6px 14px;border:1px solid var(--ink);border-radius:4px;background:var(--ink);color:var(--paper);cursor:pointer;">Apply</button>
                   <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Move a PO or a whole truck # onto an existing truck (rides its lane and date), split to its own truck, or hold it. Results show as rows in the table above (independent / ⚡ moved) or in the Held strip below. To undo an edit, enter the PO or truck # and choose "Clear adjustment (back to plan)". Booked trucks are locked — unbook first.</span>
                 </div>
-                ${''/* ledger removed — adjustments are commands only; results render as rows above, undo via "Clear adjustment" */}
+                ${adjTrucks.length ? `<div style="margin-top:12px;"><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:4px;">Adjusted trucks (${adjTrucks.length}) — same workflow as above; quote and book from here.</div>${truckTable(adjTrucks)}</div>` : ''}
               </div>
             </div>`;
           })()}
