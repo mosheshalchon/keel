@@ -48086,7 +48086,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                 });
               }));
               const secs9 = [...map9.values()];
-              secs9.forEach(e9 => { e9.num = Object.keys(e9.byNum).map(Number).sort((a9, b9) => (e9.byNum[b9] - e9.byNum[a9]) || (a9 - b9))[0]; });
+              secs9.forEach(e9 => { e9.num = secs9.length === 1 ? Math.min(...Object.keys(e9.byNum).map(Number)) : Object.keys(e9.byNum).map(Number).sort((a9, b9) => (e9.byNum[b9] - e9.byNum[a9]) || (a9 - b9))[0]; }); // single stop → show what the COMBINED truck will keep (lowest member); multi-stop → dominant contributor (pinned on Leave out)
               secs9.forEach(e9 => e9.pos.sort((a9, b9) => (a9.date || '9999').localeCompare(b9.date || '9999')));
               secs9.sort((a9, b9) => ((a9.minShip || '9999').localeCompare(b9.minShip || '9999')) || (_stDist(a9.state) - _stDist(b9.state)));
               return secs9.map((e9, si9) => {
@@ -48299,7 +48299,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                 }
               } catch (e9) {}
             }
-            const rows2 = sos2.map(so2 => ({ brand_id: brandId, so_num: so2, target: 'own:' + sos2[0], updated_at: new Date().toISOString() }));
+            // Combine-panel destination Leave out (data-num set): the stop's POs consolidate onto ONE
+            // truck at the group's earliest date (first SO = anchor pin, rest ride with it) — declining
+            // the multi-stop routing but keeping the same-dock consolidation. Auto-route stop Leave out
+            // (no data-num) keeps the original ships-as-planned own-group behavior.
+            const rows2 = btn.dataset.num
+              ? sos2.map((so2, i2) => ({ brand_id: brandId, so_num: so2, target: i2 === 0 ? 'own' : 'with:' + sos2[0], updated_at: new Date().toISOString() }))
+              : sos2.map(so2 => ({ brand_id: brandId, so_num: so2, target: 'own:' + sos2[0], updated_at: new Date().toISOString() }));
             const { error } = await sb.from('freight_order_moves').upsert(rows2, { onConflict: 'brand_id,so_num' }); if (error) throw error;
             _frRenderTab(brandId, sb);
           } catch (e) { alert('Could not split the stop — ' + (e.message || e)); btn.disabled = false; }
