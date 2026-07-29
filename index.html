@@ -47860,7 +47860,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           if (!live.length) return 'Its potential partner' + (fits.length > 1 ? 's were' : ' was') + ' kept separate by you — re-offer via Reset all consolidations.';
           const svs = live.map(u => { const big = u.plan >= t.plan ? u : t; const a2 = truckCost(t), b2 = truckCost(u), comb = truckCost(big, u.plan + t.plan); return (a2 != null && b2 != null && comb != null) ? Math.round(a2 + b2 - comb) : null; });
           if (svs.length && svs.every(v => v != null && v <= 0)) { const worst = Math.min(...svs.map(v => -v)); return 'Combining with #' + live[svs.indexOf(Math.max(...svs))]._num + ' would cost ' + (worst > 0 ? '$' + worst + ' more' : 'the same') + ' per the rate matrix — separate is cheaper.'; }
-          return 'Partner available (#' + live[0]._num + ') — see the proposals above.';
+          return 'Partner available (#' + live[0]._num + ') in a proposal above — the frozen plan can\'t add members to it. ⟳ Rerun plan to re-optimize this truck in.';
         };
         const isOwnTruck = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
         const splitDesc = full => { const i = String(full || '').lastIndexOf(' - '); return i > 0 ? { name: full.slice(0, i), pack: full.slice(i + 3) } : { name: full || '', pack: '' }; };
