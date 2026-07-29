@@ -47998,7 +47998,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
               const parts = [b.anchor, ...b.members.map(m => m.truck)];
               const costs = parts.map(t => truckCost(t));
               if (costs.every(c2 => c2 != null)) { const comb = truckCost(b.anchor, b.plan); if (comb != null) save = Math.round(costs.reduce((a2, c2) => a2 + c2, 0) - comb); }
-              if (save != null && save < 0) return; // matrix says separate is cheaper — trucks go straight to Get a Quote
+              if (save != null && save < 0 && new Set(b.stops).size > 1) return; // matrix veto applies ONLY to multi-destination combos — same-dock consolidation is always proposed (one truck to one dock can't truly cost more than two; negative verdicts there are bracket noise)
               candidates.push({ dcName, anchor: b.anchor, members: b.members, plan: b.plan, weight: b.weight, ship: b.anchor.minShip, save });
             });
           });
