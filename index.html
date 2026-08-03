@@ -47860,7 +47860,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           if (!live.length) return 'Its potential partner' + (fits.length > 1 ? 's were' : ' was') + ' kept separate by you — re-offer via Reset all consolidations.';
           const svs = live.map(u => { const big = u.plan >= t.plan ? u : t; const a2 = truckCost(t), b2 = truckCost(u), comb = truckCost(big, u.plan + t.plan); return (a2 != null && b2 != null && comb != null) ? Math.round(a2 + b2 - comb) : null; });
           if (svs.length && svs.every(v => v != null && v <= 0)) { const worst = Math.min(...svs.map(v => -v)); return 'Combining with #' + live[svs.indexOf(Math.max(...svs))]._num + ' would cost ' + (worst > 0 ? '$' + worst + ' more' : 'the same') + ' per the rate matrix — separate is cheaper.'; }
-          return 'Partner available (#' + live[0]._num + ') in a proposal above — the frozen plan can\'t add members to it. ⟳ Rerun plan to re-optimize this truck in.';
+          const snap9 = window._frFrozenBins;
+          const mySos9 = [...new Set(t.stops.flatMap(x => x.ships || []))];
+          const known9 = !!(snap9 && Array.isArray(snap9.allSos) && mySos9.length && mySos9.every(so => snap9.allSos.includes(so)));
+          return known9
+            ? 'Partner (#' + live[0]._num + ') is committed to a proposal above — the last optimization couldn\'t fit this truck into that pairing (proposal capacity, stop cap, or a higher-savings claim took the partner). To force them together anyway: Manual adjustments → Move to truck #' + live[0]._num + '.'
+            : 'Partner available (#' + live[0]._num + ') in a proposal above — this truck arrived after the last optimization, and the frozen plan can\'t add members. ⟳ Rerun plan to fold it in.';
         };
         const isOwnTruck = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
         const splitDesc = full => { const i = String(full || '').lastIndexOf(' - '); return i > 0 ? { name: full.slice(0, i), pack: full.slice(i + 3) } : { name: full || '', pack: '' }; };
@@ -48012,7 +48017,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             parts.forEach(t => { used.add(t); t._oppHold = true; });
             window._frOppGroups.push(c);
           });
-          window._frFrozenBins = { src, ts: new Date().toISOString(), bins: window._frOppGroups.map(gp => { const pts = [gp.anchor, ...gp.members.map(m => m.truck)]; return { dcName: gp.dcName, sos: [...new Set(pts.flatMap(t => sosOf(t)))] }; }) };
+          window._frFrozenBins = { src, ts: new Date().toISOString(), allSos: allTrucks.filter(eligible).flatMap(t9 => sosOf(t9)), bins: window._frOppGroups.map(gp => { const pts = [gp.anchor, ...gp.members.map(m => m.truck)]; return { dcName: gp.dcName, sos: [...new Set(pts.flatMap(t => sosOf(t)))] }; }) };
           try { localStorage.setItem('keel_fr_frozen_' + brandId, JSON.stringify(window._frFrozenBins)); } catch (e) {}
           }
         })();
