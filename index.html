@@ -48324,7 +48324,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           if (await acceptSigs([btn.dataset.sig])) _frRenderTab(brandId, sb); else btn.disabled = false;
         }));
         const rerunBtn = document.getElementById('fr-rerun-plan');
-        if (rerunBtn) rerunBtn.addEventListener('click', () => { window._frFrozenBins = null; try { localStorage.removeItem('keel_fr_frozen_' + brandId); } catch (e) {} _frRenderTab(brandId, sb); });
+        if (rerunBtn) rerunBtn.addEventListener('click', () => { window._frFrozenBins = null; try { localStorage.removeItem('keel_fr_frozen_' + brandId); } catch (e) {} location.reload(); });
         const accAll = document.getElementById('fr-accept-all');
         if (accAll) accAll.addEventListener('click', async () => {
           accAll.disabled = true;
