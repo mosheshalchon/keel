@@ -47025,7 +47025,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _prodLocFilter = 'all', _prodLineFilter = 'all';
   let _prodLineTargets = new Map(), _prodRowsByItem = new Map();
   // Weekly production schedule state (Coverage | Weekly schedule toggle)
-  let _prodTab = 'coverage';            // 'coverage' | 'schedule'
+  let _prodTab = (() => { try { const t = localStorage.getItem('keel_prod_tab'); return ['coverage', 'history', 'schedule', 'assumptions'].includes(t) ? t : 'coverage'; } catch (e) { return 'coverage'; } })();   // persisted across refreshes
   let _prodSchedWeek = null;            // Monday ISO date of the shown week
   let _prodSettings = null;             // { production_days: [...] }
   let _prodCfg = new Map();             // product_id -> { cases_per_day, prod_group }
@@ -49555,6 +49555,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     `;
     main.querySelectorAll('.hl-prod-tab').forEach(b => b.addEventListener('click', () => {
       _prodTab = b.dataset.prodtab;
+      try { localStorage.setItem('keel_prod_tab', _prodTab); } catch (e) {}
       main.querySelectorAll('.hl-prod-tab').forEach(x => { const on = x.dataset.prodtab === _prodTab; x.style.color = on ? 'var(--ink)' : 'var(--ink-3)'; x.style.borderBottom = on ? '2px solid var(--ink)' : '2px solid transparent'; x.style.fontWeight = on ? '600' : '400'; });
       _prodRenderBody();
     }));
