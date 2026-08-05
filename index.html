@@ -47417,7 +47417,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const place9 = (r, want) => {
           if (want <= 0) return 0;
           const cap9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0;
-          const perDay = cap9 > 0 ? cap9 : Math.ceil(want / Math.max(activeDays.length, 1));
+          // CONCENTRATE, don't spread: an uncapped SKU runs as hard as the facility allows on as few
+          // days as possible, so it occupies the fewest SKU-changeover slots and leaves days open for
+          // the next SKU. (No facility cap AND no SKU cap → fall back to an even spread.)
+          const perDay = cap9 > 0 ? cap9 : (fcap != null ? Infinity : Math.ceil(want / Math.max(activeDays.length, 1)));
           let need = Math.round(want), placed = 0;
           for (const day of activeDays) {
             if (need <= 0) break;
