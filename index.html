@@ -47032,7 +47032,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   let _prodSched = new Map();           // `${product_id}|${weekday}` -> cases
   let _prodSchedManual = new Set();     // product_ids added manually as overrides (this week)
   let _prodSchedLoaded = false, _prodSchedLoading = false, _prodSchedWkLoaded = null;
-  let _prodPlan4 = null, _prodPlan4Loaded = false, _prodPlan4Loading = false;   // 4-week plan grid (week -> Map(pid -> cases))
+  let _prodPlan4 = null, _prodPlan4Loaded = false, _prodPlan4Loading = false;
+  let _prodSchedSummary = false;   // SUMMARY view: 8-week ending-inventory matrix   // 4-week plan grid (week -> Map(pid -> cases))
   const _prodEsc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
   const _prodFmt = (n, d = 0) => (n == null || isNaN(n)) ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
   const WK_PER_MONTH = 52 / 12;
@@ -47140,6 +47141,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _prodBlockedDays() { const b = _prodSettings && _prodSettings.blocked_days; return b ? String(b).split(',').map(x => x.trim()).filter(Boolean) : []; }
   function _prodMaxDaysWk() { const n = _prodSettings && Number(_prodSettings.max_prod_days_per_week); return (n && n > 0) ? n : null; }
   function _prodFacilityCap() { const n = _prodSettings && Number(_prodSettings.facility_max_cases_per_day); return (n && n > 0) ? n : null; }
+  function _prodMaxSkusDay() { const n = _prodSettings && Number(_prodSettings.max_skus_per_day); return (n && n > 0) ? n : 2; }   // default 2 SKUs per day
   function _prodActiveDays() {
     // Purely assumptions-driven: all days minus blocked, first max_prod_days_per_week of what's left
     // (no max set → Mon–Fri minus blocked).
@@ -47329,14 +47331,39 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:6px 8px;text-align:center;">${isManual ? `<button class="hl-psd-del" data-pid="${esc(r.prodId)}" title="Remove product" style="background:none;border:none;color:var(--lost);cursor:pointer;font-size:14px;line-height:1;">×</button>` : ''}</td>
       </tr>`;
     }).join('');
+    const _sumHtml = () => {
+      // 8-week ending-inventory matrix: chained End inv balance per SKU per week
+      // (actual on-hand − demand + scheduled, rolled forward). Colors: red ≤0, amber < Min,
+      // gold < Target, green ≥ Target.
+      const merged = new Map();
+      for (const r of baseRows) { if (!r.prodId) continue; const ex = merged.get(r.prodId); if (ex) ex.onHand += r.onHand; else merged.set(r.prodId, Object.assign({}, r)); }
+      const mrows = [...merged.values()].sort((a, b) => String(a.item).localeCompare(String(b.item)));
+      const schedOf9 = (pid, wk) => (_prodPlan4 && _prodPlan4.get(wk) && _prodPlan4.get(wk).get(pid)) || 0;
+      const head9 = weeks8.map((w9, i9) => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</th>`).join('');
+      const body9 = mrows.map(r => {
+        const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
+        const minW = (() => { const m9 = Number((_prodCfg.get(r.prodId) || {}).min_weeks); return (m9 && m9 > 0) ? m9 : 4; })();
+        const tgtW = r.target || 8;
+        let inv = r.onHand;
+        const cells9 = weeks8.map(w9 => {
+          inv = inv - wkD + schedOf9(r.prodId, w9);
+          const wos = wkD > 0 ? inv / wkD : null;
+          const col = inv <= 0 ? '#a8381f' : wos != null && wos < minW ? '#b8860b' : wos != null && wos < tgtW ? '#8a6d1f' : '#3f6f4a';
+          return `<td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;white-space:nowrap;color:${col};${inv <= 0 ? 'font-weight:700;' : ''}">${_prodFmt(Math.round(inv), 0)}${wos != null ? `<div style="font-size:9px;color:${col};opacity:0.75;">${_prodFmt(Math.round(wos * 10) / 10, 1)} wk</div>` : ''}</td>`;
+        }).join('');
+        return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}</td>${cells9}</tr>`;
+      }).join('');
+      return `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th>${head9}</tr></thead><tbody>${body9}</tbody></table></div>
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Projected <b>End inv balance</b> per week (on-hand − demand + scheduled, chained) with weeks of supply beneath. <span style="color:#a8381f;">Red ≤ 0</span> · <span style="color:#b8860b;">below Min</span> · <span style="color:#8a6d1f;">below Target</span> · <span style="color:#3f6f4a;">at/above Target</span>. Click a week tab to edit its days.</p>`;
+    };
     host.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
-        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">${weeks8.map((w9, i9) => `<button class="hl-psd-wktab" data-wk="${w9}" style="font-family:var(--mono);font-size:11px;padding:7px 12px;border-radius:5px;border:1px solid ${w9 === _prodSchedWeek ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${w9 === _prodSchedWeek ? 'var(--ink)' : 'transparent'};color:${w9 === _prodSchedWeek ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};font-weight:${w9 === _prodSchedWeek ? '700' : '400'};white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</button>`).join('')}</div>
-        <div style="display:flex;gap:8px;align-items:center;"><button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);font-weight:700;">Suggest 8 weeks</button><button id="hl-psd-clear" style="${btn}">Clear week</button></div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;"><button id="hl-psd-sumtab" style="font-family:var(--mono);font-size:11px;font-weight:700;padding:7px 14px;border-radius:5px;border:2px solid ${_prodSchedSummary ? '#534AB7' : 'var(--ink)'};cursor:pointer;background:var(--ink);color:var(--paper,#f4efe6);white-space:nowrap;">SUMMARY</button>${weeks8.map((w9, i9) => `<button class="hl-psd-wktab" data-wk="${w9}" style="font-family:var(--mono);font-size:11px;padding:7px 12px;border-radius:5px;border:1px solid ${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--ink)' : 'transparent'};color:${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};font-weight:${!_prodSchedSummary && w9 === _prodSchedWeek ? '700' : '400'};white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</button>`).join('')}</div>
+        <div style="display:flex;gap:8px;align-items:center;"><button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);font-weight:700;">Suggest 8 weeks</button>${_prodSchedSummary ? '' : `<button id="hl-psd-clear" style="${btn}">Clear week</button>`}</div>
       </div>
-      ${rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;">${['Product', wkIdx === 0 ? 'Current inv' : 'Est inv · ' + _prodSchedWeek.slice(5), 'Wks supply', 'Weekly demand', 'Ending inv', 'Inv needed', 'Max prod/day'].map((h, i) => `<th style="padding:8px ${i === 0 ? '10px' : '8px'};text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}${dayHead}${['Scheduled', 'End inv balance · ' + (() => { const d9 = new Date(_prodSchedWeek + 'T00:00:00'); d9.setDate(d9.getDate() + 6); return d9.toISOString().slice(5, 10); })(), 'End wks supply', 'Still needed'].map(h => `<th style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}<th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const cells = tots.map(t => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}</td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td colspan="7" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td>${cells}<td colspan="5"></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
-      ${candidates.length ? `<div style="margin-top:10px;"><select id="hl-psd-add" style="${btn}"><option value="">+ Add product…</option>${candidates.map(p => `<option value="${esc(p.id)}">${esc(p.item_description || p.id)}</option>`).join('')}</select></div>` : ''}
-      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Weeks chain: Wk 1 starts from actual inventory; Wks 2–8 start from the prior week's End inv balance (Est inv, shown in purple). Inv needed = cases to reach the SKU's target weeks on hand (Assumptions; default 8) from that week's starting inventory. Cells save as you type; a red cell is over the SKU's max/day. <b>Suggest 8 weeks</b> replaces all 8 weeks with a chained plan under the SKU and facility caps.</p>`;
+      ${_prodSchedSummary ? _sumHtml() : rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;">${['Product', wkIdx === 0 ? 'Current inv' : 'Est inv · ' + _prodSchedWeek.slice(5), 'Wks supply', 'Weekly demand', 'Ending inv', 'Inv needed', 'Max prod/day'].map((h, i) => `<th style="padding:8px ${i === 0 ? '10px' : '8px'};text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}${dayHead}${['Scheduled', 'End inv balance · ' + (() => { const d9 = new Date(_prodSchedWeek + 'T00:00:00'); d9.setDate(d9.getDate() + 6); return d9.toISOString().slice(5, 10); })(), 'End wks supply', 'Still needed'].map(h => `<th style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}<th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const cells = tots.map(t => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}</td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td colspan="7" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td>${cells}<td colspan="5"></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
+      ${!_prodSchedSummary && candidates.length ? `<div style="margin-top:10px;"><select id="hl-psd-add" style="${btn}"><option value="">+ Add product…</option>${candidates.map(p => `<option value="${esc(p.id)}">${esc(p.item_description || p.id)}</option>`).join('')}</select></div>` : ''}
+      ${_prodSchedSummary ? '' : `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Weeks chain: Wk 1 starts from actual inventory; Wks 2–8 start from the prior week's End inv balance (Est inv, shown in purple). Inv needed = cases to reach the SKU's target weeks on hand (Assumptions; default 8) from that week's starting inventory. Cells save as you type; a red cell is over the SKU's max/day. <b>Suggest 8 weeks</b> replaces all 8 weeks with a chained plan under the SKU and facility caps.</p>`}`;
     _prodSchedWire(host, rows, activeDays);
   }
   function _prodSchedWire(host, rows, activeDays) {
@@ -47349,7 +47376,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     host.querySelectorAll('.hl-psd-group').forEach(inp => inp.addEventListener('change', async () => { await saveCfg(inp.dataset.pid, { prod_group: (inp.value || '').trim() }); _prodRenderBody(); }));
     const addSel = host.querySelector('#hl-psd-add'); if (addSel) addSel.addEventListener('change', () => { const pid = addSel.value; if (pid) { _prodSchedManual.add(pid); _prodRenderBody(); } });
     host.querySelectorAll('.hl-psd-del').forEach(b => b.addEventListener('click', async () => { const pid = b.dataset.pid; if (!confirm('Remove this product from the week?')) return; try { await sb.from('production_schedule').delete().eq('brand_id', brandId).eq('week_start', _prodSchedWeek).eq('product_id', pid); _prodPlan4Loaded = false; } catch (e) { alert(e.message || e); return; } for (const day of _PROD_DAYS_ALL) _prodSched.delete(pid + '|' + day); _prodSchedManual.delete(pid); _prodRenderBody(); }));
-    host.querySelectorAll('.hl-psd-wktab').forEach(b => b.addEventListener('click', () => { const wk = b.dataset.wk; if (wk && wk !== _prodSchedWeek) { _prodSchedWeek = wk; _prodSchedLoaded = false; _prodSchedManual = new Set(); _prodRenderBody(); } }));
+    const sumTab = host.querySelector('#hl-psd-sumtab');
+    if (sumTab) sumTab.addEventListener('click', () => { if (!_prodSchedSummary) { _prodSchedSummary = true; _prodRenderBody(); } });
+    host.querySelectorAll('.hl-psd-wktab').forEach(b => b.addEventListener('click', () => { const wk = b.dataset.wk; if (_prodSchedSummary || (wk && wk !== _prodSchedWeek)) { _prodSchedSummary = false; if (wk) { _prodSchedWeek = wk; _prodSchedLoaded = false; } _prodSchedManual = new Set(); _prodRenderBody(); } }));
     const clr = host.querySelector('#hl-psd-clear'); if (clr) clr.addEventListener('click', async () => { if (!confirm('Clear all scheduled cases for this week?')) return; try { await sb.from('production_schedule').delete().eq('brand_id', brandId).eq('week_start', _prodSchedWeek); _prodPlan4Loaded = false; } catch (e) { alert(e.message || e); return; } _prodSched = new Map(); _prodRenderBody(); });
     const sug = host.querySelector('#hl-psd-suggest'); if (sug) sug.addEventListener('click', async () => {
       if (!confirm('Suggest will REPLACE the scheduled cases for all 8 weeks with a chained plan (each week builds on the prior week\'s ending inventory). Continue?')) return;
@@ -47367,26 +47396,58 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const base9 = [..._byPid9.values()];
       const inv9 = new Map(base9.map(r => [r.prodId, r.onHand]));   // rolls forward week by week
       const _minOf = (r) => { const m9 = Number((_prodCfg.get(r.prodId) || {}).min_weeks); return (m9 && m9 > 0) ? m9 : 4; };
-      const allRecs = []; let short9 = 0;
+      const maxSkus = _prodMaxSkusDay();
+      const allRecs = []; let short9 = 0, survShort9 = 0;
       for (const wk9 of weeks9) {
         const dayLeft = new Map(activeDays.map(d => [d, fcap != null ? fcap : Infinity]));
-        // PRIORITY: SKUs projected below their Min weeks of supply produce FIRST (most urgent
-        // first); everyone else follows, also most-urgent first. Scarce capacity goes to tier 1.
+        const daySkus = new Map(activeDays.map(d => [d, new Set()]));
+        const placedDay = new Map();
+        const made9 = new Map(base9.map(r => [r.prodId, 0]));
+        const place9 = (r, want) => {
+          if (want <= 0) return 0;
+          const cap9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0;
+          const perDay = cap9 > 0 ? cap9 : Math.ceil(want / Math.max(activeDays.length, 1));
+          let need = Math.round(want), placed = 0;
+          for (const day of activeDays) {
+            if (need <= 0) break;
+            const sset = daySkus.get(day);
+            if (!sset.has(r.prodId) && sset.size >= maxSkus) continue;   // day already at its SKU changeover limit
+            const key9 = r.prodId + '|' + day;
+            const room = Math.min(perDay - (placedDay.get(key9) || 0), need, dayLeft.get(day));
+            if (room <= 0) continue;
+            allRecs.push({ brand_id: brandId, week_start: wk9, product_id: r.prodId, weekday: day, cases: room });
+            placedDay.set(key9, (placedDay.get(key9) || 0) + room);
+            dayLeft.set(day, dayLeft.get(day) - room);
+            sset.add(r.prodId); need -= room; placed += room;
+          }
+          return placed;
+        };
+        // PRIORITY: lowest projected END-of-week weeks-of-supply first; below-Min SKUs form tier 1.
         const ordered9 = [...base9].sort((a9, b9) => {
-          const wa = inv9.get(a9.prodId) / a9.weekly, wb = inv9.get(b9.prodId) / b9.weekly;
-          const ua = wa < _minOf(a9) ? 0 : 1, ub = wb < _minOf(b9) ? 0 : 1;
-          return (ua - ub) || (wa - wb);
+          const ea = (inv9.get(a9.prodId) - a9.weekly) / a9.weekly, eb = (inv9.get(b9.prodId) - b9.weekly) / b9.weekly;
+          const ua = ea < _minOf(a9) - 1 ? 0 : 1, ub = eb < _minOf(b9) - 1 ? 0 : 1;
+          return (ua - ub) || (ea - eb);
         });
+        // PASS 1 — SURVIVAL: ending inventory may never hit zero. Every SKU first gets enough to
+        // end the week above zero (≥1 case) before anyone builds toward target.
+        for (const r of ordered9) {
+          const surv = Math.max(0, Math.ceil(r.weekly - inv9.get(r.prodId)) + 1);
+          if (surv <= 0) continue;
+          const got = place9(r, surv);
+          made9.set(r.prodId, made9.get(r.prodId) + got);
+          if (got < surv) survShort9 += surv - got;
+        }
+        // PASS 2 — BUILD: remaining capacity fills toward each SKU's target, urgency order.
         for (const r of ordered9) {
           const tgt9 = r.target || 8;
-          let need = Math.max(0, Math.round(r.weekly * tgt9 - inv9.get(r.prodId)));
-          const cap9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0;
-          const perDay = cap9 > 0 ? cap9 : Math.ceil(need / Math.max(activeDays.length, 1));
-          let made = 0;
-          for (const day of activeDays) { if (need <= 0) break; const amt = Math.min(perDay, need, dayLeft.get(day)); if (amt <= 0) continue; allRecs.push({ brand_id: brandId, week_start: wk9, product_id: r.prodId, weekday: day, cases: amt }); dayLeft.set(day, dayLeft.get(day) - amt); need -= amt; made += amt; }
-          short9 += Math.max(0, need);
-          inv9.set(r.prodId, inv9.get(r.prodId) - r.weekly + made);
+          const totalNeed = Math.max(0, Math.round(r.weekly * tgt9 - inv9.get(r.prodId)));
+          const rem9 = Math.max(0, totalNeed - made9.get(r.prodId));
+          if (rem9 <= 0) continue;
+          const got = place9(r, rem9);
+          made9.set(r.prodId, made9.get(r.prodId) + got);
+          short9 += rem9 - got;
         }
+        for (const r of base9) inv9.set(r.prodId, inv9.get(r.prodId) - r.weekly + made9.get(r.prodId));
       }
       const _recMap9 = new Map();
       for (const r9 of allRecs) { const k9 = r9.week_start + '|' + r9.product_id + '|' + r9.weekday; const ex9 = _recMap9.get(k9); if (ex9) ex9.cases += r9.cases; else _recMap9.set(k9, r9); }
@@ -47395,7 +47456,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         await sb.from('production_schedule').delete().eq('brand_id', brandId).in('week_start', weeks9);
         for (let k = 0; k < finalRecs.length; k += 400) { const { error } = await sb.from('production_schedule').insert(finalRecs.slice(k, k + 400)); if (error) throw error; }
       } catch (e) { alert('Could not save the 8-week plan — ' + (e.message || e)); sug.disabled = false; return; }
-      if (short9 > 0) alert('Capacity note: ' + short9.toLocaleString() + ' cases of need across the 8 weeks could not fit under the caps — those gaps show in Still needed week by week.');
+      if (survShort9 > 0) alert('⚠ STOCKOUT RISK: even producing the most urgent SKUs first, ' + survShort9.toLocaleString() + ' cases of keep-above-zero need could not fit under the caps (facility/day, SKU/day, max ' + maxSkus + ' SKUs/day). Some SKUs are projected to hit zero — raise a cap or add days.');
+      else if (short9 > 0) alert('Capacity note: ' + short9.toLocaleString() + ' cases of build-to-target need could not fit under the caps across the 8 weeks — nobody stocks out, but those SKUs land below target (see Still needed / the Summary view).');
       _prodSched = new Map(); for (const r9 of finalRecs) if (r9.week_start === _prodSchedWeek) _prodSched.set(r9.product_id + '|' + r9.weekday, r9.cases);
       _prodPlan4Loaded = false;
       _prodRenderBody();
@@ -47413,7 +47475,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:18px;max-width:760px;line-height:1.6;">Facility-level limits the scheduler reads when suggesting and spreading production. Per-SKU limits (cases/day, group) live on each row of the Weekly schedule.</div>
       <div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:22px;">
         ${fld('Facility max cases / day', 'hl-pas-fcap', st.facility_max_cases_per_day, 'cases', 'Total across ALL SKUs a day can produce. Suggest and Use never schedule a day past this; the schedule footer shows each day\'s total against it.')}
-        ${fld('Max production days / week', 'hl-pas-maxd', st.max_prod_days_per_week, 'days', 'Hard weekly ceiling — the day chips on the schedule can\'t enable more than this many days.')}
+        ${fld('Max production days / week', 'hl-pas-maxd', st.max_prod_days_per_week, 'days', 'Hard weekly ceiling on how many days the schedule uses.')}
+        ${fld('Max SKUs produced / day', 'hl-pas-maxsku', st.max_skus_per_day, 'SKUs', 'Changeover limit — Suggest runs at most this many different SKUs on any one day. Blank = 2.')}
       </div>
       <div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Blocked days — the facility never produces</div>${dayBtns}<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;">Click to toggle. Blocked days are struck out and locked on the schedule\'s day chips.</div></div>
       ${(() => {
@@ -47455,7 +47518,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     if (saveBtn) saveBtn.addEventListener('click', async () => {
       saveBtn.disabled = true;
       const num = id => { const v = (host.querySelector('#' + id) || {}).value; return v === '' || v == null ? null : Math.max(0, Math.round(Number(v) || 0)) || null; };
-      const patch = { facility_max_cases_per_day: num('hl-pas-fcap'), max_prod_days_per_week: num('hl-pas-maxd'), blocked_days: pendingBlk.length ? pendingBlk.join(',') : null };
+      const patch = { facility_max_cases_per_day: num('hl-pas-fcap'), max_prod_days_per_week: num('hl-pas-maxd'), max_skus_per_day: num('hl-pas-maxsku'), blocked_days: pendingBlk.length ? pendingBlk.join(',') : null };
       if (pendingBlk.length >= _PROD_DAYS_ALL.length) { alert('You\'ve blocked every day — leave at least one open.'); saveBtn.disabled = false; return; }
       _prodSettings = Object.assign({}, _prodSettings, patch);
       try {
