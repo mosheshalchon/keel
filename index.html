@@ -47277,7 +47277,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _prodRenderSchedule(host) {
     if (!_prodSchedLoaded || _prodSchedWkLoaded !== _prodSchedWeek) { if (!_prodSchedLoading) _prodSchedLoad(); host.innerHTML = '<div class="hl-loading">Loading schedule…</div>'; return; }
     if (!_prodFc && (_mrpScenarios || []).length) { if (!_prodFcLoading) _prodComputeForecast(); host.innerHTML = '<div class="hl-loading">Calculating demand from the forecast…</div>'; return; }
-    if (!_prodPlan4Loaded && !_prodPlan4Loading) _prodPlan4Load();
     const esc = _prodEsc, fmt = (n) => _prodFmt(Math.round(n), 0);
     const activeDays = _prodActiveDays();
     const baseRows = _prodComputeRows().filter(r => r.prodId);
@@ -47296,34 +47295,45 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const bodyRows = rows.map(r => {
       const cfg = _prodCfg.get(r.prodId) || {}; const cap = Number(cfg.cases_per_day) || 0; let sched = 0;
       const dayCells = activeDays.map(d => { const v = _prodSched.get(r.prodId + '|' + d) || 0; sched += v; const over = cap > 0 && v > cap; return `<td style="padding:4px 4px;text-align:center;"><input class="hl-psd-cell" data-pid="${esc(r.prodId)}" data-day="${d}" type="number" min="0" value="${v || ''}" placeholder="0" style="width:56px;text-align:right;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid ${over ? '#e24b4a' : 'var(--rule-soft)'};border-radius:4px;${over ? 'color:#a8381f;' : ''}"></td>`; }).join('');
-      const met = sched >= Math.round(r.produce);
-      const rem = Math.max(0, Math.round(r.produce) - sched);
-      const isManual = Math.round(r.produce) <= 0;
+      const need = Math.round(r.produce);
+      const rem = Math.max(0, need - sched);
+      const isManual = need <= 0;
       const weekCap = cap > 0 ? cap * activeDays.length : Infinity;
-      const overCap = weekCap < Math.round(r.produce);
+      const overCap = weekCap < need;
+      const wk = (r.weekly && r.weekly > 0) ? r.weekly : null;
+      const endInv = wk != null ? r.onHand - wk : null;               // before production
+      const endBal = wk != null ? r.onHand - wk + sched : null;       // after scheduled production
+      const endWos = (wk != null && wk > 0 && endBal != null) ? endBal / wk : null;
+      const tgt = r.target || 8;
+      const num = (v, dec) => v == null ? '—' : _prodFmt(dec ? Math.round(v * 10) / 10 : Math.round(v), dec ? 1 : 0);
+      const rcell = (html, extra) => `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11.5px;white-space:nowrap;${extra || ''}">${html}</td>`;
       return `<tr style="border-top:1px solid var(--rule-soft);">
-        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${cfg.prod_group ? `<div style="font-family:var(--mono);font-size:9px;color:#534AB7;">${esc(cfg.prod_group)}</div>` : ''}${overCap ? `<div style="font-family:var(--mono);font-size:9px;color:#a8381f;" title="Cap ${fmt(cap)}/day × ${activeDays.length} days = ${fmt(weekCap)} < need ${fmt(r.produce)}">⚠ over week cap by ${fmt(Math.round(r.produce) - weekCap)}</div>` : ''}</td>
-        <td style="padding:4px 6px;text-align:center;font-family:var(--mono);font-size:11px;color:${cap ? 'var(--ink)' : 'var(--ink-3)'};" title="Max cases/day — set in the Assumptions tab">${cap ? fmt(cap) : '—'}</td>
-        <td style="padding:4px 6px;"><input class="hl-psd-group" data-pid="${esc(r.prodId)}" value="${esc(cfg.prod_group || '')}" placeholder="group" style="width:92px;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;"></td>
+        <td style="padding:6px 10px;font-family:var(--serif);font-size:13px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${cfg.prod_group ? `<div style="font-family:var(--mono);font-size:9px;color:#534AB7;">${esc(cfg.prod_group)}</div>` : ''}${overCap ? `<div style="font-family:var(--mono);font-size:9px;color:#a8381f;" title="Cap ${fmt(cap)}/day × ${activeDays.length} days = ${fmt(weekCap)} < need ${fmt(need)}">⚠ over week cap by ${fmt(need - weekCap)}</div>` : ''}</td>
+        ${rcell(num(r.onHand))}
+        ${rcell(num(r.weeksSupply, 1), r.weeksSupply != null && r.weeksSupply < tgt ? 'color:#a8381f;' : 'color:var(--ink-3);')}
+        ${rcell(num(wk))}
+        ${rcell(num(endInv), endInv != null && endInv < 0 ? 'color:#a8381f;font-weight:600;' : 'color:var(--ink-3);')}
+        ${rcell(`<b>${num(need)}</b>`)}
+        ${rcell(cap ? num(cap) : '—', 'color:var(--ink-3);')}
         ${dayCells}
-        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">${fmt(r.produce)}</td>
-        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:${met ? '#3f6f4a' : '#a8381f'};">${fmt(sched)}${met ? ' ✓' : ''}</td>
-        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:${rem > 0 ? '#a8381f' : '#3f6f4a'};">${rem > 0 ? fmt(rem) : '0'}</td>
+        ${rcell(`${num(sched)}${sched >= need && need > 0 ? ' <span style="color:#3f6f4a;">✓</span>' : ''}`, sched >= need ? 'color:#3f6f4a;' : '')}
+        ${rcell(num(endBal), endBal != null && endBal < 0 ? 'color:#a8381f;font-weight:700;' : 'font-weight:600;')}
+        ${rcell(num(endWos, 1), endWos == null ? 'color:var(--ink-3);' : endWos < 0 ? 'color:#a8381f;font-weight:700;' : endWos < tgt ? 'color:#8a6d1f;' : 'color:#3f6f4a;')}
+        ${rcell(rem > 0 ? num(rem) : '0', rem > 0 ? 'color:#a8381f;' : 'color:#3f6f4a;')}
         <td style="padding:6px 8px;text-align:center;">${isManual ? `<button class="hl-psd-del" data-pid="${esc(r.prodId)}" title="Remove product" style="background:none;border:none;color:var(--lost);cursor:pointer;font-size:14px;line-height:1;">×</button>` : ''}</td>
       </tr>`;
     }).join('');
     const overCount = rows.filter(r => { const c = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0; return c > 0 && c * activeDays.length < Math.round(r.produce); }).length;
     host.innerHTML = `
-      ${_prodPlan4Loaded ? _prodPlan4GridHtml(baseRows) : '<div class="hl-loading">Loading 4-week plan…</div>'}
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
         <div style="display:flex;align-items:center;gap:8px;"><button id="hl-psd-prev" style="${btn}">◀</button><span style="font-family:var(--mono);font-size:12px;">Week of ${esc(_prodSchedWeek)}</span><button id="hl-psd-next" style="${btn}">▶</button></div>
         <div style="display:flex;gap:8px;align-items:center;"><button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);">Suggest schedule</button><button id="hl-psd-clear" style="${btn}">Clear week</button></div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;"><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Production days</span>${dayChips}</div>
       ${overCount ? `<div style="background:#f3dcd5;color:#a8381f;font-family:var(--mono);font-size:11px;padding:8px 12px;border-radius:6px;margin-bottom:12px;">⚠ ${overCount} product${overCount === 1 ? '' : 's'} can't be fully produced this week at the current cases/day and production days — add a day or raise a cap.</div>` : ''}
-      ${rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th><th style="padding:8px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Cases/day</th><th style="padding:8px 6px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Group</th>${dayHead}<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Need</th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sched</th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Still needed</th><th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const cells = tots.map(t => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}</td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td><td></td><td></td>${cells}<td></td><td></td><td></td><td></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
+      ${rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;">${['Product', 'Current inv', 'Wks supply', 'Weekly demand', 'Ending inv', 'Inv needed', 'Max prod/day'].map((h, i) => `<th style="padding:8px ${i === 0 ? '10px' : '8px'};text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}${dayHead}${['Scheduled', 'End inv balance', 'End wks supply', 'Still needed'].map(h => `<th style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}<th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const cells = tots.map(t => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}</td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td colspan="7" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td>${cells}<td colspan="5"></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
       ${candidates.length ? `<div style="margin-top:10px;"><select id="hl-psd-add" style="${btn}"><option value="">+ Add product…</option>${candidates.map(p => `<option value="${esc(p.id)}">${esc(p.item_description || p.id)}</option>`).join('')}</select></div>` : ''}
-      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Need = cases to produce to hit target coverage (from the Coverage tab). Cells save as you type; a red cell is over that product's cases/day. <b>Suggest schedule</b> spreads each product's need across the production days above, capped per day. <b>Group</b> is a label — it sorts and tags related products together but doesn't drive the schedule (yet).</p>`;
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Inv needed = cases to reach this SKU's target weeks on hand (set in Assumptions; default 8). Ending inv = current − weekly demand; End inv balance adds what you've scheduled; End wks supply is that balance in weeks (green ≥ target, amber below, red negative). Cells save as you type; a red cell is over the SKU's max/day. <b>Suggest schedule</b> spreads each product's need across the production days, capped per SKU and per facility.</p>`;
     _prodSchedWire(host, rows, activeDays);
   }
   function _prodSchedWire(host, rows, activeDays) {
@@ -47341,8 +47351,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const prev = host.querySelector('#hl-psd-prev'); if (prev) prev.addEventListener('click', () => { const d = new Date(_prodSchedWeek); d.setDate(d.getDate() - 7); _prodSchedWeek = _prodMonday(d); _prodSchedLoaded = false; _prodSchedManual = new Set(); _prodRenderBody(); });
     const next = host.querySelector('#hl-psd-next'); if (next) next.addEventListener('click', () => { const d = new Date(_prodSchedWeek); d.setDate(d.getDate() + 7); _prodSchedWeek = _prodMonday(d); _prodSchedLoaded = false; _prodSchedManual = new Set(); _prodRenderBody(); });
     const clr = host.querySelector('#hl-psd-clear'); if (clr) clr.addEventListener('click', async () => { if (!confirm('Clear all scheduled cases for this week?')) return; try { await sb.from('production_schedule').delete().eq('brand_id', brandId).eq('week_start', _prodSchedWeek); _prodPlan4Loaded = false; } catch (e) { alert(e.message || e); return; } _prodSched = new Map(); _prodRenderBody(); });
-    host.querySelectorAll('.hl-p4-wk').forEach(th => th.addEventListener('click', () => { const wk = th.dataset.wk; if (wk && wk !== _prodSchedWeek) { _prodSchedWeek = wk; _prodSchedLoaded = false; _prodSchedManual = new Set(); _prodRenderBody(); } }));
-    host.querySelectorAll('.hl-p4-use').forEach(b => b.addEventListener('click', async () => { b.disabled = true; const ok = await _prodSpreadWeek(b.dataset.pid, b.dataset.wk, Number(b.dataset.cases) || 0); if (ok) { _prodRenderBody(); } else b.disabled = false; }));
     const sug = host.querySelector('#hl-psd-suggest'); if (sug) sug.addEventListener('click', async () => {
       const newSched = new Map();
       const fcap = _prodFacilityCap();
