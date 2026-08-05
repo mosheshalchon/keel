@@ -47287,12 +47287,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const esc = _prodEsc;
     const weeks8 = _prodWeeks4(8);
     const merged = new Map();
-    for (const r of _prodComputeRows()) { if (!r.prodId) continue; const ex = merged.get(r.prodId); if (ex) { ex.onHand += r.onHand; ex._items = (ex._items || [ex.item]).concat(r.item); } else merged.set(r.prodId, Object.assign({}, r)); }
+    for (const r of _prodComputeRows()) {
+      if (!r.prodId) continue;
+      const ex = merged.get(r.prodId);
+      if (ex) { ex.onHand += r.onHand; ex._items.push({ item: r.item, onHand: r.onHand }); }
+      else { const c9 = Object.assign({}, r); c9._items = [{ item: r.item, onHand: r.onHand }]; merged.set(r.prodId, c9); }
+    }
     const mrows = [...merged.values()].sort((a, b) => String(a.item).localeCompare(String(b.item)));
     const schedOf9 = (pid, wk) => (_prodPlan4 && _prodPlan4.get(wk) && _prodPlan4.get(wk).get(pid)) || 0;
-    // ── Ending-inventory matrix: cells clickable → beginning − demand + production = ending ──
+    // ── Matrix: clickable cells (beginning − demand + production = ending); expandable merge badges ──
     const head9 = weeks8.map((w9, i9) => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</th>`).join('');
-    const body9 = mrows.map(r => {
+    const body9 = mrows.map((r, ri9) => {
       const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
       const minW = (() => { const m9 = Number((_prodCfg.get(r.prodId) || {}).min_weeks); return (m9 && m9 > 0) ? m9 : 4; })();
       const tgtW = r.target || 8;
@@ -47304,79 +47309,97 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const col = (inv <= 0 || (wos != null && wos < minW)) ? '#a8381f' : wos != null && wos < tgtW ? '#8a6d1f' : '#3f6f4a';
         return `<td class="hl-plancell" data-item="${esc(r.item)}" data-wk="Wk ${i9 + 1} · ${w9.slice(5)}" data-start="${Math.round(start9)}" data-dem="${Math.round(wkD)}" data-prod="${Math.round(prod9)}" data-end="${Math.round(inv)}" title="Click for the calculation" style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;white-space:nowrap;cursor:pointer;color:${col};${inv <= 0 ? 'font-weight:700;' : ''}">${_prodFmt(Math.round(inv), 0)}${wos != null ? `<div style="font-size:9px;color:${col};opacity:0.75;">${_prodFmt(Math.round(wos * 10) / 10, 1)} wk</div>` : ''}</td>`;
       }).join('');
-      return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${r._items ? `<div style="font-family:var(--mono);font-size:9px;color:#b8860b;">⚠ merges ${r._items.length} items: ${esc(r._items.join(' + '))}</div>` : ''}</td>${cells9}</tr>`;
+      const badge = r._items.length > 1
+        ? `<div><button class="hl-mergetgl" data-mtid="hl-mrg-${ri9}" style="background:none;border:none;padding:0;font-family:var(--mono);font-size:9px;color:#b8860b;cursor:pointer;">⚠ merges ${r._items.length} items <span id="hl-mrg-${ri9}-car">▸</span></button><div id="hl-mrg-${ri9}" style="display:none;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);padding:3px 0 2px 8px;border-left:2px solid #b8860b;margin-top:2px;">${r._items.map(x9 => `<div>${esc(x9.item)} — ${_prodFmt(Math.round(x9.onHand), 0)} cs</div>`).join('')}<div style="border-top:1px solid var(--rule-soft);margin-top:2px;padding-top:2px;">combined — ${_prodFmt(Math.round(r.onHand), 0)} cs</div></div></div>`
+        : '';
+      return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${badge}</td>${cells9}</tr>`;
     }).join('');
     const matrix = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th>${head9}</tr></thead><tbody>${body9}</tbody></table></div>
     <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Projected <b>End inv balance</b> per week (beginning − weekly demand + scheduled production, chained; click any number for its calculation). <span style="color:#a8381f;">Red = below Min wks supply (default 4) or ≤ 0</span> · <span style="color:#8a6d1f;">below Target</span> · <span style="color:#3f6f4a;">at/above Target</span>.</p>`;
-    // ── Chart + picker ──
-    const chartSec = (() => {
-      const series = mrows.map(r => {
-        const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
-        let inv = r.onHand; const pts = [];
-        for (const w9 of weeks8) { inv = inv - wkD + schedOf9(r.prodId, w9); pts.push({ bal: inv, wos: wkD > 0 ? inv / wkD : null }); }
-        return { pid: r.prodId, item: r.item, pts, minWos: Math.min(...pts.map(p9 => p9.wos == null ? Infinity : p9.wos)) };
-      });
-      if (_prodSumSel == null) {
-        const risky = series.filter(sr => sr.minWos < 4).slice(0, 8).map(sr => sr.pid);
-        _prodSumSel = new Set(risky.length ? risky : series.slice(0, 5).map(sr => sr.pid));
-      }
+    // ── Series for the chart ──
+    const series = mrows.map(r => {
+      const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
+      let inv = r.onHand; const pts = [];
+      for (const w9 of weeks8) { inv = inv - wkD + schedOf9(r.prodId, w9); pts.push({ bal: inv, wos: wkD > 0 ? inv / wkD : null }); }
+      return { pid: r.prodId, item: r.item, pts, minWos: Math.min(...pts.map(p9 => p9.wos == null ? Infinity : p9.wos)) };
+    });
+    if (_prodSumSel == null) {
+      const risky = series.filter(sr => sr.minWos < 4).slice(0, 8).map(sr => sr.pid);
+      _prodSumSel = new Set(risky.length ? risky : series.slice(0, 5).map(sr => sr.pid));
+    }
+    host.innerHTML = `<div style="font-family:var(--serif);font-size:16px;margin-bottom:12px;">8-week inventory projection</div>${matrix}
+      <div style="margin-top:26px;border-top:1px solid var(--rule-soft);padding-top:18px;">
+        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+          <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Products:</span>
+          <div id="hl-plms" style="position:relative;display:inline-block;">
+            <button type="button" id="hl-plms-btn" style="padding:5px 10px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper,#f4efe6);cursor:pointer;min-width:170px;max-width:300px;text-align:left;display:flex;justify-content:space-between;align-items:center;gap:8px;"><span id="hl-plms-summary" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span><span style="color:var(--ink-3);">▾</span></button>
+            <div id="hl-plms-panel" style="display:none;position:absolute;top:100%;left:0;z-index:50;margin-top:4px;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.12);min-width:300px;">
+              <div style="padding:8px 10px;border-bottom:1px solid var(--rule-soft);"><input type="text" id="hl-plms-search" placeholder="Search products…" style="width:100%;padding:5px 8px;font-family:var(--sans,sans-serif);font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;box-sizing:border-box;"></div>
+              <div style="padding:6px 10px;border-bottom:1px solid var(--rule-soft);display:flex;gap:12px;">
+                <button type="button" id="hl-plms-allall" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select all</button>
+                <button type="button" id="hl-plms-vis" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select visible</button>
+                <button type="button" id="hl-plms-none" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;padding:0;">Clear</button>
+              </div>
+              <div id="hl-plms-opts" style="max-height:290px;overflow-y:auto;"></div>
+            </div>
+          </div>
+          <span id="hl-plms-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
+          <span style="margin-left:auto;display:inline-flex;gap:8px;">
+            <button class="hl-plms-metric" data-m="wos" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;cursor:pointer;"></button>
+            <button class="hl-plms-metric" data-m="bal" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;cursor:pointer;"></button>
+          </span>
+        </div>
+        <div id="hl-plan-chart"></div>
+      </div>`;
+    // ── Wiring: fgh-style persistent panel; selection/metric redraw ONLY the chart ──
+    const q9 = (id9) => host.querySelector('#' + id9);
+    const msBtn = q9('hl-plms-btn'), msPanel = q9('hl-plms-panel'), msOpts = q9('hl-plms-opts'), msSearch = q9('hl-plms-search');
+    msSearch.value = _prodSumQ || '';
+    const visibleOptions = () => { const qq = (_prodSumQ || '').toLowerCase(); return qq ? series.filter(sr => String(sr.item).toLowerCase().includes(qq)) : series; };
+    const renderOptions = () => {
+      msOpts.innerHTML = visibleOptions().map(sr => `<label style="display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;font-family:var(--sans,sans-serif);font-size:13px;white-space:nowrap;${sr.minWos < 4 ? 'color:#a8381f;' : ''}"><input type="checkbox" data-plval="${esc(sr.pid)}" ${_prodSumSel.has(sr.pid) ? 'checked' : ''} style="cursor:pointer;"> ${esc(sr.item)}</label>`).join('') || '<div style="padding:10px;font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No matches.</div>';
+      msOpts.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', () => {
+        if (cb.checked) _prodSumSel.add(cb.dataset.plval); else _prodSumSel.delete(cb.dataset.plval);
+        updateView();
+      }));
+    };
+    const updateSummary = () => {
+      const n9 = _prodSumSel.size;
+      q9('hl-plms-summary').textContent = n9 === series.length ? 'All products' : n9 === 0 ? 'None selected' : n9 === 1 ? (series.find(sr => _prodSumSel.has(sr.pid)) || {}).item || '1 selected' : n9 + ' selected';
+      q9('hl-plms-count').textContent = n9 + ' of ' + series.length + ' products';
+    };
+    const styleMetricBtns = () => host.querySelectorAll('.hl-plms-metric').forEach(b9 => { const on9 = _prodSumMetric === b9.dataset.m; b9.textContent = b9.dataset.m === 'wos' ? 'Weeks of supply' : 'Cases'; b9.style.cssText = `font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid ${on9 ? 'var(--ink)' : 'var(--rule-soft)'};background:${on9 ? 'var(--ink)' : 'transparent'};color:${on9 ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};`; });
+    const renderChart = () => {
       const pal = ['#534AB7', '#2e7d32', '#b8860b', '#a8381f', '#1565c0', '#6d4c41', '#00838f', '#c2185b', '#5e35b1', '#f57f17', '#33691e', '#4527a0'];
       const chosen = series.filter(sr => _prodSumSel.has(sr.pid));
       const useWos = _prodSumMetric === 'wos';
       const vals = chosen.flatMap(sr => sr.pts.map(p9 => useWos ? p9.wos : p9.bal)).filter(v9 => v9 != null && isFinite(v9));
-      let chart = '<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);padding:20px 0;">Select products to chart.</div>';
-      if (chosen.length && vals.length) {
-        const yMax = Math.max(useWos ? 5 : 1, ...vals) * 1.08, yMin = Math.min(0, ...vals);
-        const W = 1000, H = 280, L = 58, R = 24, T = 14, B = 30;
-        const xOf = i9 => L + i9 * ((W - L - R) / (weeks8.length - 1));
-        const yOf = v9 => T + (H - T - B) * (1 - (v9 - yMin) / (yMax - yMin || 1));
-        const grid = [0, 0.25, 0.5, 0.75, 1].map(f9 => { const v9 = yMin + f9 * (yMax - yMin); return `<line x1="${L}" x2="${W - R}" y1="${yOf(v9)}" y2="${yOf(v9)}" stroke="rgba(0,0,0,0.07)"/><text x="${L - 8}" y="${yOf(v9) + 3}" text-anchor="end" font-size="10" fill="#8a8578" font-family="monospace">${useWos ? (Math.round(v9 * 10) / 10) : Math.round(v9).toLocaleString()}</text>`; }).join('');
-        const thresh = useWos ? `<line x1="${L}" x2="${W - R}" y1="${yOf(4)}" y2="${yOf(4)}" stroke="#a8381f" stroke-dasharray="5,4" stroke-width="1.4"/><text x="${W - R}" y="${yOf(4) - 5}" text-anchor="end" font-size="10" fill="#a8381f" font-family="monospace">4 wk min</text>` : '';
-        const xLbls = weeks8.map((w9, i9) => `<text x="${xOf(i9)}" y="${H - 8}" text-anchor="middle" font-size="10" fill="#8a8578" font-family="monospace">${w9.slice(5)}</text>`).join('');
-        const lines = chosen.map((sr, si9) => { const c9 = pal[si9 % pal.length]; const ptsArr = sr.pts.map((p9, i9) => ({ x: xOf(i9), y: (useWos ? p9.wos : p9.bal), i: i9 })).filter(p9 => p9.y != null && isFinite(p9.y)); const poly = ptsArr.map(p9 => `${p9.x},${yOf(p9.y)}`).join(' '); const dots = ptsArr.map(p9 => `<circle cx="${p9.x}" cy="${yOf(p9.y)}" r="3.4" fill="${c9}"><title>${esc(sr.item)} · Wk ${p9.i + 1}: ${useWos ? (Math.round(p9.y * 10) / 10) + ' wk' : Math.round(p9.y).toLocaleString() + ' cs'}</title></circle>`).join(''); return `<polyline points="${poly}" fill="none" stroke="${c9}" stroke-width="2"/>${dots}`; }).join('');
-        const legend = chosen.map((sr, si9) => `<span style="font-family:var(--mono);font-size:10px;margin-right:14px;white-space:nowrap;"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${pal[si9 % pal.length]};vertical-align:middle;margin-right:5px;"></span>${esc(sr.item)}</span>`).join('');
-        chart = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;">${grid}${thresh}${xLbls}${lines}</svg><div style="margin-top:6px;">${legend}</div>`;
-      }
-      const pickRows = series.filter(sr => !_prodSumQ || String(sr.item).toLowerCase().includes(_prodSumQ)).map(sr => `<label style="display:flex;align-items:center;gap:9px;font-size:13px;padding:6px 4px;cursor:pointer;${sr.minWos < 4 ? 'color:#a8381f;' : ''}"><input type="checkbox" class="hl-sumchart-pick" data-pid="${esc(sr.pid)}" ${_prodSumSel.has(sr.pid) ? 'checked' : ''} style="cursor:pointer;width:15px;height:15px;">${esc(sr.item)}</label>`).join('') || '<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);padding:8px 2px;">No products match.</div>';
-      const useW = _prodSumMetric === 'wos';
-      return `<div style="margin-top:26px;border-top:1px solid var(--rule-soft);padding-top:18px;">
-        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
-          <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Projected inventory chart</span>
-          <button class="hl-sumchart-metric" data-m="wos" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border:1px solid ${useW ? 'var(--ink)' : 'var(--rule-soft)'};border-radius:4px;background:${useW ? 'var(--ink)' : 'transparent'};color:${useW ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};cursor:pointer;">Weeks of supply</button>
-          <button class="hl-sumchart-metric" data-m="bal" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border:1px solid ${!useW ? 'var(--ink)' : 'var(--rule-soft)'};border-radius:4px;background:${!useW ? 'var(--ink)' : 'transparent'};color:${!useW ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};cursor:pointer;">Cases</button>
-          <div style="position:relative;margin-left:auto;">
-            <button id="hl-sumpick-btn" style="font-family:var(--mono);font-size:11px;padding:6px 14px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper,#f4efe6);color:var(--ink);cursor:pointer;">Products: ${_prodSumSel.size} of ${series.length} ▾</button>
-            ${_prodSumOpen ? `<div id="hl-sumpick-box" style="position:absolute;right:0;top:calc(100% + 6px);z-index:40;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,0.14);padding:12px;width:340px;">
-              <input id="hl-sumchart-q" type="text" value="${esc(_prodSumQ)}" placeholder="Search products…" style="width:100%;font-family:var(--mono);font-size:12px;padding:8px 11px;border:2px solid #534AB7;border-radius:6px;background:var(--paper,#f4efe6);color:var(--ink);margin-bottom:8px;">
-              <div style="display:flex;gap:14px;font-family:var(--mono);font-size:11px;color:#8a6d1f;border-bottom:1px solid var(--rule-soft);padding-bottom:7px;margin-bottom:6px;">
-                <span class="hl-sumpick-act" data-act="all" style="cursor:pointer;">Select all</span>
-                <span class="hl-sumpick-act" data-act="visible" style="cursor:pointer;">Select visible</span>
-                <span class="hl-sumpick-act" data-act="clear" style="cursor:pointer;color:var(--ink-3);">Clear</span>
-              </div>
-              <div style="max-height:300px;overflow-y:auto;">${pickRows}</div>
-            </div>` : ''}
-          </div>
-        </div>
-        ${chart}
-      </div>`;
-    })();
-    host.innerHTML = `<div style="font-family:var(--serif);font-size:16px;margin-bottom:12px;">8-week inventory projection</div>${matrix}${chartSec}`;
-    // ── Wiring ──
-    host.querySelectorAll('.hl-sumchart-pick').forEach(cb => cb.addEventListener('change', () => { if (cb.checked) _prodSumSel.add(cb.dataset.pid); else _prodSumSel.delete(cb.dataset.pid); _prodRenderBody(); }));
-    host.querySelectorAll('.hl-sumchart-metric').forEach(b => b.addEventListener('click', () => { if (_prodSumMetric !== b.dataset.m) { _prodSumMetric = b.dataset.m; _prodRenderBody(); } }));
-    const pickBtn = host.querySelector('#hl-sumpick-btn');
-    if (pickBtn) pickBtn.addEventListener('click', () => { _prodSumOpen = !_prodSumOpen; _prodRenderBody(); if (_prodSumOpen) requestAnimationFrame(() => { const el = document.getElementById('hl-sumchart-q'); if (el) el.focus(); }); });
-    host.querySelectorAll('.hl-sumpick-act').forEach(a => a.addEventListener('click', () => {
-      const all9 = [...merged.values()];
-      if (a.dataset.act === 'all') _prodSumSel = new Set(all9.map(r => r.prodId));
-      else if (a.dataset.act === 'visible') { for (const r of all9.filter(r => !_prodSumQ || String(r.item).toLowerCase().includes(_prodSumQ))) _prodSumSel.add(r.prodId); }
-      else _prodSumSel = new Set();
-      _prodRenderBody();
-    }));
-    const sumQ = host.querySelector('#hl-sumchart-q');
-    if (sumQ) { sumQ.addEventListener('input', () => { _prodSumQ = sumQ.value.trim().toLowerCase(); const pos = sumQ.selectionStart; _prodRenderBody(); requestAnimationFrame(() => { const el = document.getElementById('hl-sumchart-q'); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} } }); }); }
-    // Calc popover: click a cell → beginning − demand + production = ending
+      if (!chosen.length || !vals.length) { q9('hl-plan-chart').innerHTML = '<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);padding:20px 0;">Select products to chart.</div>'; return; }
+      const yMax = Math.max(useWos ? 5 : 1, ...vals) * 1.08, yMin = Math.min(0, ...vals);
+      const W = 1000, H = 280, L = 58, R = 24, T = 14, B = 30;
+      const xOf = i9 => L + i9 * ((W - L - R) / (weeks8.length - 1));
+      const yOf = v9 => T + (H - T - B) * (1 - (v9 - yMin) / (yMax - yMin || 1));
+      const grid = [0, 0.25, 0.5, 0.75, 1].map(f9 => { const v9 = yMin + f9 * (yMax - yMin); return `<line x1="${L}" x2="${W - R}" y1="${yOf(v9)}" y2="${yOf(v9)}" stroke="rgba(0,0,0,0.07)"/><text x="${L - 8}" y="${yOf(v9) + 3}" text-anchor="end" font-size="10" fill="#8a8578" font-family="monospace">${useWos ? (Math.round(v9 * 10) / 10) : Math.round(v9).toLocaleString()}</text>`; }).join('');
+      const thresh = useWos ? `<line x1="${L}" x2="${W - R}" y1="${yOf(4)}" y2="${yOf(4)}" stroke="#a8381f" stroke-dasharray="5,4" stroke-width="1.4"/><text x="${W - R}" y="${yOf(4) - 5}" text-anchor="end" font-size="10" fill="#a8381f" font-family="monospace">4 wk min</text>` : '';
+      const xLbls = weeks8.map((w9, i9) => `<text x="${xOf(i9)}" y="${H - 8}" text-anchor="middle" font-size="10" fill="#8a8578" font-family="monospace">${w9.slice(5)}</text>`).join('');
+      const lines = chosen.map((sr, si9) => { const c9 = pal[si9 % pal.length]; const ptsArr = sr.pts.map((p9, i9) => ({ x: xOf(i9), y: (useWos ? p9.wos : p9.bal), i: i9 })).filter(p9 => p9.y != null && isFinite(p9.y)); const poly = ptsArr.map(p9 => `${p9.x},${yOf(p9.y)}`).join(' '); const dots = ptsArr.map(p9 => `<circle cx="${p9.x}" cy="${yOf(p9.y)}" r="3.4" fill="${c9}"><title>${esc(sr.item)} · Wk ${p9.i + 1}: ${useWos ? (Math.round(p9.y * 10) / 10) + ' wk' : Math.round(p9.y).toLocaleString() + ' cs'}</title></circle>`).join(''); return `<polyline points="${poly}" fill="none" stroke="${c9}" stroke-width="2"/>${dots}`; }).join('');
+      const legend = chosen.map((sr, si9) => `<span style="font-family:var(--mono);font-size:10px;margin-right:14px;white-space:nowrap;"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${pal[si9 % pal.length]};vertical-align:middle;margin-right:5px;"></span>${esc(sr.item)}</span>`).join('');
+      q9('hl-plan-chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;">${grid}${thresh}${xLbls}${lines}</svg><div style="margin-top:6px;">${legend}</div>`;
+    };
+    const updateView = () => { updateSummary(); renderOptions(); renderChart(); };
+    msBtn.addEventListener('click', (e9) => { e9.stopPropagation(); msPanel.style.display = msPanel.style.display === 'block' ? 'none' : 'block'; if (msPanel.style.display === 'block') msSearch.focus(); });
+    msPanel.addEventListener('click', (e9) => e9.stopPropagation());
+    document.addEventListener('click', () => { if (msPanel.isConnected) msPanel.style.display = 'none'; });
+    msSearch.addEventListener('input', () => { _prodSumQ = msSearch.value.trim().toLowerCase(); renderOptions(); });
+    q9('hl-plms-allall').addEventListener('click', () => { _prodSumSel = new Set(series.map(sr => sr.pid)); updateView(); });
+    q9('hl-plms-vis').addEventListener('click', () => { for (const sr of visibleOptions()) _prodSumSel.add(sr.pid); updateView(); });
+    q9('hl-plms-none').addEventListener('click', () => { _prodSumSel = new Set(); updateView(); });
+    host.querySelectorAll('.hl-plms-metric').forEach(b9 => b9.addEventListener('click', () => { if (_prodSumMetric !== b9.dataset.m) { _prodSumMetric = b9.dataset.m; styleMetricBtns(); renderChart(); } }));
+    styleMetricBtns(); updateView();
+    // Merge-badge expander + calc popover (pure DOM, no re-render)
     host.addEventListener('click', (ev) => {
+      const tg = ev.target.closest('.hl-mergetgl');
+      if (tg) { const box9 = document.getElementById(tg.dataset.mtid); const car9 = document.getElementById(tg.dataset.mtid + '-car'); if (box9) { const open9 = box9.style.display !== 'none'; box9.style.display = open9 ? 'none' : 'block'; if (car9) car9.textContent = open9 ? '▸' : '▾'; } ev.stopPropagation(); return; }
       const old9 = document.getElementById('hl-plancalc'); if (old9) old9.remove();
       const td = ev.target.closest('.hl-plancell'); if (!td) return;
       const d9 = td.dataset; const fm = (n) => Number(n).toLocaleString();
@@ -47401,10 +47424,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       document.addEventListener('click', (ev) => {
         const pop = document.getElementById('hl-plancalc');
         if (pop && !pop.contains(ev.target) && !ev.target.closest('.hl-plancell')) pop.remove();
-        if (_prodSumOpen && _prodTab === 'planning') {
-          const box = document.getElementById('hl-sumpick-box'), btn9 = document.getElementById('hl-sumpick-btn');
-          if (box && !box.contains(ev.target) && btn9 && !btn9.contains(ev.target)) { _prodSumOpen = false; try { _prodRenderBody(); } catch (e) {} }
-        }
       });
     }
   }
