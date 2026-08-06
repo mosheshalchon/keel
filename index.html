@@ -26787,8 +26787,10 @@ render();
       const ids = [...selectedToDelete];
       if (!ids.length) return;
       if (!confirm(`Delete ${ids.length} promo${ids.length===1?'':'s'}? This cannot be undone.`)) return;
-      const { error } = await sb.from('promos').delete().in('id', ids);
+      const { data: delRows, error } = await sb.from('promos').delete().in('id', ids).select('id');
       if (error) { alert('Delete failed: ' + error.message); return; }
+      const nDel = (delRows || []).length;
+      if (nDel !== ids.length) alert('Deleted ' + nDel + ' of ' + ids.length + ' — the database refused the rest. This usually means the promos table is missing a DELETE policy; run:\n\ndrop policy if exists authenticated_all on promos;\ncreate policy authenticated_all on promos for all to authenticated using (true) with check (true);');
       renderPromosPage();
     });
 
@@ -27376,8 +27378,9 @@ render();
     const delBtn = document.getElementById('hl-pc-delete');
     if (delBtn) delBtn.addEventListener('click', async () => {
       if (!confirm('Delete this promo line?')) return;
-      const { error } = await sb.from('promos').delete().eq('id', promoId);
+      const { data: delRows, error } = await sb.from('promos').delete().eq('id', promoId).select('id');
       if (error) { alert('Delete failed: ' + error.message); return; }
+      if (!(delRows || []).length) { alert('The database refused the delete (0 rows removed) — likely a missing DELETE policy on promos. Run:\n\ndrop policy if exists authenticated_all on promos;\ncreate policy authenticated_all on promos for all to authenticated using (true) with check (true);'); return; }
       renderPromosPage();
     });
 
