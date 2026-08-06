@@ -47304,7 +47304,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const fcM = (pid, ym) => { const cm9 = _prodFc && _prodFc.monthly && _prodFc.monthly.get(pid); const v9 = cm9 && cm9.get(ym); return (v9 != null && isFinite(v9)) ? Number(v9) : null; };
     // ── Matrix: clickable cells (beginning − demand + production = ending); expandable merge badges ──
     const head9 = weeks8.map((w9, i9) => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</th>`).join('')
-      + months4.map((m9, mi9) => `<th title="Monthly bucket — demand from the forecast; no production planned past week 8" style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:#534AB7;white-space:nowrap;${mi9 === 0 ? 'border-left:2px solid var(--rule-soft);' : ''}">${m9.label}</th>`).join('');
+      + months4.map((m9, mi9) => `<th title="Monthly planning bucket — demand from the forecast; production = suggested amount to hold target (capacity-capped), firmed into the weekly schedule as these weeks roll into the 8-week window" style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:#534AB7;white-space:nowrap;${mi9 === 0 ? 'border-left:2px solid var(--rule-soft);' : ''}">${m9.label}</th>`).join('');
     const body9 = mrows.map((r, ri9) => {
       const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
       const minW = (() => { const m9 = Number((_prodCfg.get(r.prodId) || {}).min_weeks); return (m9 && m9 > 0) ? m9 : 4; })();
@@ -47320,11 +47320,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const mCells9 = months4.map((m9, mi9) => {
         let dem9 = fcM(r.prodId, m9.ym); if (dem9 == null) dem9 = wkD * WK_PER_MONTH;
         if (mi9 === 0 && orphanDays > 0 && wkD > 0) dem9 += wkD * (orphanDays / 7);
-        const start9 = inv, prod9 = 0;
+        // Months are PLANNING buckets (nothing schedulable past week 8): production here is the
+        // SUGGESTED amount to hold target, capped by the SKU's monthly capacity. It becomes a real
+        // weekly schedule as these weeks roll into the 8-week window.
+        const cap9m = (() => { const c9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0; return c9 > 0 ? c9 * _prodActiveDays().length * WK_PER_MONTH : Infinity; })();
+        const start9 = inv;
+        const prod9 = Math.min(Math.max(0, Math.round(tgtW * wkD + dem9 - start9)), cap9m);
         inv = inv - dem9 + prod9;
         const wos = wkD > 0 ? inv / wkD : null;
         const col = (inv <= 0 || (wos != null && wos < minW)) ? '#a8381f' : wos != null && wos < tgtW ? '#8a6d1f' : '#3f6f4a';
-        return `<td class="hl-plancell" data-item="${esc(r.item)}" data-wk="${m9.label} (month)" data-start="${Math.round(start9)}" data-dem="${Math.round(dem9)}" data-prod="0" data-end="${Math.round(inv)}" title="Click for the calculation" style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;white-space:nowrap;cursor:pointer;color:${col};background:rgba(83,74,183,0.045);${mi9 === 0 ? 'border-left:2px solid var(--rule-soft);' : ''}${inv <= 0 ? 'font-weight:700;' : ''}">${_prodFmt(Math.round(inv), 0)}${wos != null ? `<div style="font-size:9px;color:${col};opacity:0.75;">${_prodFmt(Math.round(wos * 10) / 10, 1)} wk</div>` : ''}</td>`;
+        return `<td class="hl-plancell" data-item="${esc(r.item)}" data-wk="${m9.label} (month)" data-start="${Math.round(start9)}" data-dem="${Math.round(dem9)}" data-demlbl="monthly demand" data-prod="${Math.round(prod9)}" data-prodlbl="suggested production (month — not yet scheduled)" data-end="${Math.round(inv)}" title="Click for the calculation" style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;white-space:nowrap;cursor:pointer;color:${col};background:rgba(83,74,183,0.045);${mi9 === 0 ? 'border-left:2px solid var(--rule-soft);' : ''}${inv <= 0 ? 'font-weight:700;' : ''}">${_prodFmt(Math.round(inv), 0)}${wos != null ? `<div style="font-size:9px;color:${col};opacity:0.75;">${_prodFmt(Math.round(wos * 10) / 10, 1)} wk</div>` : ''}</td>`;
       }).join('');
       const badge = r._items.length > 1
         ? `<div><button class="hl-mergetgl" data-mtid="hl-mrg-${ri9}" style="background:none;border:none;padding:0;font-family:var(--mono);font-size:9px;color:#b8860b;cursor:pointer;">⚠ merges ${r._items.length} items <span id="hl-mrg-${ri9}-car">▸</span></button><div id="hl-mrg-${ri9}" style="display:none;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);padding:3px 0 2px 8px;border-left:2px solid #b8860b;margin-top:2px;">${r._items.map(x9 => `<div>${esc(x9.item)} — ${_prodFmt(Math.round(x9.onHand), 0)} cs</div>`).join('')}<div style="border-top:1px solid var(--rule-soft);margin-top:2px;padding-top:2px;">combined — ${_prodFmt(Math.round(r.onHand), 0)} cs</div></div></div>`
@@ -47332,7 +47337,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${badge}</td>${cells9}${mCells9}</tr>`;
     }).join('');
     const matrix = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th>${head9}</tr></thead><tbody>${body9}</tbody></table></div>
-    <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Projected <b>End inv balance</b>, chained (beginning − demand + scheduled production; click any number for its calculation): 8 weeks, then <span style=\"color:#534AB7;\">4 monthly buckets</span> (demand from the monthly forecast; nothing is scheduled past week 8, so months show the drain — the chart covers the 8 weeks). <span style="color:#a8381f;">Red = below Min wks supply (default 4) or ≤ 0</span> · <span style="color:#8a6d1f;">below Target</span> · <span style="color:#3f6f4a;">at/above Target</span>.</p>`;
+    <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Projected <b>End inv balance</b>, chained (beginning − demand + scheduled production; click any number for its calculation): 8 weeks, then <span style=\"color:#534AB7;\">4 monthly planning buckets</span>: demand from the monthly forecast, production = <b>suggested</b> hold-target amount capped by the SKU's monthly capacity (months aren't scheduled — they firm into the Weekly schedule as they roll inside 8 weeks; facility-level contention not modeled out here). The chart covers the 8 weeks. <span style="color:#a8381f;">Red = below Min wks supply (default 4) or ≤ 0</span> · <span style="color:#8a6d1f;">below Target</span> · <span style="color:#3f6f4a;">at/above Target</span>.</p>`;
     // ── Series for the chart ──
     const series = mrows.map(r => {
       const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
@@ -47425,8 +47430,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       pop.style.cssText = 'position:fixed;z-index:70;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,0.18);padding:12px 16px;font-family:var(--mono);font-size:12px;line-height:1.9;max-width:340px;';
       pop.innerHTML = '<div style="font-family:var(--serif);font-size:13px;margin-bottom:4px;">' + d9.item + ' <span style="color:#8a8578;font-family:var(--mono);font-size:10px;">' + d9.wk + '</span></div>'
         + '<div>' + fm(d9.start) + ' <span style="color:#8a8578;">beginning inventory</span></div>'
-        + '<div>− ' + fm(d9.dem) + ' <span style="color:#8a8578;">weekly demand</span></div>'
-        + '<div>+ ' + fm(d9.prod) + ' <span style="color:#8a8578;">scheduled production</span></div>'
+        + '<div>− ' + fm(d9.dem) + ' <span style="color:#8a8578;">' + (d9.demlbl || 'weekly demand') + '</span></div>'
+        + '<div>+ ' + fm(d9.prod) + ' <span style="color:#8a8578;">' + (d9.prodlbl || 'scheduled production') + '</span></div>'
         + '<div style="border-top:1px solid var(--rule-soft);margin-top:3px;padding-top:3px;"><b>= ' + fm(d9.end) + '</b> <span style="color:#8a8578;">ending balance</span></div>';
       document.body.appendChild(pop);
       const rc = td.getBoundingClientRect();
