@@ -47156,7 +47156,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     } else if (raw && typeof raw === 'object') { for (const k of Object.keys(raw)) if (raw[k]) map[k] = 'grp:' + String(raw[k]).trim().toLowerCase(); }
     return map;
   }
-  function _prodGroupOfPid(pid) { const pr = _prodProductById.get(pid); const line = (pr && pr.product_line) || '(no line)'; return _prodLineGroupKeyMap()[line] || ('line:' + line); } // ungrouped lines are their own implicit group
+  function _prodGroupLineOf(pr) { const nm = String((pr && pr.item_description) || ''); if (/shell/i.test(nm)) return 'Pizza Shells'; return (pr && pr.product_line) || '(no line)'; } // synthetic grouping-only line: shells have no product_line of their own (display/grouping only — products data untouched)
+  function _prodGroupOfPid(pid) { const pr = _prodProductById.get(pid); const line = _prodGroupLineOf(pr); return _prodLineGroupKeyMap()[line] || ('line:' + line); } // ungrouped lines are their own implicit group
   function _prodActiveDays() {
     // Purely assumptions-driven: all days minus blocked, first max_prod_days_per_week of what's left
     // (no max set → Mon–Fri minus blocked).
@@ -47661,7 +47662,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
       <div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Blocked days — the facility never produces</div>${dayBtns}<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;">Click to toggle. Blocked days are struck out and locked on the schedule\'s day chips.</div></div>
       ${(() => {
-        const lines9 = [...new Set([..._prodProductById.values()].map(pr => (pr && pr.product_line) || '(no line)'))].sort();
+        const lines9 = [...new Set([..._prodProductById.values()].map(pr => _prodGroupLineOf(pr)))].sort();
         if (!lines9.length) return '';
         const raw9 = (() => { const g9 = _prodLineGroups(); return Array.isArray(g9) ? g9.filter(x9 => Array.isArray(x9) && x9[0] && x9[1]) : []; })();
         // one row per anchor line, right side holds ALL its partners
@@ -47711,7 +47712,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     host.querySelectorAll('.hl-pas-skumin').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { min_weeks: v }); }));
     const grpRows = host.querySelector('#hl-pas-grprows');
     if (grpRows) {
-      const lines9 = [...new Set([..._prodProductById.values()].map(pr => (pr && pr.product_line) || '(no line)'))].sort();
+      const lines9 = [...new Set([..._prodProductById.values()].map(pr => _prodGroupLineOf(pr)))].sort();
       const selStyle9 = 'font-family:var(--mono);font-size:11px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper,#f4efe6);color:var(--ink);min-width:160px;';
       const blankRow9 = () => `<div class="hl-pas-grprow" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><select class="hl-pas-grpa" style="${selStyle9}"><option value=""></option>${lines9.map(l9 => `<option value="${esc(l9)}">${esc(l9)}</option>`).join('')}</select><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">runs with</span><div class="hl-pas-grpm" style="position:relative;"><button type="button" class="hl-pas-grpmb" style="${selStyle9}min-width:220px;max-width:340px;cursor:pointer;text-align:left;display:flex;justify-content:space-between;align-items:center;gap:8px;"><span class="hl-pas-grpms" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">—</span><span style="color:var(--ink-3);">▾</span></button><div class="hl-pas-grpmp" style="display:none;position:absolute;top:100%;left:0;z-index:45;margin-top:4px;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.12);min-width:230px;max-height:260px;overflow-y:auto;padding:4px 0;">${lines9.map(l9 => `<label style="display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;font-family:var(--sans,sans-serif);font-size:13px;white-space:nowrap;"><input type="checkbox" class="hl-pas-grpmc" data-line="${esc(l9)}" style="cursor:pointer;"> ${esc(l9)}</label>`).join('')}</div></div><button type="button" class="hl-pas-grpx" title="Remove this grouping" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:15px;line-height:1;">×</button></div>`;
       const saveGrp9 = async () => {
