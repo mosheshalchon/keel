@@ -26976,12 +26976,12 @@ render();
     const nextPromoBtnHtml = (promoId && siblings.length > 1)
       ? `<button id="hl-pc-next-promo" class="hl-btn-secondary" title="Go to the next event in this retailer + group">Next promo →</button>` : '';
 
-    const inp = (id, val, ph, step) => `<input id="${id}" type="number" step="${step||'any'}" value="${val===''?'':esc(val)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" />`;
+    const inp = (id, val, ph, step) => `<input id="${id}" class="hl-pc-in" type="number" step="${step||'any'}" value="${val===''?'':esc(val)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" />`;
     // Percent-display input: shows the decimal value ×100 (e.g. 0.35 → 35) with a %
     // suffix; getInputs converts back to a decimal on read.
     const pctInp = (id, val, ph) => {
       const shown = (val === '' || val == null) ? '' : (Number(val) * 100);
-      return `<div style="position:relative;"><input id="${id}" type="number" step="any" value="${shown===''?'':esc(shown)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 22px 7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" /><span style="position:absolute;right:9px;top:50%;transform:translateY(-50%);font-family:var(--mono);font-size:11px;color:var(--ink-3);pointer-events:none;">%</span></div>`;
+      return `<div style="position:relative;"><input id="${id}" class="hl-pc-in" type="number" step="any" value="${shown===''?'':esc(shown)}" placeholder="${ph||''}" style="width:100%;box-sizing:border-box;padding:7px 22px 7px 9px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);text-align:right;" /><span style="position:absolute;right:9px;top:50%;transform:translateY(-50%);font-family:var(--mono);font-size:11px;color:var(--ink-3);pointer-events:none;">%</span></div>`;
     };
     const lbl = (t) => `<label style="display:block;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:3px;">${t}</label>`;
 
@@ -27035,19 +27035,19 @@ render();
           </div>
         </div>
 
-        <div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Pricing</div>
+        <style>.hl-pc-in::placeholder{color:#c8c1b2;font-style:italic;opacity:1;}</style><div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Pricing</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
-          <div>${lbl('ATG gross price')}${inp('hl-pc-atg', v('atg_gross_price'), '4.87')}</div>
+          <div>${lbl('ATG gross price')}${inp('hl-pc-atg', v('atg_gross_price'), 'e.g. 4.87')}</div>
           <div>${lbl('Dist markup %')}${pctInp('hl-pc-markup', dv('dist_markup', 0.13), '13')}</div>
-          <div>${lbl('Cur retail / SRP')}${inp('hl-pc-srp', v('srp'), '8.49')}</div>
+          <div>${lbl('Cur retail / SRP')}${inp('hl-pc-srp', v('srp'), 'e.g. 8.49')}</div>
           <div></div>
         </div>
 
         <div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Volume & promo</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;">
-          <div>${lbl('Base UPSPW (velocity)')}${inp('hl-pc-upspw', v('base_upspw'), '1.2')}</div>
+          <div>${lbl('Base UPSPW (velocity)')}${inp('hl-pc-upspw', v('base_upspw'), 'e.g. 1.2')}</div>
           <div>${lbl('# Items (auto from selection)')}${inp('hl-pc-items-count', v('num_items'), '1')}</div>
-          <div>${lbl('Doors')}${inp('hl-pc-doors', v('doors'), '845')}</div>
+          <div>${lbl('Doors')}${inp('hl-pc-doors', v('doors'), 'e.g. 845')}</div>
           <div>${lbl('Lift %')}${pctInp('hl-pc-lift', dv('lift', 0.35), '35')}</div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
@@ -27064,6 +27064,7 @@ render();
         </div>
 
         <div class="hl-docs-label" style="font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:8px;">Calculated</div>
+        <div id="hl-pc-calc-note" style="display:none;font-family:var(--mono);font-size:11px;color:#8a6d1f;background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:5px;padding:8px 12px;margin-bottom:10px;"></div>
         <div id="hl-pc-calc-row1" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px;"></div>
         <div id="hl-pc-calc-row2" style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px;"></div>
 
@@ -27267,6 +27268,16 @@ render();
       if (step2El.style.display === 'none') return;
       const inputs = getInputs();
       const r = computePromoLine(inputs);
+      const noteEl = document.getElementById('hl-pc-calc-note');
+      if (noteEl) {
+        const missing = [];
+        if (!inputs.atg_gross_price) missing.push('ATG gross price');
+        if (!inputs.srp) missing.push('SRP');
+        if (!inputs.base_upspw) missing.push('Base UPSPW');
+        if (!inputs.doors) missing.push('Doors');
+        noteEl.style.display = missing.length ? '' : 'none';
+        noteEl.textContent = missing.length ? ('Waiting on: ' + missing.join(' · ') + ' — the grey numbers in empty fields are examples, not values.') : '';
+      }
       document.getElementById('hl-pc-calc-row1').innerHTML =
         calcCell('Retailer margin', pctf(r.retailer_margin), 'margin') +
         calcCell('Annual base units', numf(r.annual_base_units), 'baseunits') +
@@ -47533,7 +47544,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;"><button id="hl-psd-sumtab" style="font-family:var(--mono);font-size:11px;font-weight:700;padding:7px 14px;border-radius:5px;border:2px solid ${_prodSchedSummary ? '#534AB7' : 'var(--ink)'};cursor:pointer;background:var(--ink);color:var(--paper,#f4efe6);white-space:nowrap;">SUMMARY</button>${weeks8.map((w9, i9) => `<button class="hl-psd-wktab" data-wk="${w9}" style="font-family:var(--mono);font-size:11px;padding:7px 12px;border-radius:5px;border:1px solid ${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--ink)' : 'transparent'};color:${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};font-weight:${!_prodSchedSummary && w9 === _prodSchedWeek ? '700' : '400'};white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</button>`).join('')}</div>
         <div style="display:flex;gap:8px;align-items:center;"><button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);font-weight:700;">Suggest 8 weeks</button>${_prodSchedSummary ? '' : `<button id="hl-psd-clear" style="${btn}">Clear week</button>`}</div>
       </div>
-      ${_prodSchedSummary ? _sumHtml() : rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;">${['Product', wkIdx === 0 ? 'Current inv' : 'Est inv · ' + _prodSchedWeek.slice(5), 'Wks supply', 'Weekly demand', 'Ending inv', 'Inv needed', 'Max prod/day'].map((h, i) => `<th style="padding:8px ${i === 0 ? '10px' : '8px'};text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}${dayHead}${['Scheduled', 'End inv balance · ' + (() => { const d9 = new Date(_prodSchedWeek + 'T00:00:00'); d9.setDate(d9.getDate() + 6); return d9.toISOString().slice(5, 10); })(), 'End wks supply', 'Still needed'].map(h => `<th style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}<th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const cells = tots.map(t => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}</td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td colspan="7" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td>${cells}<td colspan="5"></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
+      ${_prodSchedSummary ? _sumHtml() : rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;">${['Product', wkIdx === 0 ? 'Current inv' : 'Est inv · ' + _prodSchedWeek.slice(5), 'Wks supply', 'Weekly demand', 'Ending inv', 'Inv needed', 'Max prod/day'].map((h, i) => `<th style="padding:8px ${i === 0 ? '10px' : '8px'};text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}${dayHead}${['Scheduled', 'End inv balance · ' + (() => { const d9 = new Date(_prodSchedWeek + 'T00:00:00'); d9.setDate(d9.getDate() + 6); return d9.toISOString().slice(5, 10); })(), 'End wks supply', 'Still needed'].map(h => `<th style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}<th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const maxSk = _prodMaxSkusDay(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const skCts = activeDays.map(d => rows.reduce((a, r) => a + ((_prodSched.get(r.prodId + '|' + d) || 0) > 0 ? 1 : 0), 0)); const cells = tots.map((t, i) => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}<div style="font-weight:400;color:${skCts[i] >= maxSk ? '#a8381f' : 'var(--ink-3)'};" title="SKUs running this day vs the Max SKUs/day changeover limit — a full day can't take another SKU even with case capacity spare">${skCts[i]}/${maxSk} SKUs</div></td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td colspan="7" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td>${cells}<td colspan="5"></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
       ${!_prodSchedSummary && candidates.length ? `<div style="margin-top:10px;"><select id="hl-psd-add" style="${btn}"><option value="">+ Add product…</option>${candidates.map(p => `<option value="${esc(p.id)}">${esc(p.item_description || p.id)}</option>`).join('')}</select></div>` : ''}
       ${_prodSchedSummary ? '' : `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Weeks chain: Wk 1 starts from actual inventory; Wks 2–8 start from the prior week's End inv balance (Est inv, shown in purple). Inv needed = cases to reach the SKU's target weeks on hand (Assumptions; default 8) from that week's starting inventory. Cells save as you type; a red cell is over the SKU's max/day. <b>Suggest 8 weeks</b> replaces all 8 weeks with a chained plan under the SKU and facility caps.</p>`}`;
     _prodSchedWire(host, rows, activeDays);
