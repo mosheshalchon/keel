@@ -47663,6 +47663,29 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           made9.set(r.prodId, made9.get(r.prodId) + got);
           short9 += rem9 - got;
         }
+        // PASS 3 — FILL (the Min–Max flexibility): once everyone has reached Target as far as caps
+        // allow, leftover capacity tops SKUs up toward Max — but ONLY on days they already run
+        // (zero new changeovers, so it never costs a SKU slot). Urgency order; caps always rule.
+        for (const r of ordered9) {
+          let room9 = Math.max(0, needTo9(r, _maxOf(r)) - made9.get(r.prodId));
+          if (room9 <= 0) continue;
+          const cap9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0;
+          const perDay9 = cap9 > 0 ? cap9 : Infinity;
+          let add9 = 0;
+          for (const day of activeDays) {
+            if (room9 <= 0) break;
+            const key9 = r.prodId + '|' + day;
+            const already9 = placedDay.get(key9) || 0;
+            if (already9 <= 0) continue;   // this SKU isn't running that day — filling would cost a changeover slot
+            const take9 = Math.min(perDay9 - already9, room9, dayLeft.get(day));
+            if (take9 <= 0) continue;
+            allRecs.push({ brand_id: brandId, week_start: wk9, product_id: r.prodId, weekday: day, cases: take9 });
+            placedDay.set(key9, already9 + take9);
+            dayLeft.set(day, dayLeft.get(day) - take9);
+            room9 -= take9; add9 += take9;
+          }
+          if (add9 > 0) made9.set(r.prodId, made9.get(r.prodId) + add9);
+        }
         for (const r of base9) inv9.set(r.prodId, inv9.get(r.prodId) - r.weekly + made9.get(r.prodId));
       }
       const _recMap9 = new Map();
