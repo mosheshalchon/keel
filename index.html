@@ -47143,8 +47143,20 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   function _prodMaxDaysWk() { const n = _prodSettings && Number(_prodSettings.max_prod_days_per_week); return (n && n > 0) ? n : null; }
   function _prodFacilityCap() { const n = _prodSettings && Number(_prodSettings.facility_max_cases_per_day); return (n && n > 0) ? n : null; }
   function _prodMaxSkusDay() { const n = _prodSettings && Number(_prodSettings.max_skus_per_day); return (n && n > 0) ? n : 2; }   // default 2 SKUs per day
-  function _prodLineGroups() { const g = _prodSettings && _prodSettings.line_groups; if (!g) return {}; if (typeof g === 'string') { try { return JSON.parse(g) || {}; } catch (e) { return {}; } } return g; }
-  function _prodGroupOfPid(pid) { const pr = _prodProductById.get(pid); const line = (pr && pr.product_line) || '(no line)'; const lbl = _prodLineGroups()[line]; return lbl ? 'grp:' + String(lbl).trim().toLowerCase() : 'line:' + line; } // unlabeled lines are their own implicit group
+  function _prodLineGroups() { const g = _prodSettings && _prodSettings.line_groups; if (!g) return null; if (typeof g === 'string') { try { return JSON.parse(g); } catch (e) { return null; } } return g; }
+  function _prodLineGroupKeyMap() {
+    // Groups are stored as PAIRS [[lineA, lineB], ...] ("A runs with B"); connected pairs merge
+    // into one group via union-find, so Pizza+Rolls and Pizza+Baguettes = one pizza-and-bread group.
+    const raw = _prodLineGroups(); const map = {};
+    if (Array.isArray(raw)) {
+      const parent = {};
+      const find = (x) => { while (parent[x] !== undefined && parent[x] !== x) x = parent[x]; return x; };
+      for (const pr of raw) { if (!Array.isArray(pr) || !pr[0] || !pr[1]) continue; const a = pr[0], b = pr[1]; if (parent[a] === undefined) parent[a] = a; if (parent[b] === undefined) parent[b] = b; const ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra; }
+      for (const k of Object.keys(parent)) map[k] = 'grp:' + find(k);
+    } else if (raw && typeof raw === 'object') { for (const k of Object.keys(raw)) if (raw[k]) map[k] = 'grp:' + String(raw[k]).trim().toLowerCase(); }
+    return map;
+  }
+  function _prodGroupOfPid(pid) { const pr = _prodProductById.get(pid); const line = (pr && pr.product_line) || '(no line)'; return _prodLineGroupKeyMap()[line] || ('line:' + line); } // ungrouped lines are their own implicit group
   function _prodActiveDays() {
     // Purely assumptions-driven: all days minus blocked, first max_prod_days_per_week of what's left
     // (no max set → Mon–Fri minus blocked).
@@ -47646,14 +47658,19 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         ${fld('Max production days / week', 'hl-pas-maxd', st.max_prod_days_per_week, 'days', 'Hard weekly ceiling on how many days the schedule uses.')}
         ${fld('Max SKUs produced / day', 'hl-pas-maxsku', st.max_skus_per_day, 'SKUs', 'Changeover limit — Suggest runs at most this many different SKUs on any one day. Blank = 2.')}
       </div>
+
+      <div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Blocked days — the facility never produces</div>${dayBtns}<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;">Click to toggle. Blocked days are struck out and locked on the schedule\'s day chips.</div></div>
       ${(() => {
         const lines9 = [...new Set([..._prodProductById.values()].map(pr => (pr && pr.product_line) || '(no line)'))].sort();
         if (!lines9.length) return '';
-        const lg9 = _prodLineGroups();
-        const rows9 = lines9.map(l9 => `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;">${esc(l9)}</td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-linegrp" data-line="${esc(l9)}" type="text" value="${esc(lg9[l9] || '')}" placeholder="—" style="width:150px;font-family:var(--mono);font-size:11px;padding:4px 8px;border:1px solid var(--rule-soft);border-radius:4px;"></td></tr>`).join('');
-        return `<div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Production groups — product lines that run together</div><div style="max-width:520px;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product line</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Group</th></tr></thead><tbody>${rows9}</tbody></table></div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;line-height:1.6;max-width:520px;">Same label = produced on the same days (e.g. give 12&quot; Pizza and Bread both <b>A</b>). Suggest fills a group\'s days together before opening new days. Unlabeled lines still cluster with themselves. Saves as you type.</div></div>`;
+        const raw9 = (() => { const g9 = _prodLineGroups(); return Array.isArray(g9) ? g9.filter(x9 => Array.isArray(x9) && x9[0] && x9[1]) : []; })();
+        const pairs9 = raw9.slice();
+        while (pairs9.length < 2) pairs9.push(['', '']);
+        const selStyle9 = 'font-family:var(--mono);font-size:11px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper,#f4efe6);color:var(--ink);min-width:160px;';
+        const opt9 = (sel9) => '<option value=""></option>' + lines9.map(l9 => `<option value="${esc(l9)}"${l9 === sel9 ? ' selected' : ''}>${esc(l9)}</option>`).join('');
+        const row9 = (a9, b9) => `<div class="hl-pas-grprow" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><select class="hl-pas-grpa" style="${selStyle9}">${opt9(a9)}</select><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">runs with</span><select class="hl-pas-grpb" style="${selStyle9}">${opt9(b9)}</select><button type="button" class="hl-pas-grpx" title="Remove this grouping" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:15px;line-height:1;">×</button></div>`;
+        return `<div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Production groups — product lines that run together</div><div id="hl-pas-grprows">${pairs9.map(p9 => row9(p9[0], p9[1])).join('')}</div><button type="button" id="hl-pas-grpadd" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">+ Add grouping</button><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.6;max-width:560px;">Each row pairs two product lines that produce on the same days (e.g. 12&quot; Pizza runs with Rolls). Chained pairs merge — Pizza+Rolls and Pizza+Baguettes become one group. Suggest fills a group\'s days together before opening new days. Saves as you choose.</div></div>`;
       })()}
-      <div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Blocked days — the facility never produces</div>${dayBtns}<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;">Click to toggle. Blocked days are struck out and locked on the schedule\'s day chips.</div></div>
       ${(() => {
         const prods = [..._prodProductById.values()].filter(pr => pr && pr.id).sort((a, b) => String(a.item_description || '').localeCompare(String(b.item_description || '')));
         if (!prods.length) return '<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:20px;">Products load with the Coverage tab — open it once, then come back.</div>';
@@ -47689,17 +47706,30 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     host.querySelectorAll('.hl-pas-skucap').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Math.round(Number(inp.value) || 0)); _pasCfgSave(inp.dataset.pid, { cases_per_day: v }); }));
     host.querySelectorAll('.hl-pas-skutgt').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { target_weeks: v }); }));
     host.querySelectorAll('.hl-pas-skumin').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { min_weeks: v }); }));
-    host.querySelectorAll('.hl-pas-linegrp').forEach(inp => inp.addEventListener('change', async () => {
-      const lg9 = Object.assign({}, _prodLineGroups());
-      const v9 = inp.value.trim();
-      if (v9) lg9[inp.dataset.line] = v9; else delete lg9[inp.dataset.line];
-      _prodSettings = Object.assign({}, _prodSettings, { line_groups: lg9 });
-      try {
-        const sb = window.Auth.getClient(); const brandId = BrandLibrary.getSession().brandId;
-        const { error } = await sb.from('production_settings').upsert({ brand_id: brandId, line_groups: lg9, updated_at: new Date().toISOString() }, { onConflict: 'brand_id' });
-        if (error) throw error;
-      } catch (e) { alert('Could not save groups — run the migration first: alter table production_settings add column if not exists line_groups jsonb;  (' + (e.message || e) + ')'); }
-    }));
+    const grpRows = host.querySelector('#hl-pas-grprows');
+    if (grpRows) {
+      const lines9 = [...new Set([..._prodProductById.values()].map(pr => (pr && pr.product_line) || '(no line)'))].sort();
+      const selStyle9 = 'font-family:var(--mono);font-size:11px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper,#f4efe6);color:var(--ink);min-width:160px;';
+      const blankRow9 = () => `<div class="hl-pas-grprow" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><select class="hl-pas-grpa" style="${selStyle9}"><option value=""></option>${lines9.map(l9 => `<option value="${esc(l9)}">${esc(l9)}</option>`).join('')}</select><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">runs with</span><select class="hl-pas-grpb" style="${selStyle9}"><option value=""></option>${lines9.map(l9 => `<option value="${esc(l9)}">${esc(l9)}</option>`).join('')}</select><button type="button" class="hl-pas-grpx" title="Remove this grouping" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:15px;line-height:1;">×</button></div>`;
+      const saveGrp9 = async () => {
+        const pairs9 = []; const seen9 = new Set();
+        grpRows.querySelectorAll('.hl-pas-grprow').forEach(r9 => {
+          const a9 = (r9.querySelector('.hl-pas-grpa') || {}).value || '';
+          const b9 = (r9.querySelector('.hl-pas-grpb') || {}).value || '';
+          if (a9 && b9 && a9 !== b9) { const k9 = [a9, b9].sort().join('|'); if (!seen9.has(k9)) { seen9.add(k9); pairs9.push([a9, b9]); } }
+        });
+        _prodSettings = Object.assign({}, _prodSettings, { line_groups: pairs9 });
+        try {
+          const sb = window.Auth.getClient(); const brandId = BrandLibrary.getSession().brandId;
+          const { error } = await sb.from('production_settings').upsert({ brand_id: brandId, line_groups: pairs9, updated_at: new Date().toISOString() }, { onConflict: 'brand_id' });
+          if (error) throw error;
+        } catch (e) { alert('Could not save groups — run the migration first: alter table production_settings add column if not exists line_groups jsonb;  (' + (e.message || e) + ')'); }
+      };
+      grpRows.addEventListener('change', (ev9) => { const t9 = ev9.target; if (t9 && (t9.classList.contains('hl-pas-grpa') || t9.classList.contains('hl-pas-grpb'))) saveGrp9(); });
+      grpRows.addEventListener('click', (ev9) => { const x9 = ev9.target.closest('.hl-pas-grpx'); if (!x9) return; const r9 = x9.closest('.hl-pas-grprow'); if (r9) r9.remove(); if (!grpRows.querySelectorAll('.hl-pas-grprow').length) grpRows.insertAdjacentHTML('beforeend', blankRow9()); saveGrp9(); });
+      const addB9 = host.querySelector('#hl-pas-grpadd');
+      if (addB9) addB9.addEventListener('click', () => grpRows.insertAdjacentHTML('beforeend', blankRow9()));
+    }
     const saveBtn = host.querySelector('#hl-pas-save');
     if (saveBtn) saveBtn.addEventListener('click', async () => {
       saveBtn.disabled = true;
