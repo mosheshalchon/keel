@@ -47056,7 +47056,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (fgR.error) throw fgR.error;
       _prodFg = fgR.data || [];
       _prodLineTargets = new Map((ltR.data || []).map(t => [t.product_line, Number(t.target_weeks)]));
-      if (cfgR2 && cfgR2.data) _prodCfg = new Map(cfgR2.data.map(c => [c.product_id, { cases_per_day: c.cases_per_day, prod_group: c.prod_group, target_weeks: c.target_weeks, min_weeks: c.min_weeks }]));
+      if (cfgR2 && cfgR2.data) _prodCfg = new Map(cfgR2.data.map(c => [c.product_id, { cases_per_day: c.cases_per_day, prod_group: c.prod_group, target_weeks: c.target_weeks, min_weeks: c.min_weeks, max_weeks: c.max_weeks }]));
       if (setR2 && setR2.data) _prodSettings = setR2.data;   // settings load with the page, not just the schedule tab — assumptions/planner see them on any first tab
       if ((prodR.data || []).length) _mrpProducts = prodR.data;   // shared with the matcher
       _prodProductById = new Map((_mrpProducts || []).map(p => [p.id, p]));
@@ -47202,7 +47202,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         sb.from('production_schedule').select('*').eq('brand_id', brandId).eq('week_start', _prodSchedWeek),
       ]);
       _prodSettings = (setR && setR.data) || _prodSettings || null;
-      _prodCfg = new Map(((cfgR && cfgR.data) || []).map(c => [c.product_id, { cases_per_day: c.cases_per_day, prod_group: c.prod_group, target_weeks: c.target_weeks, min_weeks: c.min_weeks }]));
+      _prodCfg = new Map(((cfgR && cfgR.data) || []).map(c => [c.product_id, { cases_per_day: c.cases_per_day, prod_group: c.prod_group, target_weeks: c.target_weeks, min_weeks: c.min_weeks, max_weeks: c.max_weeks }]));
       _prodSched = new Map(((schR && schR.data) || []).map(s => [s.product_id + '|' + s.weekday, Number(s.cases) || 0]));
     } catch (e) { console.error('[PROD sched] load failed:', e); }
     finally { _prodSchedLoaded = true; _prodSchedWkLoaded = _prodSchedWeek; _prodSchedLoading = false; _prodRenderBody(); }
@@ -47571,6 +47571,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const base9 = [..._byPid9.values()];
       const inv9 = new Map(base9.map(r => [r.prodId, r.onHand]));   // rolls forward week by week
       const _minOf = (r) => { const m9 = Number((_prodCfg.get(r.prodId) || {}).min_weeks); return (m9 && m9 > 0) ? m9 : 4; };
+      const _maxOf = (r) => { const m9 = Number((_prodCfg.get(r.prodId) || {}).max_weeks); return (m9 && m9 > 0) ? m9 : 12; };
       const maxSkus = _prodMaxSkusDay();
       const allRecs = []; let short9 = 0, survShort9 = 0;
       for (const wk9 of weeks9) {
@@ -47638,17 +47639,27 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         // PASS 1 — SURVIVAL: ending inventory may never hit zero. Every SKU first gets enough to
         // end the week above zero (≥1 case) before anyone builds toward target.
         for (const r of ordered9) {
-          const surv = Math.max(0, Math.ceil(r.weekly - inv9.get(r.prodId)) + 1);
+          const surv = Math.min(Math.max(0, Math.ceil(r.weekly - inv9.get(r.prodId)) + 1), Math.max(0, Math.round(r.weekly * _maxOf(r) - inv9.get(r.prodId))));
           if (surv <= 0) continue;
           const got = place9(r, surv);
           made9.set(r.prodId, made9.get(r.prodId) + got);
           if (got < surv) survShort9 += surv - got;
         }
-        // PASS 2 — BUILD: remaining capacity fills toward each SKU's target, urgency order.
+        // BUILD, in FAIRNESS PHASES (Moshe's model): lift EVERY SKU to its Min floor before anyone
+        // builds comfort stock, then lift everyone toward Target — and never plan production that
+        // would push a SKU past its Max ceiling. Urgency order within each phase; caps always rule.
+        const needTo9 = (r, wks) => Math.max(0, Math.round(r.weekly * wks - inv9.get(r.prodId)));
+        // PASS 2a — floor: everyone reaches Min weeks first.
+        for (const r of ordered9) {
+          const rem9 = Math.min(Math.max(0, needTo9(r, _minOf(r)) - made9.get(r.prodId)), Math.max(0, needTo9(r, _maxOf(r)) - made9.get(r.prodId)));
+          if (rem9 <= 0) continue;
+          const got = place9(r, rem9);
+          made9.set(r.prodId, made9.get(r.prodId) + got);
+        }
+        // PASS 2b — build: everyone toward Target, capped at Max.
         for (const r of ordered9) {
           const tgt9 = r.target || 8;
-          const totalNeed = Math.max(0, Math.round(r.weekly * tgt9 - inv9.get(r.prodId)));
-          const rem9 = Math.max(0, totalNeed - made9.get(r.prodId));
+          const rem9 = Math.min(Math.max(0, needTo9(r, tgt9) - made9.get(r.prodId)), Math.max(0, needTo9(r, _maxOf(r)) - made9.get(r.prodId)));
           if (rem9 <= 0) continue;
           const got = place9(r, rem9);
           made9.set(r.prodId, made9.get(r.prodId) + got);
@@ -47711,9 +47722,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const cap = c.cases_per_day != null && c.cases_per_day !== '' ? c.cases_per_day : '';
           const tw = c.target_weeks != null && c.target_weeks !== '' ? c.target_weeks : '';
           const mw = c.min_weeks != null && c.min_weeks !== '' ? c.min_weeks : '';
-          return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;">${esc(pr.item_description || pr.id)}</td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-skucap" data-pid="${esc(pr.id)}" type="number" min="0" value="${esc(String(cap))}" placeholder="—" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;"></td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-skutgt" data-pid="${esc(pr.id)}" type="number" min="0" step="0.5" value="${esc(String(tw))}" placeholder="8" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;"></td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-skumin" data-pid="${esc(pr.id)}" type="number" min="0" step="0.5" value="${esc(String(mw))}" placeholder="4" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;"></td></tr>`;
+          const xw = c.max_weeks != null && c.max_weeks !== '' ? c.max_weeks : '';
+          return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;">${esc(pr.item_description || pr.id)}</td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-skucap" data-pid="${esc(pr.id)}" type="number" min="0" value="${esc(String(cap))}" placeholder="—" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;"></td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-skutgt" data-pid="${esc(pr.id)}" type="number" min="0" step="0.5" value="${esc(String(tw))}" placeholder="8" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;"></td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-skumin" data-pid="${esc(pr.id)}" type="number" min="0" step="0.5" value="${esc(String(mw))}" placeholder="4" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;"></td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-skumax" data-pid="${esc(pr.id)}" type="number" min="0" step="0.5" value="${esc(String(xw))}" placeholder="12" style="width:72px;text-align:right;font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;"></td></tr>`;
         }).join('');
-        return `<div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Per-SKU limits & targets</div><div style="max-width:640px;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Cases/day</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Target weeks on hand</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Min wks supply</th></tr></thead><tbody>${rows}</tbody></table></div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;line-height:1.6;">Saves as you type. Cases/day is the same number the Weekly schedule shows (edit here, read there). Target weeks on hand drives the Coverage tab and every production recommendation — blank means the default of <b>8 weeks</b>. Min wks supply (blank = <b>4</b>) is the priority line: when capacity is scarce, Suggest produces SKUs projected below their minimum FIRST, most urgent first.</div></div>`;
+        return `<div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Per-SKU limits & targets</div><div style="max-width:640px;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Cases/day</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Target weeks on hand</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Min wks supply</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Max wks supply</th></tr></thead><tbody>${rows}</tbody></table></div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;line-height:1.6;">Saves as you type. Cases/day is the same number the Weekly schedule shows (edit here, read there). Target weeks on hand drives the Coverage tab and every production recommendation — blank means the default of <b>8 weeks</b>. The band: <b>Min</b> (blank = 4) is the floor and priority line — below-Min SKUs produce first; <b>Target</b> (blank = 8) is the aim; <b>Max</b> (blank = 12) is the ceiling — Suggest never plans production that would push a SKU past it.</div></div>`;
       })()}
       <button id="hl-pas-save" style="font-family:var(--mono);font-size:12px;font-weight:700;padding:10px 20px;border:1px solid var(--ink);border-radius:5px;background:var(--ink);color:var(--paper,#f4efe6);cursor:pointer;">Save assumptions</button>
       <span id="hl-pas-msg" style="font-family:var(--mono);font-size:11px;color:#3f6f4a;margin-left:12px;"></span>
@@ -47738,6 +47750,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     host.querySelectorAll('.hl-pas-skucap').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Math.round(Number(inp.value) || 0)); _pasCfgSave(inp.dataset.pid, { cases_per_day: v }); }));
     host.querySelectorAll('.hl-pas-skutgt').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { target_weeks: v }); }));
     host.querySelectorAll('.hl-pas-skumin').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { min_weeks: v }); }));
+    host.querySelectorAll('.hl-pas-skumax').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { max_weeks: v }); }));
     const grpRows = host.querySelector('#hl-pas-grprows');
     if (grpRows) {
       const lines9 = [...new Set([..._prodProductById.values()].map(pr => _prodGroupLineOf(pr)))].sort();
