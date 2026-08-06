@@ -47138,11 +47138,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
   // ─── Weekly production schedule ───────────────────────────────────
   const _PROD_DAYS_ALL = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  function _prodMonday(d) { const x = new Date(d); const off = (x.getDay() + 6) % 7; x.setDate(x.getDate() - off); return x.toISOString().slice(0, 10); }
+  function _prodMonday(d) { const x = new Date(d); x.setHours(12, 0, 0, 0); const off = (x.getDay() + 6) % 7; x.setDate(x.getDate() - off); return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0'); } // LOCAL date parts — toISOString() here shifted week keys a day forward every evening (UTC rollover)
   function _prodBlockedDays() { const b = _prodSettings && _prodSettings.blocked_days; return b ? String(b).split(',').map(x => x.trim()).filter(Boolean) : []; }
   function _prodMaxDaysWk() { const n = _prodSettings && Number(_prodSettings.max_prod_days_per_week); return (n && n > 0) ? n : null; }
   function _prodFacilityCap() { const n = _prodSettings && Number(_prodSettings.facility_max_cases_per_day); return (n && n > 0) ? n : null; }
   function _prodMaxSkusDay() { const n = _prodSettings && Number(_prodSettings.max_skus_per_day); return (n && n > 0) ? n : 2; }   // default 2 SKUs per day
+  function _prodLineGroups() { const g = _prodSettings && _prodSettings.line_groups; if (!g) return {}; if (typeof g === 'string') { try { return JSON.parse(g) || {}; } catch (e) { return {}; } } return g; }
+  function _prodGroupOfPid(pid) { const pr = _prodProductById.get(pid); const line = (pr && pr.product_line) || '(no line)'; const lbl = _prodLineGroups()[line]; return lbl ? 'grp:' + String(lbl).trim().toLowerCase() : 'line:' + line; } // unlabeled lines are their own implicit group
   function _prodActiveDays() {
     // Purely assumptions-driven: all days minus blocked, first max_prod_days_per_week of what's left
     // (no max set → Mon–Fri minus blocked).
@@ -47193,7 +47195,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
   function _prodWeeks4(n) {
     const out = []; let wk = _prodMonday(new Date());
-    for (let i = 0; i < (n || 8); i++) { out.push(wk); const nx = new Date(wk + 'T00:00:00'); nx.setDate(nx.getDate() + 7); wk = nx.toISOString().slice(0, 10); }
+    for (let i = 0; i < (n || 8); i++) { out.push(wk); const nx = new Date(wk + 'T12:00:00'); nx.setDate(nx.getDate() + 7); wk = nx.getFullYear() + '-' + String(nx.getMonth() + 1).padStart(2, '0') + '-' + String(nx.getDate()).padStart(2, '0'); }
     return out;
   }
   async function _prodPlan4Load() {
@@ -47295,16 +47297,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     }
     const mrows = [...merged.values()].sort((a, b) => String(a.item).localeCompare(String(b.item)));
     const schedOf9 = (pid, wk) => (_prodPlan4 && _prodPlan4.get(wk) && _prodPlan4.get(wk).get(pid)) || 0;
-    // ── Monthly buckets: 4 calendar months after the 8-week horizon. Demand = that month's
-    // forecast (fallback: weekly × wks/month); the few orphan days between week 8's end and the
-    // first month boundary are prorated into month 1. No production is planned past week 8.
-    const wk8End = new Date(weeks8[7] + 'T00:00:00'); wk8End.setDate(wk8End.getDate() + 6);
-    const orphanDays = (() => { const eom = new Date(wk8End.getFullYear(), wk8End.getMonth() + 1, 0); return Math.max(0, Math.round((eom.getTime() - wk8End.getTime()) / 864e5)); })();
-    const months4 = [1, 2, 3, 4].map(n9 => { const d9 = new Date(wk8End.getFullYear(), wk8End.getMonth() + n9, 1); return { ym: d9.getFullYear() + '-' + String(d9.getMonth() + 1).padStart(2, '0'), label: d9.toLocaleString('en-US', { month: 'short' }) + ' ' + String(d9.getFullYear()).slice(2) }; });
-    const fcM = (pid, ym) => { const cm9 = _prodFc && _prodFc.monthly && _prodFc.monthly.get(pid); const v9 = cm9 && cm9.get(ym); return (v9 != null && isFinite(v9)) ? Number(v9) : null; };
     // ── Matrix: clickable cells (beginning − demand + production = ending); expandable merge badges ──
-    const head9 = weeks8.map((w9, i9) => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</th>`).join('')
-      + months4.map((m9, mi9) => `<th title="Monthly planning bucket — demand from the forecast; production = suggested amount to hold target (capacity-capped), firmed into the weekly schedule as these weeks roll into the 8-week window" style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:#534AB7;white-space:nowrap;${mi9 === 0 ? 'border-left:2px solid var(--rule-soft);' : ''}">${m9.label}</th>`).join('');
+    const head9 = weeks8.map((w9, i9) => `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</th>`).join('');
     const body9 = mrows.map((r, ri9) => {
       const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
       const minW = (() => { const m9 = Number((_prodCfg.get(r.prodId) || {}).min_weeks); return (m9 && m9 > 0) ? m9 : 4; })();
@@ -47317,27 +47311,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const col = (inv <= 0 || (wos != null && wos < minW)) ? '#a8381f' : wos != null && wos < tgtW ? '#8a6d1f' : '#3f6f4a';
         return `<td class="hl-plancell" data-item="${esc(r.item)}" data-wk="Wk ${i9 + 1} · ${w9.slice(5)}" data-start="${Math.round(start9)}" data-dem="${Math.round(wkD)}" data-prod="${Math.round(prod9)}" data-end="${Math.round(inv)}" title="Click for the calculation" style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;white-space:nowrap;cursor:pointer;color:${col};${inv <= 0 ? 'font-weight:700;' : ''}">${_prodFmt(Math.round(inv), 0)}${wos != null ? `<div style="font-size:9px;color:${col};opacity:0.75;">${_prodFmt(Math.round(wos * 10) / 10, 1)} wk</div>` : ''}</td>`;
       }).join('');
-      const mCells9 = months4.map((m9, mi9) => {
-        let dem9 = fcM(r.prodId, m9.ym); if (dem9 == null) dem9 = wkD * WK_PER_MONTH;
-        if (mi9 === 0 && orphanDays > 0 && wkD > 0) dem9 += wkD * (orphanDays / 7);
-        // Months are PLANNING buckets (nothing schedulable past week 8): production here is the
-        // SUGGESTED amount to hold target, capped by the SKU's monthly capacity. It becomes a real
-        // weekly schedule as these weeks roll into the 8-week window.
-        const cap9m = (() => { const c9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0; return c9 > 0 ? c9 * _prodActiveDays().length * WK_PER_MONTH : Infinity; })();
-        const start9 = inv;
-        const prod9 = Math.min(Math.max(0, Math.round(tgtW * wkD + dem9 - start9)), cap9m);
-        inv = inv - dem9 + prod9;
-        const wos = wkD > 0 ? inv / wkD : null;
-        const col = (inv <= 0 || (wos != null && wos < minW)) ? '#a8381f' : wos != null && wos < tgtW ? '#8a6d1f' : '#3f6f4a';
-        return `<td class="hl-plancell" data-item="${esc(r.item)}" data-wk="${m9.label} (month)" data-start="${Math.round(start9)}" data-dem="${Math.round(dem9)}" data-demlbl="monthly demand" data-prod="${Math.round(prod9)}" data-prodlbl="suggested production (month — not yet scheduled)" data-end="${Math.round(inv)}" title="Click for the calculation" style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;white-space:nowrap;cursor:pointer;color:${col};background:rgba(83,74,183,0.045);${mi9 === 0 ? 'border-left:2px solid var(--rule-soft);' : ''}${inv <= 0 ? 'font-weight:700;' : ''}">${_prodFmt(Math.round(inv), 0)}${wos != null ? `<div style="font-size:9px;color:${col};opacity:0.75;">${_prodFmt(Math.round(wos * 10) / 10, 1)} wk</div>` : ''}</td>`;
-      }).join('');
       const badge = r._items.length > 1
         ? `<div><button class="hl-mergetgl" data-mtid="hl-mrg-${ri9}" style="background:none;border:none;padding:0;font-family:var(--mono);font-size:9px;color:#b8860b;cursor:pointer;">⚠ merges ${r._items.length} items <span id="hl-mrg-${ri9}-car">▸</span></button><div id="hl-mrg-${ri9}" style="display:none;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);padding:3px 0 2px 8px;border-left:2px solid #b8860b;margin-top:2px;">${r._items.map(x9 => `<div>${esc(x9.item)} — ${_prodFmt(Math.round(x9.onHand), 0)} cs</div>`).join('')}<div style="border-top:1px solid var(--rule-soft);margin-top:2px;padding-top:2px;">combined — ${_prodFmt(Math.round(r.onHand), 0)} cs</div></div></div>`
         : '';
-      return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${badge}</td>${cells9}${mCells9}</tr>`;
+      return `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;position:sticky;left:0;background:var(--paper,#f4efe6);min-width:170px;">${esc(r.item)}${badge}</td>${cells9}</tr>`;
     }).join('');
     const matrix = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product</th>${head9}</tr></thead><tbody>${body9}</tbody></table></div>
-    <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Projected <b>End inv balance</b>, chained (beginning − demand + scheduled production; click any number for its calculation): 8 weeks, then <span style=\"color:#534AB7;\">4 monthly planning buckets</span>: demand from the monthly forecast, production = <b>suggested</b> hold-target amount capped by the SKU's monthly capacity (months aren't scheduled — they firm into the Weekly schedule as they roll inside 8 weeks; facility-level contention not modeled out here). The chart covers the 8 weeks. <span style="color:#a8381f;">Red = below Min wks supply (default 4) or ≤ 0</span> · <span style="color:#8a6d1f;">below Target</span> · <span style="color:#3f6f4a;">at/above Target</span>.</p>`;
+    <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Projected <b>End inv balance</b> per week (beginning − weekly demand + scheduled production, chained; click any number for its calculation). <span style="color:#a8381f;">Red = below Min wks supply (default 4) or ≤ 0</span> · <span style="color:#8a6d1f;">below Target</span> · <span style="color:#3f6f4a;">at/above Target</span>.</p>`;
     // ── Series for the chart ──
     const series = mrows.map(r => {
       const wkD = (r.weekly && r.weekly > 0) ? r.weekly : 0;
@@ -47591,7 +47571,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           // the next SKU. (No facility cap AND no SKU cap → fall back to an even spread.)
           const perDay = cap9 > 0 ? cap9 : (fcap != null ? Infinity : Math.ceil(want / Math.max(activeDays.length, 1)));
           let need = Math.round(want), placed = 0;
-          for (const day of activeDays) {
+          // GROUP AFFINITY: fill days already running this SKU's production group first (pizza days
+          // attract their bread), then empty days, then days held by other groups.
+          const myGrp = _prodGroupOfPid(r.prodId);
+          const affin9 = (d9) => { const ss9 = daySkus.get(d9); if (ss9 && ss9.has(r.prodId)) return -1; if (!ss9 || ss9.size === 0) return 1; for (const pid9 of ss9) if (_prodGroupOfPid(pid9) === myGrp) return 0; return 2; };
+          const days9 = activeDays.map((d9, i9) => ({ d: d9, i: i9 })).sort((a9, b9) => (affin9(a9.d) - affin9(b9.d)) || (a9.i - b9.i)).map(x9 => x9.d);
+          for (const day of days9) {
             if (need <= 0) break;
             const sset = daySkus.get(day);
             if (!sset.has(r.prodId) && sset.size >= maxSkus) continue;   // day already at its SKU changeover limit
@@ -47661,6 +47646,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         ${fld('Max production days / week', 'hl-pas-maxd', st.max_prod_days_per_week, 'days', 'Hard weekly ceiling on how many days the schedule uses.')}
         ${fld('Max SKUs produced / day', 'hl-pas-maxsku', st.max_skus_per_day, 'SKUs', 'Changeover limit — Suggest runs at most this many different SKUs on any one day. Blank = 2.')}
       </div>
+      ${(() => {
+        const lines9 = [...new Set([..._prodProductById.values()].map(pr => (pr && pr.product_line) || '(no line)'))].sort();
+        if (!lines9.length) return '';
+        const lg9 = _prodLineGroups();
+        const rows9 = lines9.map(l9 => `<tr style="border-top:1px solid var(--rule-soft);"><td style="padding:6px 10px;font-family:var(--serif);font-size:12.5px;">${esc(l9)}</td><td style="padding:4px 8px;text-align:center;"><input class="hl-pas-linegrp" data-line="${esc(l9)}" type="text" value="${esc(lg9[l9] || '')}" placeholder="—" style="width:150px;font-family:var(--mono);font-size:11px;padding:4px 8px;border:1px solid var(--rule-soft);border-radius:4px;"></td></tr>`).join('');
+        return `<div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Production groups — product lines that run together</div><div style="max-width:520px;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;"><th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Product line</th><th style="padding:8px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Group</th></tr></thead><tbody>${rows9}</tbody></table></div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;line-height:1.6;max-width:520px;">Same label = produced on the same days (e.g. give 12&quot; Pizza and Bread both <b>A</b>). Suggest fills a group\'s days together before opening new days. Unlabeled lines still cluster with themselves. Saves as you type.</div></div>`;
+      })()}
       <div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Blocked days — the facility never produces</div>${dayBtns}<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;">Click to toggle. Blocked days are struck out and locked on the schedule\'s day chips.</div></div>
       ${(() => {
         const prods = [..._prodProductById.values()].filter(pr => pr && pr.id).sort((a, b) => String(a.item_description || '').localeCompare(String(b.item_description || '')));
@@ -47676,7 +47668,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       })()}
       <button id="hl-pas-save" style="font-family:var(--mono);font-size:12px;font-weight:700;padding:10px 20px;border:1px solid var(--ink);border-radius:5px;background:var(--ink);color:var(--paper,#f4efe6);cursor:pointer;">Save assumptions</button>
       <span id="hl-pas-msg" style="font-family:var(--mono);font-size:11px;color:#3f6f4a;margin-left:12px;"></span>
-      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:20px;max-width:760px;line-height:1.7;">Still to come here: SKU grouping rules (split days / batch same-group SKUs to cut changeover yield loss) and weekly SKU priorities — those need the floor\'s grouping rules first.</p>`;
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:20px;max-width:760px;line-height:1.7;">Still to come here: weekly SKU priority overrides. Grouping lives above at the product-line level; Min wks supply already decides who produces first when capacity is tight.</p>`;
     let pendingBlk = [...blk];
     host.querySelectorAll('.hl-pas-blk').forEach(b => b.addEventListener('click', () => {
       const d = b.dataset.day;
@@ -47697,6 +47689,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     host.querySelectorAll('.hl-pas-skucap').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Math.round(Number(inp.value) || 0)); _pasCfgSave(inp.dataset.pid, { cases_per_day: v }); }));
     host.querySelectorAll('.hl-pas-skutgt').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { target_weeks: v }); }));
     host.querySelectorAll('.hl-pas-skumin').forEach(inp => inp.addEventListener('change', () => { const v = inp.value === '' ? null : Math.max(0, Number(inp.value) || 0) || null; _pasCfgSave(inp.dataset.pid, { min_weeks: v }); }));
+    host.querySelectorAll('.hl-pas-linegrp').forEach(inp => inp.addEventListener('change', async () => {
+      const lg9 = Object.assign({}, _prodLineGroups());
+      const v9 = inp.value.trim();
+      if (v9) lg9[inp.dataset.line] = v9; else delete lg9[inp.dataset.line];
+      _prodSettings = Object.assign({}, _prodSettings, { line_groups: lg9 });
+      try {
+        const sb = window.Auth.getClient(); const brandId = BrandLibrary.getSession().brandId;
+        const { error } = await sb.from('production_settings').upsert({ brand_id: brandId, line_groups: lg9, updated_at: new Date().toISOString() }, { onConflict: 'brand_id' });
+        if (error) throw error;
+      } catch (e) { alert('Could not save groups — run the migration first: alter table production_settings add column if not exists line_groups jsonb;  (' + (e.message || e) + ')'); }
+    }));
     const saveBtn = host.querySelector('#hl-pas-save');
     if (saveBtn) saveBtn.addEventListener('click', async () => {
       saveBtn.disabled = true;
