@@ -47664,12 +47664,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const lines9 = [...new Set([..._prodProductById.values()].map(pr => (pr && pr.product_line) || '(no line)'))].sort();
         if (!lines9.length) return '';
         const raw9 = (() => { const g9 = _prodLineGroups(); return Array.isArray(g9) ? g9.filter(x9 => Array.isArray(x9) && x9[0] && x9[1]) : []; })();
-        const pairs9 = raw9.slice();
-        while (pairs9.length < 2) pairs9.push(['', '']);
+        // one row per anchor line, right side holds ALL its partners
+        const byAnchor9 = new Map();
+        for (const p9 of raw9) { if (!byAnchor9.has(p9[0])) byAnchor9.set(p9[0], []); if (!byAnchor9.get(p9[0]).includes(p9[1])) byAnchor9.get(p9[0]).push(p9[1]); }
+        const rows0 = [...byAnchor9.entries()];
+        while (rows0.length < 2) rows0.push(['', []]);
         const selStyle9 = 'font-family:var(--mono);font-size:11px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper,#f4efe6);color:var(--ink);min-width:160px;';
         const opt9 = (sel9) => '<option value=""></option>' + lines9.map(l9 => `<option value="${esc(l9)}"${l9 === sel9 ? ' selected' : ''}>${esc(l9)}</option>`).join('');
-        const row9 = (a9, b9) => `<div class="hl-pas-grprow" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><select class="hl-pas-grpa" style="${selStyle9}">${opt9(a9)}</select><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">runs with</span><select class="hl-pas-grpb" style="${selStyle9}">${opt9(b9)}</select><button type="button" class="hl-pas-grpx" title="Remove this grouping" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:15px;line-height:1;">×</button></div>`;
-        return `<div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Production groups — product lines that run together</div><div id="hl-pas-grprows">${pairs9.map(p9 => row9(p9[0], p9[1])).join('')}</div><button type="button" id="hl-pas-grpadd" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">+ Add grouping</button><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.6;max-width:560px;">Each row pairs two product lines that produce on the same days (e.g. 12&quot; Pizza runs with Rolls). Chained pairs merge — Pizza+Rolls and Pizza+Baguettes become one group. Suggest fills a group\'s days together before opening new days. Saves as you choose.</div></div>`;
+        const row9 = (a9, bs9) => `<div class="hl-pas-grprow" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><select class="hl-pas-grpa" style="${selStyle9}">${opt9(a9)}</select><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">runs with</span><div class="hl-pas-grpm" style="position:relative;"><button type="button" class="hl-pas-grpmb" style="${selStyle9}min-width:220px;max-width:340px;cursor:pointer;text-align:left;display:flex;justify-content:space-between;align-items:center;gap:8px;"><span class="hl-pas-grpms" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${bs9.length ? esc(bs9.join(', ')) : '—'}</span><span style="color:var(--ink-3);">▾</span></button><div class="hl-pas-grpmp" style="display:none;position:absolute;top:100%;left:0;z-index:45;margin-top:4px;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.12);min-width:230px;max-height:260px;overflow-y:auto;padding:4px 0;">${lines9.map(l9 => `<label style="display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;font-family:var(--sans,sans-serif);font-size:13px;white-space:nowrap;"><input type="checkbox" class="hl-pas-grpmc" data-line="${esc(l9)}" ${bs9.includes(l9) ? 'checked' : ''} style="cursor:pointer;"> ${esc(l9)}</label>`).join('')}</div></div><button type="button" class="hl-pas-grpx" title="Remove this grouping" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:15px;line-height:1;">×</button></div>`;
+        return `<div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Production groups — product lines that run together</div><div id="hl-pas-grprows">${rows0.map(r0 => row9(r0[0], r0[1])).join('')}</div><button type="button" id="hl-pas-grpadd" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">+ Add grouping</button><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.6;max-width:560px;">Pick a line, then check every line that produces on the same days (e.g. 12&quot; Pizza runs with Baguettes, Rolls). Overlapping rows merge into one group. Suggest fills a group\'s days together before opening new days. Saves as you choose.</div></div>`;
       })()}
       ${(() => {
         const prods = [..._prodProductById.values()].filter(pr => pr && pr.id).sort((a, b) => String(a.item_description || '').localeCompare(String(b.item_description || '')));
@@ -47710,13 +47713,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     if (grpRows) {
       const lines9 = [...new Set([..._prodProductById.values()].map(pr => (pr && pr.product_line) || '(no line)'))].sort();
       const selStyle9 = 'font-family:var(--mono);font-size:11px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper,#f4efe6);color:var(--ink);min-width:160px;';
-      const blankRow9 = () => `<div class="hl-pas-grprow" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><select class="hl-pas-grpa" style="${selStyle9}"><option value=""></option>${lines9.map(l9 => `<option value="${esc(l9)}">${esc(l9)}</option>`).join('')}</select><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">runs with</span><select class="hl-pas-grpb" style="${selStyle9}"><option value=""></option>${lines9.map(l9 => `<option value="${esc(l9)}">${esc(l9)}</option>`).join('')}</select><button type="button" class="hl-pas-grpx" title="Remove this grouping" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:15px;line-height:1;">×</button></div>`;
+      const blankRow9 = () => `<div class="hl-pas-grprow" style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><select class="hl-pas-grpa" style="${selStyle9}"><option value=""></option>${lines9.map(l9 => `<option value="${esc(l9)}">${esc(l9)}</option>`).join('')}</select><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">runs with</span><div class="hl-pas-grpm" style="position:relative;"><button type="button" class="hl-pas-grpmb" style="${selStyle9}min-width:220px;max-width:340px;cursor:pointer;text-align:left;display:flex;justify-content:space-between;align-items:center;gap:8px;"><span class="hl-pas-grpms" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">—</span><span style="color:var(--ink-3);">▾</span></button><div class="hl-pas-grpmp" style="display:none;position:absolute;top:100%;left:0;z-index:45;margin-top:4px;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.12);min-width:230px;max-height:260px;overflow-y:auto;padding:4px 0;">${lines9.map(l9 => `<label style="display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;font-family:var(--sans,sans-serif);font-size:13px;white-space:nowrap;"><input type="checkbox" class="hl-pas-grpmc" data-line="${esc(l9)}" style="cursor:pointer;"> ${esc(l9)}</label>`).join('')}</div></div><button type="button" class="hl-pas-grpx" title="Remove this grouping" style="background:none;border:none;color:var(--ink-3);cursor:pointer;font-size:15px;line-height:1;">×</button></div>`;
       const saveGrp9 = async () => {
         const pairs9 = []; const seen9 = new Set();
         grpRows.querySelectorAll('.hl-pas-grprow').forEach(r9 => {
           const a9 = (r9.querySelector('.hl-pas-grpa') || {}).value || '';
-          const b9 = (r9.querySelector('.hl-pas-grpb') || {}).value || '';
-          if (a9 && b9 && a9 !== b9) { const k9 = [a9, b9].sort().join('|'); if (!seen9.has(k9)) { seen9.add(k9); pairs9.push([a9, b9]); } }
+          if (!a9) return;
+          r9.querySelectorAll('.hl-pas-grpmc:checked').forEach(cb9 => {
+            const b9 = cb9.dataset.line || '';
+            if (b9 && b9 !== a9) { const k9 = [a9, b9].sort().join('|'); if (!seen9.has(k9)) { seen9.add(k9); pairs9.push([a9, b9]); } }
+          });
         });
         _prodSettings = Object.assign({}, _prodSettings, { line_groups: pairs9 });
         try {
@@ -47725,8 +47731,19 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           if (error) throw error;
         } catch (e) { alert('Could not save groups — run the migration first: alter table production_settings add column if not exists line_groups jsonb;  (' + (e.message || e) + ')'); }
       };
-      grpRows.addEventListener('change', (ev9) => { const t9 = ev9.target; if (t9 && (t9.classList.contains('hl-pas-grpa') || t9.classList.contains('hl-pas-grpb'))) saveGrp9(); });
-      grpRows.addEventListener('click', (ev9) => { const x9 = ev9.target.closest('.hl-pas-grpx'); if (!x9) return; const r9 = x9.closest('.hl-pas-grprow'); if (r9) r9.remove(); if (!grpRows.querySelectorAll('.hl-pas-grprow').length) grpRows.insertAdjacentHTML('beforeend', blankRow9()); saveGrp9(); });
+      const updRowSummary9 = (r9) => { const sp9 = r9.querySelector('.hl-pas-grpms'); if (!sp9) return; const picked9 = [...r9.querySelectorAll('.hl-pas-grpmc:checked')].map(cb9 => cb9.dataset.line); sp9.textContent = picked9.length ? picked9.join(', ') : '—'; };
+      grpRows.addEventListener('click', (ev9) => {
+        const mb9 = ev9.target.closest('.hl-pas-grpmb');
+        if (mb9) { ev9.stopPropagation(); const pnl9 = mb9.parentElement.querySelector('.hl-pas-grpmp'); const open9 = pnl9.style.display === 'block'; grpRows.querySelectorAll('.hl-pas-grpmp').forEach(p9 => { p9.style.display = 'none'; }); pnl9.style.display = open9 ? 'none' : 'block'; return; }
+        if (ev9.target.closest('.hl-pas-grpmp')) { ev9.stopPropagation(); return; }
+        const x9 = ev9.target.closest('.hl-pas-grpx');
+        if (x9) { const r9 = x9.closest('.hl-pas-grprow'); if (r9) r9.remove(); if (!grpRows.querySelectorAll('.hl-pas-grprow').length) grpRows.insertAdjacentHTML('beforeend', blankRow9()); saveGrp9(); }
+      });
+      grpRows.addEventListener('change', (ev9) => {
+        if (ev9.target.classList.contains('hl-pas-grpmc')) { const r9 = ev9.target.closest('.hl-pas-grprow'); if (r9) updRowSummary9(r9); saveGrp9(); }
+        else if (ev9.target.classList.contains('hl-pas-grpa')) saveGrp9();
+      });
+      document.addEventListener('click', () => { if (grpRows.isConnected) grpRows.querySelectorAll('.hl-pas-grpmp').forEach(p9 => { p9.style.display = 'none'; }); });
       const addB9 = host.querySelector('#hl-pas-grpadd');
       if (addB9) addB9.addEventListener('click', () => grpRows.insertAdjacentHTML('beforeend', blankRow9()));
     }
