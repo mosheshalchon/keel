@@ -27362,8 +27362,11 @@ render();
 
     // Save
     document.getElementById('hl-pc-save').addEventListener('click', async () => {
-      const res = await savePromo(document.getElementById('hl-pc-save'), 'Saving…');
-      if (res.ok) renderPromosPage();
+      const b9 = document.getElementById('hl-pc-save');
+      try {
+        const res = await savePromo(b9, 'Saving…');
+        if (res.ok) renderPromosPage();
+      } catch (err) { console.error('[PROMO] save failed:', err); alert('Save hit an error: ' + ((err && err.message) || err)); if (b9) { b9.disabled = false; b9.textContent = promoId ? 'Save changes' : 'Add promo'; } }
     });
 
     // Save & replicate: save this event, then reopen a pre-filled new draft to
@@ -27371,8 +27374,11 @@ render();
     // retailer+group in the list, so replicas don't double-count base.
     const repBtn = document.getElementById('hl-pc-replicate');
     if (repBtn) repBtn.addEventListener('click', async () => {
-      const res = await savePromo(repBtn, 'Saving…');
-      if (res.ok) openPromoCard(null, seedFromCurrent(res.inputs, res.itemIds));
+      try {
+        const res = await savePromo(repBtn, 'Saving…');
+        if (!res.ok) return;   // savePromo already alerted (validation or DB error)
+        openPromoCard(null, seedFromCurrent(res.inputs, res.itemIds));
+      } catch (err) { console.error('[PROMO] replicate failed:', err); alert('Save & replicate hit an error: ' + ((err && err.message) || err)); repBtn.disabled = false; repBtn.textContent = 'Save & replicate'; }
     });
 
     const delBtn = document.getElementById('hl-pc-delete');
