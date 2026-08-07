@@ -47573,7 +47573,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;"><button id="hl-psd-sumtab" style="font-family:var(--mono);font-size:11px;font-weight:700;padding:7px 14px;border-radius:5px;border:2px solid ${_prodSchedSummary ? '#534AB7' : 'var(--ink)'};cursor:pointer;background:var(--ink);color:var(--paper,#f4efe6);white-space:nowrap;">SUMMARY</button>${weeks8.map((w9, i9) => `<button class="hl-psd-wktab" data-wk="${w9}" style="font-family:var(--mono);font-size:11px;padding:7px 12px;border-radius:5px;border:1px solid ${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--ink)' : 'transparent'};color:${!_prodSchedSummary && w9 === _prodSchedWeek ? 'var(--paper,#f4efe6)' : 'var(--ink-3)'};font-weight:${!_prodSchedSummary && w9 === _prodSchedWeek ? '700' : '400'};white-space:nowrap;">Wk ${i9 + 1} · ${w9.slice(5)}</button>`).join('')}</div>
         <div style="display:flex;gap:8px;align-items:center;"><button id="hl-psd-suggest" style="${btn}background:var(--ink);color:var(--paper,#f4efe6);border-color:var(--ink);font-weight:700;">Suggest 8 weeks</button>${_prodSchedSummary ? '' : `<button id="hl-psd-clear" style="${btn}">Clear week</button>`}</div>
       </div>
-      ${_prodSchedSummary ? _sumHtml() : rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;">${['Product', wkIdx === 0 ? 'Current inv' : 'Est inv · ' + _prodSchedWeek.slice(5), 'Wks supply', 'Weekly demand', 'Ending inv', 'Inv needed', 'Max prod/day'].map((h, i) => `<th style="padding:8px ${i === 0 ? '10px' : '8px'};text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}${dayHead}${['Scheduled', 'End inv balance · ' + (() => { const d9 = new Date(_prodSchedWeek + 'T00:00:00'); d9.setDate(d9.getDate() + 6); return d9.toISOString().slice(5, 10); })(), 'End wks supply', 'Still needed'].map(h => `<th style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}<th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const maxSk = _prodMaxSkusDay(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const skCts = activeDays.map(d => rows.reduce((a, r) => a + ((_prodSched.get(r.prodId + '|' + d) || 0) > 0 ? 1 : 0), 0)); const cells = tots.map((t, i) => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}<div style="font-weight:400;color:${skCts[i] >= maxSk ? '#a8381f' : 'var(--ink-3)'};" title="SKUs running this day vs the Max SKUs/day changeover limit — a full day can't take another SKU even with case capacity spare">${skCts[i]}/${maxSk} SKUs</div></td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td colspan="7" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td>${cells}<td colspan="5"></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
+      ${_prodSchedSummary ? _sumHtml() : rows.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#efe9dd;">${['Product', wkIdx === 0 ? 'Current inv' : 'Est inv · ' + _prodSchedWeek.slice(5), 'Wks supply', 'Weekly demand', 'Ending inv', 'Inv needed', 'Max prod/day'].map((h, i) => `<th style="padding:8px ${i === 0 ? '10px' : '8px'};text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}${dayHead}${['Scheduled', 'End inv balance · ' + (() => { const d9 = new Date(_prodSchedWeek + 'T00:00:00'); d9.setDate(d9.getDate() + 6); return d9.toISOString().slice(5, 10); })(), 'End wks supply', 'Still needed'].map(h => `<th style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}<th></th></tr></thead><tbody>${bodyRows}</tbody>${(() => { const fcap = _prodFacilityCap(); const maxSk = _prodMaxSkusDay(); const tots = activeDays.map(d => rows.reduce((a, r) => a + (_prodSched.get(r.prodId + '|' + d) || 0), 0)); const skCts = activeDays.map(d => rows.reduce((a, r) => a + ((_prodSched.get(r.prodId + '|' + d) || 0) > 0 ? 1 : 0), 0)); const grCts = activeDays.map(d => new Set(rows.filter(r => (_prodSched.get(r.prodId + '|' + d) || 0) > 0).map(r => _prodGroupOfPid(r.prodId))).size); const cells = tots.map((t, i) => `<td style="padding:6px 4px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:600;color:${fcap != null && t > fcap ? '#a8381f' : 'var(--ink-3)'};">${_prodFmt(t, 0)}${fcap != null ? `<span style=\"font-weight:400;\"> / ${_prodFmt(fcap, 0)}</span>` : ''}<div style="font-weight:400;color:${grCts[i] >= maxSk ? '#a8381f' : 'var(--ink-3)'};" title="Production groups running this day vs the Max groups/day changeover limit, and the SKU count inside them. Lines set to run together count as ONE group — a day at its group limit can still take more SKUs from the groups already on it.">${grCts[i]}/${maxSk} grp · ${skCts[i]} SKU</div></td>`).join(''); return `<tfoot><tr style="border-top:2px solid var(--rule-soft);"><td colspan="7" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Day total${fcap != null ? ' / facility cap' : ''}</td>${cells}<td colspan="5"></td></tr></tfoot>`; })()}</table></div>` : '<div style="padding:24px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">Nothing to produce this week — every item is at or above target coverage.</div>'}
       ${!_prodSchedSummary && candidates.length ? `<div style="margin-top:10px;"><select id="hl-psd-add" style="${btn}"><option value="">+ Add product…</option>${candidates.map(p => `<option value="${esc(p.id)}">${esc(p.item_description || p.id)}</option>`).join('')}</select></div>` : ''}
       ${_prodSchedSummary ? '' : `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:820px;line-height:1.6;">Weeks chain: Wk 1 starts from actual inventory; Wks 2–8 start from the prior week's End inv balance (Est inv, shown in purple). Inv needed = cases to reach the SKU's target weeks on hand (Assumptions; default 8) from that week's starting inventory. Cells save as you type; a red cell is over the SKU's max/day. <b>Suggest 8 weeks</b> replaces all 8 weeks with a chained plan under the SKU and facility caps.</p>`}`;
     _prodSchedWire(host, rows, activeDays);
@@ -47615,6 +47615,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       for (const wk9 of weeks9) {
         const dayLeft = new Map(activeDays.map(d => [d, fcap != null ? fcap : Infinity]));
         const daySkus = new Map(activeDays.map(d => [d, new Set()]));
+        // Changeovers are per production GROUP, not per SKU: lines that "run together" in
+        // Assumptions share one setup, so a bread day can carry Bagels + Baguettes + Rolls for the
+        // price of one slot. maxSkus therefore caps distinct GROUPS on a day.
+        const dayGrps = new Map(activeDays.map(d => [d, new Set()]));
         const placedDay = new Map();
         const made9 = new Map(base9.map(r => [r.prodId, 0]));
         const place9 = (r, want) => {
@@ -47633,14 +47637,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           for (const day of days9) {
             if (need <= 0) break;
             const sset = daySkus.get(day);
-            if (!sset.has(r.prodId) && sset.size >= maxSkus) continue;   // day already at its SKU changeover limit
+            const gset = dayGrps.get(day);
+            // Free to join a day this SKU's own group already owns; only a NEW group costs a slot.
+            if (!gset.has(myGrp) && gset.size >= maxSkus) continue;   // day already at its changeover limit
             const key9 = r.prodId + '|' + day;
             const room = Math.min(perDay - (placedDay.get(key9) || 0), need, dayLeft.get(day));
             if (room <= 0) continue;
             allRecs.push({ brand_id: brandId, week_start: wk9, product_id: r.prodId, weekday: day, cases: room });
             placedDay.set(key9, (placedDay.get(key9) || 0) + room);
             dayLeft.set(day, dayLeft.get(day) - room);
-            sset.add(r.prodId); need -= room; placed += room;
+            sset.add(r.prodId); gset.add(myGrp); need -= room; placed += room;
           }
           return placed;
         };
@@ -47704,27 +47710,35 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           short9 += rem9 - got;
         }
         // PASS 3 — FILL (the Min–Max flexibility): once everyone has reached Target as far as caps
-        // allow, leftover capacity tops SKUs up toward Max — but ONLY on days they already run
-        // (zero new changeovers, so it never costs a SKU slot). Urgency order; caps always rule.
-        for (const r of ordered9) {
-          let room9 = Math.max(0, needTo9(r, _maxOf(r)) - made9.get(r.prodId));
-          if (room9 <= 0) continue;
-          const cap9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0;
-          const perDay9 = cap9 > 0 ? cap9 : Infinity;
-          let add9 = 0;
-          for (const day of activeDays) {
-            if (room9 <= 0) break;
-            const key9 = r.prodId + '|' + day;
-            const already9 = placedDay.get(key9) || 0;
-            if (already9 <= 0) continue;   // this SKU isn't running that day — filling would cost a changeover slot
-            const take9 = Math.min(perDay9 - already9, room9, dayLeft.get(day));
-            if (take9 <= 0) continue;
-            allRecs.push({ brand_id: brandId, week_start: wk9, product_id: r.prodId, weekday: day, cases: take9 });
-            placedDay.set(key9, already9 + take9);
-            dayLeft.set(day, dayLeft.get(day) - take9);
-            room9 -= take9; add9 += take9;
+        // allow, leftover facility capacity tops SKUs up toward Max. A SKU may fill any day its own
+        // production GROUP already owns — joining teammates costs no extra changeover — so a
+        // half-empty pizza day pulls in more pizza rather than being left short of the cap.
+        // Two sweeps: days the SKU already runs first (pure volume, zero setup), then same-group
+        // days it hasn't touched yet. Urgency order throughout; Max ceilings always rule.
+        for (const pass3 of ['running', 'group']) {
+          for (const r of ordered9) {
+            let room9 = Math.max(0, needTo9(r, _maxOf(r)) - made9.get(r.prodId));
+            if (room9 <= 0) continue;
+            const cap9 = Number((_prodCfg.get(r.prodId) || {}).cases_per_day) || 0;
+            const perDay9 = cap9 > 0 ? cap9 : Infinity;
+            const myGrp3 = _prodGroupOfPid(r.prodId);
+            let add9 = 0;
+            for (const day of activeDays) {
+              if (room9 <= 0) break;
+              const key9 = r.prodId + '|' + day;
+              const already9 = placedDay.get(key9) || 0;
+              if (pass3 === 'running') { if (already9 <= 0) continue; }
+              else if (already9 > 0 || !dayGrps.get(day).has(myGrp3)) continue;   // not this group's day — filling would cost a changeover
+              const take9 = Math.min(perDay9 - already9, room9, dayLeft.get(day));
+              if (take9 <= 0) continue;
+              allRecs.push({ brand_id: brandId, week_start: wk9, product_id: r.prodId, weekday: day, cases: take9 });
+              placedDay.set(key9, already9 + take9);
+              dayLeft.set(day, dayLeft.get(day) - take9);
+              daySkus.get(day).add(r.prodId);
+              room9 -= take9; add9 += take9;
+            }
+            if (add9 > 0) made9.set(r.prodId, made9.get(r.prodId) + add9);
           }
-          if (add9 > 0) made9.set(r.prodId, made9.get(r.prodId) + add9);
         }
         for (const r of base9) inv9.set(r.prodId, inv9.get(r.prodId) - r.weekly + made9.get(r.prodId));
       }
@@ -47757,7 +47771,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       <div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:22px;">
         ${fld('Facility max cases / day', 'hl-pas-fcap', st.facility_max_cases_per_day, 'cases', 'Total across ALL SKUs a day can produce. Suggest and Use never schedule a day past this; the schedule footer shows each day\'s total against it.')}
         ${fld('Max production days / week', 'hl-pas-maxd', st.max_prod_days_per_week, 'days', 'Hard weekly ceiling on how many days the schedule uses.')}
-        ${fld('Max SKUs produced / day', 'hl-pas-maxsku', st.max_skus_per_day, 'SKUs', 'Changeover limit — Suggest runs at most this many different SKUs on any one day. Blank = 2.')}
+        ${fld('Max production groups / day', 'hl-pas-maxsku', st.max_skus_per_day, 'groups', 'Changeover limit — Suggest runs at most this many different production GROUPS on any one day. Lines set to run together below count as one group, so a bread day can carry Bagels + Baguettes + Rolls on a single slot. Set to 1 for strict single-line days. Blank = 2.')}
       </div>
 
       <div style="margin-bottom:22px;"><div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Blocked days — the facility never produces</div>${dayBtns}<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;">Click to toggle. Blocked days are struck out and locked on the schedule\'s day chips.</div></div>
