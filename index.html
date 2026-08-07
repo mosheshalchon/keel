@@ -4615,6 +4615,18 @@ window.Auth = (function() {
     let acc = accFirst;
     if (grantWrote) acc = await readAccess();
     if (acc) { accessRole = acc.role; accessDept = acc.department; }
+    // TAB GATING: non-admin users in a specific department get the tab list the Team-page
+    // permissions matrix allows for that department. No rows configured for the department
+    // → ungated (fail-open, so an unconfigured dept never locks anyone out). Admins and
+    // department 'all' are never gated.
+    let tabAllow = null;
+    if (accessRole !== 'admin' && accessDept && accessDept !== 'all') {
+      try {
+        const ccp = client();
+        const { data: tp } = await ccp.from('role_tab_permissions').select('tab_key, can_access').eq('brand_id', profile.brand_id).eq('department', accessDept);
+        if (tp && tp.length) tabAllow = tp.filter(p9 => p9.can_access).map(p9 => p9.tab_key);
+      } catch (e) { /* fail-open */ }
+    }
 
     return {
       email: profile.email,
@@ -4623,6 +4635,7 @@ window.Auth = (function() {
       roleLabel: profile.role_label || 'rep',
       accessRole: accessRole,
       department: accessDept || 'all',
+      tabAllow: tabAllow,
       linkedContactId: profile.linked_contact_id || null,
       // We don't have a "real name" yet; derive from the email local part.
       name: (profile.email || '').split('@')[0]
@@ -5188,6 +5201,8 @@ HL.renderSidebar = function(activeId) {
   };
 
   const itemById = Object.fromEntries(HL.NAV_ITEMS.map(it => [it.id, it]));
+  const _allow9 = session.tabAllow;   // null = ungated
+  const _canSee9 = (id) => !_allow9 || id === 'dashboard' || _allow9.includes(id);
   const navItemHtml = (item, opts = {}) => {
     if (!item) return '';
     const isActive = item.id === activeId;
@@ -5203,7 +5218,8 @@ HL.renderSidebar = function(activeId) {
 
   const items = (HL.NAV_GROUPS || HL.NAV_ITEMS.map(it => ({ type: 'item', id: it.id }))).map(entry => {
     if (entry.type === 'group') {
-      const children = entry.children.map(cid => itemById[cid]).filter(Boolean);
+      const children = entry.children.map(cid => itemById[cid]).filter(Boolean).filter(c => _canSee9(c.id));
+      if (!children.length) return '';
       const groupActive = children.some(c => c.id === activeId);
       return `
         <div class="nav-group ${groupActive ? 'open' : ''}">
@@ -5214,7 +5230,7 @@ HL.renderSidebar = function(activeId) {
         </div>
       `;
     }
-    return navItemHtml(itemById[entry.id]);
+    return _canSee9(entry.id) ? navItemHtml(itemById[entry.id]) : '';
   }).join('');
 
   return `
@@ -5276,6 +5292,10 @@ HL.renderSidebar = function(activeId) {
 HL.mountPage = function(activeId) {
   const session = BrandLibrary.requireAuth();
   if (!session) return null;
+  if (session.tabAllow && activeId && activeId !== 'dashboard' && !session.tabAllow.includes(activeId)) {
+    location.href = './dashboard.html';   // tab not permitted for this department
+    return session;
+  }
   const root = document.getElementById('app-root');
   if (!root) return session;
   root.innerHTML = `
@@ -48506,8 +48526,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const stOpts = st8 === 'buyer' ? [['buyer', 'Needs buyer approval'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['', 'Pending']] : [['', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected']];
             const tSos = [...new Set(t.stops.flatMap(st => st.ships || []))].join(',');
             const consolidated = t.stops.some(st => (st.ships || []).some(so => ovrMap[so]));
-            const buyerBtn = consolidated ? `<button class="fr-buyer" data-idx="${i}" title="Email the buyer (customer) to approve the date change" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid #7c3aed;border-radius:4px;background:transparent;cursor:pointer;color:#7c3aed;margin-left:5px;">✉ Buyer</button>` : '';
-            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" data-sos="${tSos}" data-prev="${st8}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${stOpts.map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select>${buyerBtn}<button class="fr-quote" data-idx="${i}" title="Request a freight quote (needs Approved)" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);margin-left:5px;">✉ Quote</button></td>`;
+            const buyerBtn = consolidated ? `<button class="fr-buyer" data-num="${t._num}" title="Email the buyer (customer) to approve the date change" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid #7c3aed;border-radius:4px;background:transparent;cursor:pointer;color:#7c3aed;margin-left:5px;">✉ Buyer</button>` : '';
+            const statusCell = `<td style="padding:6px 9px;border-top:1px solid var(--rule-soft);white-space:nowrap;"><select class="fr-status-sel" data-sig="${sig}" data-sos="${tSos}" data-prev="${st8}" style="font-family:var(--mono);font-size:10px;padding:3px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:${stColor};font-weight:700;cursor:pointer;">${stOpts.map(o => `<option value="${o[0]}" ${st8 === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select>${buyerBtn}<button class="fr-quote" data-num="${t._num}" title="Request a freight quote (needs Approved)" style="font-family:var(--mono);font-size:10px;padding:3px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);margin-left:5px;">✉ Quote</button></td>`;
             const quoteCell = `<td style="padding:6px 6px;border-top:1px solid var(--rule-soft);"><input type="number" step="any" min="0" class="fr-cost" data-sig="${sig}" value="${ap.quote_cost != null ? ap.quote_cost : ''}" placeholder="—" style="width:74px;font-family:var(--mono);font-size:11px;padding:3px 5px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);text-align:right;"></td>`;
             const dateCell = `<td style="padding:6px 6px;border-top:1px solid var(--rule-soft);"><input type="date" class="fr-pickup" data-sig="${sig}" value="${ap.pickup_date || ''}" style="font-family:var(--mono);font-size:10px;padding:3px 4px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);"></td>`;
             const canBook = st8 === 'approved' && ap.quote_cost != null && ap.pickup_date;
@@ -48547,6 +48567,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           nst.bySo = Object.fromEntries(Object.entries(nst.bySo).filter(([so2]) => seen.has(so2)));
           try { localStorage.setItem('keel_fr_nums_' + brandId, JSON.stringify(nst)); } catch (e) {}
         })();
+        // Row buttons carry the STABLE truck number (t._num), not a position in allTrucks —
+        // _num is persisted per-SO and never reissued, so it drifts away from the array index
+        // as freight books out. Look up by number; shout instead of dying silently if it misses.
+        const _frTruckByNum = (n) => {
+          const t = allTrucks.find(u => u._num === Number(n));
+          if (!t) { console.warn('[FREIGHT] no truck for #' + n + ' — stale render?'); alert('That truck (#' + n + ') is no longer in the current plan — refresh the tab and try again.'); }
+          return t || null;
+        };
         (() => {
           const oppWin = Number(s.opp_window_days) || 7, mP = s.max_pallets || 28, mW = s.max_weight || 40000, mS = s.max_stops || 3, autoWin = s.date_window_days || 1;
           const dd = (a, b) => (!a || !b) ? 999 : Math.abs((new Date(a) - new Date(b)) / 86400000);
@@ -49100,7 +49128,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const resetBtn = document.getElementById('hl-fr-reset-ovr');
         if (resetBtn) resetBtn.addEventListener('click', async () => { if (!confirm('Remove all consolidation date-changes, restore original ship dates, and re-offer dismissed pairings?')) return; try { await sb.from('freight_overrides').delete().eq('brand_id', brandId); try { await sb.from('freight_opp_dismissals').delete().eq('brand_id', brandId); } catch (e2) {} _frRenderTab(brandId, sb); } catch (e) { alert(e.message || e); } });
         body.querySelectorAll('.fr-buyer').forEach(btn => btn.addEventListener('click', () => {
-          const t = allTrucks[+btn.dataset.idx]; if (!t) return;
+          const t = _frTruckByNum(btn.dataset.num); if (!t) return;
           const movedStops = t.stops.filter(st => (st.ships || []).some(so => ovrMap[so]));
           const contacts = movedStops.map(contactFor).filter(Boolean);
           const emails = [...new Set(contacts.map(c => c.email).filter(Boolean))];
@@ -49117,7 +49145,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         }));
         body.querySelectorAll('.fr-quote').forEach(btn => btn.addEventListener('click', () => {
           const selEl = btn.parentElement.querySelector('.fr-status-sel'); const st = selEl ? selEl.value : '';
-          const t = allTrucks[+btn.dataset.idx]; if (!t) return;
+          const t = _frTruckByNum(btn.dataset.num); if (!t) return;
           if (st !== 'approved') { alert('Set status to Approved first — then Quote opens the carrier picker.'); return; }
           const dcs = [...new Set(t.stops.map(x => x.dc).filter(Boolean))].join('; ') || custOf(t);
           const overlay = document.createElement('div'); overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:99999;display:flex;align-items:center;justify-content:center;';
