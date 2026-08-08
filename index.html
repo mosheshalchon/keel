@@ -45379,11 +45379,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   const _mrpNorm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
   let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes' || s === 'vendors' || s === 'costs') ? s : 'planning'; } catch (e) { return 'planning'; } })();            // 'planning' | 'recipes' | 'ingredients' | 'vendors'
-  let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 8 };
+  let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
   let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [], _mrpProdSchedRows = [];
   let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false, _mrpStatusFilter = 'all', _mrpVendors = [];
   let _mrpGridUnit = 'units';             // 'units' | 'dollars'
-  let _mrpGridHorizon = 13;               // weeks shown
+  let _mrpGridHorizon = 12;               // weeks shown — default 4 plan + 8 forecast
   let _mrpGridStart = null;               // ISO week_start of first column
   let _mrpDemandSource = 'forecast';      // 'forecast' | 'plan'
   let _mrpScenarioId = null;
@@ -45467,7 +45467,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
   async function _mrpLoad() {
     if (_mrpLoading) return;
-    _mrpLoading = true; _mrpErr = null;
+    _mrpLoading = true; _mrpErr = null; _mrpSchedHzCache = null;
     const sb = window.Auth.getClient();
     const brandId = BrandLibrary.getSession().brandId;
     try {
@@ -45705,7 +45705,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${num(oh, 0)}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${onOrder ? num(onOrder, 0) : '—'}</td>
         <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;">${num(total, 0)}</td>
-        <td style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;">${wk > 0 ? num(wk, 1) : '—'}</td>
+        <td data-ingcalc="demand" data-ingnorm="${_mrpEsc(norm)}" title="Audit this number: cases per SKU per week, and where each week's cases come from" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${wk > 0 ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}">${wk > 0 ? num(wk, 1) : '—'}</td>
         <td data-ingcalc="oh" data-ingnorm="${_mrpEsc(norm)}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:11px;${ohWeeks != null ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px;' : ''}${ohWeeks != null && lead != null && ohWeeks <= lead ? 'color:#a8381f;font-weight:600;' : ''}">${ohWeeks != null ? num(ohWeeks, 1) : '—'}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'shelf_life_weeks', shelf)}</td>
         <td style="padding:5px 8px;text-align:right;">${inp(i.ingredient, 'lead_time_weeks', lead)}</td>
@@ -45827,12 +45827,20 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     return _mrpDemand.some(d => d.source === 'prod' && d.week_start === dateISO);
   }
   function _mrpCasesFor(code, dateISO) {
-    // Production plan for the weeks it covers (near-term); forecast after.
+    // ONE source of truth for "how many cases of this SKU that week", used by both the Ingredients
+    // tab and the Planning grid: (1) the Weekly production schedule inside the firm-plan horizon,
+    // (2) a seeded demand plan row if one exists, (3) forecast. A horizon week with no schedule
+    // rows at all falls through to forecast so an unplanned week never reads as zero demand.
+    const sched = _mrpSchedHorizon();
+    if (sched.has(dateISO)) return sched.get(dateISO).get(code) || 0;
     if (_mrpProdWeek(dateISO)) {
       const row = _mrpDemand.find(d => d.sku_code === code && d.week_start === dateISO && d.source === 'prod');
       return row ? (Number(row.cases) || 0) : 0;
     }
     return _mrpForecastCases(code, dateISO);
+  }
+  function _mrpCaseSource(dateISO) {
+    return _mrpSchedHorizon().has(dateISO) ? 'plan' : (_mrpProdWeek(dateISO) ? 'seeded' : 'forecast');
   }
   function _mrpWeeklyDemandMap() {
     const weeks = _mrpGridWeeks();
@@ -45882,9 +45890,105 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
 
   function _mrpCloseCell() { const el = document.getElementById('hl-mrp-cell-modal'); if (el) el.remove(); }
+  function _mrpShowDemandAudit(i, norm) {
+    // CASE-LEVEL AUDIT of the Wkly demand column: every SKU that uses this ingredient, the cases
+    // planned or forecast for it each week, and the resulting ingredient units. This is the only
+    // place in Procurement where the CASE numbers behind the BOM explosion are visible, so it also
+    // surfaces the silent failure mode: a recipe that uses the ingredient but draws zero cases
+    // (unmapped SKU, or no production scheduled and no forecast).
+    const weeks = _mrpGridWeeks();
+    const nW = weeks.length || 1;
+    const uom = i.uom || 'units';
+    const f = (n, d) => _mrpFmt(n, d == null ? 1 : d);
+    const rows = [], dead = [];
+    for (const b of _mrpBoms) {
+      let per = 0;
+      for (const l of (_mrpLinesByCode.get(b.code) || [])) if (_mrpNorm(l.ingredient) === norm) per += _mrpLbsPerCase(l, b);
+      if (per <= 0) continue;
+      const cases = weeks.map(w => _mrpCasesFor(b.code, w));
+      const tot = cases.reduce((x, y) => x + y, 0);
+      const mapped = !!(_mrpSkuMap.get(b.code) && _mrpSkuMap.get(b.code).product_id);
+      if (tot <= 0) { dead.push({ code: b.code, name: b.name, mapped }); continue; }
+      rows.push({ code: b.code, name: b.name, per, cases, tot, avg: tot / nW, qty: (tot / nW) * per, mapped });
+    }
+    rows.sort((a, b) => b.qty - a.qty);
+    const weekly = rows.reduce((sx, r) => sx + r.qty, 0);
+    const colTot = weeks.map((w, wi) => rows.reduce((sx, r) => sx + r.cases[wi] * r.per, 0));
+    const caseTot = weeks.map((w, wi) => rows.reduce((sx, r) => sx + r.cases[wi], 0));
+    const srcOf = weeks.map(w => _mrpCaseSource(w));
+    const nPlan = srcOf.filter(x => x !== 'forecast').length;
+
+    const th = (txt, align, extra) => `<th style="padding:6px 8px;text-align:${align || 'right'};font-family:var(--mono);font-size:9px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;${extra || ''}">${txt}</th>`;
+    const wkHead = weeks.map((w, wi) => {
+      const plan = srcOf[wi] !== 'forecast';
+      const edge = (wi > 0 && !plan && srcOf[wi - 1] !== 'forecast') ? 'border-left:2px solid var(--ink-3);' : '';
+      const tag = plan
+        ? `<div style="font-size:8px;color:#3d7a4e;font-weight:700;">${srcOf[wi] === 'plan' ? 'PLAN' : 'SEED'}</div>`
+        : '<div style="font-size:8px;color:var(--ink-3);opacity:0.7;">FCST</div>';
+      return th(_mrpWeekLabel(w) + tag, 'right', edge + (plan ? 'background:rgba(61,122,78,0.06);' : ''));
+    }).join('');
+
+    const cellsFor = (arr, dp) => arr.map((v, wi) => {
+      const plan = srcOf[wi] !== 'forecast';
+      const edge = (wi > 0 && !plan && srcOf[wi - 1] !== 'forecast') ? 'border-left:2px solid var(--ink-3);' : '';
+      return `<td style="padding:5px 8px;text-align:right;font-family:var(--mono);font-size:11px;${edge}${v ? '' : 'color:var(--ink-3);opacity:0.45;'}">${v ? _mrpFmt(v, dp) : '·'}</td>`;
+    }).join('');
+
+    const bodyRows = rows.map(r => `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:5px 10px;font-family:var(--mono);font-size:11px;white-space:nowrap;">${_mrpEsc(r.code)}${r.mapped ? '' : ' <span title="No product mapped in the SKU map — these cases come from forecast only, never from the production schedule" style="color:#b8860b;">⚑</span>'}</td>
+        <td style="padding:5px 10px;font-family:var(--serif);font-size:12px;">${_mrpEsc(r.name || '')}</td>
+        ${cellsFor(r.cases, 0)}
+        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;border-left:1px solid var(--rule-soft);">${f(r.avg, 0)}</td>
+        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_mrpFmt(r.per, 4)}</td>
+        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;">${f(r.qty)}</td>
+      </tr>`).join('') || `<tr><td colspan="${weeks.length + 5}" style="padding:14px;text-align:center;color:var(--ink-3);font-family:var(--serif);font-style:italic;">No cases in any week for the recipes that use this ingredient.</td></tr>`;
+
+    const deadNote = dead.length ? `<div style="margin-top:14px;padding:10px 12px;border:1px solid #e0d3b8;background:#faf0d7;border-radius:6px;font-family:var(--mono);font-size:10px;line-height:1.7;">
+        <b>${dead.length} recipe${dead.length > 1 ? 's' : ''} use this ingredient but drew ZERO cases</b> across all ${nW} weeks — contributing nothing to the demand above:<br>
+        ${dead.map(d => _mrpEsc(d.code) + (d.mapped ? ' <span style="color:var(--ink-3);">(mapped — no schedule or forecast volume)</span>' : ' <span style="color:#b8860b;">(⚑ not mapped in SKU map)</span>')).join('<br>')}
+      </div>` : '';
+
+    const html = `<div id="hl-mrp-cell-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:1180px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+        <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:20px;">${_mrpEsc(i.ingredient)} — weekly demand audit</div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px;">cases per SKU per week · ${nW} weeks (${nPlan} from the production plan, ${nW - nPlan} forecast)</div>
+          </div>
+          <button data-mrpcellclose style="background:transparent;border:none;font-size:22px;line-height:1;cursor:pointer;color:var(--ink-3);">×</button>
+        </div>
+        <div style="padding:18px 22px;">
+          <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:16px;align-items:flex-end;">
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Total cases · ${nW} wks</div><div style="font-family:var(--mono);font-size:18px;">${f(caseTot.reduce((a, b) => a + b, 0), 0)}</div></div>
+            <div style="align-self:center;font-size:18px;color:var(--ink-3);">÷ ${nW} =</div>
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Avg cases / wk</div><div style="font-family:var(--mono);font-size:18px;">${f(caseTot.reduce((a, b) => a + b, 0) / nW, 0)}</div></div>
+            <div style="align-self:center;font-size:18px;color:var(--ink-3);">→</div>
+            <div><div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;">Weekly demand</div><div style="font-family:var(--mono);font-size:18px;">${f(weekly)} <span style="font-size:11px;color:var(--ink-3);">${_mrpEsc(uom)}/wk</span></div></div>
+          </div>
+          <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
+            <thead><tr style="background:#efe9dd;">${th('SKU', 'left')}${th('Recipe', 'left')}${wkHead}${th('Avg cases', 'right', 'border-left:1px solid var(--rule-soft);')}${th(uom + '/case', 'right')}${th('Avg wkly ' + uom, 'right')}</tr></thead>
+            <tbody>${bodyRows}</tbody>
+            <tfoot>
+              <tr style="border-top:2px solid var(--ink);"><td colspan="2" style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">Cases / wk</td>${cellsFor(caseTot, 0)}<td colspan="3"></td></tr>
+              <tr><td colspan="2" style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${_mrpEsc(uom)} / wk</td>${cellsFor(colTot, 1)}<td colspan="2" style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">Weekly demand</td><td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">${f(weekly)}</td></tr>
+            </tfoot>
+          </table></div>
+          ${deadNote}
+          <div style="margin-top:14px;font-family:var(--serif);font-size:12px;color:var(--ink-3);font-style:italic;line-height:1.5;">PLAN weeks read cases straight from the Weekly production schedule; FCST weeks come from the forecast scenario. The Wkly demand column on the grid is the average of the ${_mrpEsc(uom)}/wk row above, so a week with no scheduled production pulls that average down.</div>
+        </div>
+      </div></div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const modal = document.getElementById('hl-mrp-cell-modal');
+    if (modal) {
+      modal.addEventListener('click', (ev) => { if (ev.target === modal || ev.target.closest('[data-mrpcellclose]')) _mrpCloseCell(); });
+      const onKey = (ev) => { if (ev.key === 'Escape') { _mrpCloseCell(); document.removeEventListener('keydown', onKey); } };
+      document.addEventListener('keydown', onKey);
+    }
+  }
   function _mrpShowIngCalc(norm, type) {
     const i = _mrpIngs.find(x => _mrpNorm(x.ingredient) === norm);
     if (!i) return;
+    if (type === 'demand') { _mrpShowDemandAudit(i, norm); return; }
     const weeks = _mrpGridWeeks();
     const nW = weeks.length || 1;
     // avg weekly contribution per SKU for this ingredient
@@ -46185,11 +46289,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   }
   function _mrpPlanWeeks() {
     // How many weeks of the grid are driven by the Weekly production schedule before forecast
-    // takes over. Matches Production's Suggest-8-weeks horizon by default.
+    // takes over. Default 4 — the plant's firm window; forecast covers the rest of the grid.
     const n = Number(_mrpSettings && _mrpSettings.plan_weeks_from_prod);
-    return (n && n > 0) ? n : 8;
+    return (n && n > 0) ? n : 4;
   }
+  let _mrpSchedHzCache = null;   // cleared on every _mrpLoad and on schedule/mapping change
   function _mrpSchedHorizon() {
+    if (_mrpSchedHzCache) return _mrpSchedHzCache;
     // The next N Mondays (incl. the current week) that have scheduled production, keyed by BOM code.
     // N = plan_weeks_from_prod (default 8) — the firm-plan window; forecast covers everything after.
     const codeByProduct = new Map();
@@ -46206,19 +46312,16 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       const cm = out.get(r.week_start);
       cm.set(code, (cm.get(code) || 0) + (Number(r.cases) || 0));
     }
+    _mrpSchedHzCache = out;
     return out;
   }
   function _mrpComputeGrid() {
     const weeks = _mrpGridWeeks();
-    const prodWeeks = new Set(_mrpDemand.filter(d => d.source === 'prod').map(d => d.week_start));
-    const prodMap = new Map();
-    for (const d of _mrpDemand) if (d.source === 'prod') prodMap.set(d.sku_code + '|' + d.week_start, Number(d.cases) || 0);
     // FIRM-PLAN HORIZON: the first plan_weeks_from_prod weeks of demand (default 8, rolling from
     // this Monday) come from the Weekly production schedule — what the plant will ACTUALLY run,
     // exploded through the BOM. Forecast covers everything after. A horizon week with NO schedule
     // rows at all falls back to forecast, so an unplanned week never zeroes out demand.
-    const schedByWk = _mrpSchedHorizon();
-    const casesFor = (sku, date) => schedByWk.has(date) ? (schedByWk.get(date).get(sku) || 0) : (prodWeeks.has(date) ? (prodMap.get(sku + '|' + date) || 0) : _mrpForecastCases(sku, date));
+    const casesFor = (sku, date) => _mrpCasesFor(sku, date);   // shared with the Ingredients tab
     const skuIng = _mrpSkuIngLbs();
     const demand = new Map();
     for (const [sku, im] of skuIng) {
@@ -46314,7 +46417,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const fcSel = `<select id="hl-mrp-scenario" style="font-family:var(--serif);font-size:13px;padding:6px 9px;border:1px solid var(--rule-soft);border-radius:4px;max-width:280px;">${opts || '<option>No scenarios</option>'}</select>`;
     const mapBtn = `<button id="hl-mrp-mapbtn" style="background:${unmapped?'rgba(184,134,11,0.12)':'transparent'};border:1px solid ${unmapped?'#b8860b':'var(--rule-soft)'};font-family:var(--mono);font-size:11px;letter-spacing:0.03em;padding:6px 11px;cursor:pointer;border-radius:4px;color:${unmapped?'#8a6410':'var(--ink-3)'};">${unmapped?'⚠ ':''}${mapped}/${_mrpBoms.length} mapped</button>`;
     const startInp = `<input type="date" id="hl-mrp-grid-start" value="${_mrpGridStart || ''}" style="font-family:var(--mono);font-size:12px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;" />`;
-    const wksSel = `<select id="hl-mrp-grid-horizon" style="font-family:var(--mono);font-size:12px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;">${[13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}</select>`;
+    const wksSel = `<select id="hl-mrp-grid-horizon" style="font-family:var(--mono);font-size:12px;padding:6px 8px;border:1px solid var(--rule-soft);border-radius:4px;">${[12,13,26,39,52].map(n=>`<option value="${n}" ${n===_mrpGridHorizon?'selected':''}>${n}</option>`).join('')}</select>`;
     return `<div style="display:flex;flex-wrap:wrap;align-items:flex-end;gap:20px;padding-bottom:14px;border-bottom:1px solid var(--rule-soft);">${field('Select forecast', fcSel)}${field('SKU mapping', mapBtn)}${field('Planning start date', startInp)}${field('Display wks', wksSel)}</div>`;
   }
   function _mrpMapEditorHtml() {
