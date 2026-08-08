@@ -45379,7 +45379,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
   const _mrpNorm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   let _mrpLoaded = false, _mrpLoading = false, _mrpErr = null;
   let _mrpSubTab = (() => { try { const s = localStorage.getItem('keel_mrp_subtab'); return (s === 'ingredients' || s === 'planning' || s === 'recipes' || s === 'vendors' || s === 'costs') ? s : 'planning'; } catch (e) { return 'planning'; } })();            // 'planning' | 'recipes' | 'ingredients' | 'vendors'
-  let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 4 };
+  let _mrpSettings = { g_to_lb: 0.00220462, target_months: 2, plan_weeks_from_prod: 8 };
   let _mrpBoms = [], _mrpLines = [], _mrpIngs = [], _mrpSuppliers = [], _mrpDemand = [], _mrpProdSchedRows = [];
   let _mrpOrders = [], _mrpOrdersByIng = new Map(), _mrpShowPending = false, _mrpStatusFilter = 'all', _mrpVendors = [];
   let _mrpGridUnit = 'units';             // 'units' | 'dollars'
@@ -45724,7 +45724,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const rightCols = new Set([2,3,4,5,6,7,8,9,10,11,12,20]);   // original numerics + Avg cost
     const colsToggle = `<button data-mrpcolstoggle="1" title="${_mrpIngColsExpanded ? 'Hide the additional supplier/cost columns' : 'Show supplier terms, costs and notes as columns'}" style="margin-left:8px;font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);font-weight:600;cursor:pointer;text-transform:uppercase;white-space:nowrap;">${_mrpIngColsExpanded ? '&minus; Additional info' : '+ Additional info'}</button>`;
     const _shWks = (typeof _mrpSchedHorizon === 'function') ? [..._mrpSchedHorizon().keys()].sort() : [];
-    const _shNote = _shWks.length ? ' · wk' + (_shWks.length > 1 ? 's' : '') + ' ' + _shWks[0].slice(5) + (_shWks.length > 1 ? '–' + _shWks[_shWks.length - 1].slice(5) : '') + ' from Weekly schedule' : '';
+    const _shNote = _shWks.length
+      ? ' · first ' + _shWks.length + ' wk' + (_shWks.length > 1 ? 's' : '') + ' (' + _shWks[0].slice(5) + (_shWks.length > 1 ? '–' + _shWks[_shWks.length - 1].slice(5) : '') + ') from the Weekly production schedule, forecast after'
+      : ' · no production scheduled in the next ' + _mrpPlanWeeks() + ' wks — all forecast';
     const srcLabel = (_mrpDemandSource === 'forecast' ? (_mrpFc ? 'forecast "' + _mrpEsc(_mrpFc.scenarioName) + '"' : 'forecast (computing…)') : 'seeded plan') + _shNote;
     return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
         ${filtersHtml}
@@ -46181,13 +46183,21 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     for (let i = 0; i < _mrpGridHorizon; i++) { out.push(d.toISOString().slice(0,10)); d = new Date(d.getTime() + 7*864e5); }
     return out;
   }
+  function _mrpPlanWeeks() {
+    // How many weeks of the grid are driven by the Weekly production schedule before forecast
+    // takes over. Matches Production's Suggest-8-weeks horizon by default.
+    const n = Number(_mrpSettings && _mrpSettings.plan_weeks_from_prod);
+    return (n && n > 0) ? n : 8;
+  }
   function _mrpSchedHorizon() {
-    // next 4 Mondays (incl. the current week) with scheduled production, keyed by BOM code
+    // The next N Mondays (incl. the current week) that have scheduled production, keyed by BOM code.
+    // N = plan_weeks_from_prod (default 8) — the firm-plan window; forecast covers everything after.
     const codeByProduct = new Map();
     for (const [code, m] of _mrpSkuMap) if (m.product_id) codeByProduct.set(m.product_id, code);
     let d = new Date(); d.setHours(0, 0, 0, 0);
     while (d.getDay() !== 1) d = new Date(d.getTime() - 864e5);
-    const horizon = []; for (let i = 0; i < 4; i++) horizon.push(new Date(d.getTime() + i * 7 * 864e5).toISOString().slice(0, 10));
+    const nWk = _mrpPlanWeeks();
+    const horizon = []; for (let i = 0; i < nWk; i++) horizon.push(new Date(d.getTime() + i * 7 * 864e5).toISOString().slice(0, 10));
     const out = new Map();
     for (const r of (_mrpProdSchedRows || [])) {
       if (!horizon.includes(r.week_start)) continue;
@@ -46203,9 +46213,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const prodWeeks = new Set(_mrpDemand.filter(d => d.source === 'prod').map(d => d.week_start));
     const prodMap = new Map();
     for (const d of _mrpDemand) if (d.source === 'prod') prodMap.set(d.sku_code + '|' + d.week_start, Number(d.cases) || 0);
-    // FIRM-PLAN HORIZON: the next 4 weeks of demand come from the Weekly production schedule
-    // (rolling from this Monday); forecast covers everything after. A horizon week with NO
-    // schedule rows at all falls back to forecast, so an unplanned week never zeroes demand.
+    // FIRM-PLAN HORIZON: the first plan_weeks_from_prod weeks of demand (default 8, rolling from
+    // this Monday) come from the Weekly production schedule — what the plant will ACTUALLY run,
+    // exploded through the BOM. Forecast covers everything after. A horizon week with NO schedule
+    // rows at all falls back to forecast, so an unplanned week never zeroes out demand.
     const schedByWk = _mrpSchedHorizon();
     const casesFor = (sku, date) => schedByWk.has(date) ? (schedByWk.get(date).get(sku) || 0) : (prodWeeks.has(date) ? (prodMap.get(sku + '|' + date) || 0) : _mrpForecastCases(sku, date));
     const skuIng = _mrpSkuIngLbs();
@@ -46366,7 +46377,22 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       || String(a.ing).localeCompare(String(b.ing)));
     const cellVal = (r, v) => dollars ? (r.avgCost ? '$' + _mrpFmt(v * r.avgCost, 0) : '—') : _mrpFmt(v, 0);
     const counts = { stockout: allRows.filter(r => r.firstStockout >= 0).length, reorder: allRows.filter(r => r.firstStockout < 0 && r.firstBreach >= 0).length, ok: allRows.filter(r => r.firstStockout < 0 && r.firstBreach < 0).length };
-    const headWeeks = weeks.map(w => `<th style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${_mrpWeekLabel(w)}</th>`).join('');
+    // Which grid columns are firm plan (driven by the Weekly production schedule) vs forecast.
+    // A horizon week with no schedule rows falls back to forecast, so it reads FCST here too.
+    const _planWkSet = new Set(_mrpSchedHorizon().keys());
+    const _isPlanWk = (w) => _planWkSet.has(w);
+    const _isFirstFcWk = (w, wi) => wi > 0 && !_planWkSet.has(w) && _planWkSet.has(weeks[wi - 1]);
+    const headWeeks = weeks.map((w, wi) => {
+      const plan = _isPlanWk(w);
+      const edge = _isFirstFcWk(w, wi) ? 'border-left:2px solid var(--ink-3);' : '';
+      const tag = plan
+        ? '<div style="font-size:8px;letter-spacing:0.08em;color:#3d7a4e;font-weight:700;">PLAN</div>'
+        : '<div style="font-size:8px;letter-spacing:0.08em;color:var(--ink-3);opacity:0.7;">FCST</div>';
+      const tip = plan
+        ? 'Demand for this week is exploded from the Weekly production schedule — what the plant is actually set to run.'
+        : 'Demand for this week comes from the forecast (beyond the firm-plan horizon, or no production scheduled that week).';
+      return `<th title="${tip}" style="padding:7px 8px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;${edge}${plan ? 'background:rgba(61,122,78,0.06);' : ''}">${_mrpWeekLabel(w)}${tag}</th>`;
+    }).join('');
     const body = rows.map(r => {
       const status = r.firstStockout >= 0
         ? `<span style="background:#a8381f;color:#fff;font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;text-transform:uppercase;">Stockout</span>`
@@ -46385,7 +46411,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const col = neg ? 'color:#a8381f;font-weight:600;' : '';
         const recMark = hasReceipt ? 'box-shadow:inset 0 3px 0 #3d7a4e;' : '';
         const recTitle = hasReceipt ? ` title="+${_mrpFmt(r.receipts[w],0)} ${_mrpEsc(r.uom||'')} on-order arrives"` : '';
-        return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}"${recTitle} style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${bg}${col}${recMark}">${cellVal(r, v)}</td>`;
+        const edge = _isFirstFcWk(weeks[w], w) ? 'border-left:2px solid var(--ink-3);' : '';
+        return `<td data-celling="${_mrpEsc(_mrpNorm(r.ing))}" data-cellweek="${w}"${recTitle} style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;cursor:pointer;${edge}${bg}${col}${recMark}">${cellVal(r, v)}</td>`;
       }).join('');
       const rec = _mrpRecOrder(r);
       const _pend = _mrpOrdersByIng.get(_mrpNorm(r.ing)) || [];
