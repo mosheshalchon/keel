@@ -40164,7 +40164,7 @@ render();
     { key: 'brand',     label: 'Brand'    },
     { key: 'item_desc', label: 'Item'     },
   ];
-  let _wfState = { sel: { region: [], category: [], brand: [], item_desc: [] }, search: { region: '', category: '', brand: '', item_desc: '' }, limit: 500 };
+  let _wfState = { sel: { region: [], category: [], brand: [], item_desc: [] }, search: { region: '', category: '', brand: '', item_desc: '' }, period: 12, grain: 'week', offset: 0, limit: 25 };
 
   function clearWfmCache() { try { window.KeelCache.invalidate(/^wfmSales:/); } catch (e) {} }
   window.clearWfmCache = clearWfmCache;
@@ -40327,13 +40327,15 @@ render();
     const maxWk = all.reduce((m, r) => (r.week_end > m ? r.week_end : m), '');
     const cutoff = new Date(new Date(maxWk + 'T00:00:00Z').getTime() - 51 * 7 * 864e5).toISOString().slice(0, 10);
     const rows52 = all.filter(r => r.week_end >= cutoff);
-    const weekCount = new Set(rows52.map(r => r.week_end)).size;
+    // ROLLING WINDOW: 4 / 12 / 24 / 52 weeks back from the newest week in the data.
+    const winStart = () => new Date(new Date(maxWk + 'T00:00:00Z').getTime() - (_wfState.period - 1) * 7 * 864e5).toISOString().slice(0, 10);
+    const windowRows = () => rows52.filter(r => r.week_end >= winStart());
 
     // filter option lists come from the 52-week window, each narrowed by the OTHER
     // filters so you can't tick a combination that yields nothing
     const optsFor = (dim) => {
       const others = _WFM_DIMS.filter(d => d.key !== dim.key);
-      const pool = rows52.filter(r => others.every(o => !_wfState.sel[o.key].length || _wfState.sel[o.key].includes(r[o.key])));
+      const pool = windowRows().filter(r => others.every(o => !_wfState.sel[o.key].length || _wfState.sel[o.key].includes(r[o.key])));
       return [...new Set(pool.map(r => r[dim.key]).filter(v => v != null))].sort((a, b) => String(a).localeCompare(String(b)));
     };
     const matches = (r) => _WFM_DIMS.every(d => !_wfState.sel[d.key].length || _wfState.sel[d.key].includes(r[d.key]));
@@ -40362,15 +40364,30 @@ render();
 
     host.innerHTML = `
       <div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:4px;">Whole Foods &middot; Weekly sales</div>
-      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:12px;">Trailing 52 weeks · ${weekCount} weeks through ${maxWk}</div>
+      <div id="hl-wf-sub" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:12px;"></div>
+      <div style="display:flex;gap:22px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px;">
+        <div>
+          <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px;">Time period (rolling window)</div>
+          <div style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:6px;overflow:hidden;background:var(--paper);">
+            ${[4, 12, 24, 52].map(n => `<button type="button" data-wfper="${n}" style="padding:6px 14px;font-family:var(--mono);font-size:11px;border:none;cursor:pointer;background:transparent;color:var(--ink-3);">${String(n).padStart(2, '0')}W</button>`).join('')}
+          </div>
+        </div>
+        <div>
+          <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px;">View</div>
+          <div style="display:inline-flex;border:1px solid var(--rule-soft);border-radius:6px;overflow:hidden;background:var(--paper);">
+            <button type="button" data-wfgrain="week"  style="padding:6px 14px;font-family:var(--mono);font-size:11px;border:none;cursor:pointer;background:transparent;color:var(--ink-3);">By week</button>
+            <button type="button" data-wfgrain="total" style="padding:6px 14px;font-family:var(--mono);font-size:11px;border:none;cursor:pointer;background:transparent;color:var(--ink-3);">Period total</button>
+          </div>
+        </div>
+      </div>
       <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
         ${_WFM_DIMS.map(msHtml).join('')}
         <button type="button" id="hl-wf-reset" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;text-decoration:underline;">Reset filters</button>
         <span id="hl-wf-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
       </div>
       <div id="hl-wf-grid" style="overflow-x:auto;"></div>
-      <div id="hl-wf-more" style="text-align:center;margin-top:10px;"></div>
-      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.6;">One row per week × region × item, newest first. YOY percentages are recomputed from the totals in view rather than averaged, so they stay correct when several rows are combined. Avg net retail price is unit-weighted.</p>
+      <div id="hl-wf-more" style="display:flex;gap:10px;justify-content:center;margin-top:14px;"></div>
+      <p id="hl-wf-note" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.6;"></p>
     `;
 
     const COLS = [
@@ -40405,7 +40422,7 @@ render();
         const v = cb.dataset.wfmval;
         if (cb.checked) { if (!_wfState.sel[d.key].includes(v)) _wfState.sel[d.key].push(v); }
         else _wfState.sel[d.key] = _wfState.sel[d.key].filter(x => x !== v);
-        _wfState.limit = 500;
+        _wfState.offset = 0;
         update();
       }));
       box._opts = opts; box._vis = vis;
@@ -40417,14 +40434,61 @@ render();
         host.querySelector(`[data-wfmsum="${d.key}"]`).textContent =
           n === 0 ? 'All ' + d.label.toLowerCase() + 's' : n === 1 ? _wfState.sel[d.key][0] : n + ' selected';
       }
-      const shown = rows52.filter(matches).sort((a, b) =>
-        (a.week_end < b.week_end ? 1 : a.week_end > b.week_end ? -1 : 0) ||
-        String(a.region).localeCompare(String(b.region)) ||
-        String(a.item_desc).localeCompare(String(b.item_desc)));
-      host.querySelector('#hl-wf-count').textContent =
-        `${shown.length.toLocaleString()} of ${rows52.length.toLocaleString()} rows`;
+      host.querySelectorAll('[data-wfper]').forEach(b => {
+        const on = Number(b.dataset.wfper) === _wfState.period;
+        b.style.background = on ? 'var(--ink)' : 'transparent';
+        b.style.color = on ? 'var(--paper)' : 'var(--ink-3)';
+        b.style.fontWeight = on ? '700' : '400';
+      });
+      host.querySelectorAll('[data-wfgrain]').forEach(b => {
+        const on = b.dataset.wfgrain === _wfState.grain;
+        b.style.background = on ? 'var(--ink)' : 'transparent';
+        b.style.color = on ? 'var(--paper)' : 'var(--ink-3)';
+        b.style.fontWeight = on ? '700' : '400';
+      });
 
-      const sum = (k) => shown.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+      const inWindow = windowRows();
+      const nWk = new Set(inWindow.map(r => r.week_end)).size;
+      host.querySelector('#hl-wf-sub').textContent =
+        `Last ${_wfState.period} weeks · ${nWk} week${nWk === 1 ? '' : 's'} ${winStart()} → ${maxWk} · 52 weeks of history on file`;
+
+      const base = inWindow.filter(matches);
+      // PERIOD TOTAL collapses the week dimension: one row per region × item across the window.
+      // Dollars and units sum; store count is AVERAGED over the weeks that item sold (summing
+      // store counts across weeks would multiply the fleet by the number of weeks).
+      let shown;
+      if (_wfState.grain === 'total') {
+        const g = new Map();
+        for (const r of base) {
+          const k = r.region + '|' + r.scan_code;
+          let o = g.get(k);
+          if (!o) {
+            o = { week_end: `${_wfState.period} wks → ${maxWk}`, region: r.region, brand: r.brand, category: r.category,
+                  scan_code: r.scan_code, item_desc: r.item_desc,
+                  net_sales: 0, net_sales_ly: 0, unit_sales: 0, unit_sales_ly: 0,
+                  _sc: 0, _scn: 0, _scl: 0, _scln: 0 };
+            g.set(k, o);
+          }
+          o.net_sales += Number(r.net_sales) || 0;
+          o.net_sales_ly += Number(r.net_sales_ly) || 0;
+          o.unit_sales += Number(r.unit_sales) || 0;
+          o.unit_sales_ly += Number(r.unit_sales_ly) || 0;
+          if (r.store_count != null) { o._sc += Number(r.store_count); o._scn++; }
+          if (r.store_count_ly != null) { o._scl += Number(r.store_count_ly); o._scln++; }
+        }
+        shown = [...g.values()].map(o => Object.assign(o, {
+          store_count: o._scn ? o._sc / o._scn : null,
+          store_count_ly: o._scln ? o._scl / o._scln : null,
+          avg_retail_price: o.unit_sales > 0 ? o.net_sales / o.unit_sales : null,
+        })).sort((a, b) => (b.net_sales || 0) - (a.net_sales || 0));
+      } else {
+        shown = base.slice().sort((a, b) =>
+          (a.week_end < b.week_end ? 1 : a.week_end > b.week_end ? -1 : 0) ||
+          String(a.region).localeCompare(String(b.region)) ||
+          String(a.item_desc).localeCompare(String(b.item_desc)));
+      }
+
+      const sum = (k) => shown.reduce((s2, r) => s2 + (Number(r[k]) || 0), 0);
       const tSales = sum('net_sales'), tSalesLy = sum('net_sales_ly');
       const tUnits = sum('unit_sales'), tUnitsLy = sum('unit_sales_ly');
       const tot = {
@@ -40434,8 +40498,13 @@ render();
         avg_retail_price: tUnits > 0 ? tSales / tUnits : null,
       };
 
-      const head = COLS.map(c => `<th style="padding:8px 10px;text-align:${c.align || 'right'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);">${c.label}</th>`).join('');
-      const slice = shown.slice(0, _wfState.limit);
+      // Only the visible page is turned into HTML — the totals above are computed over
+      // every matching row, so the footer never changes as you page.
+      const slice = shown.slice(0, _wfState.offset + _wfState.limit);
+      host.querySelector('#hl-wf-count').textContent =
+        `${shown.length.toLocaleString()} row${shown.length === 1 ? '' : 's'}`;
+
+      const head = COLS.map(c => `<th style="padding:8px 10px;text-align:${c.align || 'right'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);">${c.key === 'week_end' && _wfState.grain === 'total' ? 'Period' : c.label}</th>`).join('');
       const body = slice.map(r => {
         const v = Object.assign({}, r, {
           pct_sales: _wfmPct(Number(r.net_sales) || 0, r.net_sales_ly),
@@ -40450,25 +40519,34 @@ render();
         return `<tr style="border-bottom:1px solid var(--rule-soft);">${tds}</tr>`;
       }).join('') || `<tr><td colspan="${COLS.length}" style="padding:24px;text-align:center;font-family:var(--serif);font-style:italic;color:var(--ink-3);">No rows match these filters.</td></tr>`;
 
-      const totTds = COLS.map((c, ci) => {
-        if (ci === 0) return `<td style="padding:8px 10px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;">Total</td>`;
-        if (!c.fmt) return '<td></td>';
-        return `<td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;white-space:nowrap;">${_wfmFmt(tot[c.key], c.fmt)}</td>`;
-      }).join('');
+      const nText = COLS.filter(c => !c.fmt).length;
+      const totTds = `<td colspan="${nText}" style="padding:8px 10px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Total &middot; ${shown.length.toLocaleString()} rows</td>` +
+        COLS.filter(c => c.fmt).map(c => {
+          const raw = tot[c.key];
+          const colr = c.fmt === 'pct' && raw != null ? (raw < 0 ? 'color:var(--lost,#a8381f);' : raw > 0 ? 'color:#3d7a4e;' : '') : '';
+          return `<td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;white-space:nowrap;${colr}">${_wfmFmt(raw, c.fmt)}</td>`;
+        }).join('');
 
       host.querySelector('#hl-wf-grid').innerHTML = `
-        <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+        <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;font-variant-numeric:tabular-nums;">
           <thead><tr>${head}</tr></thead>
           <tbody>${body}</tbody>
-          <tfoot><tr style="border-top:2px solid var(--ink);">${totTds}</tr></tfoot>
+          <tfoot><tr style="border-top:2px solid var(--ink);background:rgba(0,0,0,0.02);">${totTds}</tr></tfoot>
         </table>`;
 
       const more = host.querySelector('#hl-wf-more');
       more.innerHTML = shown.length > slice.length
-        ? `<button type="button" id="hl-wf-showall" style="font-family:var(--mono);font-size:11px;padding:6px 14px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;">Showing ${slice.length.toLocaleString()} of ${shown.length.toLocaleString()} — show all</button>`
+        ? `<button type="button" id="hl-wf-more25" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">Load 25 more</button>
+           <button type="button" id="hl-wf-moreall" class="hl-btn-primary" style="background:transparent;color:var(--ink-3);border:1px solid var(--rule-soft);">Show all ${shown.length.toLocaleString()}</button>`
         : '';
-      const sa = host.querySelector('#hl-wf-showall');
-      if (sa) sa.addEventListener('click', () => { _wfState.limit = 1e9; update(); });
+      const b25 = host.querySelector('#hl-wf-more25');
+      if (b25) b25.addEventListener('click', () => { _wfState.offset += _wfState.limit; update(); });
+      const ball = host.querySelector('#hl-wf-moreall');
+      if (ball) ball.addEventListener('click', () => { _wfState.offset = shown.length; update(); });
+
+      host.querySelector('#hl-wf-note').textContent = _wfState.grain === 'total'
+        ? `One row per region × item, totalled over the window and ranked by net sales. Store counts are averaged across the weeks in the period — summing them would multiply the store fleet by the number of weeks. YOY and avg retail are recomputed from the totals, never averaged.`
+        : `One row per week × region × item, newest first. Showing ${slice.length.toLocaleString()} of ${shown.length.toLocaleString()} — the Total line covers every matching row, not just the page. YOY percentages are recomputed from the totals rather than averaged; avg retail is unit-weighted.`;
     };
 
     // ─── filter wiring ───
@@ -40487,22 +40565,30 @@ render();
       panel.addEventListener('click', (e) => e.stopPropagation());
       search.addEventListener('input', () => { _wfState.search[d.key] = search.value; renderOptions(d); });
       host.querySelector(`[data-wfmall="${d.key}"]`).addEventListener('click', () => {
-        _wfState.sel[d.key] = optsFor(d).map(String); _wfState.limit = 500; renderOptions(d); update();
+        _wfState.sel[d.key] = optsFor(d).map(String); _wfState.offset = 0; renderOptions(d); update();
       });
       host.querySelector(`[data-wfmvis="${d.key}"]`).addEventListener('click', () => {
         const box = host.querySelector(`[data-wfmopts="${d.key}"]`);
         for (const o of (box._vis || [])) if (!_wfState.sel[d.key].includes(String(o))) _wfState.sel[d.key].push(String(o));
-        _wfState.limit = 500; renderOptions(d); update();
+        _wfState.offset = 0; renderOptions(d); update();
       });
       host.querySelector(`[data-wfmnone="${d.key}"]`).addEventListener('click', () => {
-        _wfState.sel[d.key] = []; _wfState.limit = 500; renderOptions(d); update();
+        _wfState.sel[d.key] = []; _wfState.offset = 0; renderOptions(d); update();
       });
       renderOptions(d);
     }
+    host.querySelectorAll('[data-wfper]').forEach(btn => btn.addEventListener('click', () => {
+      _wfState.period = Number(btn.dataset.wfper); _wfState.offset = 0;
+      for (const d of _WFM_DIMS) renderOptions(d);   // option lists follow the window
+      update();
+    }));
+    host.querySelectorAll('[data-wfgrain]').forEach(btn => btn.addEventListener('click', () => {
+      _wfState.grain = btn.dataset.wfgrain; _wfState.offset = 0; update();
+    }));
     document.addEventListener('click', () => { host.querySelectorAll('[data-wfmpanel]').forEach(p => { p.style.display = 'none'; }); });
     host.querySelector('#hl-wf-reset').addEventListener('click', () => {
       for (const d of _WFM_DIMS) { _wfState.sel[d.key] = []; _wfState.search[d.key] = ''; }
-      _wfState.limit = 500;
+      _wfState.offset = 0;
       renderWfmView(brandId, sb);
     });
 
