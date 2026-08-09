@@ -40164,7 +40164,10 @@ render();
     { key: 'brand',     label: 'Brand'    },
     { key: 'item_desc', label: 'Item'     },
   ];
-  let _wfState = { sel: { region: [], category: [], brand: [], item_desc: [] }, search: { region: '', category: '', brand: '', item_desc: '' }, period: 12, grain: 'week', offset: 0, limit: 25 };
+  let _wfState = { sel: { region: [], category: [], brand: [], item_desc: [] }, search: { region: '', category: '', brand: '', item_desc: '' }, period: 12, grain: 'week', offset: 0, limit: 25, atgOnly: true };
+  // The WFM export carries every HumanCo brand it sells; this tab is an ATG tool, so
+  // non-ATG rows (Snow Days) are stored but scoped out by default — reversible in one click.
+  const _wfmIsAtg = (b) => /against\s*the\s*grain/i.test(String(b || ''));
 
   function clearWfmCache() { try { window.KeelCache.invalidate(/^wfmSales:/); } catch (e) {} }
   window.clearWfmCache = clearWfmCache;
@@ -40436,7 +40439,9 @@ render();
     const rows52 = all.filter(r => r.week_end >= cutoff);
     // ROLLING WINDOW: 4 / 12 / 24 / 52 weeks back from the newest week in the data.
     const winStart = () => new Date(new Date(maxWk + 'T00:00:00Z').getTime() - (_wfState.period - 1) * 7 * 864e5).toISOString().slice(0, 10);
-    const windowRows = () => rows52.filter(r => r.week_end >= winStart());
+    const otherBrands = [...new Set(rows52.filter(r => !_wfmIsAtg(r.brand)).map(r => r.brand).filter(Boolean))].sort();
+    const scoped = _wfState.atgOnly ? rows52.filter(r => _wfmIsAtg(r.brand)) : rows52;
+    const windowRows = () => scoped.filter(r => r.week_end >= winStart());
 
     // filter option lists come from the 52-week window, each narrowed by the OTHER
     // filters so you can't tick a combination that yields nothing
@@ -40471,7 +40476,13 @@ render();
 
     host.innerHTML = `
       <div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:4px;">Whole Foods &middot; Weekly sales</div>
-      <div id="hl-wf-sub" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:12px;"></div>
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px;">
+        <span id="hl-wf-sub" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
+        ${otherBrands.length ? `<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">·
+          ${_wfState.atgOnly ? `Against the Grain only (${escapeHtml(otherBrands.join(', '))} excluded)` : 'all brands, including ' + escapeHtml(otherBrands.join(', '))}
+          <button type="button" id="hl-wf-scope" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;text-decoration:underline;">${_wfState.atgOnly ? 'include them' : 'ATG only'}</button>
+        </span>` : ''}
+      </div>
       <div style="display:flex;gap:22px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px;">
         <div>
           <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px;">Time period (rolling window)</div>
@@ -40487,13 +40498,14 @@ render();
           </div>
         </div>
       </div>
+      <div id="hl-wf-hist" style="margin-bottom:14px;"></div>
+      <div id="hl-wf-summary" style="margin-bottom:18px;"></div>
       <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+        <span style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;">Slice detail:</span>
         ${_WFM_DIMS.map(msHtml).join('')}
         <button type="button" id="hl-wf-reset" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;text-decoration:underline;">Reset filters</button>
         <span id="hl-wf-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
       </div>
-      <div id="hl-wf-hist" style="margin-bottom:14px;"></div>
-      <div id="hl-wf-summary" style="margin-bottom:18px;"></div>
       <div id="hl-wf-grid" style="overflow-x:auto;"></div>
       <div id="hl-wf-more" style="display:flex;gap:10px;justify-content:center;margin-top:14px;"></div>
       <p id="hl-wf-note" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.6;"></p>
@@ -40560,13 +40572,17 @@ render();
             o.wW  += sales;
           }
         }
-        const rows = [...g.values()].map(o => Object.assign(o, {
+        const built = [...g.values()].map(o => Object.assign(o, {
           pctS: _wfmPct(o.sales, o.salesLy),
           pctU: _wfmPct(o.units, o.unitsLy),
           avgStores: o.nStore ? o.stores / o.nStore : null,
           v$: o.wW > 0 ? o.wv$ / o.wW : null,
           vU: o.wW > 0 ? o.wvU / o.wW : null,
         })).sort((x, y) => y.sales - x.sales);
+        // Drop anything with no sales in the window — discontinued and DO-NOT-REORDER lines
+        // were filling the summary with $0 / -100% rows. They stay in the detail grid below.
+        const rows = built.filter(r => r.sales > 0 || r.units > 0);
+        const hidden = built.length - rows.length;
         const tS = rows.reduce((a2, r) => a2 + r.sales, 0), tSl = rows.reduce((a2, r) => a2 + r.salesLy, 0);
         const tU = rows.reduce((a2, r) => a2 + r.units, 0), tUl = rows.reduce((a2, r) => a2 + r.unitsLy, 0);
         const tW = rows.reduce((a2, r) => a2 + r.wW, 0);
@@ -40589,7 +40605,7 @@ render();
             <thead><tr style="background:#efe9dd;">${heads.map((h, i) => `<th style="padding:6px 9px;text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;">${h}</th>`).join('')}</tr></thead>
             <tbody>${body}</tbody>
             <tfoot><tr style="border-top:2px solid var(--ink);background:rgba(0,0,0,0.02);">
-              <td style="padding:6px 9px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Total &middot; ${rows.length}</td>
+              <td style="padding:6px 9px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Total &middot; ${rows.length}${hidden ? `<span style="font-weight:400;color:var(--ink-3);text-transform:none;letter-spacing:0;"> &middot; ${hidden} with no sales hidden</span>` : ''}</td>
               <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${_wfmFmt(tS, 'usd0')}</td>
               ${pctCol(_wfmPct(tS, tSl))}
               <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${_wfmFmt(tU, 'int')}</td>
@@ -40600,7 +40616,7 @@ render();
             </tr></tfoot>
           </table></div>`;
       };
-      return `<div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:7px;">Summary &middot; last ${_wfState.period} weeks &middot; velocity is sales-weighted</div>
+      return `<div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:7px;">Summary &middot; last ${_wfState.period} weeks &middot; velocity is sales-weighted &middot; zero-sales lines excluded</div>
         <div style="display:flex;gap:16px;flex-wrap:wrap;">${roll(r => r.item_desc, 'Product')}${roll(r => r.region, 'Region')}</div>`;
     };
 
@@ -40775,6 +40791,12 @@ render();
       _wfState.grain = btn.dataset.wfgrain; _wfState.offset = 0; update();
     }));
     document.addEventListener('click', () => { host.querySelectorAll('[data-wfmpanel]').forEach(p => { p.style.display = 'none'; }); });
+    const scopeBtn = host.querySelector('#hl-wf-scope');
+    if (scopeBtn) scopeBtn.addEventListener('click', () => {
+      _wfState.atgOnly = !_wfState.atgOnly;
+      _wfState.sel.brand = []; _wfState.offset = 0;
+      renderWfmView(brandId, sb);
+    });
     host.querySelector('#hl-wf-reset').addEventListener('click', () => {
       for (const d of _WFM_DIMS) { _wfState.sel[d.key] = []; _wfState.search[d.key] = ''; }
       _wfState.offset = 0;
