@@ -40493,6 +40493,7 @@ render();
         <span id="hl-wf-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
       </div>
       <div id="hl-wf-hist" style="margin-bottom:14px;"></div>
+      <div id="hl-wf-summary" style="margin-bottom:18px;"></div>
       <div id="hl-wf-grid" style="overflow-x:auto;"></div>
       <div id="hl-wf-more" style="display:flex;gap:10px;justify-content:center;margin-top:14px;"></div>
       <p id="hl-wf-note" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.6;"></p>
@@ -40536,6 +40537,71 @@ render();
         update();
       }));
       box._opts = opts; box._vis = vis;
+    };
+
+    // ── SUMMARY: the same filtered window rolled up two ways, by product and by region.
+    // Velocity here is a SALES-WEIGHTED average of the underlying weekly rows, so a region
+    // doing most of the volume drives the number more than a region with two stores.
+    const summaryHtml = (src) => {
+      const roll = (keyFn, label) => {
+        const g = new Map();
+        for (const r of src) {
+          const k = keyFn(r) || '—';
+          let o = g.get(k);
+          if (!o) { o = { k, sales: 0, salesLy: 0, units: 0, unitsLy: 0, stores: 0, nStore: 0, wv$: 0, wvU: 0, wW: 0 }; g.set(k, o); }
+          const sales = Number(r.net_sales) || 0, units = Number(r.unit_sales) || 0;
+          const sc = Number(r.store_count) || 0;
+          o.sales += sales; o.salesLy += Number(r.net_sales_ly) || 0;
+          o.units += units; o.unitsLy += Number(r.unit_sales_ly) || 0;
+          if (sc > 0) {
+            o.stores += sc; o.nStore++;
+            o.wv$ += (sales / sc) * sales;      // weight each row's velocity by its net sales
+            o.wvU += (units / sc) * sales;
+            o.wW  += sales;
+          }
+        }
+        const rows = [...g.values()].map(o => Object.assign(o, {
+          pctS: _wfmPct(o.sales, o.salesLy),
+          pctU: _wfmPct(o.units, o.unitsLy),
+          avgStores: o.nStore ? o.stores / o.nStore : null,
+          v$: o.wW > 0 ? o.wv$ / o.wW : null,
+          vU: o.wW > 0 ? o.wvU / o.wW : null,
+        })).sort((x, y) => y.sales - x.sales);
+        const tS = rows.reduce((a2, r) => a2 + r.sales, 0), tSl = rows.reduce((a2, r) => a2 + r.salesLy, 0);
+        const tU = rows.reduce((a2, r) => a2 + r.units, 0), tUl = rows.reduce((a2, r) => a2 + r.unitsLy, 0);
+        const tW = rows.reduce((a2, r) => a2 + r.wW, 0);
+        const tV$ = tW > 0 ? rows.reduce((a2, r) => a2 + r.wv$, 0) / tW : null;
+        const tVU = tW > 0 ? rows.reduce((a2, r) => a2 + r.wvU, 0) / tW : null;
+        const heads = [label, 'Net sales', '% $ YOY', 'Units', '% U YOY', 'Stores', '$ / store', 'U / store'];
+        const pctCol = (v) => `<td style="padding:5px 9px;text-align:right;font-family:var(--mono);font-size:11px;${v == null ? '' : v < 0 ? 'color:var(--lost,#a8381f);' : v > 0 ? 'color:#3d7a4e;' : ''}">${_wfmFmt(v, 'pct')}</td>`;
+        const body = rows.map(r => `<tr style="border-top:1px solid var(--rule-soft);">
+            <td style="padding:5px 9px;font-family:var(--serif);font-size:12px;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(String(r.k))}">${escapeHtml(String(r.k))}</td>
+            <td style="padding:5px 9px;text-align:right;font-family:var(--mono);font-size:11px;">${_wfmFmt(r.sales, 'usd0')}</td>
+            ${pctCol(r.pctS)}
+            <td style="padding:5px 9px;text-align:right;font-family:var(--mono);font-size:11px;">${_wfmFmt(r.units, 'int')}</td>
+            ${pctCol(r.pctU)}
+            <td style="padding:5px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_wfmFmt(r.avgStores, 'int')}</td>
+            <td style="padding:5px 9px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;">${_wfmFmt(r.v$, 'usd2')}</td>
+            <td style="padding:5px 9px;text-align:right;font-family:var(--mono);font-size:11px;">${_wfmFmt(r.vU, 'num2')}</td>
+          </tr>`).join('') || `<tr><td colspan="8" style="padding:14px;text-align:center;font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:12px;">Nothing in view.</td></tr>`;
+        return `<div style="flex:1 1 460px;min-width:420px;">
+          <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;font-variant-numeric:tabular-nums;">
+            <thead><tr style="background:#efe9dd;">${heads.map((h, i) => `<th style="padding:6px 9px;text-align:${i === 0 ? 'left' : 'right'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;">${h}</th>`).join('')}</tr></thead>
+            <tbody>${body}</tbody>
+            <tfoot><tr style="border-top:2px solid var(--ink);background:rgba(0,0,0,0.02);">
+              <td style="padding:6px 9px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Total &middot; ${rows.length}</td>
+              <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${_wfmFmt(tS, 'usd0')}</td>
+              ${pctCol(_wfmPct(tS, tSl))}
+              <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${_wfmFmt(tU, 'int')}</td>
+              ${pctCol(_wfmPct(tU, tUl))}
+              <td></td>
+              <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${_wfmFmt(tV$, 'usd2')}</td>
+              <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${_wfmFmt(tVU, 'num2')}</td>
+            </tr></tfoot>
+          </table></div>`;
+      };
+      return `<div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:7px;">Summary &middot; last ${_wfState.period} weeks &middot; velocity is sales-weighted</div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap;">${roll(r => r.item_desc, 'Product')}${roll(r => r.region, 'Region')}</div>`;
     };
 
     const update = () => {
@@ -40597,6 +40663,8 @@ render();
           String(a.region).localeCompare(String(b.region)) ||
           String(a.item_desc).localeCompare(String(b.item_desc)));
       }
+
+      host.querySelector('#hl-wf-summary').innerHTML = summaryHtml(base);
 
       const sum = (k) => shown.reduce((s2, r) => s2 + (Number(r[k]) || 0), 0);
       const tSales = sum('net_sales'), tSalesLy = sum('net_sales_ly');
