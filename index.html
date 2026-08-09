@@ -40150,6 +40150,332 @@ render();
   ];
   let _krState = { year: null, sel: [], search: '' };
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // WHOLE FOODS WEEKLY (source: WFM portal export, one row per week × region × item)
+  // Two file shapes land here and both parse: the 52-week history ("Week Ending
+  // 2025-07-20") and the 4-week refresh (" 2026-07-12 ", padded). Both normalise to a
+  // week-ending date, and the upsert key is week+region+scan code — so re-uploading the
+  // 4-week file overwrites those weeks in place instead of double-counting them.
+  // The view always shows the trailing 52 weeks from the newest week in the data.
+  // ══════════════════════════════════════════════════════════════════════════
+  const _WFM_DIMS = [
+    { key: 'region',    label: 'Region'   },
+    { key: 'category',  label: 'Category' },
+    { key: 'brand',     label: 'Brand'    },
+    { key: 'item_desc', label: 'Item'     },
+  ];
+  let _wfState = { sel: { region: [], category: [], brand: [], item_desc: [] }, search: { region: '', category: '', brand: '', item_desc: '' }, limit: 500 };
+
+  function clearWfmCache() { try { window.KeelCache.invalidate(/^wfmSales:/); } catch (e) {} }
+  window.clearWfmCache = clearWfmCache;
+
+  // "Week Ending 2025-07-20" · " 2026-07-12 " · a real Date · an Excel serial → YYYY-MM-DD
+  function _wfmWeekEnd(v) {
+    if (v == null || v === '') return null;
+    if (v instanceof Date && !isNaN(v)) return v.toISOString().slice(0, 10);
+    if (typeof v === 'number' && v > 20000 && v < 80000) {
+      return new Date(Date.UTC(1899, 11, 30) + v * 864e5).toISOString().slice(0, 10);
+    }
+    const m = String(v).match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return m[1] + '-' + m[2] + '-' + m[3];
+    const m2 = String(v).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (m2) {
+      const y = m2[3].length === 2 ? '20' + m2[3] : m2[3];
+      return y + '-' + String(m2[1]).padStart(2, '0') + '-' + String(m2[2]).padStart(2, '0');
+    }
+    return null;
+  }
+
+  async function handleWfmSalesUpload(file, brandId, sb, onProgress) {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const recs = XLSX.utils.sheet_to_json(ws, { defval: null, raw: true });
+    if (!recs.length) throw new Error('No rows found in the first sheet');
+    const need = ['Week Desc', 'Region', 'Scan Code', 'Item Description'];
+    const missing = need.filter(h => !(h in recs[0]));
+    if (missing.length) throw new Error('Missing expected column(s): ' + missing.join(', ') + '. Is this the WFM sales export?');
+
+    const num = (v) => { if (v == null || v === '') return null; const n = Number(v); return isFinite(n) ? n : null; };
+    const txt = (v) => { const t = (v == null ? '' : String(v)).trim(); return t === '' ? null : t; };
+    const byKey = new Map();
+    let skipped = 0;
+    for (const r of recs) {
+      const wk = _wfmWeekEnd(r['Week Desc']);
+      const scan = txt(r['Scan Code']);
+      const region = txt(r['Region']);
+      if (!wk || !scan || !region) { skipped++; continue; }
+      // last row wins on an in-file duplicate, same as the DB upsert would do
+      byKey.set(wk + '|' + region + '|' + scan, {
+        brand_id: brandId,
+        week_end: wk,
+        region,
+        brand: txt(r['Brand']),
+        category: txt(r['Category']),
+        subcategory: txt(r['Subcategory']),
+        scan_code: scan,
+        item_desc: txt(r['Item Description']),
+        net_sales: num(r['Net Sales']),
+        net_sales_ly: num(r['Net Sales LY']),
+        unit_sales: num(r['Unit Sales']),
+        unit_sales_ly: num(r['Unit Sales LY']),
+        store_count: num(r['Sale Scan Code Store Count']),
+        store_count_ly: num(r['Sale Scan Code Store Count LY']),
+        avg_retail_price: num(r['Avg Net Retail Price']),
+      });
+    }
+    const rows = [...byKey.values()];
+    if (!rows.length) throw new Error('Parsed 0 usable rows — every row was missing a week, region or scan code');
+    let done = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await sb.from('wfm_sales').upsert(chunk, { onConflict: 'brand_id,week_end,region,scan_code' });
+      if (error) throw error;
+      done += chunk.length;
+      if (onProgress) onProgress(done, rows.length);
+    }
+    return {
+      rows: rows.length, skipped,
+      weeks: new Set(rows.map(r => r.week_end)).size,
+      items: new Set(rows.map(r => r.scan_code)).size,
+      regions: new Set(rows.map(r => r.region)).size,
+    };
+  }
+
+  async function _wfmFetch(brandId) {
+    return window.KeelCache.get('wfmSales:' + brandId, async () => {
+      const sb = window.Auth.getClient();
+      const res = await window.sbPageAll((from, to, withCount) =>
+        sb.from('wfm_sales')
+          .select('*', withCount ? { count: 'exact' } : undefined)
+          .eq('brand_id', brandId)
+          .order('id', { ascending: true }).range(from, to)
+      );
+      if (res.error) throw res.error;
+      return res.data || [];
+    }, 10 * 60 * 1000);
+  }
+
+  function _wfmPct(ty, ly) { return (ly != null && ly !== 0) ? (ty - ly) / ly : null; }
+  function _wfmFmt(v, fmt) {
+    if (v == null || !isFinite(v)) return '—';
+    if (fmt === 'usd0') return '$' + Math.round(v).toLocaleString();
+    if (fmt === 'usd2') return '$' + v.toFixed(2);
+    if (fmt === 'int')  return Math.round(v).toLocaleString();
+    if (fmt === 'pct')  return (v * 100).toFixed(1) + '%';
+    return String(v);
+  }
+
+  async function renderWfmView(brandId, sb) {
+    const host = document.getElementById('hl-wf-section');
+    if (!host) return;
+    host.innerHTML = `<div class="hl-loading">Loading Whole Foods sales…</div>`;
+    let all;
+    try {
+      all = await _wfmFetch(brandId);
+    } catch (err) {
+      const missing = /relation .* does not exist|could not find the table|schema cache/i.test(err.message || '');
+      host.innerHTML = `<div style="padding:24px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;">
+        <div style="font-family:var(--serif);font-size:18px;margin-bottom:6px;">Couldn't load Whole Foods sales.</div>
+        <div style="font-family:var(--serif);color:var(--ink-3);font-size:15px;">${missing
+          ? 'The <b>wfm_sales</b> table isn\u2019t there yet — run the SQL for this tab in Supabase, then reload.'
+          : escapeHtml(err.message || String(err))}</div></div>`;
+      return;
+    }
+    if (!all.length) {
+      host.innerHTML = `<div style="text-align:center;padding:48px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
+        No Whole Foods data yet. Click <strong>+ Upload Whole Foods weekly</strong> above with the WFM sales export.
+      </div>`;
+      return;
+    }
+
+    // TRAILING 52 WEEKS from the newest week present — older history stays in the table
+    // (so a future 104-week view costs nothing) but never renders here.
+    const maxWk = all.reduce((m, r) => (r.week_end > m ? r.week_end : m), '');
+    const cutoff = new Date(new Date(maxWk + 'T00:00:00Z').getTime() - 51 * 7 * 864e5).toISOString().slice(0, 10);
+    const rows52 = all.filter(r => r.week_end >= cutoff);
+    const weekCount = new Set(rows52.map(r => r.week_end)).size;
+
+    // filter option lists come from the 52-week window, each narrowed by the OTHER
+    // filters so you can't tick a combination that yields nothing
+    const optsFor = (dim) => {
+      const others = _WFM_DIMS.filter(d => d.key !== dim.key);
+      const pool = rows52.filter(r => others.every(o => !_wfState.sel[o.key].length || _wfState.sel[o.key].includes(r[o.key])));
+      return [...new Set(pool.map(r => r[dim.key]).filter(v => v != null))].sort((a, b) => String(a).localeCompare(String(b)));
+    };
+    const matches = (r) => _WFM_DIMS.every(d => !_wfState.sel[d.key].length || _wfState.sel[d.key].includes(r[d.key]));
+
+    const msHtml = (d) => `
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;">${d.label}:</span>
+        <div style="position:relative;display:inline-block;">
+          <button type="button" data-wfms="${d.key}" style="min-width:130px;max-width:230px;display:flex;align-items:center;gap:8px;justify-content:space-between;padding:5px 10px;font-family:var(--mono);font-size:11px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;">
+            <span data-wfmsum="${d.key}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+            <span style="color:var(--ink-3);">▾</span>
+          </button>
+          <div data-wfmpanel="${d.key}" style="display:none;position:absolute;top:100%;left:0;z-index:50;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.14);min-width:300px;">
+            <div style="padding:8px 10px;border-bottom:1px solid var(--rule-soft);">
+              <input type="text" data-wfmsearch="${d.key}" placeholder="Search ${d.label.toLowerCase()}…" style="width:100%;padding:5px 8px;font-family:var(--sans);font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+            </div>
+            <div style="padding:6px 10px;border-bottom:1px solid var(--rule-soft);display:flex;gap:12px;">
+              <button type="button" data-wfmall="${d.key}" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select all</button>
+              <button type="button" data-wfmvis="${d.key}" style="font-family:var(--mono);font-size:10px;color:var(--accent,#8a7320);background:none;border:none;cursor:pointer;padding:0;">Select visible</button>
+              <button type="button" data-wfmnone="${d.key}" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;padding:0;">Clear</button>
+            </div>
+            <div data-wfmopts="${d.key}" style="max-height:280px;overflow-y:auto;"></div>
+          </div>
+        </div>
+      </div>`;
+
+    host.innerHTML = `
+      <div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:4px;">Whole Foods &middot; Weekly sales</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:12px;">Trailing 52 weeks · ${weekCount} weeks through ${maxWk}</div>
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+        ${_WFM_DIMS.map(msHtml).join('')}
+        <button type="button" id="hl-wf-reset" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;text-decoration:underline;">Reset filters</button>
+        <span id="hl-wf-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
+      </div>
+      <div id="hl-wf-grid" style="overflow-x:auto;"></div>
+      <div id="hl-wf-more" style="text-align:center;margin-top:10px;"></div>
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.6;">One row per week × region × item, newest first. YOY percentages are recomputed from the totals in view rather than averaged, so they stay correct when several rows are combined. Avg net retail price is unit-weighted.</p>
+    `;
+
+    const COLS = [
+      { key: 'week_end',   label: 'Week ending', align: 'left'  },
+      { key: 'region',     label: 'Region',      align: 'left'  },
+      { key: 'brand',      label: 'Brand',       align: 'left'  },
+      { key: 'category',   label: 'Category',    align: 'left'  },
+      { key: 'scan_code',  label: 'Scan code',   align: 'left'  },
+      { key: 'item_desc',  label: 'Item',        align: 'left'  },
+      { key: 'net_sales',      label: 'Net sales',    fmt: 'usd0' },
+      { key: 'net_sales_ly',   label: 'Net sales LY', fmt: 'usd0' },
+      { key: 'pct_sales',      label: '% $ YOY',      fmt: 'pct'  },
+      { key: 'unit_sales',     label: 'Units',        fmt: 'int'  },
+      { key: 'unit_sales_ly',  label: 'Units LY',     fmt: 'int'  },
+      { key: 'pct_units',      label: '% U YOY',      fmt: 'pct'  },
+      { key: 'store_count',    label: 'Stores',       fmt: 'int'  },
+      { key: 'store_count_ly', label: 'Stores LY',    fmt: 'int'  },
+      { key: 'avg_retail_price', label: 'Avg retail', fmt: 'usd2' },
+    ];
+
+    const renderOptions = (d) => {
+      const opts = optsFor(d);
+      const q = (_wfState.search[d.key] || '').toLowerCase();
+      const vis = q ? opts.filter(o => String(o).toLowerCase().includes(q)) : opts;
+      const sel = new Set(_wfState.sel[d.key]);
+      const box = host.querySelector(`[data-wfmopts="${d.key}"]`);
+      box.innerHTML = vis.map(o => `
+        <label style="display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;font-family:var(--sans);font-size:13px;white-space:nowrap;">
+          <input type="checkbox" data-wfmval="${escapeHtml(String(o))}" ${sel.has(o) ? 'checked' : ''} style="cursor:pointer;"> ${escapeHtml(String(o))}
+        </label>`).join('') || `<div style="padding:10px;font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No matches.</div>`;
+      box.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', () => {
+        const v = cb.dataset.wfmval;
+        if (cb.checked) { if (!_wfState.sel[d.key].includes(v)) _wfState.sel[d.key].push(v); }
+        else _wfState.sel[d.key] = _wfState.sel[d.key].filter(x => x !== v);
+        _wfState.limit = 500;
+        update();
+      }));
+      box._opts = opts; box._vis = vis;
+    };
+
+    const update = () => {
+      for (const d of _WFM_DIMS) {
+        const n = _wfState.sel[d.key].length;
+        host.querySelector(`[data-wfmsum="${d.key}"]`).textContent =
+          n === 0 ? 'All ' + d.label.toLowerCase() + 's' : n === 1 ? _wfState.sel[d.key][0] : n + ' selected';
+      }
+      const shown = rows52.filter(matches).sort((a, b) =>
+        (a.week_end < b.week_end ? 1 : a.week_end > b.week_end ? -1 : 0) ||
+        String(a.region).localeCompare(String(b.region)) ||
+        String(a.item_desc).localeCompare(String(b.item_desc)));
+      host.querySelector('#hl-wf-count').textContent =
+        `${shown.length.toLocaleString()} of ${rows52.length.toLocaleString()} rows`;
+
+      const sum = (k) => shown.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+      const tSales = sum('net_sales'), tSalesLy = sum('net_sales_ly');
+      const tUnits = sum('unit_sales'), tUnitsLy = sum('unit_sales_ly');
+      const tot = {
+        net_sales: tSales, net_sales_ly: tSalesLy, pct_sales: _wfmPct(tSales, tSalesLy),
+        unit_sales: tUnits, unit_sales_ly: tUnitsLy, pct_units: _wfmPct(tUnits, tUnitsLy),
+        store_count: null, store_count_ly: null,
+        avg_retail_price: tUnits > 0 ? tSales / tUnits : null,
+      };
+
+      const head = COLS.map(c => `<th style="padding:8px 10px;text-align:${c.align || 'right'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);">${c.label}</th>`).join('');
+      const slice = shown.slice(0, _wfState.limit);
+      const body = slice.map(r => {
+        const v = Object.assign({}, r, {
+          pct_sales: _wfmPct(Number(r.net_sales) || 0, r.net_sales_ly),
+          pct_units: _wfmPct(Number(r.unit_sales) || 0, r.unit_sales_ly),
+        });
+        const tds = COLS.map(c => {
+          if (!c.fmt) return `<td style="padding:6px 10px;font-family:var(--mono);font-size:11px;white-space:nowrap;">${escapeHtml(String(v[c.key] == null ? '—' : v[c.key]))}</td>`;
+          const raw = v[c.key];
+          const colr = c.fmt === 'pct' && raw != null ? (raw < 0 ? 'color:var(--lost,#a8381f);' : raw > 0 ? 'color:#3d7a4e;' : '') : '';
+          return `<td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;white-space:nowrap;${colr}">${_wfmFmt(raw, c.fmt)}</td>`;
+        }).join('');
+        return `<tr style="border-bottom:1px solid var(--rule-soft);">${tds}</tr>`;
+      }).join('') || `<tr><td colspan="${COLS.length}" style="padding:24px;text-align:center;font-family:var(--serif);font-style:italic;color:var(--ink-3);">No rows match these filters.</td></tr>`;
+
+      const totTds = COLS.map((c, ci) => {
+        if (ci === 0) return `<td style="padding:8px 10px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;">Total</td>`;
+        if (!c.fmt) return '<td></td>';
+        return `<td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;white-space:nowrap;">${_wfmFmt(tot[c.key], c.fmt)}</td>`;
+      }).join('');
+
+      host.querySelector('#hl-wf-grid').innerHTML = `
+        <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+          <thead><tr>${head}</tr></thead>
+          <tbody>${body}</tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">${totTds}</tr></tfoot>
+        </table>`;
+
+      const more = host.querySelector('#hl-wf-more');
+      more.innerHTML = shown.length > slice.length
+        ? `<button type="button" id="hl-wf-showall" style="font-family:var(--mono);font-size:11px;padding:6px 14px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;">Showing ${slice.length.toLocaleString()} of ${shown.length.toLocaleString()} — show all</button>`
+        : '';
+      const sa = host.querySelector('#hl-wf-showall');
+      if (sa) sa.addEventListener('click', () => { _wfState.limit = 1e9; update(); });
+    };
+
+    // ─── filter wiring ───
+    for (const d of _WFM_DIMS) {
+      const btn = host.querySelector(`[data-wfms="${d.key}"]`);
+      const panel = host.querySelector(`[data-wfmpanel="${d.key}"]`);
+      const search = host.querySelector(`[data-wfmsearch="${d.key}"]`);
+      search.value = _wfState.search[d.key] || '';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = panel.style.display === 'block';
+        host.querySelectorAll('[data-wfmpanel]').forEach(p => { p.style.display = 'none'; });
+        panel.style.display = open ? 'none' : 'block';
+        if (!open) { renderOptions(d); search.focus(); }
+      });
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      search.addEventListener('input', () => { _wfState.search[d.key] = search.value; renderOptions(d); });
+      host.querySelector(`[data-wfmall="${d.key}"]`).addEventListener('click', () => {
+        _wfState.sel[d.key] = optsFor(d).map(String); _wfState.limit = 500; renderOptions(d); update();
+      });
+      host.querySelector(`[data-wfmvis="${d.key}"]`).addEventListener('click', () => {
+        const box = host.querySelector(`[data-wfmopts="${d.key}"]`);
+        for (const o of (box._vis || [])) if (!_wfState.sel[d.key].includes(String(o))) _wfState.sel[d.key].push(String(o));
+        _wfState.limit = 500; renderOptions(d); update();
+      });
+      host.querySelector(`[data-wfmnone="${d.key}"]`).addEventListener('click', () => {
+        _wfState.sel[d.key] = []; _wfState.limit = 500; renderOptions(d); update();
+      });
+      renderOptions(d);
+    }
+    document.addEventListener('click', () => { host.querySelectorAll('[data-wfmpanel]').forEach(p => { p.style.display = 'none'; }); });
+    host.querySelector('#hl-wf-reset').addEventListener('click', () => {
+      for (const d of _WFM_DIMS) { _wfState.sel[d.key] = []; _wfState.search[d.key] = ''; }
+      _wfState.limit = 500;
+      renderWfmView(brandId, sb);
+    });
+
+    update();
+  }
+
   function clearKrogerCache() { try { window.KeelCache.invalidate(/^krSales:/); } catch (e) {} }
   window.clearKrogerCache = clearKrogerCache;
 
@@ -40410,7 +40736,7 @@ render();
     updateView();
   }
 
-  let _spSubTab = (() => { try { const s = localStorage.getItem('keel_sp_subtab'); return (s === 'pacing' || s === 'dist' || s === 'kroger') ? s : 'pacing'; } catch (e) { return 'pacing'; } })();
+  let _spSubTab = (() => { try { const s = localStorage.getItem('keel_sp_subtab'); return (s === 'pacing' || s === 'dist' || s === 'kroger' || s === 'wfm') ? s : 'pacing'; } catch (e) { return 'pacing'; } })();
 
   async function renderSalesPacingPage() {
     const session = HL.mountPage('sales-pacing');
@@ -40432,6 +40758,7 @@ render();
           <input type="file" id="hl-cw-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <input type="file" id="hl-kw-upload" accept=".xlsx,.xls" multiple style="display:none;" />
           <input type="file" id="hl-kr-upload" accept=".xlsx,.xls" style="display:none;" />
+          <input type="file" id="hl-wf-upload" accept=".xlsx,.xls" style="display:none;" />
           <span id="hl-sp-btns-dist" style="display:none;gap:8px;flex-wrap:wrap;">
             <button class="hl-btn-primary" id="hl-cd-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI L52 total</button>
             <button class="hl-btn-primary" id="hl-cw-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload UNFI weekly</button>
@@ -40439,6 +40766,9 @@ render();
           </span>
           <span id="hl-sp-btns-kroger" style="display:none;">
             <button class="hl-btn-primary" id="hl-kr-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload Kroger weekly</button>
+          </span>
+          <span id="hl-sp-btns-wfm" style="display:none;">
+            <button class="hl-btn-primary" id="hl-wf-upload-btn" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);">+ Upload Whole Foods weekly</button>
           </span>
           <span id="hl-sp-btns-pacing" style="display:none;">
             <button class="hl-btn-primary" id="hl-sp-upload-btn">+ Upload Sales ($ &amp; units)</button>
@@ -40449,10 +40779,12 @@ render();
         <button class="hl-sp-tab" data-sptab="pacing" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;">Pacing</button>
         <button class="hl-sp-tab" data-sptab="dist" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;">UNFI / KeHE weekly</button>
         <button class="hl-sp-tab" data-sptab="kroger" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;">Kroger weekly</button>
+        <button class="hl-sp-tab" data-sptab="wfm" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;">Whole Foods weekly</button>
       </div>
       <div id="hl-sp-body" style="margin-top:18px;"><div class="hl-loading">Loading…</div></div>
       <div id="hl-cd-section" style="margin-top:18px;display:none;"><div class="hl-loading">Loading customer detail…</div></div>
       <div id="hl-kr-section" style="margin-top:18px;display:none;"><div class="hl-loading">Loading Kroger sales…</div></div>
+      <div id="hl-wf-section" style="margin-top:18px;display:none;"><div class="hl-loading">Loading Whole Foods sales…</div></div>
     `;
 
     const uploadInput = document.getElementById('hl-sp-upload');
@@ -40555,6 +40887,29 @@ render();
       uploadInput.value = '';
     });
 
+    // ─── Whole Foods weekly upload ───
+    const wfInput = document.getElementById('hl-wf-upload');
+    document.getElementById('hl-wf-upload-btn').addEventListener('click', () => wfInput.click());
+    wfInput.addEventListener('change', async (e) => {
+      const file = (e.target.files || [])[0];
+      wfInput.value = '';
+      if (!file) return;
+      const body = document.getElementById('hl-wf-section');
+      body.innerHTML = `<div class="hl-loading">Parsing “${escapeHtml(file.name)}”…</div>`;
+      try {
+        const res = await handleWfmSalesUpload(file, brandId, sb, (d, total) => {
+          body.innerHTML = `<div class="hl-loading">Saving Whole Foods sales… ${d.toLocaleString()} / ${total.toLocaleString()} rows</div>`;
+        });
+        console.log('[WFMSales]', res);
+        clearWfmCache();
+        body.innerHTML = `<div class="hl-loading">Loaded ${res.rows.toLocaleString()} rows · ${res.weeks} weeks · ${res.items} items · ${res.regions} regions. Refreshing…</div>`;
+        await renderWfmView(brandId, sb);
+      } catch (err) {
+        console.error('[WFMSales upload]', err);
+        body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Upload failed: ${escapeHtml(err.message || 'unknown error')}</div>`;
+      }
+    });
+
     // ─── Kroger weekly upload ───
     const krInput = document.getElementById('hl-kr-upload');
     document.getElementById('hl-kr-upload-btn').addEventListener('click', () => krInput.click());
@@ -40585,9 +40940,9 @@ render();
     // ─── Tabs: Pacing | UNFI / KeHE weekly | Kroger weekly ───
     // One section at a time (was stacked vertically); heavy sections load
     // lazily on first activation and stay warm after.
-    let _pacingInited = false, _cdInited = false, _krInited = false;
-    const PANES = { pacing: 'hl-sp-body', dist: 'hl-cd-section', kroger: 'hl-kr-section' };
-    const BTNS  = { pacing: 'hl-sp-btns-pacing', dist: 'hl-sp-btns-dist', kroger: 'hl-sp-btns-kroger' };
+    let _pacingInited = false, _cdInited = false, _krInited = false, _wfInited = false;
+    const PANES = { pacing: 'hl-sp-body', dist: 'hl-cd-section', kroger: 'hl-kr-section', wfm: 'hl-wf-section' };
+    const BTNS  = { pacing: 'hl-sp-btns-pacing', dist: 'hl-sp-btns-dist', kroger: 'hl-sp-btns-kroger', wfm: 'hl-sp-btns-wfm' };
     const showTab = (t) => {
       if (!PANES[t]) t = 'pacing';
       _spSubTab = t;
@@ -40603,6 +40958,7 @@ render();
       if (t === 'pacing' && !_pacingInited) { _pacingInited = true; loadAndRenderSalesPacing(brandId, sb); }
       if (t === 'dist'   && !_cdInited)     { _cdInited = true;     renderCustomerDetailView(brandId, sb); }
       if (t === 'kroger' && !_krInited)     { _krInited = true;     renderKrogerView(brandId, sb); }
+      if (t === 'wfm'    && !_wfInited)     { _wfInited = true;     renderWfmView(brandId, sb); }
     };
     document.querySelectorAll('.hl-sp-tab').forEach(b => b.addEventListener('click', () => showTab(b.dataset.sptab)));
     showTab(_spSubTab);
