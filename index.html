@@ -40192,36 +40192,64 @@ render();
     const ws = wb.Sheets[wb.SheetNames[0]];
     const recs = XLSX.utils.sheet_to_json(ws, { defval: null, raw: true });
     if (!recs.length) throw new Error('No rows found in the first sheet');
-    const need = ['Week Desc', 'Region', 'Scan Code', 'Item Description'];
-    const missing = need.filter(h => !(h in recs[0]));
-    if (missing.length) throw new Error('Missing expected column(s): ' + missing.join(', ') + '. Is this the WFM sales export?');
 
-    const num = (v) => { if (v == null || v === '') return null; const n = Number(v); return isFinite(n) ? n : null; };
+    // HEADER MATCHING IS FUZZY BY DESIGN. The WFM export pads its currency headers with
+    // spaces (" Net Sales ", " Avg Net Retail Price ") while leaving the integer ones bare,
+    // and an exact-key lookup silently returned null for exactly those columns. So: collapse
+    // whitespace, lowercase, drop punctuation, then match — and accept known aliases.
+    const hnorm = (h) => String(h == null ? '' : h).replace(/[\s\u00a0]+/g, ' ').trim().toLowerCase().replace(/[^a-z0-9% ]/g, '');
+    const keyOf = new Map();
+    for (const k of Object.keys(recs[0])) if (!keyOf.has(hnorm(k))) keyOf.set(hnorm(k), k);
+    const found = {}, notFound = [];
+    const bind = (field, ...aliases) => {
+      for (const a of aliases) { const k = keyOf.get(hnorm(a)); if (k) { found[field] = k; return; } }
+      found[field] = null; notFound.push(aliases[0]);
+    };
+    bind('week',      'Week Desc', 'Week Ending', 'Week');
+    bind('region',    'Region');
+    bind('brand',     'Brand');
+    bind('category',  'Category');
+    bind('subcat',    'Subcategory');
+    bind('scan',      'Scan Code', 'UPC', 'Scan Code (UPC)');
+    bind('item',      'Item Description', 'Item');
+    bind('sales',     'Net Sales');
+    bind('salesLy',   'Net Sales LY');
+    bind('units',     'Unit Sales');
+    bind('unitsLy',   'Unit Sales LY');
+    bind('stores',    'Sale Scan Code Store Count', 'Store Count');
+    bind('storesLy',  'Sale Scan Code Store Count LY', 'Store Count LY');
+    bind('arp',       'Avg Net Retail Price', 'Average Net Retail Price', 'Avg Retail Price');
+    const needed = ['week', 'region', 'scan'];
+    const missing = needed.filter(f => !found[f]);
+    if (missing.length) throw new Error('Missing required column(s): ' + missing.join(', ') + '. Is this the WFM sales export? Headers seen: ' + Object.keys(recs[0]).slice(0, 8).join(' · '));
+
+    const num = (v) => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[$,\s]/g, '')); return isFinite(n) ? n : null; };
     const txt = (v) => { const t = (v == null ? '' : String(v)).trim(); return t === '' ? null : t; };
+    const G = (r, f) => (found[f] ? r[found[f]] : null);
     const byKey = new Map();
     let skipped = 0;
     for (const r of recs) {
-      const wk = _wfmWeekEnd(r['Week Desc']);
-      const scan = txt(r['Scan Code']);
-      const region = txt(r['Region']);
+      const wk = _wfmWeekEnd(G(r, 'week'));
+      const scan = txt(G(r, 'scan'));
+      const region = txt(G(r, 'region'));
       if (!wk || !scan || !region) { skipped++; continue; }
       // last row wins on an in-file duplicate, same as the DB upsert would do
       byKey.set(wk + '|' + region + '|' + scan, {
         brand_id: brandId,
         week_end: wk,
         region,
-        brand: txt(r['Brand']),
-        category: txt(r['Category']),
-        subcategory: txt(r['Subcategory']),
+        brand: txt(G(r, 'brand')),
+        category: txt(G(r, 'category')),
+        subcategory: txt(G(r, 'subcat')),
         scan_code: scan,
-        item_desc: txt(r['Item Description']),
-        net_sales: num(r['Net Sales']),
-        net_sales_ly: num(r['Net Sales LY']),
-        unit_sales: num(r['Unit Sales']),
-        unit_sales_ly: num(r['Unit Sales LY']),
-        store_count: num(r['Sale Scan Code Store Count']),
-        store_count_ly: num(r['Sale Scan Code Store Count LY']),
-        avg_retail_price: num(r['Avg Net Retail Price']),
+        item_desc: txt(G(r, 'item')),
+        net_sales: num(G(r, 'sales')),
+        net_sales_ly: num(G(r, 'salesLy')),
+        unit_sales: num(G(r, 'units')),
+        unit_sales_ly: num(G(r, 'unitsLy')),
+        store_count: num(G(r, 'stores')),
+        store_count_ly: num(G(r, 'storesLy')),
+        avg_retail_price: num(G(r, 'arp')),
       });
     }
     const rows = [...byKey.values()];
@@ -40234,8 +40262,13 @@ render();
       done += chunk.length;
       if (onProgress) onProgress(done, rows.length);
     }
+    // Loud about anything that came through empty — a header the export renames would
+    // otherwise just show as a column of dashes in the grid.
+    const blank = ['net_sales', 'net_sales_ly', 'unit_sales', 'unit_sales_ly', 'store_count', 'store_count_ly', 'avg_retail_price']
+      .filter(f => rows.every(r => r[f] == null));
     return {
-      rows: rows.length, skipped,
+      rows: rows.length, skipped, notFound, blank,
+      matched: found,
       weeks: new Set(rows.map(r => r.week_end)).size,
       items: new Set(rows.map(r => r.scan_code)).size,
       regions: new Set(rows.map(r => r.region)).size,
@@ -40902,6 +40935,11 @@ render();
         });
         console.log('[WFMSales]', res);
         clearWfmCache();
+        const warn = [].concat(
+          res.notFound.length ? ['columns not found in the file: ' + res.notFound.join(', ')] : [],
+          res.blank.length ? ['columns that came through empty: ' + res.blank.join(', ')] : []
+        );
+        if (warn.length) alert('Loaded ' + res.rows.toLocaleString() + ' rows, but heads up —\n\n' + warn.join('\n') + '\n\nCheck the header names in row 1 of the export.');
         body.innerHTML = `<div class="hl-loading">Loaded ${res.rows.toLocaleString()} rows · ${res.weeks} weeks · ${res.items} items · ${res.regions} regions. Refreshing…</div>`;
         await renderWfmView(brandId, sb);
       } catch (err) {
