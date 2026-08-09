@@ -40186,8 +40186,32 @@ render();
     return null;
   }
 
+  async function _wfmSha256(buf) {
+    try {
+      const d = await crypto.subtle.digest('SHA-256', buf);
+      return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) { return null; }
+  }
+
+  // Every row already in the DB for the weeks this file covers, keyed the same way the
+  // upsert is. Lets us report new / replaced / unchanged BEFORE writing, which is the only
+  // way to tell "this file has new data" from "this is the same file again".
+  async function _wfmExistingFor(sb, brandId, wkMin, wkMax) {
+    const res = await window.sbPageAll((from, to, withCount) =>
+      sb.from('wfm_sales')
+        .select('week_end,region,scan_code,net_sales,unit_sales,store_count', withCount ? { count: 'exact' } : undefined)
+        .eq('brand_id', brandId).gte('week_end', wkMin).lte('week_end', wkMax)
+        .order('id', { ascending: true }).range(from, to)
+    );
+    if (res.error) throw res.error;
+    const m = new Map();
+    for (const r of (res.data || [])) m.set(r.week_end + '|' + r.region + '|' + r.scan_code, r);
+    return m;
+  }
+
   async function handleWfmSalesUpload(file, brandId, sb, onProgress) {
     const buf = await file.arrayBuffer();
+    const fileHash = await _wfmSha256(buf);
     const wb = XLSX.read(buf, { type: 'array', cellDates: true });
     const ws = wb.Sheets[wb.SheetNames[0]];
     const recs = XLSX.utils.sheet_to_json(ws, { defval: null, raw: true });
@@ -40254,6 +40278,21 @@ render();
     }
     const rows = [...byKey.values()];
     if (!rows.length) throw new Error('Parsed 0 usable rows — every row was missing a week, region or scan code');
+
+    const wkMin = rows.reduce((m, r) => (r.week_end < m ? r.week_end : m), rows[0].week_end);
+    const wkMax = rows.reduce((m, r) => (r.week_end > m ? r.week_end : m), rows[0].week_end);
+    let added = 0, replaced = 0, identical = 0;
+    try {
+      const prev = await _wfmExistingFor(sb, brandId, wkMin, wkMax);
+      const same = (a2, b2) => Math.abs((Number(a2) || 0) - (Number(b2) || 0)) < 0.005;
+      for (const r of rows) {
+        const old = prev.get(r.week_end + '|' + r.region + '|' + r.scan_code);
+        if (!old) added++;
+        else if (same(old.net_sales, r.net_sales) && same(old.unit_sales, r.unit_sales) && same(old.store_count, r.store_count)) identical++;
+        else replaced++;
+      }
+    } catch (e) { console.warn('[WFMSales] diff check skipped:', e); }
+
     let done = 0;
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500);
@@ -40266,13 +40305,24 @@ render();
     // otherwise just show as a column of dashes in the grid.
     const blank = ['net_sales', 'net_sales_ly', 'unit_sales', 'unit_sales_ly', 'store_count', 'store_count_ly', 'avg_retail_price']
       .filter(f => rows.every(r => r[f] == null));
-    return {
+    const out = {
       rows: rows.length, skipped, notFound, blank,
-      matched: found,
+      matched: found, added, replaced, identical,
+      week_min: wkMin, week_max: wkMax, file_hash: fileHash,
       weeks: new Set(rows.map(r => r.week_end)).size,
       items: new Set(rows.map(r => r.scan_code)).size,
       regions: new Set(rows.map(r => r.region)).size,
     };
+    // Log it. A failure here must not look like a failed upload — the data is already saved.
+    try {
+      let who = null; try { who = (BrandLibrary.getSession() || {}).email || null; } catch (e) {}
+      await sb.from('wfm_upload_log').insert({
+        brand_id: brandId, file_name: file.name, file_hash: fileHash,
+        rows_parsed: rows.length, rows_added: added, rows_replaced: replaced, rows_identical: identical,
+        rows_skipped: skipped, weeks: out.weeks, week_min: wkMin, week_max: wkMax, uploaded_by: who,
+      });
+    } catch (e) { console.warn('[WFMSales] upload log failed:', e); }
+    return out;
   }
 
   async function _wfmFetch(brandId) {
@@ -40296,7 +40346,64 @@ render();
     if (fmt === 'usd2') return '$' + v.toFixed(2);
     if (fmt === 'int')  return Math.round(v).toLocaleString();
     if (fmt === 'pct')  return (v * 100).toFixed(1) + '%';
+    if (fmt === 'num2') return v.toFixed(2);
     return String(v);
+  }
+
+  // Upload history + the >52-week prune. Kept as a collapsed strip so it never competes
+  // with the grid, but it answers "what did we last load, and did it actually change anything".
+  async function _wfmRenderHistory(brandId, sb, olderCount, cutoff) {
+    const el = document.getElementById('hl-wf-hist');
+    if (!el) return;
+    let logs = [];
+    try {
+      const { data, error } = await sb.from('wfm_upload_log')
+        .select('*').eq('brand_id', brandId).order('uploaded_at', { ascending: false }).limit(10);
+      if (error) throw error;
+      logs = data || [];
+    } catch (e) {
+      el.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Upload history unavailable — run the <b>wfm_upload_log</b> SQL to enable it.</div>`;
+      return;
+    }
+    const last = logs[0];
+    const rowsHtml = logs.map(l => `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:5px 10px;font-family:var(--mono);font-size:10px;white-space:nowrap;">${new Date(l.uploaded_at).toLocaleString()}</td>
+        <td style="padding:5px 10px;font-family:var(--serif);font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.file_name || '')}">${escapeHtml(l.file_name || '—')}</td>
+        <td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);white-space:nowrap;">${escapeHtml(l.week_min || '')} → ${escapeHtml(l.week_max || '')}</td>
+        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:#3d7a4e;">${(l.rows_added || 0).toLocaleString()}</td>
+        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:#b8860b;">${(l.rows_replaced || 0).toLocaleString()}</td>
+        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${(l.rows_identical || 0).toLocaleString()}</td>
+        <td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(l.uploaded_by || '—')}</td>
+      </tr>`).join('');
+    el.innerHTML = `
+      <details style="border:1px solid var(--rule-soft);border-radius:8px;background:var(--paper);padding:0;">
+        <summary style="cursor:pointer;padding:9px 12px;font-family:var(--mono);font-size:10px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">
+          Upload history${last ? ` &middot; last loaded ${new Date(last.uploaded_at).toLocaleDateString()} (${(last.rows_added || 0).toLocaleString()} new, ${(last.rows_replaced || 0).toLocaleString()} replaced)` : ' · none yet'}
+        </summary>
+        <div style="padding:0 12px 12px;">
+          ${logs.length ? `<table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${['When', 'File', 'Weeks covered', 'New', 'Replaced', 'Unchanged', 'By'].map((h, i) => `<th style="padding:6px 10px;text-align:${i >= 3 && i <= 5 ? 'right' : 'left'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;">${h}</th>`).join('')}</tr></thead>
+            <tbody>${rowsHtml}</tbody>
+          </table>` : `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;padding:8px 0;">No uploads logged yet.</div>`}
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--rule-soft);display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">
+              ${olderCount > 0
+                ? olderCount.toLocaleString() + ' row(s) sit older than the 52-week window (before ' + cutoff + '). They are stored but never displayed.'
+                : 'Nothing older than the 52-week window is stored.'}
+            </span>
+            ${olderCount > 0 ? `<button type="button" id="hl-wf-prune" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;">Delete rows before ${cutoff}</button>` : ''}
+          </div>
+        </div>
+      </details>`;
+    const pr = document.getElementById('hl-wf-prune');
+    if (pr) pr.addEventListener('click', async () => {
+      if (!confirm('Permanently delete ' + olderCount.toLocaleString() + ' row(s) dated before ' + cutoff + '?\n\nThis cannot be undone. The grid already hides them — deleting only reclaims space.')) return;
+      pr.disabled = true; pr.textContent = 'Deleting…';
+      const { error } = await sb.from('wfm_sales').delete().eq('brand_id', brandId).lt('week_end', cutoff);
+      if (error) { alert('Prune failed: ' + error.message); pr.disabled = false; return; }
+      clearWfmCache();
+      await renderWfmView(brandId, sb);
+    });
   }
 
   async function renderWfmView(brandId, sb) {
@@ -40385,6 +40492,7 @@ render();
         <button type="button" id="hl-wf-reset" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;text-decoration:underline;">Reset filters</button>
         <span id="hl-wf-count" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);"></span>
       </div>
+      <div id="hl-wf-hist" style="margin-bottom:14px;"></div>
       <div id="hl-wf-grid" style="overflow-x:auto;"></div>
       <div id="hl-wf-more" style="display:flex;gap:10px;justify-content:center;margin-top:14px;"></div>
       <p id="hl-wf-note" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.6;"></p>
@@ -40405,6 +40513,8 @@ render();
       { key: 'pct_units',      label: '% U YOY',      fmt: 'pct'  },
       { key: 'store_count',    label: 'Stores',       fmt: 'int'  },
       { key: 'store_count_ly', label: 'Stores LY',    fmt: 'int'  },
+      { key: 'dollar_velocity', label: '$ / store',   fmt: 'usd2' },
+      { key: 'unit_velocity',   label: 'Units / store', fmt: 'num2' },
       { key: 'avg_retail_price', label: 'Avg retail', fmt: 'usd2' },
     ];
 
@@ -40491,10 +40601,16 @@ render();
       const sum = (k) => shown.reduce((s2, r) => s2 + (Number(r[k]) || 0), 0);
       const tSales = sum('net_sales'), tSalesLy = sum('net_sales_ly');
       const tUnits = sum('unit_sales'), tUnitsLy = sum('unit_sales_ly');
+      // Store counts across rows are store-WEEKS in By week (same store counted each week)
+      // and store-regions in Period total, so the footer velocity is $ per store per week
+      // either way — the only figure that stays comparable as rows are combined.
+      const tStores = sum('store_count');
       const tot = {
         net_sales: tSales, net_sales_ly: tSalesLy, pct_sales: _wfmPct(tSales, tSalesLy),
         unit_sales: tUnits, unit_sales_ly: tUnitsLy, pct_units: _wfmPct(tUnits, tUnitsLy),
         store_count: null, store_count_ly: null,
+        dollar_velocity: tStores > 0 ? tSales / tStores : null,
+        unit_velocity:   tStores > 0 ? tUnits / tStores : null,
         avg_retail_price: tUnits > 0 ? tSales / tUnits : null,
       };
 
@@ -40506,9 +40622,14 @@ render();
 
       const head = COLS.map(c => `<th style="padding:8px 10px;text-align:${c.align || 'right'};font-family:var(--mono);font-size:10px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;border-bottom:1px solid var(--rule-soft);">${c.key === 'week_end' && _wfState.grain === 'total' ? 'Period' : c.label}</th>`).join('');
       const body = slice.map(r => {
+        const sc = Number(r.store_count) || 0;
         const v = Object.assign({}, r, {
           pct_sales: _wfmPct(Number(r.net_sales) || 0, r.net_sales_ly),
           pct_units: _wfmPct(Number(r.unit_sales) || 0, r.unit_sales_ly),
+          // velocity per selling store — in Period total the store count is already the
+          // weekly average, so this reads as $/store over the window, not per store-week
+          dollar_velocity: sc > 0 ? (Number(r.net_sales) || 0) / sc : null,
+          unit_velocity:   sc > 0 ? (Number(r.unit_sales) || 0) / sc : null,
         });
         const tds = COLS.map(c => {
           if (!c.fmt) return `<td style="padding:6px 10px;font-family:var(--mono);font-size:11px;white-space:nowrap;">${escapeHtml(String(v[c.key] == null ? '—' : v[c.key]))}</td>`;
@@ -40593,6 +40714,7 @@ render();
     });
 
     update();
+    _wfmRenderHistory(brandId, sb, all.length - rows52.length, cutoff);
   }
 
   function clearKrogerCache() { try { window.KeelCache.invalidate(/^krSales:/); } catch (e) {} }
@@ -41014,8 +41136,24 @@ render();
       wfInput.value = '';
       if (!file) return;
       const body = document.getElementById('hl-wf-section');
-      body.innerHTML = `<div class="hl-loading">Parsing “${escapeHtml(file.name)}”…</div>`;
+      body.innerHTML = `<div class="hl-loading">Checking “${escapeHtml(file.name)}”…</div>`;
       try {
+        // Same bytes as a previous upload? Re-running it is harmless (the upsert is
+        // idempotent) but it's almost always a mistake, so make it a decision.
+        const hash = await _wfmSha256(await file.arrayBuffer());
+        if (hash) {
+          const { data: dupes } = await sb.from('wfm_upload_log')
+            .select('uploaded_at,file_name').eq('brand_id', brandId).eq('file_hash', hash)
+            .order('uploaded_at', { ascending: false }).limit(1);
+          if (dupes && dupes.length) {
+            const when = new Date(dupes[0].uploaded_at).toLocaleString();
+            if (!confirm('This exact file was already uploaded on ' + when + ' (as "' + dupes[0].file_name + '").\n\nNothing will change if you load it again. Upload anyway?')) {
+              await renderWfmView(brandId, sb);
+              return;
+            }
+          }
+        }
+        body.innerHTML = `<div class="hl-loading">Parsing “${escapeHtml(file.name)}”…</div>`;
         const res = await handleWfmSalesUpload(file, brandId, sb, (d, total) => {
           body.innerHTML = `<div class="hl-loading">Saving Whole Foods sales… ${d.toLocaleString()} / ${total.toLocaleString()} rows</div>`;
         });
@@ -41026,7 +41164,10 @@ render();
           res.blank.length ? ['columns that came through empty: ' + res.blank.join(', ')] : []
         );
         if (warn.length) alert('Loaded ' + res.rows.toLocaleString() + ' rows, but heads up —\n\n' + warn.join('\n') + '\n\nCheck the header names in row 1 of the export.');
-        body.innerHTML = `<div class="hl-loading">Loaded ${res.rows.toLocaleString()} rows · ${res.weeks} weeks · ${res.items} items · ${res.regions} regions. Refreshing…</div>`;
+        if (res.added === 0 && res.replaced === 0 && res.rows > 0) {
+          alert('That file matched what was already stored — ' + res.identical.toLocaleString() + ' rows identical, nothing added or changed.\n\nWeeks ' + res.week_min + ' → ' + res.week_max + '. If you expected new weeks, check the export\u2019s date range.');
+        }
+        body.innerHTML = `<div class="hl-loading">${res.added.toLocaleString()} new · ${res.replaced.toLocaleString()} replaced · ${res.identical.toLocaleString()} unchanged · weeks ${res.week_min}–${res.week_max}. Refreshing…</div>`;
         await renderWfmView(brandId, sb);
       } catch (err) {
         console.error('[WFMSales upload]', err);
