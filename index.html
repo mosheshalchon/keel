@@ -4766,8 +4766,16 @@ window.Auth = (function() {
     if (/email not confirmed/i.test(msg)) return 'Please confirm your email before signing in. Check your inbox.';
     if (/user already registered/i.test(msg)) return 'An account with this email already exists. Try signing in instead.';
     if (/password should be at least/i.test(msg)) return msg;
-    if (/database error/i.test(msg) || /not from a recognized brand domain/i.test(msg)) {
-      return 'This email domain is not yet enabled for sign-up. Contact your admin.';
+    // These were one branch, and it cost a long debugging session on Aug 10 2026: a
+    // NOT NULL violation on user_profiles.brand_id surfaced as "Database error saving
+    // new user" and got reported as a domain policy, so we hunted an allowlist that
+    // does not exist. Keep them apart, and always log the raw message.
+    if (/not from a recognized brand domain/i.test(msg)) {
+      return 'This email domain isn\u2019t set up for sign-up yet. Ask your admin to add it.';
+    }
+    if (/database error/i.test(msg)) {
+      console.error('[auth] database error from Supabase:', msg, err);
+      return 'Sign-up couldn\u2019t complete \u2014 the server rejected the account. Ask your admin to check the console for details, or sign in if you already have an account.';
     }
     return msg;
   }
@@ -43292,6 +43300,16 @@ render();
         </p>
         <div id="settings-team-body">Loading…</div>
       </div>
+      <div class="hl-settings-section" id="settings-domains" style="margin-top:48px;">
+        <h2>Sign-up domains</h2>
+        <p class="hl-sub">
+          Email domains allowed to create their own account on this brand. Anyone signing up from a
+          listed domain lands in this brand with the role and department set here — no manual
+          provisioning. Domains that aren't listed are turned away at sign-up with a clear message.
+          <strong>Only add domains you control.</strong>
+        </p>
+        <div id="settings-domains-body">Loading…</div>
+      </div>
       <div class="hl-settings-section" id="settings-stages">
         <h2>Stage Definitions</h2>
         <p class="hl-sub">The 9 stages of every submission. Edit names, change which date each stage anchors to, and set the offset (negative = before, positive = after). Action types describe what happens when each stage activates.</p>
@@ -43309,8 +43327,136 @@ render();
     `;
     renderSettingsIdentity();
     renderSettingsTeam();
+    renderSettingsDomains();
     renderSettingsStages();
     renderSettingsSynonyms();
+  }
+
+  // ─── Settings: Sign-up domains ───────────────────────────────────────────
+  // Replaces the hardcoded brand_id_from_email() CASE statement. That function
+  // now reads the brand_domains table, so onboarding a new brand is a row here
+  // rather than a SQL edit — the point being commercialization: every new
+  // customer brings its own email domain(s).
+  //
+  // Security note, deliberately conservative: adding a domain lets ANYONE with
+  // an address at it create an account on this brand. Admin-only, and the list
+  // is scoped to the current brand by RLS.
+  async function renderSettingsDomains() {
+    const host = document.getElementById('settings-domains-body');
+    if (!host) return;
+    const session = Auth.getSession();
+    const sb = Auth.getClient();
+    const brandId = session && session.brandId;
+    if (!brandId) { host.innerHTML = '<div class="hl-empty">No brand on this session.</div>'; return; }
+    const admin = isAdmin() || (session.accessRole === 'admin');
+
+    let rows = [];
+    try {
+      const { data, error } = await sb.from('brand_domains')
+        .select('*').eq('brand_id', brandId).order('domain', { ascending: true });
+      if (error) throw error;
+      rows = data || [];
+    } catch (err) {
+      const missing = /relation .* does not exist|could not find the table|schema cache/i.test(err.message || '');
+      host.innerHTML = missing
+        ? `<div style="padding:16px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;font-family:var(--serif);font-size:14px;">
+             The <b>brand_domains</b> table isn't set up yet. Run the migration for this section in Supabase, then reload.
+           </div>`
+        : `<div class="hl-empty" style="color:var(--lost);">Couldn't load domains: ${escapeHtml(err.message || String(err))}</div>`;
+      return;
+    }
+
+    const ROLES = ['viewer', 'editor', 'admin'];
+    const DEPTS = ['all', 'sales', 'ops', 'finance'];
+    const sel = (name, val, opts) => `<select data-bd="${name}" style="font-family:var(--mono);font-size:11px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+      ${opts.map(o => `<option value="${o}" ${o === val ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
+
+    const body = rows.map(r => `<tr data-bdid="${r.id}" style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:8px 10px;font-family:var(--mono);font-size:12px;">@${escapeHtml(r.domain)}</td>
+        <td style="padding:8px 10px;">${admin ? sel('role', r.default_role || 'viewer', ROLES) : `<span style="font-family:var(--mono);font-size:11px;">${escapeHtml(r.default_role || 'viewer')}</span>`}</td>
+        <td style="padding:8px 10px;">${admin ? sel('dept', r.default_department || 'all', DEPTS) : `<span style="font-family:var(--mono);font-size:11px;">${escapeHtml(r.default_department || 'all')}</span>`}</td>
+        <td style="padding:8px 10px;text-align:center;">
+          <input type="checkbox" data-bd="auto" ${r.auto_join === false ? '' : 'checked'} ${admin ? '' : 'disabled'} style="cursor:pointer;">
+        </td>
+        <td style="padding:8px 10px;text-align:right;">
+          ${admin ? `<button type="button" data-bdsave style="font-family:var(--mono);font-size:10px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);cursor:pointer;">Save</button>
+                     <button type="button" data-bddel style="font-family:var(--mono);font-size:10px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--lost,#a8381f);cursor:pointer;margin-left:6px;">Remove</button>` : ''}
+        </td>
+      </tr>`).join('') || `<tr><td colspan="5" style="padding:18px;text-align:center;font-family:var(--serif);font-style:italic;color:var(--ink-3);">No domains yet — nobody can self-serve sign-up for this brand.</td></tr>`;
+
+    host.innerHTML = `
+      <table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+        <thead><tr style="background:#efe9dd;">
+          ${['Domain', 'Default role', 'Default department', 'Self sign-up', ''].map((h, i) => `<th style="padding:7px 10px;text-align:${i === 3 ? 'center' : i === 4 ? 'right' : 'left'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;color:var(--ink-3);text-transform:uppercase;">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+      ${admin ? `<div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">@</span>
+        <input type="text" id="hl-bd-new" placeholder="company.com" style="padding:6px 10px;font-family:var(--mono);font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);min-width:220px;">
+        ${sel('newrole', 'viewer', ROLES)}
+        ${sel('newdept', 'all', DEPTS)}
+        <button type="button" id="hl-bd-add" class="hl-btn-primary" style="font-size:12px;">+ Add domain</button>
+      </div>` : `<p style="margin-top:12px;font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">Only admins can change sign-up domains.</p>`}
+      <p style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.6;max-width:820px;">
+        Turning <b>Self sign-up</b> off keeps the domain recognised — existing accounts still resolve to this brand — but blocks new self-created accounts, so you can provision those people yourself.
+        Changing a default only affects people who sign up <em>after</em> the change; existing members keep whatever the Team table says.
+      </p>`;
+
+    if (!admin) return;
+
+    const norm = (d) => String(d || '').trim().toLowerCase()
+      .replace(/^https?:\/\//, '').replace(/^@/, '').replace(/\/.*$/, '');
+
+    host.querySelectorAll('[data-bdsave]').forEach(btn => btn.addEventListener('click', async () => {
+      const tr = btn.closest('tr');
+      const patch = {
+        default_role: tr.querySelector('[data-bd="role"]').value,
+        default_department: tr.querySelector('[data-bd="dept"]').value,
+        auto_join: tr.querySelector('[data-bd="auto"]').checked,
+      };
+      btn.disabled = true; btn.textContent = 'Saving…';
+      const { error } = await sb.from('brand_domains').update(patch).eq('id', tr.dataset.bdid);
+      if (error) { alert('Could not save: ' + error.message); btn.disabled = false; btn.textContent = 'Save'; return; }
+      btn.textContent = 'Saved ✓';
+      setTimeout(() => { btn.disabled = false; btn.textContent = 'Save'; }, 1400);
+    }));
+
+    host.querySelectorAll('[data-bddel]').forEach(btn => btn.addEventListener('click', async () => {
+      const tr = btn.closest('tr');
+      const dom = tr.querySelector('td').textContent.trim();
+      if (!confirm('Remove ' + dom + '?\n\nPeople with existing accounts keep their access — this only stops NEW sign-ups from this domain.')) return;
+      // count-verified: a silent zero-row delete means the RLS policy is missing
+      const { data, error } = await sb.from('brand_domains').delete().eq('id', tr.dataset.bdid).select('id');
+      if (error) { alert('Could not remove: ' + error.message); return; }
+      if (!data || !data.length) { alert('Nothing was removed — the delete was refused, most likely an RLS policy on brand_domains.'); return; }
+      renderSettingsDomains();
+    }));
+
+    const addBtn = document.getElementById('hl-bd-add');
+    if (addBtn) addBtn.addEventListener('click', async () => {
+      const input = document.getElementById('hl-bd-new');
+      const dom = norm(input.value);
+      if (!dom || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(dom)) { alert('Enter a domain like company.com'); input.focus(); return; }
+      const FREE = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'aol.com', 'proton.me', 'protonmail.com'];
+      if (FREE.includes(dom) && !confirm(dom + ' is a public email provider.\n\nAdding it would let ANYONE with a ' + dom + ' address create an account on this brand. Add it anyway?')) return;
+      addBtn.disabled = true;
+      const { error } = await sb.from('brand_domains').insert({
+        brand_id: brandId, domain: dom,
+        default_role: document.querySelector('[data-bd="newrole"]').value,
+        default_department: document.querySelector('[data-bd="newdept"]').value,
+        auto_join: true,
+      });
+      addBtn.disabled = false;
+      if (error) {
+        alert(/duplicate|unique/i.test(error.message)
+          ? dom + ' is already claimed — by this brand or another one. A domain can only belong to one brand.'
+          : 'Could not add: ' + error.message);
+        return;
+      }
+      input.value = '';
+      renderSettingsDomains();
+    });
   }
 
   // ─── Settings: Team management ──────────────────────────────────────────────
