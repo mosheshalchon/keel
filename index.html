@@ -39663,8 +39663,11 @@ render();
     if (rows.length === 0) throw new Error('No data rows found under the header.');
 
     // Replace the prior UNFI snapshot, then chunked insert.
+    // report_type IS NULL scopes this to snapshot rows only. Without it this delete also
+    // wiped every weekly row for the distributor — a snapshot upload silently erased the
+    // whole weekly history, which then reads as missing weeks in Sales Pacing.
     const { error: delErr } = await sb.from('distributor_customer_sales')
-      .delete().eq('brand_id', brandId).eq('distributor', distributor);
+      .delete().eq('brand_id', brandId).eq('distributor', distributor).is('report_type', null);
     if (delErr) throw new Error('Could not clear the prior UNFI snapshot: ' + delErr.message);
 
     const CHUNK = 500;
@@ -43395,17 +43398,17 @@ render();
 
     // Build the permission matrix UI for admins.
     // Tabs follow the canonical app navigation. Departments are the 4 fixed ones.
-    const TAB_DEFS = [
-      { key: 'submission-timeline', label: 'Submission Timeline' },
-      { key: 'submissions', label: 'Submissions' },
-      { key: 'brand-library', label: 'Brand Library' },
-      { key: 'retailer-library', label: 'Retailer Library' },
-      { key: 'distributor', label: 'Distributor' },
-      { key: 'forecast', label: 'Forecast' },
-      { key: 'master-deadlines', label: 'Master Deadlines' },
-      { key: 'settings', label: 'Settings' },
-      { key: 'notifications', label: 'Notifications' },
-    ];
+    // DERIVED FROM THE REAL NAV — never hand-maintained again. The old hardcoded list had
+    // drifted badly: it used keys that no page owns ('submissions' vs 'submission-docs',
+    // 'forecast' vs 'forecasts', 'distributor' vs 'distribution', plus two tabs that don't
+    // exist) and was missing every Operations page, Sales Pacing, Promos, Insights, Sales
+    // Tools and Finance. Since the sidebar filters on NAV_ITEMS ids, any department with a
+    // configured row could ONLY ever be granted the two or three keys that happened to match
+    // — everything else stayed invisible with no way to turn it on. Dashboard is excluded
+    // because it is always visible by design.
+    const TAB_DEFS = ((window.HL && HL.NAV_ITEMS) || [])
+      .filter(n => n.id !== 'dashboard')
+      .map(n => ({ key: n.id, label: n.label }));
     const DEPTS = ['sales', 'ops', 'finance', 'all'];
     const permLookup = (dept, tab) => permissions.find(p => p.department === dept && p.tab_key === tab)?.can_access || false;
 
