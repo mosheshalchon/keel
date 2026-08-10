@@ -39199,11 +39199,13 @@ render();
       parsed.push({ metric, rows });
     }
 
-    // Don't clobber NetSuite-sourced cells: fetch their keys and skip them.
+    // Don't clobber SYNC-sourced cells: fetch their keys and skip them.
+    // This looked only for source='netsuite', but the live cron writes source='dropbox' —
+    // so a manual upload could silently overwrite synced cells it was meant to defer to.
     const netsuiteKeys = new Set();
     {
       const { data: nsRows, error } = await sb.from('sales_actuals')
-        .select('dimension, entity, month').eq('brand_id', brandId).eq('source', 'netsuite');
+        .select('dimension, entity, month').eq('brand_id', brandId).neq('source', 'upload');
       if (!error && nsRows) nsRows.forEach(r => netsuiteKeys.add(`${r.dimension}|${r.entity}|${r.month}`));
     }
 
@@ -41385,6 +41387,30 @@ render();
     );
   }
 
+  // DUPLICATE GUARD. sales_actuals has no enforced unique key, and the Dropbox sync
+  // INSERTS rather than upserts — so a re-run leaves the previous run's rows in place and
+  // every total silently inflates. (Aug 10 2026: August read $2.07M against a $1.89M file.)
+  // The real identity of a cell is brand × dimension × entity × month × STATUS — one
+  // customer legitimately has a Billed row AND a Pending Fulfillment row in the same month,
+  // so status must stay in the key or real money gets dropped. Within one key we keep the
+  // newest write and report the rest rather than summing them.
+  function _spDedupeActuals(rows) {
+    const best = new Map();
+    let dupes = 0, dupAmount = 0;
+    for (const r of (rows || [])) {
+      const k = [r.dimension, r.entity, r.month, r.status == null ? '~' : r.status].join('|');
+      const prev = best.get(k);
+      if (!prev) { best.set(k, r); continue; }
+      dupes++;
+      const a1 = new Date(prev.updated_at || 0).getTime();
+      const b1 = new Date(r.updated_at || 0).getTime();
+      const loser = b1 > a1 ? prev : r;
+      dupAmount += Number(loser.amount) || 0;
+      if (b1 > a1) best.set(k, r);
+    }
+    return { rows: [...best.values()], dupes, dupAmount };
+  }
+
   async function loadAndRenderSalesPacing(brandId, sb) {
     const body = document.getElementById('hl-sp-body');
     if (!body) return;
@@ -41401,6 +41427,7 @@ render();
       // error text (which is unreliable on a 400), we just fall through to the
       // next leaner set on ANY error until one succeeds.
       const columnSets = [
+        'dimension, entity, upc, month, amount, units, status, source, updated_at',
         'dimension, entity, upc, month, amount, units, status, source',
         'dimension, entity, upc, month, amount, units, source',
         'dimension, entity, month, amount, units, source',
@@ -41425,6 +41452,13 @@ render();
         body.innerHTML = `<div class="hl-empty" style="padding:32px;text-align:center;color:var(--lost);">Couldn’t load sales data: ${escapeHtml(error.message)}</div>`;
         return;
       }
+    }
+    // Collapse duplicate sync runs before ANY total is computed from these rows.
+    {
+      const dd = _spDedupeActuals(_spState.rows);
+      _spState.dupWarn = dd.dupes ? { rows: dd.dupes, amount: dd.dupAmount } : null;
+      if (dd.dupes) console.warn('[SalesPacing] ignored ' + dd.dupes + ' duplicate sales_actuals row(s) worth $' + dd.dupAmount.toFixed(2) + ' — older sync runs left in place');
+      _spState.rows = dd.rows;
     }
     // Build a UPC → {category, product_line} map from the brand product library,
     // so product sales rows can be filtered by category and product line.
@@ -41957,6 +41991,9 @@ render();
       </tr>
     `;
     return `
+      ${_spState.dupWarn ? `<div style="margin-bottom:10px;padding:9px 12px;border:1px solid #e0d3b8;background:#faf0d7;border-radius:6px;font-family:var(--mono);font-size:10px;line-height:1.6;">
+        <b>${_spState.dupWarn.rows.toLocaleString()} duplicate row(s) ignored</b> — worth $${Math.round(_spState.dupWarn.amount).toLocaleString()}. The sales sync inserted these on top of an earlier run instead of replacing it. The totals below use only the newest write per customer · month · status, so they are correct, but the extra rows are still in <span style="color:var(--ink-2);">sales_actuals</span> and will keep accumulating until the sync is fixed.
+      </div>` : ''}
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:8px;letter-spacing:0.04em;">Variance (Var $, Var %) compares: <span style="color:var(--ink-2);">${escapeHtml(periods.caption)}</span></div>
       <div style="overflow-x:auto;border:1px solid var(--rule-softer);border-radius:6px;">
         <table style="border-collapse:collapse;width:100%;min-width:${260 + windowMonths.length * 78 + 240}px;">
