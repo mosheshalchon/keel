@@ -43344,11 +43344,30 @@ render();
   async function renderSettingsDomains() {
     const host = document.getElementById('settings-domains-body');
     if (!host) return;
-    const session = Auth.getSession();
-    const sb = Auth.getClient();
-    const brandId = session && session.brandId;
+    try { await _renderSettingsDomainsInner(host); }
+    catch (err) {
+      console.error('[domains] render failed:', err);
+      host.innerHTML = `<div class="hl-empty" style="color:var(--lost);">Sign-up domains failed to render: ${escapeHtml(err && err.message || String(err))} — details in the console.</div>`;
+    }
+  }
+
+  async function _renderSettingsDomainsInner(host) {
+    // Bare Auth/isAdmin aren't in scope in this script block — the neighbouring
+    // settings renderers go through window.*, and getting this wrong threw before
+    // the try below, leaving the panel stuck on "Loading…" with no message.
+    let session, sb, brandId, admin;
+    try {
+      sb = window.Auth.getClient();
+      session = (window.BrandLibrary && window.BrandLibrary.getSession && window.BrandLibrary.getSession())
+             || (window.Auth.getSession && window.Auth.getSession()) || {};
+      brandId = session.brandId;
+      admin = session.accessRole === 'admin' || session.roleLabel === 'admin';
+    } catch (e) {
+      console.error('[domains] session lookup failed:', e);
+      host.innerHTML = `<div class="hl-empty" style="color:var(--lost);">Couldn't read your session: ${escapeHtml(e.message || String(e))}</div>`;
+      return;
+    }
     if (!brandId) { host.innerHTML = '<div class="hl-empty">No brand on this session.</div>'; return; }
-    const admin = isAdmin() || (session.accessRole === 'admin');
 
     let rows = [];
     try {
