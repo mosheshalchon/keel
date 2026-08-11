@@ -41585,6 +41585,12 @@ render();
         const anchorKeyNum = anchor.y * 12 + anchor.m;
         if (latestKeyNum > anchorKeyNum) displayAnchor = { y: ly, m: lm };
       }
+      // Always carry at least one column past the current month, so next month's order
+      // book has somewhere to appear the moment the first order lands — rather than the
+      // column materialising mid-month and looking like a sudden jump.
+      const _now = new Date();
+      const nxt = spAddMonths(_now.getFullYear(), _now.getMonth() + 1, 1);
+      if ((nxt.y * 12 + nxt.m) > (displayAnchor.y * 12 + displayAnchor.m)) displayAnchor = { y: nxt.y, m: nxt.m };
     }
 
     // Build the trailing window off the DISPLAY anchor so the current month shows.
@@ -41620,19 +41626,24 @@ render();
     const curMonthKey = spMonthKey(today.getFullYear(), today.getMonth() + 1);
     const FINAL_STATUSES = new Set(['billed', 'closed']);
     const statusFilterActive = !!(_spState.statusSel && _spState.statusSel.length);
-    const countRow = (r) => statusFilterActive || r.month === curMonthKey || FINAL_STATUSES.has(String(r.status || '').trim().toLowerCase());
+    // ">=" not "==": a FUTURE month is even more in-progress than this one. Orders for
+    // next month are all Pending Fulfillment, so the finalized-only rule was filtering
+    // every one of them out and the column read as zero.
+    const countRow = (r) => statusFilterActive || r.month >= curMonthKey || FINAL_STATUSES.has(String(r.status || '').trim().toLowerCase());
     // CURRENT-MONTH COMPOSITION. The closed-month rule above means past columns are
     // finalized (Billed + Closed) while the in-progress month also carries the live
     // pipeline. That makes the last column structurally different from every other
     // one — in Aug 2026 it was 82% not-yet-shipped — so measure the split and say so
     // in the header rather than letting it read as a sales jump.
-    let _curShipped = 0, _curOpen = 0;
+    const _splitByMonth = {};
     for (const r of rows) {
-      if (r.month !== curMonthKey) continue;
+      if (r.month < curMonthKey) continue;
+      const sl = _splitByMonth[r.month] || (_splitByMonth[r.month] = { shipped: 0, open: 0 });
       const v = Number(r[metricKey] || 0);
-      if (FINAL_STATUSES.has(String(r.status || '').trim().toLowerCase())) _curShipped += v; else _curOpen += v;
+      if (FINAL_STATUSES.has(String(r.status || '').trim().toLowerCase())) sl.shipped += v; else sl.open += v;
     }
-    _spState.curSplit = { shipped: _curShipped, open: _curOpen, month: curMonthKey };
+    _spState.splitByMonth = _splitByMonth;
+    _spState.curMonthKey = curMonthKey;
 
     const byEntity = new Map();
     const upcByEntity = new Map();
@@ -41993,15 +42004,22 @@ render();
       return '$' + Math.round(n);
     };
     const monthTh = (w) => {
-      const isCurr = w.key === curMonthKey;
-      const bg = isCurr ? 'background:var(--bone-2);' : '';
-      const sp = isCurr ? (_spState.curSplit || null) : null;
-      const openPct = sp && (sp.shipped + sp.open) > 0 ? sp.open / (sp.shipped + sp.open) : 0;
-      // The tag turns amber once most of the in-progress month is still open orders.
-      const tag = isCurr
-        ? `<div style="font-size:7px;color:${openPct >= 0.5 ? '#b8860b' : 'var(--ink-3)'};letter-spacing:0.08em;">CURR</div>${sp && (sp.shipped + sp.open) > 0 && _spState.metric === 'amount'
-            ? `<div title="Past months count only finalized orders (Billed + Closed). This month also includes the live pipeline, so it is not directly comparable — ${Math.round(openPct * 100)}% of it has not shipped yet." style="font-size:7px;font-weight:400;letter-spacing:0;color:var(--ink-3);margin-top:1px;">${_fmtK(sp.shipped)} shipped<br>${_fmtK(sp.open)} open</div>`
-            : ''}`
+      const cmk = _spState.curMonthKey || curMonthKey;
+      const isCurr = w.key === cmk;
+      const isFuture = w.key > cmk;
+      const bg = isCurr ? 'background:var(--bone-2);' : isFuture ? 'background:rgba(184,134,11,0.06);' : '';
+      const sp = (isCurr || isFuture) ? ((_spState.splitByMonth || {})[w.key] || { shipped: 0, open: 0 }) : null;
+      const tot = sp ? sp.shipped + sp.open : 0;
+      const openPct = tot > 0 ? sp.open / tot : (isFuture ? 1 : 0);
+      // Amber once most of an in-progress month is still open orders — always, for a
+      // future month, since by definition nothing in it has shipped.
+      const label = isCurr ? 'CURR' : isFuture ? 'ORDERS' : '';
+      const tag = (isCurr || isFuture)
+        ? `<div style="font-size:7px;color:${openPct >= 0.5 ? '#b8860b' : 'var(--ink-3)'};letter-spacing:0.08em;">${label}</div>${tot > 0 && _spState.metric === 'amount'
+            ? `<div title="${isFuture
+                ? 'Orders already booked to ship in this month. Nothing here has shipped yet — it is the forward order book, not sales.'
+                : 'Past months count only finalized orders (Billed + Closed). This month also includes the live pipeline, so it is not directly comparable — ' + Math.round(openPct * 100) + '% of it has not shipped yet.'}" style="font-size:7px;font-weight:400;letter-spacing:0;color:var(--ink-3);margin-top:1px;">${isFuture ? _fmtK(sp.open) + ' open' : _fmtK(sp.shipped) + ' shipped<br>' + _fmtK(sp.open) + ' open'}</div>`
+            : (isFuture ? '<div style="font-size:7px;font-weight:400;letter-spacing:0;color:var(--ink-3);margin-top:1px;">no orders yet</div>' : '')}`
         : '';
       return `<th data-sp-sortkey="m:${w.key}" style="cursor:pointer;text-align:right;padding:8px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);white-space:nowrap;${bg}">${w.label.replace(' ', '<br>')}${tag} ${sortIcon('m:' + w.key)}</th>`;
     };
