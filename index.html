@@ -41387,6 +41387,117 @@ render();
   // Fetch ALL rows for a query, paging past Supabase's default 1,000-row cap.
   // Without this, a brand with >1,000 monthly cells loads only a truncated
   // (and order-dependent) subset — which silently undercounts totals.
+  // ─── Sales Pacing: customer × product drill-down ─────────────────────────
+  // sales_actuals keeps 'product' and 'customer' as separate dimensions that are
+  // never joined, so "which customers drove this item?" was unanswerable in the
+  // app. The sync now also writes 'customer_product' rows whose entity is
+  // "<product> § <customer>". Fetched only when someone clicks — they outnumber
+  // the flat dimensions 2:1 and would triple the page's payload otherwise.
+  let _spCpCache = null;
+  window.clearSpCrossCache = () => { _spCpCache = null; };
+
+  async function spFetchCrossRows(brandId, sb) {
+    if (_spCpCache) return _spCpCache;
+    const res = await window.sbPageAll((from, to, withCount) =>
+      sb.from('sales_actuals')
+        .select('entity, month, amount, units, status', withCount ? { count: 'exact' } : undefined)
+        .eq('brand_id', brandId).eq('dimension', 'customer_product')
+        .order('id', { ascending: true }).range(from, to)
+    );
+    if (res.error) throw res.error;
+    _spCpCache = res.data || [];
+    return _spCpCache;
+  }
+
+  async function spShowProductCustomers(product, windowMonths, metricKey, curMonthKey) {
+    const brandId = _spState.brandId;
+    const sb = window.Auth.getClient();
+    const wrapId = 'hl-sp-cp-modal';
+    document.getElementById(wrapId)?.remove();
+    document.body.insertAdjacentHTML('beforeend', `<div id="${wrapId}" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:1240px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+        <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:20px;">${escapeHtml(product)}</div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px;">by customer</div>
+          </div>
+          <button data-spcpclose style="background:transparent;border:none;font-size:22px;line-height:1;cursor:pointer;color:var(--ink-3);">×</button>
+        </div>
+        <div id="hl-sp-cp-body" style="padding:18px 22px;"><div class="hl-loading">Loading customer detail…</div></div>
+      </div></div>`);
+    const modal = document.getElementById(wrapId);
+    const close = () => modal.remove();
+    modal.addEventListener('click', (e) => { if (e.target === modal || e.target.closest('[data-spcpclose]')) close(); });
+    const onKey = (e) => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); } };
+    document.addEventListener('keydown', onKey);
+
+    const host = document.getElementById('hl-sp-cp-body');
+    let all;
+    try {
+      all = await spFetchCrossRows(brandId, sb);
+    } catch (err) {
+      host.innerHTML = `<div class="hl-empty" style="color:var(--lost);">Couldn't load the breakdown: ${escapeHtml(err.message || String(err))}</div>`;
+      return;
+    }
+
+    const prefix = product + ' § ';
+    const mine = all.filter(r => r.entity && r.entity.startsWith(prefix));
+    if (!mine.length) {
+      host.innerHTML = `<div style="padding:20px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">
+        No customer breakdown stored for this item yet. These rows are written by the sales sync — they appear after its next run.
+      </div>`;
+      return;
+    }
+
+    // Same closed-month rule the table uses: finalized only for past months, every
+    // status for the month in progress and beyond. Otherwise the drill-down would
+    // not add up to the row the user clicked.
+    const FINAL = new Set(['billed', 'closed']);
+    const isFinal = (r) => FINAL.has(String(r.status || '').trim().toLowerCase());
+    const counts = (r) => r.month >= curMonthKey || isFinal(r);
+
+    const byCust = new Map();
+    for (const r of mine) {
+      if (!counts(r)) continue;
+      const cust = r.entity.slice(prefix.length);
+      let o = byCust.get(cust);
+      if (!o) { o = { cust, months: {}, total: 0, curShipped: 0, curOpen: 0 }; byCust.set(cust, o); }
+      const v = Number(r[metricKey] || 0);
+      o.months[r.month] = (o.months[r.month] || 0) + v;
+      o.total += v;
+      if (r.month >= curMonthKey) { if (isFinal(r)) o.curShipped += v; else o.curOpen += v; }
+    }
+    const latest = windowMonths[windowMonths.length - 1].key;
+    const rows = [...byCust.values()].sort((a, b) => (b.months[latest] || 0) - (a.months[latest] || 0) || b.total - a.total);
+
+    const money = (v) => v ? ('$' + Math.round(v).toLocaleString()) : '·';
+    const th = (t, a2, extra) => `<th style="padding:7px 8px;text-align:${a2 || 'right'};font-family:var(--mono);font-size:9px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;${extra || ''}">${t}</th>`;
+    const totalsByMonth = {};
+    for (const w of windowMonths) totalsByMonth[w.key] = rows.reduce((s2, r) => s2 + (r.months[w.key] || 0), 0);
+
+    host.innerHTML = `
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;">
+        <thead><tr style="background:#efe9dd;">
+          ${th('Customer', 'left')}
+          ${windowMonths.map(w => th(w.label.replace(' ', '<br>'), 'right', w.key === curMonthKey ? 'background:var(--bone-2);' : (w.key > curMonthKey ? 'background:rgba(184,134,11,0.06);' : ''))).join('')}
+          ${th('Total', 'right', 'border-left:1px solid var(--rule-soft);')}
+        </tr></thead>
+        <tbody>${rows.map(r => `<tr style="border-top:1px solid var(--rule-soft);">
+          <td style="padding:6px 10px;font-family:var(--sans);font-size:12px;white-space:nowrap;">${escapeHtml(r.cust)}${r.curOpen > 0 ? ` <span title="${money(r.curOpen)} of this customer's current and future months is ordered but not yet shipped" style="font-family:var(--mono);font-size:9px;color:#b8860b;">${money(r.curOpen)} open</span>` : ''}</td>
+          ${windowMonths.map(w => `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:${r.months[w.key] ? 'var(--ink-2)' : 'var(--ink-4)'};${w.key === curMonthKey ? 'background:var(--bone-2);' : (w.key > curMonthKey ? 'background:rgba(184,134,11,0.06);' : '')}">${money(r.months[w.key] || 0)}</td>`).join('')}
+          <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;border-left:1px solid var(--rule-soft);">${money(r.total)}</td>
+        </tr>`).join('')}</tbody>
+        <tfoot><tr style="border-top:2px solid var(--ink);background:rgba(0,0,0,0.02);">
+          <td style="padding:8px 10px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Total · ${rows.length} customers</td>
+          ${windowMonths.map(w => `<td style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${money(totalsByMonth[w.key])}</td>`).join('')}
+          <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;border-left:1px solid var(--rule-soft);">${money(rows.reduce((s2, r) => s2 + r.total, 0))}</td>
+        </tr></tfoot>
+      </table></div>
+      <p style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.6;max-width:900px;">
+        Sorted by the most recent column. Past months count finalized orders only (Billed + Closed); the current and future months also include orders not yet shipped — those carry an amber <b>open</b> figure beside the customer name. Totals here match the row you clicked in the table behind.
+      </p>`;
+  }
+
   async function spFetchAll(sb, brandId, cols) {
     // Parallel paging: page 1 returns an exact count, remaining pages fetch
     // concurrently (was strictly sequential — one round trip per 1k rows).
@@ -41394,6 +41505,9 @@ render();
       sb.from('sales_actuals')
         .select(cols, withCount ? { count: 'exact' } : undefined)
         .eq('brand_id', brandId)
+        // customer_product rows exist only for the drill-down and outnumber the
+        // other two dimensions 2:1 — fetched on demand so this page stays light.
+        .neq('dimension', 'customer_product')
         .order('id', { ascending: true })
         .range(from, to)
     );
@@ -41762,7 +41876,7 @@ render();
       ${spControlsHtml(allRows)}
       ${spHeadlineHtml(grandL12, grandCur, grandPrev, grandVarAbs, grandVarPct, periods)}
       ${spChartHtml(l12Window, chartSeries, singleEntity ? _spState.entitySel[0] : `All ${dim}s`)}
-      ${spTableHtml(windowMonths, perEntity, anchorKey, periods, totalsByMonth, grandL12, grandCur, grandVarAbs, grandVarPct)}
+      ${(_spState._lastWindow = windowMonths, '')}${spTableHtml(windowMonths, perEntity, anchorKey, periods, totalsByMonth, grandL12, grandCur, grandVarAbs, grandVarPct)}
       ${diag}
     `;
     spWireControls(body, allRows);
@@ -42038,7 +42152,7 @@ render();
     };
     const bodyRows = perEntity.map(pe => `
       <tr style="border-bottom:1px solid var(--rule-softer);">
-        <td style="position:sticky;left:0;background:var(--paper);text-align:left;padding:6px 10px;font-family:var(--sans);font-size:12px;color:var(--ink);z-index:1;">${escapeHtml(pe.ent)}</td>
+        <td ${_spState.dimension === 'product' ? `data-sp-drill="${escapeHtml(pe.ent)}" title="See which customers drive this item"` : ''} style="position:sticky;left:0;background:var(--paper);text-align:left;padding:6px 10px;font-family:var(--sans);font-size:12px;color:var(--ink);z-index:1;${_spState.dimension === 'product' ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;text-decoration-color:var(--rule-soft);' : ''}">${escapeHtml(pe.ent)}</td>
         ${windowMonths.map(w => monthTd(pe.months[w.key] || 0, w)).join('')}
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink);border-left:1px solid var(--rule-soft);">${fmt$(pe.l12)}</td>
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:${varColor(pe.varAbs)};border-left:1px solid var(--rule-soft);">${fmtSigned$(pe.varAbs)}</td>
@@ -42144,6 +42258,10 @@ render();
         renderSalesPacingBody(body, allRows);
       });
     });
+
+    body.querySelectorAll('[data-sp-drill]').forEach(td => td.addEventListener('click', () => {
+      spShowProductCustomers(td.dataset.spDrill, _spState._lastWindow || [], _spState.metric === 'units' ? 'units' : 'amount', _spState.curMonthKey);
+    }));
 
     body.querySelectorAll('[data-sp-preset]').forEach(btn => btn.addEventListener('click', () => {
       const sets = _spState._presetSets || {};
