@@ -39882,7 +39882,7 @@ render();
 
   // ---- UNFI Customer detail view (Phase 2a: L52 totals) ----
   let _cdState = { products: null, cat: '', line: '', item: '', search: '', offset: 0, limit: 25, rows: [], fullCount: 0, brandId: null, sb: null, mode: 'totals', grain: 'week', periods: 8, trendRows: [], periodKeys: [], total: null, error: null,
-    catSel: new Set(), lineSel: new Set(), itemSel: new Set(), distSel: new Set(), dcSel: new Set(), metric: 'dollars', openMs: null };
+    catSel: new Set(), lineSel: new Set(), itemSel: new Set(), distSel: new Set(), dcSel: new Set(), chainSel: new Set(), metric: 'dollars', openMs: null };
   function _cdSelStyle() { return 'padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;background:var(--paper);'; }
   function _cdMoney(n) { return '$' + Math.round(Number(n) || 0).toLocaleString(); }
   function _cdNum(n) { return (Number(n) || 0).toLocaleString(); }
@@ -39903,7 +39903,8 @@ render();
       body.innerHTML = `<div class="hl-empty" style="padding:28px;text-align:center;color:var(--lost);">Could not load weekly data: ${escapeHtml(err.message || 'error')}</div>`;
       return;
     }
-    _cdState.cat = ''; _cdState.line = ''; _cdState.item = ''; _cdState.search = ''; _cdState.grain = 'week'; _cdState.periods = 8; _cdState.offset = 0;
+    _cdState.cat = ''; _cdState.line = ''; _cdState.item = ''; _cdState.grain = 'week'; _cdState.periods = 8; _cdState.offset = 0;
+    _cdState.chainSel.clear();
 
     if (!_cdState.rows.length) {
       body.innerHTML = `<div style="font-family:var(--serif);font-size:18px;color:var(--ink);margin-bottom:8px;">Distributor &middot; Weekly customer detail</div>
@@ -39914,13 +39915,15 @@ render();
     const cats = [...new Set(_cdState.products.map(p => p.category).filter(Boolean))].sort();
     const allDists = [...new Set(_cdState.rows.map(r => r.distributor).filter(Boolean))].sort();
     const allDcs = [...new Set(_cdState.rows.map(r => (r.whs && String(r.whs).trim()) ? String(r.whs).trim() : '—'))].sort();
+    const allChains = [...new Set(_cdState.rows.map(r => (r.chain_name && String(r.chain_name).trim()) ? String(r.chain_name).trim() : '(no chain name)'))]
+      .sort((a2, b2) => a2.localeCompare(b2));
     body.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
         <div style="font-family:var(--serif);font-size:18px;color:var(--ink);">Distributor &middot; Weekly customer detail</div>
         <span style="display:inline-flex;gap:6px;align-items:center;"><button id="hl-cw-week"></button><button id="hl-cw-month"></button></span>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;">
-        <input id="hl-cw-search" placeholder="Search retailer…" style="padding:7px 10px;border:1px solid var(--rule-soft);border-radius:6px;font-family:var(--sans);font-size:13px;min-width:200px;" />
+        ${_cwMs('chain', 'Chain', allChains, _cdState.chainSel)}
         ${_cwMs('dist', 'Distributor', allDists, _cdState.distSel)}
         ${_cwMs('dc', 'DC', allDcs, _cdState.dcSel)}
         ${_cwMs('cat', 'Categories', cats, _cdState.catSel)}
@@ -39933,7 +39936,6 @@ render();
       </div>
       <div id="hl-cw-results"></div>`;
 
-    const search = document.getElementById('hl-cw-search');
     const refillLines = () => {
       const lines = [...new Set(_cdState.products.filter(p => !_cdState.catSel.size || _cdState.catSel.has(p.category)).map(p => p.product_line).filter(Boolean))].sort();
       const slot = document.getElementById('hl-cw-line-slot');
@@ -39951,7 +39953,6 @@ render();
     body.querySelectorAll('.hl-cw-metric').forEach(b => b.addEventListener('click', () => {
       _cdState.metric = b.dataset.metric; _cdState.offset = 0; _cwInitRerenderToolbar();
     }));
-    let t = null; search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { _cdState.search = search.value.trim(); _cdState.offset = 0; _cwRender(); }, 250); });
 
     const wbtn = document.getElementById('hl-cw-week'), mbtn = document.getElementById('hl-cw-month');
     const syncGrain = () => {
@@ -40006,7 +40007,7 @@ render();
       </span></span>`;
   }
   function _cwWireMs(scope) {
-    const sets = { dist: _cdState.distSel, dc: _cdState.dcSel, cat: _cdState.catSel, line: _cdState.lineSel, item: _cdState.itemSel };
+    const sets = { dist: _cdState.distSel, dc: _cdState.dcSel, chain: _cdState.chainSel, cat: _cdState.catSel, line: _cdState.lineSel, item: _cdState.itemSel };
     scope.querySelectorAll('.cw-ms').forEach(box => {
       if (box.dataset.wired === '1') return; box.dataset.wired = '1';
       const key = box.dataset.mskey, sel = sets[key];
@@ -40034,6 +40035,10 @@ render();
     });
   }
   function _cwAfterFilter(key) {
+    // Close the panel on any selection. It's absolutely positioned over the table,
+    // so leaving it open hides the very rows you just filtered to.
+    document.querySelectorAll('.cw-ms-panel').forEach(p => { p.style.display = 'none'; });
+    _cdState.openMs = null;
     if (key === 'cat') { _cdState.lineSel.clear(); _cdState.itemSel.clear(); _cdState.refillLines?.(); _cdState.refillItems?.(); }
     if (key === 'line') { _cdState.itemSel.clear(); _cdState.refillItems?.(); }
     _cdState.offset = 0;
@@ -40043,7 +40048,7 @@ render();
   function _cwInitRerenderToolbar() {
     document.querySelectorAll('.cw-ms').forEach(box => {
       const key = box.dataset.mskey;
-      const sets = { dist: _cdState.distSel, dc: _cdState.dcSel, cat: _cdState.catSel, line: _cdState.lineSel, item: _cdState.itemSel };
+      const sets = { dist: _cdState.distSel, dc: _cdState.dcSel, chain: _cdState.chainSel, cat: _cdState.catSel, line: _cdState.lineSel, item: _cdState.itemSel };
       const sel = sets[key]; if (!sel) return;
       const btn = box.querySelector('.cw-ms-btn');
       const lbl = sel.size === 0 ? 'All' : `${sel.size} selected`;
@@ -40064,14 +40069,13 @@ render();
     const S = _cdState;
     const cn = r => (r.chain_name && String(r.chain_name).trim()) ? String(r.chain_name).trim() : '(no chain name)';
     const dcOf = r => (r.whs && String(r.whs).trim()) ? String(r.whs).trim() : '—';
-    const q = S.search ? S.search.toLowerCase() : '';
     const f = S.rows.filter(r =>
       (!S.catSel.size || S.catSel.has(r.category)) &&
       (!S.lineSel.size || S.lineSel.has(r.product_line)) &&
       (!S.itemSel.size || S.itemSel.has(r.product_id)) &&
       (!S.distSel.size || S.distSel.has(r.distributor)) &&
       (!S.dcSel.size || S.dcSel.has(dcOf(r))) &&
-      (!q || cn(r).toLowerCase().includes(q)));
+      (!S.chainSel.size || S.chainSel.has(cn(r))));
     const pkey = r => S.grain === 'month' ? String(r.week_starting).slice(0, 7) : String(r.week_starting);
     const allP = [...new Set(f.map(pkey))].sort().reverse();
     const keys = allP.slice(0, S.periods).reverse();
@@ -41617,6 +41621,19 @@ render();
     const FINAL_STATUSES = new Set(['billed', 'closed']);
     const statusFilterActive = !!(_spState.statusSel && _spState.statusSel.length);
     const countRow = (r) => statusFilterActive || r.month === curMonthKey || FINAL_STATUSES.has(String(r.status || '').trim().toLowerCase());
+    // CURRENT-MONTH COMPOSITION. The closed-month rule above means past columns are
+    // finalized (Billed + Closed) while the in-progress month also carries the live
+    // pipeline. That makes the last column structurally different from every other
+    // one — in Aug 2026 it was 82% not-yet-shipped — so measure the split and say so
+    // in the header rather than letting it read as a sales jump.
+    let _curShipped = 0, _curOpen = 0;
+    for (const r of rows) {
+      if (r.month !== curMonthKey) continue;
+      const v = Number(r[metricKey] || 0);
+      if (FINAL_STATUSES.has(String(r.status || '').trim().toLowerCase())) _curShipped += v; else _curOpen += v;
+    }
+    _spState.curSplit = { shipped: _curShipped, open: _curOpen, month: curMonthKey };
+
     const byEntity = new Map();
     const upcByEntity = new Map();
     for (const r of rows) {
@@ -41821,12 +41838,26 @@ render();
     const plList = [...pls].sort();
     // Status options from whatever statuses exist in the data. Multi-select; empty = all.
     const statusList = [...new Set(allRows.map(r => r.status).filter(Boolean))].sort();
+    // Two presets beside the status picker. Picking one sets statusSel explicitly,
+    // which also switches OFF the closed-month rule — so "Shipped only" makes every
+    // column, including the current one, mean the same thing.
+    const _shipped = statusList.filter(x => ['billed', 'closed'].includes(String(x).trim().toLowerCase()));
+    const _open = statusList.filter(x => !['billed', 'closed'].includes(String(x).trim().toLowerCase()));
+    const _isPreset = (want) => want.length && want.length === (_spState.statusSel || []).length
+      && want.every(x => _spState.statusSel.includes(x));
+    const pbtn = (id, label, on, title) => `<button type="button" data-sp-preset="${id}" title="${title}" style="font-family:var(--mono);font-size:10px;padding:5px 10px;border:1px solid var(--rule-soft);background:${on ? 'var(--ink)' : 'var(--paper)'};color:${on ? 'var(--paper)' : 'var(--ink-3)'};cursor:pointer;">${label}</button>`;
     const statusControl = statusList.length > 1 ? `
         <div style="display:flex;align-items:center;gap:8px;">
           <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:0.06em;">Status:</span>
+          <span style="display:inline-flex;border-radius:4px;overflow:hidden;">
+            ${pbtn('all', 'Default', !(_spState.statusSel || []).length, 'Finalized orders for past months, everything for the month in progress — the current column includes orders that have not shipped.')}
+            ${pbtn('shipped', 'Shipped', _isPreset(_shipped), 'Billed and Closed only, in every month. Makes the current month comparable with history.')}
+            ${pbtn('open', 'Open orders', _isPreset(_open), 'Only orders not yet shipped — the forward book.')}
+          </span>
           ${spMultiSelectHtml('status', 'statuses', statusList, _spState.statusSel)}
         </div>
     ` : '';
+    _spState._presetSets = { all: [], shipped: _shipped, open: _open };
 
     const catPlControls = isProduct ? `
         <div style="display:flex;align-items:center;gap:8px;">
@@ -41955,10 +41986,23 @@ render();
         <span style="display:inline-flex;align-items:center;gap:4px;justify-content:flex-end;">${label} ${sortIcon(key)}</span>
       </th>`;
 
+    const _fmtK = (n) => {
+      const a2 = Math.abs(n);
+      if (a2 >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
+      if (a2 >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
+      return '$' + Math.round(n);
+    };
     const monthTh = (w) => {
       const isCurr = w.key === curMonthKey;
       const bg = isCurr ? 'background:var(--bone-2);' : '';
-      const tag = isCurr ? '<div style="font-size:7px;color:var(--ink-3);letter-spacing:0.08em;">CURR</div>' : '';
+      const sp = isCurr ? (_spState.curSplit || null) : null;
+      const openPct = sp && (sp.shipped + sp.open) > 0 ? sp.open / (sp.shipped + sp.open) : 0;
+      // The tag turns amber once most of the in-progress month is still open orders.
+      const tag = isCurr
+        ? `<div style="font-size:7px;color:${openPct >= 0.5 ? '#b8860b' : 'var(--ink-3)'};letter-spacing:0.08em;">CURR</div>${sp && (sp.shipped + sp.open) > 0 && _spState.metric === 'amount'
+            ? `<div title="Past months count only finalized orders (Billed + Closed). This month also includes the live pipeline, so it is not directly comparable — ${Math.round(openPct * 100)}% of it has not shipped yet." style="font-size:7px;font-weight:400;letter-spacing:0;color:var(--ink-3);margin-top:1px;">${_fmtK(sp.shipped)} shipped<br>${_fmtK(sp.open)} open</div>`
+            : ''}`
+        : '';
       return `<th data-sp-sortkey="m:${w.key}" style="cursor:pointer;text-align:right;padding:8px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);white-space:nowrap;${bg}">${w.label.replace(' ', '<br>')}${tag} ${sortIcon('m:' + w.key)}</th>`;
     };
     const head = `
@@ -42082,6 +42126,12 @@ render();
         renderSalesPacingBody(body, allRows);
       });
     });
+
+    body.querySelectorAll('[data-sp-preset]').forEach(btn => btn.addEventListener('click', () => {
+      const sets = _spState._presetSets || {};
+      _spState.statusSel = (sets[btn.dataset.spPreset] || []).slice();
+      renderSalesPacingBody(body, allRows);
+    }));
   }
 
   async function renderFinancePage() {
