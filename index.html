@@ -41409,73 +41409,88 @@ render();
     return _spCpCache;
   }
 
-  // Renders the customer breakdown INLINE, into the hidden <tr> that follows each
-  // product row. Was a modal; Moshe asked for an expander so the parent row stays
-  // visible and two products can be compared side by side.
+  // Customer breakdown, rendered as REAL <tr> rows inserted into the pacing table
+  // itself — not a nested table inside a colspan cell. A nested table lays out its
+  // own column widths, so the numbers drifted a column out of line with the parent
+  // (Aug 11: Moshe's Sep column showed customer values against the wrong month).
+  // Same cell structure as a product row = guaranteed alignment, forever.
   async function spShowProductCustomers(product, slug, windowMonths, metricKey, curMonthKey) {
-    const detail = document.querySelector(`[data-sp-detail="${slug}"]`);
-    if (!detail) return;
-    const cell = detail.firstElementChild;
+    const anchor = document.querySelector(`[data-sp-row="${slug}"]`);
+    if (!anchor) return;
     const caret = document.querySelector(`[data-sp-caret="${slug}"]`);
-    const open = detail.style.display !== 'none';
-    if (open) {
-      detail.style.display = 'none';
-      if (caret) { caret.textContent = '\u25B6'; }
+    const existing = anchor.parentNode.querySelectorAll(`[data-sp-kid="${slug}"]`);
+    if (existing.length) {                       // collapse
+      existing.forEach(el => el.remove());
+      if (caret) caret.textContent = '\u25B6';
       return;
     }
-    detail.style.display = '';
-    if (caret) { caret.textContent = '\u25BC'; }
-    if (cell.dataset.loaded === '1') return;   // built once, then just toggled
-    cell.innerHTML = `<div style="padding:10px 14px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Loading customer detail…</div>`;
+    if (caret) caret.textContent = '\u25BC';
 
-    const brandId = _spState.brandId;
-    const sb = window.Auth.getClient();
+    const nCols = windowMonths.length + 4;
+    const loading = document.createElement('tr');
+    loading.dataset.spKid = slug;
+    loading.innerHTML = `<td colspan="${nCols}" style="padding:8px 34px;font-family:var(--mono);font-size:10px;color:var(--ink-3);background:var(--bone-2);">Loading customer detail…</td>`;
+    anchor.after(loading);
+
     let all;
     try {
-      all = await spFetchCrossRows(brandId, sb);
+      all = await spFetchCrossRows(_spState.brandId, window.Auth.getClient());
     } catch (err) {
-      cell.innerHTML = `<div style="padding:10px 14px;font-family:var(--mono);font-size:10px;color:var(--lost,#a8381f);">Couldn't load: ${escapeHtml(err.message || String(err))}</div>`;
+      loading.firstElementChild.textContent = "Couldn't load: " + (err.message || String(err));
       return;
     }
 
     const prefix = product + ' \u00A7 ';
     const mine = all.filter(r => r.entity && r.entity.startsWith(prefix));
-    if (!mine.length) {
-      cell.innerHTML = `<div style="padding:10px 14px;font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);">No customer breakdown stored for this item yet — these rows come from the sales sync.</div>`;
-      cell.dataset.loaded = '1';
-      return;
-    }
-
-    // Same closed-month rule as the parent table, so the detail adds up to the row above.
     const FINAL = new Set(['billed', 'closed']);
     const isFinal = (r) => FINAL.has(String(r.status || '').trim().toLowerCase());
     const byCust = new Map();
     for (const r of mine) {
+      // Same closed-month rule as the parent row, so the parts sum to the whole.
       if (!(r.month >= curMonthKey || isFinal(r))) continue;
       const cust = r.entity.slice(prefix.length);
       let o = byCust.get(cust);
-      if (!o) { o = { cust, months: {}, total: 0, open: 0 }; byCust.set(cust, o); }
+      if (!o) { o = { cust, months: {}, total: 0 }; byCust.set(cust, o); }
       const v = Number(r[metricKey] || 0);
       o.months[r.month] = (o.months[r.month] || 0) + v;
       o.total += v;
-      if (r.month >= curMonthKey && !isFinal(r)) o.open += v;
     }
+    // Customers with nothing in the visible window would just be rows of dots.
     const latest = windowMonths[windowMonths.length - 1].key;
-    const rows = [...byCust.values()].sort((a, b) => (b.months[latest] || 0) - (a.months[latest] || 0) || b.total - a.total);
-    const money = (v) => v ? ('$' + Math.round(v).toLocaleString()) : '\u00B7';
+    const rows = [...byCust.values()]
+      .filter(r => windowMonths.some(w => r.months[w.key]))
+      .sort((a, b) => (b.months[latest] || 0) - (a.months[latest] || 0) || b.total - a.total);
 
-    cell.innerHTML = `<div style="padding:2px 0 8px 0;">
-      <table style="width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;">
-        <tbody>${rows.map(r => `<tr>
-          <td style="position:sticky;left:0;background:var(--bone-2);padding:4px 10px 4px 32px;font-family:var(--sans);font-size:11px;color:var(--ink-2);white-space:nowrap;">${escapeHtml(r.cust)}${r.open > 0 ? ` <span title="${money(r.open)} ordered but not yet shipped" style="font-family:var(--mono);font-size:9px;color:#b8860b;">${money(r.open)} open</span>` : ''}</td>
-          ${windowMonths.map(w => `<td style="text-align:right;padding:4px 8px;font-family:var(--mono);font-size:10px;color:${r.months[w.key] ? 'var(--ink-3)' : 'var(--ink-4)'};${w.key === curMonthKey ? 'background:rgba(0,0,0,0.03);' : ''}">${money(r.months[w.key] || 0)}</td>`).join('')}
-          <td style="text-align:right;padding:4px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);border-left:1px solid var(--rule-soft);">${money(r.total)}</td>
-          <td colspan="2"></td>
-        </tr>`).join('')}</tbody>
-      </table>
-      <div style="padding:6px 10px 0 32px;font-family:var(--mono);font-size:9px;color:var(--ink-3);">${rows.length} customer${rows.length === 1 ? '' : 's'} · sorted by the most recent column · amber = ordered, not yet shipped</div>
-    </div>`;
-    cell.dataset.loaded = '1';
+    loading.remove();
+    if (!rows.length) {
+      const none = document.createElement('tr');
+      none.dataset.spKid = slug;
+      none.innerHTML = `<td colspan="${nCols}" style="padding:8px 34px;font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);background:var(--bone-2);">No customer breakdown stored for this item yet — these rows come from the sales sync.</td>`;
+      anchor.after(none);
+      return;
+    }
+
+    const money = (v) => v ? ('$' + Math.round(v).toLocaleString()) : '\u00B7';
+    const frag = document.createDocumentFragment();
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.dataset.spKid = slug;
+      tr.style.background = 'var(--bone-2)';
+      const cells = [`<td style="position:sticky;left:0;background:var(--bone-2);text-align:left;padding:4px 10px 4px 34px;font-family:var(--sans);font-size:11px;color:var(--ink-2);white-space:nowrap;z-index:1;">${escapeHtml(r.cust)}</td>`];
+      for (const w of windowMonths) {
+        const v = r.months[w.key] || 0;
+        cells.push(`<td style="text-align:right;padding:4px 8px;font-family:var(--mono);font-size:10px;color:${v ? 'var(--ink-3)' : 'var(--ink-4)'};${w.key === curMonthKey ? 'background:rgba(0,0,0,0.03);' : ''}">${money(v)}</td>`);
+      }
+      cells.push(`<td style="text-align:right;padding:4px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);border-left:1px solid var(--rule-soft);">${money(r.total)}</td>`);
+      cells.push('<td></td><td></td>');
+      tr.innerHTML = cells.join('');
+      frag.appendChild(tr);
+    }
+    const note = document.createElement('tr');
+    note.dataset.spKid = slug;
+    note.innerHTML = `<td colspan="${nCols}" style="padding:3px 10px 7px 34px;font-family:var(--mono);font-size:9px;color:var(--ink-3);background:var(--bone-2);border-bottom:1px solid var(--rule-soft);">${rows.length} customer${rows.length === 1 ? '' : 's'} · sorted by the most recent column</td>`;
+    frag.appendChild(note);
+    anchor.after(frag);
   }
 
   async function spFetchAll(sb, brandId, cols) {
@@ -42140,7 +42155,6 @@ render();
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:${varColor(pe.varAbs)};border-left:1px solid var(--rule-soft);">${fmtSigned$(pe.varAbs)}</td>
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:${varColor(pe.varAbs)};">${pctStr(pe.varPct)}</td>
       </tr>
-      ${_drillable ? `<tr data-sp-detail="${_slug(pe.ent)}" style="display:none;"><td colspan="${windowMonths.length + 4}" style="padding:0;background:var(--bone-2);"></td></tr>` : ''}
     `).join('');
 
     // Sum row (bottom): per-month totals + grand L12 + grand period variance.
