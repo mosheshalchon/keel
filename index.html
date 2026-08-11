@@ -12327,7 +12327,9 @@ function renderTimelinePage() {
   function renderRow(r) {
     const status = statusForRow(r);
     const isOwner = r.owner_email === session.email;
-    const stripHtml = renderStageStripFor(r);
+    // The stage strip moved OUT of this row (Aug 2026) and into the individual
+    // submission page, under its detail strip — renderStageStripFor still lives
+    // here and is called from there. Cosmetic move only; nothing else changed.
     const decisionHtml = renderDecisionPanelFor(r);
     const commentsHtml = renderCommentsSectionFor(r);
     const commentCount = (_commentsBySubmission.get(r.id) || []).length;
@@ -12357,7 +12359,6 @@ function renderTimelinePage() {
             ${isOwner ? `<button class="tl2-icon-btn tl2-icon-danger" data-delete-id="${r.id}" title="Delete">×</button>` : ''}
           </div>
         </div>
-        ${stripHtml}
         ${decisionHtml}
         ${commentsHtml}
       </div>
@@ -13588,6 +13589,10 @@ window.SubmissionsPage = (function() {
     }
     const status = statusLabel(sub);
     const year = getYearForSubmission(sub);
+    // The stage strip needs _stageDefs, which only the Timeline page loaded before.
+    // Opening a submission directly (deep link, or Submissions → row) would otherwise
+    // render an empty strip. Same cached fetch, so it costs nothing on a warm cache.
+    if (!_stageDefs || !_stageDefs.length) { try { await loadStageDefs(); } catch (e) {} }
 
     main.innerHTML = `
       <div class="eyebrow">— Submission</div>
@@ -13624,6 +13629,13 @@ window.SubmissionsPage = (function() {
             <div class="hl-docs-value">${esc((sub.owner_email || '').split('@')[0] || '—')}</div>
           </div>
         </div>
+        ${(() => {
+          // Stage strip, relocated here from the Timeline rows. Same renderer, same
+          // data, same labels — the submission page just needs _stageDefs loaded,
+          // which the Timeline page normally does, so load it on demand below.
+          try { return (typeof renderStageStripFor === 'function') ? renderStageStripFor(sub) : ''; }
+          catch (e) { console.warn('[subs] stage strip skipped:', e); return ''; }
+        })()}
       </div>
 
       <div id="hl-subs-docs-host"></div>
