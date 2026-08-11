@@ -41470,7 +41470,10 @@ render();
       return;
     }
 
-    const money = (v) => v ? ('$' + Math.round(v).toLocaleString()) : '\u00B7';
+    // Follow the $ / UNITS toggle — the detail was hardcoded to dollars, so unit
+    // mode showed case counts with a dollar sign in front of them.
+    const isUnits = metricKey === 'units';
+    const money = (v) => v ? ((isUnits ? '' : '$') + Math.round(v).toLocaleString()) : '\u00B7';
     const frag = document.createDocumentFragment();
     for (const r of rows) {
       const tr = document.createElement('tr');
@@ -41486,10 +41489,9 @@ render();
       tr.innerHTML = cells.join('');
       frag.appendChild(tr);
     }
-    const note = document.createElement('tr');
-    note.dataset.spKid = slug;
-    note.innerHTML = `<td colspan="${nCols}" style="padding:3px 10px 7px 34px;font-family:var(--mono);font-size:9px;color:var(--ink-3);background:var(--bone-2);border-bottom:1px solid var(--rule-soft);">${rows.length} customer${rows.length === 1 ? '' : 's'} · sorted by the most recent column</td>`;
-    frag.appendChild(note);
+    // Close the block with a rule rather than a caption — the caption said nothing
+    // the rows don't already show.
+    if (frag.lastChild) frag.lastChild.style.borderBottom = '1px solid var(--rule-soft)';
     anchor.after(frag);
   }
 
