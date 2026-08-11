@@ -41409,93 +41409,73 @@ render();
     return _spCpCache;
   }
 
-  async function spShowProductCustomers(product, windowMonths, metricKey, curMonthKey) {
+  // Renders the customer breakdown INLINE, into the hidden <tr> that follows each
+  // product row. Was a modal; Moshe asked for an expander so the parent row stays
+  // visible and two products can be compared side by side.
+  async function spShowProductCustomers(product, slug, windowMonths, metricKey, curMonthKey) {
+    const detail = document.querySelector(`[data-sp-detail="${slug}"]`);
+    if (!detail) return;
+    const cell = detail.firstElementChild;
+    const caret = document.querySelector(`[data-sp-caret="${slug}"]`);
+    const open = detail.style.display !== 'none';
+    if (open) {
+      detail.style.display = 'none';
+      if (caret) { caret.textContent = '\u25B6'; }
+      return;
+    }
+    detail.style.display = '';
+    if (caret) { caret.textContent = '\u25BC'; }
+    if (cell.dataset.loaded === '1') return;   // built once, then just toggled
+    cell.innerHTML = `<div style="padding:10px 14px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Loading customer detail…</div>`;
+
     const brandId = _spState.brandId;
     const sb = window.Auth.getClient();
-    const wrapId = 'hl-sp-cp-modal';
-    document.getElementById(wrapId)?.remove();
-    document.body.insertAdjacentHTML('beforeend', `<div id="${wrapId}" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
-      <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:1240px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
-        <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
-          <div>
-            <div style="font-family:var(--serif);font-size:20px;">${escapeHtml(product)}</div>
-            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px;">by customer</div>
-          </div>
-          <button data-spcpclose style="background:transparent;border:none;font-size:22px;line-height:1;cursor:pointer;color:var(--ink-3);">×</button>
-        </div>
-        <div id="hl-sp-cp-body" style="padding:18px 22px;"><div class="hl-loading">Loading customer detail…</div></div>
-      </div></div>`);
-    const modal = document.getElementById(wrapId);
-    const close = () => modal.remove();
-    modal.addEventListener('click', (e) => { if (e.target === modal || e.target.closest('[data-spcpclose]')) close(); });
-    const onKey = (e) => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); } };
-    document.addEventListener('keydown', onKey);
-
-    const host = document.getElementById('hl-sp-cp-body');
     let all;
     try {
       all = await spFetchCrossRows(brandId, sb);
     } catch (err) {
-      host.innerHTML = `<div class="hl-empty" style="color:var(--lost);">Couldn't load the breakdown: ${escapeHtml(err.message || String(err))}</div>`;
+      cell.innerHTML = `<div style="padding:10px 14px;font-family:var(--mono);font-size:10px;color:var(--lost,#a8381f);">Couldn't load: ${escapeHtml(err.message || String(err))}</div>`;
       return;
     }
 
-    const prefix = product + ' § ';
+    const prefix = product + ' \u00A7 ';
     const mine = all.filter(r => r.entity && r.entity.startsWith(prefix));
     if (!mine.length) {
-      host.innerHTML = `<div style="padding:20px;font-family:var(--serif);font-style:italic;color:var(--ink-3);">
-        No customer breakdown stored for this item yet. These rows are written by the sales sync — they appear after its next run.
-      </div>`;
+      cell.innerHTML = `<div style="padding:10px 14px;font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);">No customer breakdown stored for this item yet — these rows come from the sales sync.</div>`;
+      cell.dataset.loaded = '1';
       return;
     }
 
-    // Same closed-month rule the table uses: finalized only for past months, every
-    // status for the month in progress and beyond. Otherwise the drill-down would
-    // not add up to the row the user clicked.
+    // Same closed-month rule as the parent table, so the detail adds up to the row above.
     const FINAL = new Set(['billed', 'closed']);
     const isFinal = (r) => FINAL.has(String(r.status || '').trim().toLowerCase());
-    const counts = (r) => r.month >= curMonthKey || isFinal(r);
-
     const byCust = new Map();
     for (const r of mine) {
-      if (!counts(r)) continue;
+      if (!(r.month >= curMonthKey || isFinal(r))) continue;
       const cust = r.entity.slice(prefix.length);
       let o = byCust.get(cust);
-      if (!o) { o = { cust, months: {}, total: 0, curShipped: 0, curOpen: 0 }; byCust.set(cust, o); }
+      if (!o) { o = { cust, months: {}, total: 0, open: 0 }; byCust.set(cust, o); }
       const v = Number(r[metricKey] || 0);
       o.months[r.month] = (o.months[r.month] || 0) + v;
       o.total += v;
-      if (r.month >= curMonthKey) { if (isFinal(r)) o.curShipped += v; else o.curOpen += v; }
+      if (r.month >= curMonthKey && !isFinal(r)) o.open += v;
     }
     const latest = windowMonths[windowMonths.length - 1].key;
     const rows = [...byCust.values()].sort((a, b) => (b.months[latest] || 0) - (a.months[latest] || 0) || b.total - a.total);
+    const money = (v) => v ? ('$' + Math.round(v).toLocaleString()) : '\u00B7';
 
-    const money = (v) => v ? ('$' + Math.round(v).toLocaleString()) : '·';
-    const th = (t, a2, extra) => `<th style="padding:7px 8px;text-align:${a2 || 'right'};font-family:var(--mono);font-size:9px;letter-spacing:0.04em;color:var(--ink-3);text-transform:uppercase;white-space:nowrap;${extra || ''}">${t}</th>`;
-    const totalsByMonth = {};
-    for (const w of windowMonths) totalsByMonth[w.key] = rows.reduce((s2, r) => s2 + (r.months[w.key] || 0), 0);
-
-    host.innerHTML = `
-      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;">
-        <thead><tr style="background:#efe9dd;">
-          ${th('Customer', 'left')}
-          ${windowMonths.map(w => th(w.label.replace(' ', '<br>'), 'right', w.key === curMonthKey ? 'background:var(--bone-2);' : (w.key > curMonthKey ? 'background:rgba(184,134,11,0.06);' : ''))).join('')}
-          ${th('Total', 'right', 'border-left:1px solid var(--rule-soft);')}
-        </tr></thead>
-        <tbody>${rows.map(r => `<tr style="border-top:1px solid var(--rule-soft);">
-          <td style="padding:6px 10px;font-family:var(--sans);font-size:12px;white-space:nowrap;">${escapeHtml(r.cust)}${r.curOpen > 0 ? ` <span title="${money(r.curOpen)} of this customer's current and future months is ordered but not yet shipped" style="font-family:var(--mono);font-size:9px;color:#b8860b;">${money(r.curOpen)} open</span>` : ''}</td>
-          ${windowMonths.map(w => `<td style="padding:6px 8px;text-align:right;font-family:var(--mono);font-size:11px;color:${r.months[w.key] ? 'var(--ink-2)' : 'var(--ink-4)'};${w.key === curMonthKey ? 'background:var(--bone-2);' : (w.key > curMonthKey ? 'background:rgba(184,134,11,0.06);' : '')}">${money(r.months[w.key] || 0)}</td>`).join('')}
-          <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;border-left:1px solid var(--rule-soft);">${money(r.total)}</td>
+    cell.innerHTML = `<div style="padding:2px 0 8px 0;">
+      <table style="width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;">
+        <tbody>${rows.map(r => `<tr>
+          <td style="position:sticky;left:0;background:var(--bone-2);padding:4px 10px 4px 32px;font-family:var(--sans);font-size:11px;color:var(--ink-2);white-space:nowrap;">${escapeHtml(r.cust)}${r.open > 0 ? ` <span title="${money(r.open)} ordered but not yet shipped" style="font-family:var(--mono);font-size:9px;color:#b8860b;">${money(r.open)} open</span>` : ''}</td>
+          ${windowMonths.map(w => `<td style="text-align:right;padding:4px 8px;font-family:var(--mono);font-size:10px;color:${r.months[w.key] ? 'var(--ink-3)' : 'var(--ink-4)'};${w.key === curMonthKey ? 'background:rgba(0,0,0,0.03);' : ''}">${money(r.months[w.key] || 0)}</td>`).join('')}
+          <td style="text-align:right;padding:4px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);border-left:1px solid var(--rule-soft);">${money(r.total)}</td>
+          <td colspan="2"></td>
         </tr>`).join('')}</tbody>
-        <tfoot><tr style="border-top:2px solid var(--ink);background:rgba(0,0,0,0.02);">
-          <td style="padding:8px 10px;font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Total · ${rows.length} customers</td>
-          ${windowMonths.map(w => `<td style="padding:8px 8px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${money(totalsByMonth[w.key])}</td>`).join('')}
-          <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;border-left:1px solid var(--rule-soft);">${money(rows.reduce((s2, r) => s2 + r.total, 0))}</td>
-        </tr></tfoot>
-      </table></div>
-      <p style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.6;max-width:900px;">
-        Sorted by the most recent column. Past months count finalized orders only (Billed + Closed); the current and future months also include orders not yet shipped — those carry an amber <b>open</b> figure beside the customer name. Totals here match the row you clicked in the table behind.
-      </p>`;
+      </table>
+      <div style="padding:6px 10px 0 32px;font-family:var(--mono);font-size:9px;color:var(--ink-3);">${rows.length} customer${rows.length === 1 ? '' : 's'} · sorted by the most recent column · amber = ordered, not yet shipped</div>
+    </div>`;
+    cell.dataset.loaded = '1';
   }
 
   async function spFetchAll(sb, brandId, cols) {
@@ -42150,14 +42130,17 @@ render();
       const bg = w.key === curMonthKey ? 'background:var(--bone-2);' : '';
       return `<td style="text-align:right;padding:6px 8px;font-family:var(--mono);font-size:11px;color:${v ? 'var(--ink-2)' : 'var(--ink-4)'};${bg}">${v ? fmt$(v) : '·'}</td>`;
     };
+    const _drillable = _spState.dimension === 'product';
+    const _slug = (t) => String(t).replace(/[^a-z0-9]+/gi, '_');
     const bodyRows = perEntity.map(pe => `
-      <tr style="border-bottom:1px solid var(--rule-softer);">
-        <td ${_spState.dimension === 'product' ? `data-sp-drill="${escapeHtml(pe.ent)}" title="See which customers drive this item"` : ''} style="position:sticky;left:0;background:var(--paper);text-align:left;padding:6px 10px;font-family:var(--sans);font-size:12px;color:var(--ink);z-index:1;${_spState.dimension === 'product' ? 'cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;text-decoration-color:var(--rule-soft);' : ''}">${escapeHtml(pe.ent)}</td>
+      <tr data-sp-row="${_slug(pe.ent)}" style="border-bottom:1px solid var(--rule-softer);">
+        <td ${_drillable ? `data-sp-drill="${escapeHtml(pe.ent)}" title="Show which customers drive this item"` : ''} style="position:sticky;left:0;background:var(--paper);text-align:left;padding:6px 10px;font-family:var(--sans);font-size:12px;color:var(--ink);z-index:1;${_drillable ? 'cursor:pointer;' : ''}">${_drillable ? `<span data-sp-caret="${_slug(pe.ent)}" style="display:inline-block;width:12px;color:var(--ink-3);font-size:9px;transition:transform 0.12s;">▶</span> ` : ''}${escapeHtml(pe.ent)}</td>
         ${windowMonths.map(w => monthTd(pe.months[w.key] || 0, w)).join('')}
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink);border-left:1px solid var(--rule-soft);">${fmt$(pe.l12)}</td>
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:${varColor(pe.varAbs)};border-left:1px solid var(--rule-soft);">${fmtSigned$(pe.varAbs)}</td>
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:${varColor(pe.varAbs)};">${pctStr(pe.varPct)}</td>
       </tr>
+      ${_drillable ? `<tr data-sp-detail="${_slug(pe.ent)}" style="display:none;"><td colspan="${windowMonths.length + 4}" style="padding:0;background:var(--bone-2);"></td></tr>` : ''}
     `).join('');
 
     // Sum row (bottom): per-month totals + grand L12 + grand period variance.
@@ -42260,7 +42243,8 @@ render();
     });
 
     body.querySelectorAll('[data-sp-drill]').forEach(td => td.addEventListener('click', () => {
-      spShowProductCustomers(td.dataset.spDrill, _spState._lastWindow || [], _spState.metric === 'units' ? 'units' : 'amount', _spState.curMonthKey);
+      const name = td.dataset.spDrill;
+      spShowProductCustomers(name, String(name).replace(/[^a-z0-9]+/gi, '_'), _spState._lastWindow || [], _spState.metric === 'units' ? 'units' : 'amount', _spState.curMonthKey);
     }));
 
     body.querySelectorAll('[data-sp-preset]').forEach(btn => btn.addEventListener('click', () => {
