@@ -12369,6 +12369,17 @@ function renderTimelinePage() {
   // Stage strip — renders the 9-stage timeline progress for a row.
   // Uses the shared computeCurrentStage() helper so labels and statuses
   // stay in sync with the row's status pill.
+  // Exposed for the Submissions page, which lives in a DIFFERENT IIFE
+  // (window.SubmissionsPage) and therefore cannot see _stageDefs or this function
+  // directly. Returns '' until the defs are loaded; loadStageDefs is exposed too so
+  // the caller can await it. Reading _stageDefs from outside this closure is what
+  // broke the submission page on Aug 11 — go through these two, never the variable.
+  window.KeelStageStrip = {
+    html: (row) => { try { return renderStageStripFor(row); } catch (e) { console.warn('[stagestrip]', e); return ''; } },
+    ready: () => !!(_stageDefs && _stageDefs.length),
+    load: () => loadStageDefs(),
+  };
+
   function renderStageStripFor(r) {
     if (!_stageDefs || !_stageDefs.length) return '';
     const { currentIdx } = computeCurrentStage(r);
@@ -13589,10 +13600,6 @@ window.SubmissionsPage = (function() {
     }
     const status = statusLabel(sub);
     const year = getYearForSubmission(sub);
-    // The stage strip needs _stageDefs, which only the Timeline page loaded before.
-    // Opening a submission directly (deep link, or Submissions → row) would otherwise
-    // render an empty strip. Same cached fetch, so it costs nothing on a warm cache.
-    if (!_stageDefs || !_stageDefs.length) { try { await loadStageDefs(); } catch (e) {} }
 
     main.innerHTML = `
       <div class="eyebrow">— Submission</div>
@@ -13629,17 +13636,24 @@ window.SubmissionsPage = (function() {
             <div class="hl-docs-value">${esc((sub.owner_email || '').split('@')[0] || '—')}</div>
           </div>
         </div>
-        ${(() => {
-          // Stage strip, relocated here from the Timeline rows. Same renderer, same
-          // data, same labels — the submission page just needs _stageDefs loaded,
-          // which the Timeline page normally does, so load it on demand below.
-          try { return (typeof renderStageStripFor === 'function') ? renderStageStripFor(sub) : ''; }
-          catch (e) { console.warn('[subs] stage strip skipped:', e); return ''; }
-        })()}
+        <div id="hl-subs-stage-strip"></div>
       </div>
 
       <div id="hl-subs-docs-host"></div>
     `;
+
+    // Stage strip, moved here from the Timeline rows. Painted AFTER the markup so a
+    // failure can never stop the page rendering, and via window.KeelStageStrip
+    // because the strip's data lives in the Timeline IIFE, not this one.
+    (async () => {
+      try {
+        const api = window.KeelStageStrip;
+        const slot = document.getElementById('hl-subs-stage-strip');
+        if (!api || !slot) return;
+        if (!api.ready()) await api.load();
+        slot.innerHTML = api.html(sub);
+      } catch (e) { console.warn('[subs] stage strip skipped:', e); }
+    })();
 
     // Render the existing docs panel into the host
     const host = document.getElementById('hl-subs-docs-host');
