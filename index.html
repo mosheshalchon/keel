@@ -50802,17 +50802,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${rbRow('FTL trucks', P.trucks.length, P.totals.casesFTL, P.totals.palletsFTL, P.totals.weightFTL, salesFTL)}
           ${rbRow('LTL', P.ltl.length, P.totals.casesLTL, P.totals.palletsLTL, P.totals.weightLTL, salesLTL)}
           ${rbRow('Dedicated trucks', P.dedicated.length, P.totals.casesDed, P.totals.palletsDed, P.totals.weightDed, salesDed)}
-          ${rbRow('Manual review', P.manual.length, P.totals.casesManual, manPlan, manWt, salesMan)}
-          ${rbRow('Needs ship-to DC', P.needsDc.length, P.totals.casesNeed, needPlan, needWt, salesNeed)}
-          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total (booked)</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${sumCases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${dollars(salesPlanned)}</td></tr>
+          ${P.manual.length ? rbRow('Manual review', P.manual.length, P.totals.casesManual, manPlan, manWt, salesMan) : ''}
+          ${P.needsDc.length ? rbRow('Needs ship-to DC', P.needsDc.length, P.totals.casesNeed, needPlan, needWt, salesNeed) : ''}
           <tr title="POs marked Scheduled in the freight file (column T) — already booked for pickup. Cases and dollars are summed from those POs; weight and pallets are each truck's share whose POs are scheduled, since one truck can carry both scheduled and unscheduled POs.">
-            <td style="padding:8px 9px;font-family:var(--mono);font-size:11px;color:#2e7d32;">Of which scheduled${schedTrucks ? ` <span style="color:var(--ink-3);">(${schedTrucks} full truck${schedTrucks === 1 ? '' : 's'})</span>` : ''}</td>
-            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${schedSos.size}</td>
-            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${Math.round(schedCases).toLocaleString()}</td>
-            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${Math.round(schedPlt)}</td>
-            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${money(schedWt)}</td>
-            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${dollars(schedSales)}${salesPlanned > 0 ? ` <span style="color:var(--ink-3);">${Math.round(schedSales / salesPlanned * 100)}%</span>` : ''}</td>
-          </tr></tfoot></table></div>
+            <td style="padding:8px 9px;color:#2e7d32;">Scheduled for pickup${schedTrucks ? ` <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${schedTrucks} full truck${schedTrucks === 1 ? '' : 's'}</span>` : ''}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${schedSos.size}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${Math.round(schedCases).toLocaleString()}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${Math.round(schedPlt)}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${money(schedWt)}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${dollars(schedSales)}${salesPlanned > 0 ? ` <span style="color:var(--ink-3);font-size:11px;">${Math.round(schedSales / salesPlanned * 100)}%</span>` : ''}</td>
+          </tr>
+          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total (booked)</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${sumCases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${dollars(salesPlanned)}</td></tr></tfoot></table></div>
           <div style="font-family:var(--mono);font-size:11px;margin-top:8px;color:${reconOK ? '#2e7d32' : '#b8860b'};">${reconOK ? `✓ Reconciled — all ${P.totals.cases.toLocaleString()} pending cases are accounted for across the buckets.` : `⚠ Mismatch — buckets sum to ${sumCases.toLocaleString()} vs ${P.totals.cases.toLocaleString()} pending.`}</div>
           <div style="font-family:var(--mono);font-size:11px;margin-top:4px;color:var(--ink-3);">$ Sales — booked ${dollars(salesPlanned)}${salesExcluded > 1 ? ` + excluded (pickup / 3PL / not-serviced) ${dollars(salesExcluded)}` : ''} = <b style="color:var(--ink);">${dollars(salesAll)}</b> total Pending Fulfillment (ties to the Excel file).</div>`;
         body.innerHTML = srcToggle + `
