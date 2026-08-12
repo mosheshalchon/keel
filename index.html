@@ -13271,24 +13271,19 @@ window.SubmissionsPage = (function() {
 
     // Retailers and categories come from the libraries the user already curates,
     // so this form can't invent a retailer that doesn't exist elsewhere.
-    let retailers = [], categories = [], lines = [];
-    const lineCat = {};
+    let retailers = [], categories = [];
     try {
       const [rr, pp] = await Promise.all([
         sb.from('retailers').select('name').eq('brand_id', brandId).order('name'),
-        sb.from('products').select('category, product_line').eq('brand_id', brandId),
+        sb.from('products').select('category').eq('brand_id', brandId),
       ]);
       retailers = [...new Set((rr.data || []).map(r => r.name).filter(Boolean))];
       categories = [...new Set((pp.data || []).map(p => p.category).filter(Boolean))].sort();
-      lines = [...new Set((pp.data || []).map(p => p.product_line).filter(Boolean))].sort();
-      // Which category each line belongs to, so picking a line can fill the category.
-      for (const p of (pp.data || [])) if (p.product_line && p.category && !lineCat[p.product_line]) lineCat[p.product_line] = p.category;
     } catch (e) { console.warn('[subs] new-submission lookups failed', e); }
     // Fall back to whatever is already on existing submissions, so a brand with
     // an empty Retailer Library can still create one.
     if (!retailers.length) retailers = [...new Set(_all.map(s => s.retailer).filter(Boolean))].sort();
     if (!categories.length) categories = [...new Set(_all.map(s => s.category).filter(Boolean))].sort();
-    if (!lines.length) lines = [...new Set(_all.map(s => s.product_line).filter(Boolean))].sort();
 
     const fld = (label, inner, hint) => `
       <div style="margin-bottom:14px;">
@@ -13301,17 +13296,10 @@ window.SubmissionsPage = (function() {
     document.getElementById('hl-sn-body').innerHTML = `
       ${fld('Retailer *', `<input list="hl-sn-retailers" id="hl-sn-retailer" style="${inputStyle}" placeholder="Start typing…">
         <datalist id="hl-sn-retailers">${retailers.map(r => `<option value="${esc(r)}"></option>`).join('')}</datalist>`,
-        'Pick from your Retailer Library or type a new one.')}
-      ${fld('Item / product *', `<input type="text" id="hl-sn-item" style="${inputStyle}" placeholder="e.g. Bread — pending items">`,
-        'You can add the specific products on the submission page after it exists.')}
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
-        ${fld('Product line', `<select id="hl-sn-line" style="${inputStyle}">
-            <option value="">— none —</option>
-            ${lines.map(l => `<option value="${esc(l)}">${esc(l)}</option>`).join('')}
-          </select>`, lines.length ? '' : 'No product lines in the Brand Library yet.')}
-        ${fld('Category', `<input list="hl-sn-cats" id="hl-sn-cat" style="${inputStyle}" placeholder="Optional">
-          <datalist id="hl-sn-cats">${categories.map(c => `<option value="${esc(c)}"></option>`).join('')}</datalist>`)}
-      </div>
+        `Pick one of your ${retailers.length} saved retailers, or just type a new name — you'll be offered the option to add it to the Retailer Library.`)}
+      ${fld('Category *', `<input list="hl-sn-cats" id="hl-sn-cat" style="${inputStyle}" placeholder="e.g. Bread">
+        <datalist id="hl-sn-cats">${categories.map(c => `<option value="${esc(c)}"></option>`).join('')}</datalist>`,
+        'You pick the specific products under this category on the submission page once it exists.')}
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
         ${fld('Submission due', `<input type="date" id="hl-sn-due" style="${inputStyle}">`)}
         ${fld('Reset date', `<input type="date" id="hl-sn-reset" style="${inputStyle}">`)}
@@ -13320,9 +13308,9 @@ window.SubmissionsPage = (function() {
         ${fld('Broker', `<input type="text" id="hl-sn-broker" style="${inputStyle}" placeholder="Optional">`)}
         ${fld('Notes', `<input type="text" id="hl-sn-notes" style="${inputStyle}" placeholder="Optional">`)}
       </div>
-      <label id="hl-sn-addret-wrap" style="display:none;align-items:center;gap:8px;margin:2px 0 12px;font-family:var(--sans);font-size:13px;cursor:pointer;">
-        <input type="checkbox" id="hl-sn-addret" checked style="cursor:pointer;">
-        <span>Also add <b id="hl-sn-addret-name"></b> to the Retailer Library</span>
+      <label id="hl-sn-addret-wrap" style="display:flex;align-items:center;gap:8px;margin:2px 0 12px;font-family:var(--sans);font-size:13px;cursor:pointer;opacity:0.45;">
+        <input type="checkbox" id="hl-sn-addret" checked disabled style="cursor:pointer;">
+        <span>Also add <b id="hl-sn-addret-name">a new retailer</b><span id="hl-sn-addret-tail"> to the Retailer Library</span></span>
       </label>
       <div id="hl-sn-err" style="font-family:var(--mono);font-size:11px;color:var(--lost);min-height:16px;margin-bottom:8px;"></div>
       <div style="display:flex;gap:10px;justify-content:flex-end;">
@@ -13334,15 +13322,6 @@ window.SubmissionsPage = (function() {
     const err = document.getElementById('hl-sn-err');
     const save = document.getElementById('hl-sn-save');
 
-    // Choosing a product line fills the category it belongs to, unless the user
-    // has already typed one — a line implies its category in the Brand Library.
-    const lineEl = document.getElementById('hl-sn-line');
-    const catEl = document.getElementById('hl-sn-cat');
-    if (lineEl) lineEl.addEventListener('change', () => {
-      const c = lineCat[lineEl.value];
-      if (c && !catEl.value.trim()) catEl.value = c;
-    });
-
     // The retailer box has always accepted a typed name — that only ever wrote to
     // the submission though. Offer to create the Retailer Library record too, so a
     // new retailer doesn't have to be added twice.
@@ -13350,28 +13329,41 @@ window.SubmissionsPage = (function() {
     const known = new Set(retailers.map(r => r.toLowerCase()));
     const wrap = document.getElementById('hl-sn-addret-wrap');
     const nameEl = document.getElementById('hl-sn-addret-name');
+    // Show the row from the start, greyed and disabled, so the capability is
+    // visible before anything is typed — a checkbox that only materialises after
+    // you type an unknown name is a feature nobody discovers.
     const syncNew = () => {
       const v = retEl.value.trim();
       const isNew = v.length > 1 && !known.has(v.toLowerCase());
-      wrap.style.display = isNew ? 'flex' : 'none';
-      if (isNew) nameEl.textContent = v;
+      const cb = document.getElementById('hl-sn-addret');
+      wrap.style.display = 'flex';
+      wrap.style.opacity = isNew ? '1' : '0.45';
+      cb.disabled = !isNew;
+      nameEl.textContent = isNew ? v : 'a new retailer';
+      document.getElementById('hl-sn-addret-tail').textContent = isNew
+        ? ' to the Retailer Library'
+        : ' to the Retailer Library (only applies if the name isn\u2019t already saved)';
     };
     retEl.addEventListener('input', syncNew);
     retEl.addEventListener('change', syncNew);
+    syncNew();
 
     save.addEventListener('click', async () => {
       const val = (id) => (document.getElementById(id).value || '').trim();
-      const retailer = val('hl-sn-retailer'), item = val('hl-sn-item');
+      const retailer = val('hl-sn-retailer'), category = val('hl-sn-cat');
       if (!retailer) { err.textContent = 'Retailer is required.'; return; }
-      if (!item) { err.textContent = 'Item is required.'; return; }
+      if (!category) { err.textContent = 'Category is required.'; return; }
+      // Matches the naming every existing submission already uses ("Bread — pending
+      // items"), so the list stays consistent and there's nothing to retype. The
+      // real products get attached on the submission's own page.
+      const item = category + ' \u2014 pending items';
       err.textContent = '';
       save.disabled = true; save.textContent = 'Saving…';
 
       const row = {
         brand_id: brandId,
         retailer,
-        category: val('hl-sn-cat') || null,
-        product_line: val('hl-sn-line') || null,
+        category,
         item_description: item,
         product_name: item,
         status: 'upcoming',
@@ -13383,12 +13375,7 @@ window.SubmissionsPage = (function() {
         owner_email: (window.session || {}).email || null,
         updated_by: (window.session || {}).email || null,
       };
-      let { data, error } = await sb.from('timeline_entries').insert(row).select().single();
-      // product_line may not exist on older schemas — retry without it rather than fail.
-      if (error && /product_line|column .* does not exist/i.test(error.message || '')) {
-        delete row.product_line;
-        ({ data, error } = await sb.from('timeline_entries').insert(row).select().single());
-      }
+      const { data, error } = await sb.from('timeline_entries').insert(row).select().single();
       if (error) {
         err.textContent = 'Could not save: ' + error.message;
         save.disabled = false; save.textContent = 'Save submission';
@@ -13398,7 +13385,7 @@ window.SubmissionsPage = (function() {
       // Non-fatal: the submission is already saved, so a Retailer Library failure
       // is a warning in the console, never a blocked save.
       const addRet = document.getElementById('hl-sn-addret');
-      if (wrap.style.display !== 'none' && addRet && addRet.checked) {
+      if (addRet && addRet.checked && !addRet.disabled) {
         try {
           const r = await sb.from('retailers').insert({ brand_id: brandId, name: retailer, source: 'submission' }).select('id').single();
           if (r.error) throw r.error;
