@@ -9537,7 +9537,16 @@ function initSubmissionDocsPanel() {
   // Auth gate first — mounts the H&L sidebar/header shell when authed.
   // Was HL.mountPage('timeline'), which also ran the tab-permission check and
   // could redirect. This is not a page any more, so it must never navigate.
-  const session = (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
+  //
+  // LIVE, not captured. This module now runs at page LOAD, and auth may not have
+  // resolved yet — snapshotting the session here left brandId/email undefined for
+  // the lifetime of the tab, so every write from the docs panel (including the
+  // product checkboxes) silently failed. Getters re-read Auth at each access.
+  const session = {
+    get brandId() { try { return (window.Auth.getSession() || {}).brandId; } catch (e) { return undefined; } },
+    get email() { try { return (window.Auth.getSession() || {}).email; } catch (e) { return undefined; } },
+    get linkedContactId() { try { return (window.Auth.getSession() || {}).linkedContactId; } catch (e) { return undefined; } },
+  };
   const main = document.getElementById('main-content');
 
   // ─── Module-local state ──────────────────────────────
@@ -10912,7 +10921,12 @@ function initSubmissionDocsPanel() {
     // Wire up product checkboxes
     body.querySelectorAll('[data-prod-id]').forEach(cb => {
       cb.addEventListener('change', async (e) => {
-        await toggleSubmissionProduct(submissionId, e.target.dataset.prodId, e.target.checked);
+        try {
+          await toggleSubmissionProduct(submissionId, e.target.dataset.prodId, e.target.checked);
+        } catch (err) {
+          e.target.checked = !e.target.checked;   // put the box back where it was
+          return;
+        }
         const count = body.querySelectorAll('[data-prod-id]:checked').length;
         const countEl = document.getElementById(`hl-docs-prod-count-${submissionId}`);
         if (countEl) countEl.textContent = `(${count} selected)`;
@@ -11587,6 +11601,13 @@ function initSubmissionDocsPanel() {
 
   async function toggleSubmissionProduct(submissionId, productId, isChecked) {
     const brandId = session.brandId;
+    // Without this the insert goes out with brand_id: undefined, fails RLS, logs to
+    // console only, and the panel reloads with the box unchecked — which reads as
+    // "the checkbox doesn't work". Say so instead.
+    if (!brandId) {
+      alert('Not signed in properly — reload the page and try again.');
+      throw new Error('toggleSubmissionProduct: no brandId on session');
+    }
     if (isChecked) {
       // Find next position
       const { data: existing } = await sb.from('submission_products')
@@ -11598,11 +11619,11 @@ function initSubmissionDocsPanel() {
         product_id: productId,
         position: nextPos,
       });
-      if (error) console.error('insert sub_product failed', error);
+      if (error) { console.error('insert sub_product failed', error); alert('Could not add that product: ' + error.message); throw error; }
     } else {
       const { error } = await sb.from('submission_products')
         .delete().eq('submission_id', submissionId).eq('product_id', productId);
-      if (error) console.error('delete sub_product failed', error);
+      if (error) { console.error('delete sub_product failed', error); alert('Could not remove that product: ' + error.message); throw error; }
     }
   }
 
