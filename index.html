@@ -50769,6 +50769,33 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const salesPlanned = salesFTL + salesLTL + salesDed + salesMan + salesNeed;
         const salesAll = (orders || []).reduce((a, o) => a + (Number(o.sales) || 0), 0);
         const salesExcluded = salesAll - salesPlanned;
+        // SCHEDULED — column T on the analyst's file. Any non-empty, non-"no"
+        // value counts as scheduled for pickup. Totals are computed from the ORDER
+        // rows (not the truck buckets) because scheduling is recorded per PO, and a
+        // truck can mix scheduled and unscheduled POs; summing whole trucks would
+        // overstate it. Cases/weight are prorated the same way the buckets are.
+        const _isSched = (o) => {
+          const v = String(o.scheduled == null ? '' : o.scheduled).trim().toLowerCase();
+          return v !== '' && v !== 'no' && v !== 'n' && v !== 'false' && v !== '0' && v !== '-';
+        };
+        const schedOrders = (orders || []).filter(_isSched);
+        const schedSos = new Set(schedOrders.map(o => o.so_num).filter(Boolean));
+        const schedCases = schedOrders.reduce((a2, o) => a2 + (Number(o.cases_ordered) || 0), 0);
+        const schedSales = schedOrders.reduce((a2, o) => a2 + (Number(o.sales) || 0), 0);
+        // Weight and pallets live on the built trucks, so take the share of each
+        // truck whose SOs are scheduled rather than the whole truck.
+        let schedWt = 0, schedPlt = 0, schedTrucks = 0;
+        for (const t of allTrucks) {
+          const sos = _getSos(t);
+          if (!sos.length) continue;
+          const hit = sos.filter(so => schedSos.has(so)).length;
+          if (!hit) continue;
+          if (hit === sos.length) schedTrucks++;
+          const share = hit / sos.length;
+          schedWt += (Number(t.weight) || 0) * share;
+          schedPlt += (Number(t.plan) || 0) * share;
+        }
+
         const dollars = v => '$' + Math.round(v).toLocaleString();
         const rbRow = (name, count, cases, plan, weight, sales) => `<tr>${td(name)}${td(count, true)}${td(cases.toLocaleString(), true)}${td(plan, true)}${td(money(weight), true)}${td(dollars(sales), true)}</tr>`;
         const reconTable = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${['Bucket', 'Count', 'Cases', 'Plan plt', 'Weight (lb)', '$ Sales'].map((h, i) => th(h, i >= 1)).join('')}</tr></thead><tbody>
@@ -50777,7 +50804,15 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${rbRow('Dedicated trucks', P.dedicated.length, P.totals.casesDed, P.totals.palletsDed, P.totals.weightDed, salesDed)}
           ${rbRow('Manual review', P.manual.length, P.totals.casesManual, manPlan, manWt, salesMan)}
           ${rbRow('Needs ship-to DC', P.needsDc.length, P.totals.casesNeed, needPlan, needWt, salesNeed)}
-          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total (booked)</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${sumCases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${dollars(salesPlanned)}</td></tr></tfoot></table></div>
+          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total (booked)</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${sumCases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${dollars(salesPlanned)}</td></tr>
+          <tr title="POs marked Scheduled in the freight file (column T) — already booked for pickup. Cases and dollars are summed from those POs; weight and pallets are each truck's share whose POs are scheduled, since one truck can carry both scheduled and unscheduled POs.">
+            <td style="padding:8px 9px;font-family:var(--mono);font-size:11px;color:#2e7d32;">Of which scheduled${schedTrucks ? ` <span style="color:var(--ink-3);">(${schedTrucks} full truck${schedTrucks === 1 ? '' : 's'})</span>` : ''}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${schedSos.size}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${Math.round(schedCases).toLocaleString()}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${Math.round(schedPlt)}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${money(schedWt)}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-size:11px;color:#2e7d32;">${dollars(schedSales)}${salesPlanned > 0 ? ` <span style="color:var(--ink-3);">${Math.round(schedSales / salesPlanned * 100)}%</span>` : ''}</td>
+          </tr></tfoot></table></div>
           <div style="font-family:var(--mono);font-size:11px;margin-top:8px;color:${reconOK ? '#2e7d32' : '#b8860b'};">${reconOK ? `✓ Reconciled — all ${P.totals.cases.toLocaleString()} pending cases are accounted for across the buckets.` : `⚠ Mismatch — buckets sum to ${sumCases.toLocaleString()} vs ${P.totals.cases.toLocaleString()} pending.`}</div>
           <div style="font-family:var(--mono);font-size:11px;margin-top:4px;color:var(--ink-3);">$ Sales — booked ${dollars(salesPlanned)}${salesExcluded > 1 ? ` + excluded (pickup / 3PL / not-serviced) ${dollars(salesExcluded)}` : ''} = <b style="color:var(--ink);">${dollars(salesAll)}</b> total Pending Fulfillment (ties to the Excel file).</div>`;
         body.innerHTML = srcToggle + `
@@ -51785,12 +51820,12 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     rows = sheet('Ordering Data');
     if (rows) {
       const hi = hrow(rows, ['customer', 'sku', 'cases ordered']); const h = rows[hi];
-      const c = { iid: col(h, 'internal id'), so: _frSoCol(h), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled') };
+      const c = { iid: col(h, 'internal id'), so: _frSoCol(h), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled'), sched: col(h, 'scheduled') };
       const cust2 = c.cust; // 'Customer' (not 'Customer DC') — findIndex picks first match; 'customer dc' handled separately
       const recs = [];
       for (let i = hi + 1; i < rows.length; i++) {
         const r = rows[i]; const cust = _frClean(r[cust2]); const sku = _frClean(r[c.sku]); if (!cust && !sku) continue;
-        recs.push({ brand_id: brandId, internal_id: _frClean(r[c.iid]), so_num: _frClean(r[c.so]), po_num: _frClean(r[c.po]), customer: cust, customer_dc: _frClean(r[c.dc]), po_date: _frDate(r[c.pod]), projected_ship_date: _frDate(r[c.psd]), actual_ship_date: _frDate(r[c.asd]), sku: sku, cases_ordered: _frNum(r[c.cases]), uom: _frClean(r[c.uom]), sales: _frNum(r[c.sales]), on_hand: _frNum(r[c.oh]), available: _frNum(r[c.avail]), status: _frClean(r[c.status]), qty_fulfilled: _frNum(r[c.qf]) });
+        recs.push({ brand_id: brandId, internal_id: _frClean(r[c.iid]), so_num: _frClean(r[c.so]), po_num: _frClean(r[c.po]), customer: cust, customer_dc: _frClean(r[c.dc]), po_date: _frDate(r[c.pod]), projected_ship_date: _frDate(r[c.psd]), actual_ship_date: _frDate(r[c.asd]), sku: sku, cases_ordered: _frNum(r[c.cases]), uom: _frClean(r[c.uom]), sales: _frNum(r[c.sales]), on_hand: _frNum(r[c.oh]), available: _frNum(r[c.avail]), status: _frClean(r[c.status]), qty_fulfilled: _frNum(r[c.qf]), scheduled: _frClean(r[c.sched]) });
       }
       onMsg(`Loading ${recs.length.toLocaleString()} order lines…`);
       await wipe('freight_orders');
