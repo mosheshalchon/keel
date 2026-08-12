@@ -11972,7 +11972,10 @@ function renderTimelinePage() {
     await loadDocsPanel(submissionId);
   }
 
-  async function postComment(submissionId, body) {
+  // meta carries the CRM fields: { kind, occurred_on, stage_key }. All optional —
+  // omitted keys fall to the table defaults ('note', today, null), so the older
+  // Timeline call sites that pass only a body keep working unchanged.
+  async function postComment(submissionId, body, meta) {
     body = body.trim();
     if (!body) return;
     const row = {
@@ -11981,10 +11984,17 @@ function renderTimelinePage() {
       body,
       author_email: session.email,
     };
+    if (meta && meta.kind) row.kind = meta.kind;
+    if (meta && meta.occurred_on) row.occurred_on = meta.occurred_on;
+    if (meta && meta.stage_key) row.stage_key = meta.stage_key;
     const { data, error } = await sb.from('submission_comments').insert(row).select().single();
     if (error) {
-      alert('Could not post comment: ' + error.message);
-      return;
+      // The table not existing is a setup problem, not a typo — say which.
+      const missing = /could not find the table|does not exist|schema cache/i.test(error.message || '');
+      alert(missing
+        ? 'Comments aren\u2019t set up yet — the submission_comments table is missing. Run the migration in Supabase, then reload.'
+        : 'Could not post comment: ' + error.message);
+      throw error;
     }
     // Optimistic insert into local cache
     const arr = _commentsBySubmission.get(submissionId) || [];
@@ -12428,7 +12438,10 @@ function renderTimelinePage() {
     ready: () => _commentsLoaded,
     load: () => loadComments(),
     for: (id) => (_commentsBySubmission.get(id) || []).slice(),
-    post: async (id, body) => { await postComment(id, body); return (_commentsBySubmission.get(id) || []).slice(); },
+    post: async (id, body, meta) => { await postComment(id, body, meta); return (_commentsBySubmission.get(id) || []).slice(); },
+    // Stage list for tagging an entry, so the composer offers the same names the
+    // strip shows. Empty until the defs load — the composer copes.
+    stages: () => (_stageDefs || []).map(sd => ({ key: sd.stage_key, label: sd.label })),
   };
 
   function renderStageStripFor(r) {
@@ -13128,56 +13141,97 @@ window.SubmissionsPage = (function() {
     const api = window.KeelComments;
     if (!api) { slot.innerHTML = ''; return; }
 
+    // Activity log, not a chat thread: an entry records what kind of contact it
+    // was, when it actually happened, and which stage it belongs to — so a buyer
+    // meeting logged three days later still files under the day it occurred.
+    const KINDS = [
+      { key: 'meeting',        label: 'Meeting',        icon: '\u25CF' },
+      { key: 'call',           label: 'Call',           icon: '\u25CF' },
+      { key: 'email',          label: 'Email',          icon: '\u25CF' },
+      { key: 'buyer_feedback', label: 'Buyer feedback', icon: '\u25CF' },
+      { key: 'internal',       label: 'Internal',       icon: '\u25CF' },
+      { key: 'note',           label: 'Note',           icon: '\u25CF' },
+    ];
+    const KIND_LABEL = Object.fromEntries(KINDS.map(k => [k.key, k.label]));
+    const today = () => new Date().toISOString().slice(0, 10);
+    const dayLabel = (d) => {
+      if (!d) return '';
+      const dt = new Date(String(d) + 'T12:00:00');
+      return isNaN(dt) ? String(d) : dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    };
+
     const draw = (comments) => {
-      const list = comments.length === 0
-        ? `<div class="hl-comment-empty">No comments yet.</div>`
-        : comments
-            .slice()
-            .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
-            .map(c => `
-              <div class="hl-comment">
-                <div class="hl-comment-meta">
-                  <span class="hl-comment-author">${esc((c.author_email || '').split('@')[0])}</span>
-                  <span class="hl-comment-time">${esc(relTime(c.created_at))}</span>
-                </div>
-                <div class="hl-comment-body">${esc(c.body || '')}</div>
-              </div>`).join('');
+      const stages = (api.stages && api.stages()) || [];
+      const stageLabel = (k) => (stages.find(x => x.key === k) || {}).label || '';
+      // Newest interaction first — this is a log you scan, not a conversation you read.
+      const sorted = comments.slice().sort((a, b) =>
+        String(b.occurred_on || b.created_at).localeCompare(String(a.occurred_on || a.created_at))
+        || String(b.created_at).localeCompare(String(a.created_at)));
+
+      const list = sorted.length === 0
+        ? `<div class="hl-comment-empty">Nothing logged yet.</div>`
+        : sorted.map(c => `
+            <div class="hl-comment" style="border-left:2px solid var(--rule-soft);padding-left:12px;margin-bottom:12px;">
+              <div class="hl-comment-meta" style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;">
+                <span style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border:1px solid var(--rule-soft);border-radius:3px;padding:1px 5px;">${esc(KIND_LABEL[c.kind] || c.kind || 'Note')}</span>
+                ${c.stage_key && stageLabel(c.stage_key) ? `<span style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">${esc(stageLabel(c.stage_key))}</span>` : ''}
+                <span class="hl-comment-time">${esc(dayLabel(c.occurred_on) || relTime(c.created_at))}</span>
+                <span class="hl-comment-author" style="margin-left:auto;">${esc((c.author_email || '').split('@')[0])}</span>
+              </div>
+              <div class="hl-comment-body">${esc(c.body || '')}</div>
+            </div>`).join('');
+
       slot.innerHTML = `
         <div class="hl-settings-section">
-          <h2 style="margin-bottom:4px;">Comments${comments.length ? ` <span style="font-family:var(--mono);font-size:12px;color:var(--ink-3);">${comments.length}</span>` : ''}</h2>
-          <p class="hl-sub" style="margin-bottom:14px;">Notes on this submission, shared with everyone on the brand.</p>
+          <h2 style="margin-bottom:4px;">Activity${sorted.length ? ` <span style="font-family:var(--mono);font-size:12px;color:var(--ink-3);">${sorted.length}</span>` : ''}</h2>
+          <p class="hl-sub" style="margin-bottom:14px;">Meetings, calls and feedback on this submission, shared with everyone on the brand.</p>
           <div class="hl-comments-list">${list}</div>
-          <div class="hl-comment-form" style="margin-top:12px;">
-            <textarea id="hl-subs-comment-input" placeholder="Add a comment…" rows="2"></textarea>
-            <button class="hl-btn-primary" id="hl-subs-comment-post">Post</button>
+          <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--rule-soft);">
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+              <select id="hl-sc-kind" style="font-family:var(--mono);font-size:11px;padding:5px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+                ${KINDS.map(k => `<option value="${k.key}">${k.label}</option>`).join('')}
+              </select>
+              <input type="date" id="hl-sc-date" value="${today()}" style="font-family:var(--mono);font-size:11px;padding:5px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);" title="When it happened — back-date if you're logging it later">
+              <select id="hl-sc-stage" style="font-family:var(--mono);font-size:11px;padding:5px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+                <option value="">— no stage —</option>
+                ${stages.map(st => `<option value="${esc(st.key)}">${esc(st.label)}</option>`).join('')}
+              </select>
+            </div>
+            <div class="hl-comment-form">
+              <textarea id="hl-subs-comment-input" placeholder="What happened?" rows="2"></textarea>
+              <button class="hl-btn-primary" id="hl-subs-comment-post">Log it</button>
+            </div>
           </div>
         </div>`;
 
       const btn = document.getElementById('hl-subs-comment-post');
       const ta = document.getElementById('hl-subs-comment-input');
-      // Cmd/Ctrl+Enter posts — the textarea is small and the button is easy to miss.
       const send = async () => {
         const body = (ta.value || '').trim();
         if (!body) return;
-        btn.disabled = true; btn.textContent = 'Posting…';
+        btn.disabled = true; btn.textContent = 'Saving…';
         try {
-          const updated = await api.post(sub.id, body);
+          const updated = await api.post(sub.id, body, {
+            kind: (document.getElementById('hl-sc-kind') || {}).value || 'note',
+            occurred_on: (document.getElementById('hl-sc-date') || {}).value || null,
+            stage_key: (document.getElementById('hl-sc-stage') || {}).value || null,
+          });
           draw(updated);
         } catch (e) {
-          alert('Could not post comment: ' + (e.message || e));
-          btn.disabled = false; btn.textContent = 'Post';
+          // post() already explained the failure; just restore the button.
+          btn.disabled = false; btn.textContent = 'Log it';
         }
       };
       btn.addEventListener('click', send);
       ta.addEventListener('keydown', (ev) => { if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') send(); });
     };
 
-    slot.innerHTML = `<div class="hl-settings-section"><div class="hl-loading">Loading comments…</div></div>`;
+    slot.innerHTML = `<div class="hl-settings-section"><div class="hl-loading">Loading activity…</div></div>`;
     try {
       if (!api.ready()) await api.load();
       draw(api.for(sub.id));
     } catch (e) {
-      console.warn('[subs] comments skipped:', e);
+      console.warn('[subs] activity skipped:', e);
       slot.innerHTML = '';
     }
   }
