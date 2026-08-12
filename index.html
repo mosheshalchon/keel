@@ -5179,7 +5179,10 @@ HL.NAV_ITEMS = [
   { id: 'ask-keel',        label: 'Ask Keel',        href: './ask-keel.html' },
   { id: 'brand-library',   label: 'Brand Library',   href: './brand-library.html' },
   { id: 'retailer-library',label: 'Retailer Library',href: './retailer-library.html' },
-  { id: 'timeline',        label: 'Timeline',        href: './timeline.html' },
+  // Timeline is HIDDEN from the sidebar (Aug 2026) — Submissions now carries the
+  // stage strip, the stage-derived status pill, the STAGE/SHOW filters and the
+  // Activity log. The route still resolves, so old links and bookmarks work.
+  { id: 'timeline',        label: 'Timeline',        href: './timeline.html', hidden: true },
   { id: 'submission-docs', label: 'Submissions',     href: './submission-docs.html' },
   { id: 'forecasts',       label: 'Forecasts',       href: './forecasts.html' },
   { id: 'promos',          label: 'Promos',          href: './promos.html' },
@@ -5203,7 +5206,7 @@ HL.NAV_GROUPS = [
   { type: 'item',  id: 'dashboard' },
   { type: 'item',  id: 'ask-keel' },
   { type: 'item',  id: 'brand-library' },
-  { type: 'group', label: 'Sales',      children: ['retailer-library', 'timeline', 'submission-docs', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
+  { type: 'group', label: 'Sales',      children: ['retailer-library', 'submission-docs', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
   { type: 'group', label: 'Operations', children: ['mrp', 'production', 'freight', 'service-levels', 'distribution'] },
   { type: 'item',  id: 'finance' },
   { type: 'item',  id: 'settings' },
@@ -7104,6 +7107,293 @@ window.SpinsConverter = (function() {
 
 </script>
 
+<script>
+/* KeelStages - the submission lifecycle, shared by Timeline and Submissions.
+
+   Lifted out of renderTimelinePage on Aug 11 2026. It used to live inside that
+   function, so window.KeelStageStrip and window.KeelComments only existed once
+   you VISITED the Timeline tab: anyone landing straight on a submission got an
+   empty stage strip, fallback status labels and no activity log, silently.
+   This module registers on page load instead, which is also what makes hiding
+   the Timeline tab safe. Depends only on window.Auth and window.KeelCache. */
+(function () {
+  const _sb = () => window.Auth.getClient();
+  const _sess = () => { try { return window.Auth.getSession() || {}; } catch (e) { return {}; } };
+  const _brandId = () => _sess().brandId;
+  const _email = () => _sess().email;
+  const _esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // Pages subscribe to be redrawn when defs or comments land, replacing the
+  // direct render() call this code made while it lived inside Timeline.
+  const _subs = [];
+  const _notify = () => { for (const fn of _subs) { try { fn(); } catch (e) { console.warn('[KeelStages] subscriber failed', e); } } };
+
+  let _stageDefs = [];        // 9-stage definitions, loaded from stage_definitions table
+  let _commentsBySubmission = new Map();  // submission_id -> [comment, ...]
+  let _commentsLoaded = false;            // distinguishes "not fetched yet" from "no comments"
+
+  // COLOUR ONLY. Labels come from stage_definitions; this just keeps the existing
+  // nine stages looking as they always have. A stage key that isn't here (anything
+  // added in Settings) gets a colour by position instead — see statusForStage.
+  const STAGE_CLS = {
+    upcoming: 'tlst-submitted',
+    team_kickoff: 'tlst-pending',
+    internal_signoff: 'tlst-pending',
+    submission_due: 'tlst-review',
+    buyer_review: 'tlst-review',
+    buyer_decision: 'tlst-pending',
+    post_review_docs: 'tlst-pending',
+    reset_date: 'tlst-approved',
+    post_reset: 'tlst-launched',
+  };
+
+  // The header/list pill for a stage. Label is ALWAYS sd.label, so renaming or
+  // adding a stage in Settings → Stage Definitions flows straight through to the
+  // pill — the strip and the pill can no longer disagree.
+  function statusForStage(sd, idx, total) {
+    const cls = STAGE_CLS[sd.stage_key]
+      || (total > 1 && idx === total - 1 ? 'tlst-launched'
+          : idx / Math.max(1, total - 1) > 0.7 ? 'tlst-approved'
+          : idx / Math.max(1, total - 1) > 0.35 ? 'tlst-review'
+          : 'tlst-pending');
+    return { key: sd.stage_key, label: sd.label, cls };
+  }
+
+  // Every stage as a pill option, in sequence order. Falls back to the old
+  // hardcoded list only while the definitions are still loading.
+  function statusList() {
+    if (!_stageDefs || !_stageDefs.length) return STATUS_FILTERS;
+    return _stageDefs.map((sd, i) => statusForStage(sd, i, _stageDefs.length));
+  }
+
+
+  // The 7 distinct statuses, in display order, used for filter pills
+  // Fallback only — used before stage_definitions have loaded.
+  const STATUS_FILTERS = [
+    { key: 'upcoming',           label: 'Upcoming',            cls: 'tlst-submitted' },
+    { key: 'team_preparation',   label: 'Team preparation',    cls: 'tlst-pending' },
+    { key: 'internal_signoff',   label: 'Internal sign off',   cls: 'tlst-pending' },
+    { key: 'submitted_to_buyer', label: 'Submitted to buyer',  cls: 'tlst-review' },
+    { key: 'pending_buyer',      label: 'Pending buyer review',cls: 'tlst-review' },
+    { key: 'decision',           label: 'Accepted / Rejected', cls: 'tlst-pending' },
+    { key: 'pending_launch',     label: 'Pending launch',      cls: 'tlst-approved' },
+    { key: 'live',               label: 'Live',                cls: 'tlst-launched' },
+  ];
+
+  // Special status: when buyer rejected, lifecycle freezes here regardless
+  // of timing. We render it as "Rejected" with a distinct cls.
+  const REJECTED_STATUS = { key: 'rejected', label: 'Rejected', cls: 'tlst-declined' };
+
+  const labelForStatus = (k) => (statusList().find(s => s.key === k) || {}).label || k;
+
+  // Compute the user-facing status for a submission row, using
+  // its current stage AND its buyer_decision. Rejection freezes
+  // the lifecycle at "Rejected"; acceptance lets it continue.
+  function statusForRow(r) {
+    if (r.buyer_decision === 'rejected') return REJECTED_STATUS;
+    const { current, currentIdx } = computeCurrentStage(r);
+    if (!current) return statusList()[0] || STATUS_FILTERS[0];
+    return statusForStage(current, currentIdx, (_stageDefs || []).length);
+  }
+
+  // Compute current stage from row + cached stage definitions.
+  // Lifted out of the row renderer so other code (filtering) can use it.
+  function computeCurrentStage(r) {
+    if (!_stageDefs || !_stageDefs.length) return { current: null, currentIdx: -1 };
+    const today = new Date(); today.setHours(0,0,0,0);
+    const overrides = r.stage_overrides || {};
+    const fieldVal = (k) => {
+      const v = r[k] || (k === 'submission_due' ? r.submission_date : null);
+      return v ? new Date(v) : null;
+    };
+    let current = null, currentIdx = -1;
+    _stageDefs.forEach((sd, i) => {
+      const ov = overrides[sd.stage_key] || {};
+      const anchor = ov.anchor_field || sd.anchor_field;
+      const offset = ov.offset_days != null ? ov.offset_days : sd.offset_days;
+      if (!anchor || offset == null) return;
+      const base = fieldVal(anchor);
+      if (!base) return;
+      const d = new Date(base); d.setDate(d.getDate() + offset);
+      if (d <= today) { current = sd; currentIdx = i; }
+    });
+    // If buyer decision logged, advance to (or past) buyer_decision stage
+    if (r.buyer_decision === 'accepted' || r.buyer_decision === 'rejected') {
+      const decisionIdx = _stageDefs.findIndex(s => s.stage_key === 'buyer_decision');
+      if (decisionIdx > currentIdx) {
+        current = _stageDefs[decisionIdx];
+        currentIdx = decisionIdx;
+      }
+    }
+    // If accepted, the row keeps advancing through reset_date / post_reset
+    // as time passes (no extra logic — the loop above handles it).
+    return { current, currentIdx };
+  }
+
+  async function loadStageDefs() {
+    let data;
+    try {
+      data = await window.KeelCache.get('sd:' + _brandId(), async () => {
+        const res = await _sb().from('stage_definitions').select('*').order('sequence', { ascending: true });
+        if (res.error) throw res.error;
+        return res.data || [];
+      }, 10 * 60 * 1000);
+    } catch (e) { return; }
+    if (data) {
+      _stageDefs = data;
+      _notify();   // let any mounted page redraw
+    }
+  }
+
+  async function loadComments() {
+    // Load all comments for this brand once. They're keyed by submission_id
+    // for fast lookup when rendering rows.
+    let data;
+    try {
+      data = await window.KeelCache.get('cm:' + _brandId(), async () => {
+        const res = await _sb().from('submission_comments').select('*').is('deleted_at', null).order('created_at', { ascending: true });
+        if (res.error) {
+          // Table may not exist yet (migration not run). Return [] so the result
+          // is cached and we stop re-hitting a 404 on every load this session.
+          console.warn('Comments load failed (run v3 migration?):', res.error.message);
+          return [];
+        }
+        return res.data || [];
+      }, 10 * 60 * 1000);
+    } catch (error) {
+      return;
+    }
+    _commentsBySubmission = new Map();
+    for (const c of data || []) {
+      const arr = _commentsBySubmission.get(c.submission_id) || [];
+      arr.push(c);
+      _commentsBySubmission.set(c.submission_id, arr);
+    }
+    _commentsLoaded = true;
+    _notify();
+  }
+
+  async function postComment(submissionId, body, meta) {
+    body = body.trim();
+    if (!body) return;
+    const row = {
+      brand_id: _brandId(),
+      submission_id: submissionId,
+      body,
+      author_email: _email(),
+    };
+    if (meta && meta.kind) row.kind = meta.kind;
+    if (meta && meta.occurred_on) row.occurred_on = meta.occurred_on;
+    if (meta && meta.stage_key) row.stage_key = meta.stage_key;
+    const { data, error } = await _sb().from('submission_comments').insert(row).select().single();
+    if (error) {
+      // The table not existing is a setup problem, not a typo — say which.
+      const missing = /could not find the table|does not exist|schema cache/i.test(error.message || '');
+      alert(missing
+        ? 'Comments aren\u2019t set up yet — the submission_comments table is missing. Run the migration in Supabase, then reload.'
+        : 'Could not post comment: ' + error.message);
+      throw error;
+    }
+    // Optimistic insert into local cache
+    const arr = _commentsBySubmission.get(submissionId) || [];
+    arr.push(data);
+    _commentsBySubmission.set(submissionId, arr);
+    try { window.KeelCache.invalidate('cm:' + _brandId()); } catch (e) {}
+    _notify();
+  }
+
+  function renderStageStripFor(r) {
+    if (!_stageDefs || !_stageDefs.length) return '';
+    const { currentIdx } = computeCurrentStage(r);
+    const activations = computeStageActivationsFor(r);
+
+    const cells = _stageDefs.map((sd, i) => {
+      let cls = 'upcoming';
+      if (i < currentIdx) cls = 'done';
+      else if (i === currentIdx) cls = 'current';
+      // If rejected, freeze rendering: only stages up to buyer_decision are
+      // ever "done" or "current"; everything after is "skipped".
+      if (r.buyer_decision === 'rejected') {
+        const decisionIdx = _stageDefs.findIndex(s => s.stage_key === 'buyer_decision');
+        // -1 means the stage was deleted in Settings; without this guard every
+        // node would compare `i > -1` and the whole strip would grey out.
+        if (decisionIdx >= 0 && i > decisionIdx) cls = 'skipped';
+      }
+      const d = activations[sd.stage_key];
+      // Include the YEAR when the stage falls outside the current one — a bare
+      // "May 10" on a reset date 9 months out reads as this year at a glance.
+      const thisYear = new Date().getFullYear();
+      const dateLabel = d
+        ? d.toLocaleDateString('en-US', d.getFullYear() === thisYear
+            ? { month: 'short', day: 'numeric' }
+            : { month: 'short', day: 'numeric', year: 'numeric' })
+        : '';
+      return `
+        <div class="hl-stage-cell ${cls}" title="${_esc(sd.label)}${dateLabel ? ' · ' + dateLabel : ''}">
+          <div class="hl-stage-line"></div>
+          <div class="hl-stage-dot"></div>
+          <div class="hl-stage-name">${_esc(sd.label)}</div>
+          <div class="hl-stage-date">${dateLabel || '&nbsp;'}</div>
+        </div>
+      `;
+    }).join('');
+    return `<div class="hl-stage-strip">${cells}</div>`;
+  }
+
+  function computeStageActivationsFor(r) {
+    const out = {};
+    const overrides = r.stage_overrides || {};
+    const fieldVal = (k) => {
+      const v = r[k] || (k === 'submission_due' ? r.submission_date : null);
+      return v ? new Date(v) : null;
+    };
+    for (const sd of _stageDefs || []) {
+      const ov = overrides[sd.stage_key] || {};
+      const anchor = ov.anchor_field || sd.anchor_field;
+      const offset = ov.offset_days != null ? ov.offset_days : sd.offset_days;
+      if (!anchor || offset == null) { out[sd.stage_key] = null; continue; }
+      const base = fieldVal(anchor);
+      if (!base) { out[sd.stage_key] = null; continue; }
+      const d = new Date(base);
+      d.setDate(d.getDate() + offset);
+      out[sd.stage_key] = d;
+    }
+    return out;
+  }
+
+  window.KeelStages = {
+    defs: () => _stageDefs,
+    ready: () => !!(_stageDefs && _stageDefs.length),
+    load: () => loadStageDefs(),
+    stages: () => (_stageDefs || []).map(sd => ({ key: sd.stage_key, label: sd.label })),
+    computeCurrentStage, computeStageActivationsFor,
+    statusForRow, statusForStage, statusList, labelForStatus,
+    REJECTED_STATUS, STATUS_FILTERS,
+    stripHtml: (row) => { try { return renderStageStripFor(row); } catch (e) { console.warn('[KeelStages] strip', e); return ''; } },
+    commentsReady: () => _commentsLoaded,
+    commentsLoad: () => loadComments(),
+    commentsMap: () => _commentsBySubmission,
+    commentsFor: (id) => (_commentsBySubmission.get(id) || []).slice(),
+    post: postComment,
+    onChange: (fn) => { if (typeof fn === 'function') _subs.push(fn); },
+  };
+
+  // Back-compat shapes the Submissions page already calls.
+  window.KeelStageStrip = {
+    html: (row) => window.KeelStages.stripHtml(row),
+    ready: () => window.KeelStages.ready(),
+    load: () => window.KeelStages.load(),
+    status: (row) => { try { return statusForRow(row); } catch (e) { return null; } },
+  };
+  window.KeelComments = {
+    ready: () => _commentsLoaded,
+    load: () => loadComments(),
+    for: (id) => window.KeelStages.commentsFor(id),
+    post: async (id, body, meta) => { await postComment(id, body, meta); return window.KeelStages.commentsFor(id); },
+    stages: () => window.KeelStages.stages(),
+  };
+})();
+</script>
 <script>
 /* ============================================================
    ROUTER · hash-based navigation between pages
@@ -9185,6 +9475,25 @@ render();
 
 
 function renderTimelinePage() {
+  // The stage/status/comments machinery moved to the KeelStages module so it
+  // registers on page load rather than only when this tab is opened. These
+  // aliases keep the ~40 call sites below unchanged.
+  const _KS = window.KeelStages;
+  const loadStageDefs = () => _KS.load();
+  const loadComments = () => _KS.commentsLoad();
+  const postComment = (id, body, meta) => _KS.post(id, body, meta);
+  const computeCurrentStage = (r) => _KS.computeCurrentStage(r);
+  const computeStageActivationsFor = (r) => _KS.computeStageActivationsFor(r);
+  const renderStageStripFor = (r) => _KS.stripHtml(r);
+  const statusForRow = (r) => _KS.statusForRow(r);
+  const statusForStage = (sd, i, n) => _KS.statusForStage(sd, i, n);
+  const statusList = () => _KS.statusList();
+  const labelForStatus = (k) => _KS.labelForStatus(k);
+  const REJECTED_STATUS = _KS.REJECTED_STATUS;
+  const STATUS_FILTERS = _KS.STATUS_FILTERS;
+  // The loaders used to call render() directly; they now notify subscribers.
+  _KS.onChange(() => { try { if (_loadState === 'ready') render(); } catch (e) {} });
+
   // Auth gate first — mounts the H&L sidebar/header shell when authed.
   const session = HL.mountPage('timeline');
   if (!session) throw new Error('Auth required');
@@ -9201,9 +9510,6 @@ function renderTimelinePage() {
   let _editingId = null;     // id of row currently being edited inline (or 'NEW' for new-row form)
   let _newDraft = null;       // draft row when adding a new entry
   let _realtimeChannel = null;
-  let _stageDefs = [];        // 9-stage definitions, loaded from stage_definitions table
-  let _commentsBySubmission = new Map();  // submission_id -> [comment, ...]
-  let _commentsLoaded = false;            // distinguishes "not fetched yet" from "no comments"
   let _expandedComments = new Set();      // submission ids whose comment threads are open
   let _selected = new Set();              // submission ids currently checkbox-selected for bulk actions
 
@@ -9221,103 +9527,6 @@ function renderTimelinePage() {
   // Filter pills at the top of Timeline use the 7 distinct statuses.
   // The stage strip below each row uses the 9 stage names directly.
 
-  // COLOUR ONLY. Labels come from stage_definitions; this just keeps the existing
-  // nine stages looking as they always have. A stage key that isn't here (anything
-  // added in Settings) gets a colour by position instead — see statusForStage.
-  const STAGE_CLS = {
-    upcoming: 'tlst-submitted',
-    team_kickoff: 'tlst-pending',
-    internal_signoff: 'tlst-pending',
-    submission_due: 'tlst-review',
-    buyer_review: 'tlst-review',
-    buyer_decision: 'tlst-pending',
-    post_review_docs: 'tlst-pending',
-    reset_date: 'tlst-approved',
-    post_reset: 'tlst-launched',
-  };
-
-  // The header/list pill for a stage. Label is ALWAYS sd.label, so renaming or
-  // adding a stage in Settings → Stage Definitions flows straight through to the
-  // pill — the strip and the pill can no longer disagree.
-  function statusForStage(sd, idx, total) {
-    const cls = STAGE_CLS[sd.stage_key]
-      || (total > 1 && idx === total - 1 ? 'tlst-launched'
-          : idx / Math.max(1, total - 1) > 0.7 ? 'tlst-approved'
-          : idx / Math.max(1, total - 1) > 0.35 ? 'tlst-review'
-          : 'tlst-pending');
-    return { key: sd.stage_key, label: sd.label, cls };
-  }
-
-  // Every stage as a pill option, in sequence order. Falls back to the old
-  // hardcoded list only while the definitions are still loading.
-  function statusList() {
-    if (!_stageDefs || !_stageDefs.length) return STATUS_FILTERS;
-    return _stageDefs.map((sd, i) => statusForStage(sd, i, _stageDefs.length));
-  }
-
-
-  // The 7 distinct statuses, in display order, used for filter pills
-  // Fallback only — used before stage_definitions have loaded.
-  const STATUS_FILTERS = [
-    { key: 'upcoming',           label: 'Upcoming',            cls: 'tlst-submitted' },
-    { key: 'team_preparation',   label: 'Team preparation',    cls: 'tlst-pending' },
-    { key: 'internal_signoff',   label: 'Internal sign off',   cls: 'tlst-pending' },
-    { key: 'submitted_to_buyer', label: 'Submitted to buyer',  cls: 'tlst-review' },
-    { key: 'pending_buyer',      label: 'Pending buyer review',cls: 'tlst-review' },
-    { key: 'decision',           label: 'Accepted / Rejected', cls: 'tlst-pending' },
-    { key: 'pending_launch',     label: 'Pending launch',      cls: 'tlst-approved' },
-    { key: 'live',               label: 'Live',                cls: 'tlst-launched' },
-  ];
-
-  // Special status: when buyer rejected, lifecycle freezes here regardless
-  // of timing. We render it as "Rejected" with a distinct cls.
-  const REJECTED_STATUS = { key: 'rejected', label: 'Rejected', cls: 'tlst-declined' };
-
-  const labelForStatus = (k) => (statusList().find(s => s.key === k) || {}).label || k;
-
-  // Compute the user-facing status for a submission row, using
-  // its current stage AND its buyer_decision. Rejection freezes
-  // the lifecycle at "Rejected"; acceptance lets it continue.
-  function statusForRow(r) {
-    if (r.buyer_decision === 'rejected') return REJECTED_STATUS;
-    const { current, currentIdx } = computeCurrentStage(r);
-    if (!current) return statusList()[0] || STATUS_FILTERS[0];
-    return statusForStage(current, currentIdx, (_stageDefs || []).length);
-  }
-
-  // Compute current stage from row + cached stage definitions.
-  // Lifted out of the row renderer so other code (filtering) can use it.
-  function computeCurrentStage(r) {
-    if (!_stageDefs || !_stageDefs.length) return { current: null, currentIdx: -1 };
-    const today = new Date(); today.setHours(0,0,0,0);
-    const overrides = r.stage_overrides || {};
-    const fieldVal = (k) => {
-      const v = r[k] || (k === 'submission_due' ? r.submission_date : null);
-      return v ? new Date(v) : null;
-    };
-    let current = null, currentIdx = -1;
-    _stageDefs.forEach((sd, i) => {
-      const ov = overrides[sd.stage_key] || {};
-      const anchor = ov.anchor_field || sd.anchor_field;
-      const offset = ov.offset_days != null ? ov.offset_days : sd.offset_days;
-      if (!anchor || offset == null) return;
-      const base = fieldVal(anchor);
-      if (!base) return;
-      const d = new Date(base); d.setDate(d.getDate() + offset);
-      if (d <= today) { current = sd; currentIdx = i; }
-    });
-    // If buyer decision logged, advance to (or past) buyer_decision stage
-    if (r.buyer_decision === 'accepted' || r.buyer_decision === 'rejected') {
-      const decisionIdx = _stageDefs.findIndex(s => s.stage_key === 'buyer_decision');
-      if (decisionIdx > currentIdx) {
-        current = _stageDefs[decisionIdx];
-        currentIdx = decisionIdx;
-      }
-    }
-    // If accepted, the row keeps advancing through reset_date / post_reset
-    // as time passes (no extra logic — the loop above handles it).
-    return { current, currentIdx };
-  }
 
   const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
   const fmtRelative = (iso) => {
@@ -9384,49 +9593,6 @@ function renderTimelinePage() {
     render();
   }
 
-  async function loadStageDefs() {
-    let data;
-    try {
-      data = await window.KeelCache.get('sd:' + session.brandId, async () => {
-        const res = await sb.from('stage_definitions').select('*').order('sequence', { ascending: true });
-        if (res.error) throw res.error;
-        return res.data || [];
-      }, 10 * 60 * 1000);
-    } catch (e) { return; }
-    if (data) {
-      _stageDefs = data;
-      // If timeline already rendered, re-render to pick up the strips
-      if (_loadState === 'ready') render();
-    }
-  }
-
-  async function loadComments() {
-    // Load all comments for this brand once. They're keyed by submission_id
-    // for fast lookup when rendering rows.
-    let data;
-    try {
-      data = await window.KeelCache.get('cm:' + session.brandId, async () => {
-        const res = await sb.from('submission_comments').select('*').is('deleted_at', null).order('created_at', { ascending: true });
-        if (res.error) {
-          // Table may not exist yet (migration not run). Return [] so the result
-          // is cached and we stop re-hitting a 404 on every load this session.
-          console.warn('Comments load failed (run v3 migration?):', res.error.message);
-          return [];
-        }
-        return res.data || [];
-      }, 10 * 60 * 1000);
-    } catch (error) {
-      return;
-    }
-    _commentsBySubmission = new Map();
-    for (const c of data || []) {
-      const arr = _commentsBySubmission.get(c.submission_id) || [];
-      arr.push(c);
-      _commentsBySubmission.set(c.submission_id, arr);
-    }
-    _commentsLoaded = true;
-    if (_loadState === 'ready') render();
-  }
 
   // ────────────────────────────────────────────────────────
   // DOCS PANEL — Generate Documents flow on a Timeline row
@@ -11975,34 +12141,6 @@ function renderTimelinePage() {
   // meta carries the CRM fields: { kind, occurred_on, stage_key }. All optional —
   // omitted keys fall to the table defaults ('note', today, null), so the older
   // Timeline call sites that pass only a body keep working unchanged.
-  async function postComment(submissionId, body, meta) {
-    body = body.trim();
-    if (!body) return;
-    const row = {
-      brand_id: session.brandId,
-      submission_id: submissionId,
-      body,
-      author_email: session.email,
-    };
-    if (meta && meta.kind) row.kind = meta.kind;
-    if (meta && meta.occurred_on) row.occurred_on = meta.occurred_on;
-    if (meta && meta.stage_key) row.stage_key = meta.stage_key;
-    const { data, error } = await sb.from('submission_comments').insert(row).select().single();
-    if (error) {
-      // The table not existing is a setup problem, not a typo — say which.
-      const missing = /could not find the table|does not exist|schema cache/i.test(error.message || '');
-      alert(missing
-        ? 'Comments aren\u2019t set up yet — the submission_comments table is missing. Run the migration in Supabase, then reload.'
-        : 'Could not post comment: ' + error.message);
-      throw error;
-    }
-    // Optimistic insert into local cache
-    const arr = _commentsBySubmission.get(submissionId) || [];
-    arr.push(data);
-    _commentsBySubmission.set(submissionId, arr);
-    try { window.KeelCache.invalidate('cm:' + session.brandId); } catch (e) {}
-    render();
-  }
 
   async function recordDecision(id, decision) {
     let reason = '';
@@ -12379,7 +12517,7 @@ function renderTimelinePage() {
     // here and is called from there. Cosmetic move only; nothing else changed.
     const decisionHtml = renderDecisionPanelFor(r);
     const commentsHtml = renderCommentsSectionFor(r);
-    const commentCount = (_commentsBySubmission.get(r.id) || []).length;
+    const commentCount = _KS.commentsFor(r.id).length;
     const isChecked = _selected.has(r.id);
     return `
       <div class="tl2-row" data-id="${r.id}" style="grid-template-columns: 1fr;">
@@ -12413,95 +12551,9 @@ function renderTimelinePage() {
     `;
   }
 
-  // Stage strip — renders the 9-stage timeline progress for a row.
-  // Uses the shared computeCurrentStage() helper so labels and statuses
-  // stay in sync with the row's status pill.
-  // Exposed for the Submissions page, which lives in a DIFFERENT IIFE
-  // (window.SubmissionsPage) and therefore cannot see _stageDefs or this function
-  // directly. Returns '' until the defs are loaded; loadStageDefs is exposed too so
-  // the caller can await it. Reading _stageDefs from outside this closure is what
-  // broke the submission page on Aug 11 — go through these two, never the variable.
-  window.KeelStageStrip = {
-    html: (row) => { try { return renderStageStripFor(row); } catch (e) { console.warn('[stagestrip]', e); return ''; } },
-    ready: () => !!(_stageDefs && _stageDefs.length),
-    load: () => loadStageDefs(),
-    // Same status the Timeline shows (stage-derived, rejection-aware). The
-    // Submissions page has its OWN older statusLabel() off submission.status;
-    // this lets it show the identical pill instead of a second opinion.
-    status: (row) => { try { return statusForRow(row); } catch (e) { return null; } },
-  };
+  // The stage strip and comments bridges now live in the KeelStages module at the
+  // top of the file, so they register on page load instead of on first visit here.
 
-  // Comments bridge, same reasoning as the strip: submission_comments is loaded and
-  // cached inside THIS closure, so the Submissions page (a separate IIFE) reads and
-  // writes through here rather than duplicating the table access and the cache key.
-  window.KeelComments = {
-    ready: () => _commentsLoaded,
-    load: () => loadComments(),
-    for: (id) => (_commentsBySubmission.get(id) || []).slice(),
-    post: async (id, body, meta) => { await postComment(id, body, meta); return (_commentsBySubmission.get(id) || []).slice(); },
-    // Stage list for tagging an entry, so the composer offers the same names the
-    // strip shows. Empty until the defs load — the composer copes.
-    stages: () => (_stageDefs || []).map(sd => ({ key: sd.stage_key, label: sd.label })),
-  };
-
-  function renderStageStripFor(r) {
-    if (!_stageDefs || !_stageDefs.length) return '';
-    const { currentIdx } = computeCurrentStage(r);
-    const activations = computeStageActivationsFor(r);
-
-    const cells = _stageDefs.map((sd, i) => {
-      let cls = 'upcoming';
-      if (i < currentIdx) cls = 'done';
-      else if (i === currentIdx) cls = 'current';
-      // If rejected, freeze rendering: only stages up to buyer_decision are
-      // ever "done" or "current"; everything after is "skipped".
-      if (r.buyer_decision === 'rejected') {
-        const decisionIdx = _stageDefs.findIndex(s => s.stage_key === 'buyer_decision');
-        // -1 means the stage was deleted in Settings; without this guard every
-        // node would compare `i > -1` and the whole strip would grey out.
-        if (decisionIdx >= 0 && i > decisionIdx) cls = 'skipped';
-      }
-      const d = activations[sd.stage_key];
-      // Include the YEAR when the stage falls outside the current one — a bare
-      // "May 10" on a reset date 9 months out reads as this year at a glance.
-      const thisYear = new Date().getFullYear();
-      const dateLabel = d
-        ? d.toLocaleDateString('en-US', d.getFullYear() === thisYear
-            ? { month: 'short', day: 'numeric' }
-            : { month: 'short', day: 'numeric', year: 'numeric' })
-        : '';
-      return `
-        <div class="hl-stage-cell ${cls}" title="${escapeHtml(sd.label)}${dateLabel ? ' · ' + dateLabel : ''}">
-          <div class="hl-stage-line"></div>
-          <div class="hl-stage-dot"></div>
-          <div class="hl-stage-name">${escapeHtml(sd.label)}</div>
-          <div class="hl-stage-date">${dateLabel || '&nbsp;'}</div>
-        </div>
-      `;
-    }).join('');
-    return `<div class="hl-stage-strip">${cells}</div>`;
-  }
-
-  function computeStageActivationsFor(r) {
-    const out = {};
-    const overrides = r.stage_overrides || {};
-    const fieldVal = (k) => {
-      const v = r[k] || (k === 'submission_due' ? r.submission_date : null);
-      return v ? new Date(v) : null;
-    };
-    for (const sd of _stageDefs || []) {
-      const ov = overrides[sd.stage_key] || {};
-      const anchor = ov.anchor_field || sd.anchor_field;
-      const offset = ov.offset_days != null ? ov.offset_days : sd.offset_days;
-      if (!anchor || offset == null) { out[sd.stage_key] = null; continue; }
-      const base = fieldVal(anchor);
-      if (!base) { out[sd.stage_key] = null; continue; }
-      const d = new Date(base);
-      d.setDate(d.getDate() + offset);
-      out[sd.stage_key] = d;
-    }
-    return out;
-  }
 
   // Decision panel — accept/reject buttons for the submission owner
   // when the buyer hasn't decided yet AND we're past the buyer review point.
@@ -12531,7 +12583,7 @@ function renderTimelinePage() {
   function renderCommentsSectionFor(r) {
     const expanded = _expandedComments.has(r.id);
     if (!expanded) return '';
-    const comments = _commentsBySubmission.get(r.id) || [];
+    const comments = _KS.commentsFor(r.id);
     const commentsHtml = comments.length === 0
       ? `<div class="hl-comment-empty">No comments yet.</div>`
       : comments.map(c => `
@@ -13442,6 +13494,9 @@ window.SubmissionsPage = (function() {
           <button class="hl-btn-secondary" id="hl-subs-template-btn" style="white-space:nowrap;">↓ Bulk template</button>
           <input type="file" id="hl-subs-bulk-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
           <button class="hl-btn-secondary" id="hl-subs-bulk-btn" style="white-space:nowrap;">+ Bulk upload</button>
+          <!-- Still #timeline: that page owns the create-submission modal, and the
+               route resolves fine even though the tab is hidden from the sidebar.
+               Moving the create flow over here is a separate job. -->
           <a href="#timeline?new=1" class="hl-btn-primary" style="text-decoration:none;white-space:nowrap;">+ New submission</a>
         </div>
       </div>
@@ -44117,7 +44172,7 @@ render();
     // — everything else stayed invisible with no way to turn it on. Dashboard is excluded
     // because it is always visible by design.
     const TAB_DEFS = ((window.HL && HL.NAV_ITEMS) || [])
-      .filter(n => n.id !== 'dashboard')
+      .filter(n => n.id !== 'dashboard' && !n.hidden)   // hidden routes aren't grantable
       .map(n => ({ key: n.id, label: n.label }));
     const DEPTS = ['sales', 'ops', 'finance', 'all'];
     const permLookup = (dept, tab) => permissions.find(p => p.department === dept && p.tab_key === tab)?.can_access || false;
