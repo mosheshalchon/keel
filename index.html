@@ -9212,7 +9212,7 @@ function renderTimelinePage() {
   // ────────────────────────────────────────────────────────
   // Stages (timing engine, 9 total) are defined in the
   // stage_definitions table. Statuses (user-facing labels, 7 unique)
-  // are derived from the current stage via STAGE_TO_STATUS.
+  // are derived from the current stage, whose LABEL comes from stage_definitions.
   //
   // Note: two stages map to the same status ("Team preparation"):
   //   - team_kickoff
@@ -9221,19 +9221,43 @@ function renderTimelinePage() {
   // Filter pills at the top of Timeline use the 7 distinct statuses.
   // The stage strip below each row uses the 9 stage names directly.
 
-  const STAGE_TO_STATUS = {
-    upcoming:         { key: 'upcoming',           label: 'Upcoming',            cls: 'tlst-submitted' },
-    team_kickoff:     { key: 'team_preparation',   label: 'Team preparation',    cls: 'tlst-pending' },
-    internal_signoff: { key: 'internal_signoff',   label: 'Internal sign off',   cls: 'tlst-pending' },
-    submission_due:   { key: 'submitted_to_buyer', label: 'Submitted to buyer',  cls: 'tlst-review' },
-    buyer_review:     { key: 'pending_buyer',      label: 'Pending buyer review',cls: 'tlst-review' },
-    buyer_decision:   { key: 'decision',           label: 'Accepted / Rejected', cls: 'tlst-pending' },
-    post_review_docs: { key: 'team_preparation',   label: 'Team preparation',    cls: 'tlst-pending' },
-    reset_date:       { key: 'pending_launch',     label: 'Pending launch',      cls: 'tlst-approved' },
-    post_reset:       { key: 'live',               label: 'Live',                cls: 'tlst-launched' },
+  // COLOUR ONLY. Labels come from stage_definitions; this just keeps the existing
+  // nine stages looking as they always have. A stage key that isn't here (anything
+  // added in Settings) gets a colour by position instead — see statusForStage.
+  const STAGE_CLS = {
+    upcoming: 'tlst-submitted',
+    team_kickoff: 'tlst-pending',
+    internal_signoff: 'tlst-pending',
+    submission_due: 'tlst-review',
+    buyer_review: 'tlst-review',
+    buyer_decision: 'tlst-pending',
+    post_review_docs: 'tlst-pending',
+    reset_date: 'tlst-approved',
+    post_reset: 'tlst-launched',
   };
 
+  // The header/list pill for a stage. Label is ALWAYS sd.label, so renaming or
+  // adding a stage in Settings → Stage Definitions flows straight through to the
+  // pill — the strip and the pill can no longer disagree.
+  function statusForStage(sd, idx, total) {
+    const cls = STAGE_CLS[sd.stage_key]
+      || (total > 1 && idx === total - 1 ? 'tlst-launched'
+          : idx / Math.max(1, total - 1) > 0.7 ? 'tlst-approved'
+          : idx / Math.max(1, total - 1) > 0.35 ? 'tlst-review'
+          : 'tlst-pending');
+    return { key: sd.stage_key, label: sd.label, cls };
+  }
+
+  // Every stage as a pill option, in sequence order. Falls back to the old
+  // hardcoded list only while the definitions are still loading.
+  function statusList() {
+    if (!_stageDefs || !_stageDefs.length) return STATUS_FILTERS;
+    return _stageDefs.map((sd, i) => statusForStage(sd, i, _stageDefs.length));
+  }
+
+
   // The 7 distinct statuses, in display order, used for filter pills
+  // Fallback only — used before stage_definitions have loaded.
   const STATUS_FILTERS = [
     { key: 'upcoming',           label: 'Upcoming',            cls: 'tlst-submitted' },
     { key: 'team_preparation',   label: 'Team preparation',    cls: 'tlst-pending' },
@@ -9249,20 +9273,16 @@ function renderTimelinePage() {
   // of timing. We render it as "Rejected" with a distinct cls.
   const REJECTED_STATUS = { key: 'rejected', label: 'Rejected', cls: 'tlst-declined' };
 
-  // Legacy STATUSES kept for backward-compat with the inline-edit dropdown
-  // (the old picker still uses it). New code paths use STATUS_FILTERS.
-  const STATUSES = STATUS_FILTERS;
-  const STATUS_BY_KEY = Object.fromEntries(STATUS_FILTERS.map(s => [s.key, s]));
-  const labelForStatus = (k) => STATUS_BY_KEY[k]?.label || k;
+  const labelForStatus = (k) => (statusList().find(s => s.key === k) || {}).label || k;
 
   // Compute the user-facing status for a submission row, using
   // its current stage AND its buyer_decision. Rejection freezes
   // the lifecycle at "Rejected"; acceptance lets it continue.
   function statusForRow(r) {
     if (r.buyer_decision === 'rejected') return REJECTED_STATUS;
-    const { current } = computeCurrentStage(r);
-    if (!current) return STATUS_FILTERS[0];
-    return STAGE_TO_STATUS[current.stage_key] || STATUS_FILTERS[0];
+    const { current, currentIdx } = computeCurrentStage(r);
+    if (!current) return statusList()[0] || STATUS_FILTERS[0];
+    return statusForStage(current, currentIdx, (_stageDefs || []).length);
   }
 
   // Compute current stage from row + cached stage definitions.
@@ -12262,7 +12282,7 @@ function renderTimelinePage() {
         <div class="tl2-filter-group">
           <span class="tl2-filter-label">Status</span>
           <button class="tl2-pill ${!_filter.status ? 'active' : ''}" data-status-filter="">All</button>
-          ${STATUSES.map(s => {
+          ${statusList().map(s => {
             const c = statusCount(s.key);
             return `<button class="tl2-pill ${_filter.status === s.key ? 'active' : ''}" data-status-filter="${s.key}">${s.label}${c ? ` <span class="tl2-pill-count">${c}</span>` : ''}</button>`;
           }).join('')}
@@ -12542,7 +12562,7 @@ function renderTimelinePage() {
         <div class="tl2-col-product"><input type="text" data-edit-field="product_name" value="${escapeHtml(r.product_name || '')}" placeholder="Product" /></div>
         <div class="tl2-col-status">
           <select data-edit-field="status">
-            ${STATUSES.map(s => `<option value="${s.key}" ${s.key === r.status ? 'selected' : ''}>${s.label}</option>`).join('')}
+            ${statusList().map(s => `<option value="${s.key}" ${s.key === r.status ? 'selected' : ''}>${s.label}</option>`).join('')}
           </select>
         </div>
         <div class="tl2-col-date"><input type="date" data-edit-field="submission_due" value="${r.submission_due || r.submission_date || ''}" /></div>
@@ -12918,7 +12938,7 @@ function renderTimelinePage() {
         const id = el.dataset.id;
         const popover = document.createElement('div');
         popover.className = 'tl2-status-popover';
-        popover.innerHTML = STATUSES.map(s => `<button class="tl2-status-opt ${s.cls}" data-set-status="${s.key}">${s.label}</button>`).join('');
+        popover.innerHTML = statusList().map(s => `<button class="tl2-status-opt ${s.cls}" data-set-status="${s.key}">${s.label}</button>`).join('');
         el.parentElement.style.position = 'relative';
         el.parentElement.appendChild(popover);
         popover.querySelectorAll('[data-set-status]').forEach(opt => {
@@ -44804,8 +44824,19 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         A stage with no anchor field never activates on its own; it sits on the strip as a manual step.
       </p>
     `;
+    // NOT named `status`: an unqualified `status` resolves to window.status (a legacy
+    // string) anywhere it isn't locally declared, so `status.style.color` throws a
+    // TypeError instead of a ReferenceError — silent inside an async handler. That
+    // exact mistake made the delete button do nothing on Aug 11.
+    const stageStatusEl = document.getElementById('hl-save-stages-status');
+    const setStatus = (msg, kind) => {
+      if (!stageStatusEl) return;
+      stageStatusEl.textContent = msg;
+      stageStatusEl.style.color = kind === 'bad' ? 'var(--lost)' : kind === 'good' ? 'var(--won)' : 'var(--ink-3)';
+    };
+
     document.getElementById('hl-save-stages').addEventListener('click', async () => {
-      const status = document.getElementById('hl-save-stages-status');
+      const status = stageStatusEl;
       status.textContent = 'Saving…'; status.style.color = 'var(--ink-3)';
       const rows = document.querySelectorAll('#settings-stages-body tr[data-stage-id]');
       let failed = 0;
@@ -44835,7 +44866,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     const bust = () => { try { window.KeelCache.invalidate(/^sd:/); } catch (e) {} };
 
     // stage_key is what the CODE matches on (buyer_decision drives the rejection
-    // freeze; STAGE_TO_STATUS maps keys to header statuses). Derive a stable slug
+    // freeze). The header pill now reads sd.label, so a new stage shows its own
+    // name there too. Derive a stable slug
     // from the label and keep it unique.
     const keyFrom = (label, taken) => {
       let base = String(label || 'stage').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'stage';
@@ -44845,9 +44877,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     };
 
     document.getElementById('hl-add-stage').addEventListener('click', async () => {
+      try {
       const label = (prompt('Name for the new stage:', '') || '').trim();
       if (!label) return;
-      status.textContent = 'Adding…'; status.style.color = 'var(--ink-3)';
+      setStatus('Adding…');
       const taken = new Set(defs.map(d => d.stage_key).filter(Boolean));
       const maxSeq = defs.reduce((m, d) => Math.max(m, Number(d.sequence) || 0), 0);
       const row = {
@@ -44861,16 +44894,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       };
       if (Object.prototype.hasOwnProperty.call(defs[0] || {}, 'brand_id')) row.brand_id = defs[0].brand_id;
       const { error } = await sb.from('stage_definitions').insert(row);
-      if (error) {
-        status.textContent = 'Could not add: ' + error.message;
-        status.style.color = 'var(--lost)';
-        return;
-      }
+      if (error) { setStatus('Could not add: ' + error.message, 'bad'); return; }
       bust();
       renderSettingsStages();
+      } catch (e) { console.error('[stages] add failed', e); setStatus('Add failed: ' + (e.message || e), 'bad'); }
     });
 
     document.querySelectorAll('.hl-stage-del').forEach(btn => btn.addEventListener('click', async () => {
+      try {
       const id = btn.dataset.delId, label = btn.dataset.delLabel, key = btn.dataset.delKey;
       if (defs.length <= 1) { alert('At least one stage has to remain.'); return; }
       // buyer_decision is referenced by name in the accept/reject logic; losing it
@@ -44880,17 +44911,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         ? '\n\nThis is the stage the accept/reject flow keys on — removing it means a buyer decision no longer moves a submission forward.'
         : '';
       if (!confirm('Remove the "' + label + '" stage?\n\nIt disappears from every submission\u2019s timeline, past and present.' + extra)) return;
-      status.textContent = 'Removing…'; status.style.color = 'var(--ink-3)';
+      setStatus('Removing…');
       // count-verified: a silent zero-row delete means an RLS policy is missing
       const { data, error } = await sb.from('stage_definitions').delete().eq('id', id).select('id');
-      if (error) { status.textContent = 'Could not remove: ' + error.message; status.style.color = 'var(--lost)'; return; }
-      if (!data || !data.length) {
-        status.textContent = 'Nothing was removed — the delete was refused, most likely an RLS policy on stage_definitions.';
-        status.style.color = 'var(--lost)';
-        return;
-      }
+      if (error) { setStatus('Could not remove: ' + error.message, 'bad'); return; }
+      if (!data || !data.length) { setStatus('Nothing was removed — the delete was refused, most likely an RLS policy on stage_definitions.', 'bad'); return; }
       bust();
       renderSettingsStages();
+      } catch (e) { console.error('[stages] delete failed', e); setStatus('Delete failed: ' + (e.message || e), 'bad'); }
     }));
   }
 
