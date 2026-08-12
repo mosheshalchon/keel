@@ -13234,6 +13234,129 @@ window.SubmissionsPage = (function() {
     return null;
   }
 
+  // ─── New submission (owned by THIS page) ─────────────────────────────────
+  // Previously the "+ New submission" button linked to #timeline?new=1 because
+  // the Timeline page owned the create modal. That single dependency is what
+  // made hiding Timeline messy — every route into it needed special-casing.
+  // This is a self-contained version: retailers from the Retailer Library,
+  // categories from the Brand Library, dates optional, insert straight into
+  // timeline_entries. Nothing here touches the Timeline closure.
+  let _newOpen = false;
+
+  async function openNewSubmission() {
+    if (_newOpen) return;
+    _newOpen = true;
+    const sb = window.Auth.getClient();
+    const brandId = (window.session || {}).brandId;
+
+    document.getElementById('hl-subs-new-modal')?.remove();
+    document.body.insertAdjacentHTML('beforeend', `
+      <div id="hl-subs-new-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+        <div style="background:var(--paper,#f4efe6);border-radius:12px;max-width:640px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+          <div style="padding:18px 22px;border-bottom:1px solid var(--rule-soft);display:flex;justify-content:space-between;align-items:center;">
+            <div style="font-family:var(--serif);font-size:20px;">New submission</div>
+            <button data-snclose style="background:transparent;border:none;font-size:22px;line-height:1;cursor:pointer;color:var(--ink-3);">×</button>
+          </div>
+          <div style="padding:18px 22px;" id="hl-sn-body">
+            <div class="hl-loading">Loading retailers and categories…</div>
+          </div>
+        </div>
+      </div>`);
+
+    const modal = document.getElementById('hl-subs-new-modal');
+    const close = () => { _newOpen = false; modal.remove(); document.removeEventListener('keydown', onKey); };
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    modal.addEventListener('click', (e) => { if (e.target === modal || e.target.closest('[data-snclose]')) close(); });
+    document.addEventListener('keydown', onKey);
+
+    // Retailers and categories come from the libraries the user already curates,
+    // so this form can't invent a retailer that doesn't exist elsewhere.
+    let retailers = [], categories = [];
+    try {
+      const [rr, pp] = await Promise.all([
+        sb.from('retailers').select('name').eq('brand_id', brandId).order('name'),
+        sb.from('products').select('category').eq('brand_id', brandId),
+      ]);
+      retailers = [...new Set((rr.data || []).map(r => r.name).filter(Boolean))];
+      categories = [...new Set((pp.data || []).map(p => p.category).filter(Boolean))].sort();
+    } catch (e) { console.warn('[subs] new-submission lookups failed', e); }
+    // Fall back to whatever is already on existing submissions, so a brand with
+    // an empty Retailer Library can still create one.
+    if (!retailers.length) retailers = [...new Set(_all.map(s => s.retailer).filter(Boolean))].sort();
+    if (!categories.length) categories = [...new Set(_all.map(s => s.category).filter(Boolean))].sort();
+
+    const fld = (label, inner, hint) => `
+      <div style="margin-bottom:14px;">
+        <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px;">${label}</div>
+        ${inner}
+        ${hint ? `<div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-top:4px;">${hint}</div>` : ''}
+      </div>`;
+    const inputStyle = 'width:100%;padding:7px 10px;font-family:var(--sans);font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);';
+
+    document.getElementById('hl-sn-body').innerHTML = `
+      ${fld('Retailer *', `<input list="hl-sn-retailers" id="hl-sn-retailer" style="${inputStyle}" placeholder="Start typing…">
+        <datalist id="hl-sn-retailers">${retailers.map(r => `<option value="${esc(r)}"></option>`).join('')}</datalist>`,
+        'Pick from your Retailer Library or type a new one.')}
+      ${fld('Item / product *', `<input type="text" id="hl-sn-item" style="${inputStyle}" placeholder="e.g. Bread — pending items">`,
+        'You can add the specific products on the submission page after it exists.')}
+      ${fld('Category', `<input list="hl-sn-cats" id="hl-sn-cat" style="${inputStyle}" placeholder="Optional">
+        <datalist id="hl-sn-cats">${categories.map(c => `<option value="${esc(c)}"></option>`).join('')}</datalist>`)}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+        ${fld('Submission due', `<input type="date" id="hl-sn-due" style="${inputStyle}">`)}
+        ${fld('Reset date', `<input type="date" id="hl-sn-reset" style="${inputStyle}">`)}
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+        ${fld('Broker', `<input type="text" id="hl-sn-broker" style="${inputStyle}" placeholder="Optional">`)}
+        ${fld('Notes', `<input type="text" id="hl-sn-notes" style="${inputStyle}" placeholder="Optional">`)}
+      </div>
+      <div id="hl-sn-err" style="font-family:var(--mono);font-size:11px;color:var(--lost);min-height:16px;margin-bottom:8px;"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button class="hl-btn-secondary" data-snclose>Cancel</button>
+        <button class="hl-btn-primary" id="hl-sn-save">Save submission</button>
+      </div>`;
+
+    document.getElementById('hl-sn-retailer').focus();
+    const err = document.getElementById('hl-sn-err');
+    const save = document.getElementById('hl-sn-save');
+
+    save.addEventListener('click', async () => {
+      const val = (id) => (document.getElementById(id).value || '').trim();
+      const retailer = val('hl-sn-retailer'), item = val('hl-sn-item');
+      if (!retailer) { err.textContent = 'Retailer is required.'; return; }
+      if (!item) { err.textContent = 'Item is required.'; return; }
+      err.textContent = '';
+      save.disabled = true; save.textContent = 'Saving…';
+
+      const row = {
+        brand_id: brandId,
+        retailer,
+        category: val('hl-sn-cat') || null,
+        item_description: item,
+        product_name: item,
+        status: 'upcoming',
+        submission_due: val('hl-sn-due') || null,
+        reset_date: val('hl-sn-reset') || null,
+        target_launch: val('hl-sn-reset') || null,
+        broker: val('hl-sn-broker') || null,
+        notes: val('hl-sn-notes') || null,
+        owner_email: (window.session || {}).email || null,
+        updated_by: (window.session || {}).email || null,
+      };
+      const { data, error } = await sb.from('timeline_entries').insert(row).select().single();
+      if (error) {
+        err.textContent = 'Could not save: ' + error.message;
+        save.disabled = false; save.textContent = 'Save submission';
+        return;
+      }
+      close();
+      // Straight to the new submission's page — that's where products, documents
+      // and the activity log live, so it's the useful landing spot.
+      _all = [data, ..._all];
+      window.location.hash = `#submission-docs?id=${data.id}`;
+      if (!window.location.hash.includes(data.id)) render();
+    });
+  }
+
   // ─── Comments on the individual submission ───────────────────────────────
   // The thread lives on the Timeline side (submission_comments + its cache), so
   // everything here goes through window.KeelComments. Painted after the page's
@@ -13545,10 +13668,7 @@ window.SubmissionsPage = (function() {
           <button class="hl-btn-secondary" id="hl-subs-template-btn" style="white-space:nowrap;">↓ Bulk template</button>
           <input type="file" id="hl-subs-bulk-upload" accept=".xlsx,.xls,.csv" style="display:none;" />
           <button class="hl-btn-secondary" id="hl-subs-bulk-btn" style="white-space:nowrap;">+ Bulk upload</button>
-          <!-- Still #timeline: that page owns the create-submission modal, and the
-               route resolves fine even though the tab is hidden from the sidebar.
-               Moving the create flow over here is a separate job. -->
-          <a href="#timeline?new=1" class="hl-btn-primary" style="text-decoration:none;white-space:nowrap;">+ New submission</a>
+          <button class="hl-btn-primary" id="hl-subs-new-btn" style="white-space:nowrap;">+ New submission</button>
         </div>
       </div>
 
@@ -13690,6 +13810,9 @@ window.SubmissionsPage = (function() {
       renderList();
     });
     // Row click → detail view
+    const newBtn = document.getElementById('hl-subs-new-btn');
+    if (newBtn) newBtn.addEventListener('click', openNewSubmission);
+
     document.querySelectorAll('.hl-subs-row, .hl-subs-open-btn').forEach(el => {
       el.addEventListener('click', (e) => {
         // Don't navigate if the click was inside the checkbox cell
