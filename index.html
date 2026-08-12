@@ -9188,6 +9188,7 @@ function renderTimelinePage() {
   let _realtimeChannel = null;
   let _stageDefs = [];        // 9-stage definitions, loaded from stage_definitions table
   let _commentsBySubmission = new Map();  // submission_id -> [comment, ...]
+  let _commentsLoaded = false;            // distinguishes "not fetched yet" from "no comments"
   let _expandedComments = new Set();      // submission ids whose comment threads are open
   let _selected = new Set();              // submission ids currently checkbox-selected for bulk actions
 
@@ -9388,6 +9389,7 @@ function renderTimelinePage() {
       arr.push(c);
       _commentsBySubmission.set(c.submission_id, arr);
     }
+    _commentsLoaded = true;
     if (_loadState === 'ready') render();
   }
 
@@ -12378,6 +12380,20 @@ function renderTimelinePage() {
     html: (row) => { try { return renderStageStripFor(row); } catch (e) { console.warn('[stagestrip]', e); return ''; } },
     ready: () => !!(_stageDefs && _stageDefs.length),
     load: () => loadStageDefs(),
+    // Same status the Timeline shows (stage-derived, rejection-aware). The
+    // Submissions page has its OWN older statusLabel() off submission.status;
+    // this lets it show the identical pill instead of a second opinion.
+    status: (row) => { try { return statusForRow(row); } catch (e) { return null; } },
+  };
+
+  // Comments bridge, same reasoning as the strip: submission_comments is loaded and
+  // cached inside THIS closure, so the Submissions page (a separate IIFE) reads and
+  // writes through here rather than duplicating the table access and the cache key.
+  window.KeelComments = {
+    ready: () => _commentsLoaded,
+    load: () => loadComments(),
+    for: (id) => (_commentsBySubmission.get(id) || []).slice(),
+    post: async (id, body) => { await postComment(id, body); return (_commentsBySubmission.get(id) || []).slice(); },
   };
 
   function renderStageStripFor(r) {
@@ -13024,7 +13040,10 @@ function renderTimelinePage() {
 // =============================================================
 window.SubmissionsPage = (function() {
   let _all = []; // all submissions for the brand
-  let _filter = { retailer: null, year: null, status: 'active' }; // 'active'|'archived'|'all'
+  let _filter = { retailer: null, year: null, status: 'active', stage: null };
+  // status = 'active'|'archived'|'all' (the archive axis, unchanged).
+  // stage  = a Timeline status key (upcoming, submitted_to_buyer, …) or null for all.
+  // They are DIFFERENT questions and both are useful, so they coexist rather than merge.
   let _currentDetailId = null; // null = list view
   let _selected = new Set();   // submission IDs checkbox-selected for bulk actions
 
@@ -13052,6 +13071,114 @@ window.SubmissionsPage = (function() {
       if (!isNaN(d.getTime())) return d.getFullYear();
     }
     return null;
+  }
+
+  // ─── Comments on the individual submission ───────────────────────────────
+  // The thread lives on the Timeline side (submission_comments + its cache), so
+  // everything here goes through window.KeelComments. Painted after the page's
+  // own markup, like the stage strip, so a failure here can never blank the page.
+  async function paintSubmissionComments(sub) {
+    const slot = document.getElementById('hl-subs-comments');
+    if (!slot) return;
+    const api = window.KeelComments;
+    if (!api) { slot.innerHTML = ''; return; }
+
+    const draw = (comments) => {
+      const list = comments.length === 0
+        ? `<div class="hl-comment-empty">No comments yet.</div>`
+        : comments
+            .slice()
+            .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+            .map(c => `
+              <div class="hl-comment">
+                <div class="hl-comment-meta">
+                  <span class="hl-comment-author">${esc((c.author_email || '').split('@')[0])}</span>
+                  <span class="hl-comment-time">${esc(relTime(c.created_at))}</span>
+                </div>
+                <div class="hl-comment-body">${esc(c.body || '')}</div>
+              </div>`).join('');
+      slot.innerHTML = `
+        <div class="hl-settings-section">
+          <h2 style="margin-bottom:4px;">Comments${comments.length ? ` <span style="font-family:var(--mono);font-size:12px;color:var(--ink-3);">${comments.length}</span>` : ''}</h2>
+          <p class="hl-sub" style="margin-bottom:14px;">Notes on this submission, shared with everyone on the brand.</p>
+          <div class="hl-comments-list">${list}</div>
+          <div class="hl-comment-form" style="margin-top:12px;">
+            <textarea id="hl-subs-comment-input" placeholder="Add a comment…" rows="2"></textarea>
+            <button class="hl-btn-primary" id="hl-subs-comment-post">Post</button>
+          </div>
+        </div>`;
+
+      const btn = document.getElementById('hl-subs-comment-post');
+      const ta = document.getElementById('hl-subs-comment-input');
+      // Cmd/Ctrl+Enter posts — the textarea is small and the button is easy to miss.
+      const send = async () => {
+        const body = (ta.value || '').trim();
+        if (!body) return;
+        btn.disabled = true; btn.textContent = 'Posting…';
+        try {
+          const updated = await api.post(sub.id, body);
+          draw(updated);
+        } catch (e) {
+          alert('Could not post comment: ' + (e.message || e));
+          btn.disabled = false; btn.textContent = 'Post';
+        }
+      };
+      btn.addEventListener('click', send);
+      ta.addEventListener('keydown', (ev) => { if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') send(); });
+    };
+
+    slot.innerHTML = `<div class="hl-settings-section"><div class="hl-loading">Loading comments…</div></div>`;
+    try {
+      if (!api.ready()) await api.load();
+      draw(api.for(sub.id));
+    } catch (e) {
+      console.warn('[subs] comments skipped:', e);
+      slot.innerHTML = '';
+    }
+  }
+
+  // Relative time, local to this page — the Timeline's fmtRelative is in its own closure.
+  function relTime(iso) {
+    if (!iso) return '';
+    const then = new Date(iso).getTime();
+    if (!isFinite(then)) return '';
+    const mins = Math.floor((Date.now() - then) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + ' min ago';
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return hrs + (hrs === 1 ? ' hour ago' : ' hours ago');
+    const days = Math.floor(hrs / 24);
+    if (days < 30) return days + (days === 1 ? ' day ago' : ' days ago');
+    return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  // Which lifecycle stage a submission is in, as the Timeline computes it.
+  // Null when the definitions aren't loaded — callers treat that as "unknown"
+  // rather than defaulting to a stage, so filters don't silently mis-bucket.
+  function stageKeyOf(sub) {
+    try {
+      const api = window.KeelStageStrip;
+      if (!api || !api.ready()) return null;
+      const st = api.status(sub);
+      return st ? st.key : null;
+    } catch (e) { return null; }
+  }
+
+  // Render the SAME pill the Timeline shows. window.KeelStageStrip.status() computes
+  // status from the 9 stage definitions (and freezes on rejection); it needs those
+  // defs loaded, which renderList arranges before it draws. If the bridge or the defs
+  // aren't there, fall back to this page's own statusLabel so a row is never blank.
+  function statusPill(sub, fallback) {
+    if (!sub.archived) {
+      try {
+        const api = window.KeelStageStrip;
+        if (api && api.ready()) {
+          const st = api.status(sub);
+          if (st && st.label) return `<span class="tl2-status ${st.cls}" style="cursor:default;">${esc(st.label)}</span>`;
+        }
+      } catch (e) { /* fall through */ }
+    }
+    return `<span class="hl-docs-status ${fallback.cls}">${esc(fallback.label)}</span>`;
   }
 
   function statusLabel(sub) {
@@ -13175,8 +13302,24 @@ window.SubmissionsPage = (function() {
     }
   }
 
+  let _stageDefsAsked = false;
   function renderList() {
     const main = document.getElementById('main-content');
+    // The status pill wants the Timeline's stage definitions. They're loaded by the
+    // Timeline page, which the user may never have opened. Kick the load off once and
+    // redraw when it lands — deliberately NOT awaited, so the list paints immediately
+    // and the pills upgrade a moment later rather than the page waiting on a fetch.
+    if (!_stageDefsAsked) {
+      _stageDefsAsked = true;
+      try {
+        const api = window.KeelStageStrip;
+        if (api && !api.ready()) {
+          Promise.resolve(api.load())
+            .then(() => { if (document.querySelector('.hl-subs-row')) renderList(); })
+            .catch(() => {});
+        }
+      } catch (e) { /* pills fall back to statusLabel */ }
+    }
     // Build filter options
     const retailers = [...new Set(_all.map(s => s.retailer).filter(Boolean))].sort();
     const years = [...new Set(_all.map(getYearForSubmission).filter(Boolean))].sort((a, b) => b - a);
@@ -13187,6 +13330,7 @@ window.SubmissionsPage = (function() {
     else if (_filter.status === 'archived') visible = visible.filter(s => s.archived);
     if (_filter.retailer) visible = visible.filter(s => s.retailer === _filter.retailer);
     if (_filter.year) visible = visible.filter(s => getYearForSubmission(s) === Number(_filter.year));
+    if (_filter.stage) visible = visible.filter(s => stageKeyOf(s) === _filter.stage);
 
     main.innerHTML = `
       <div class="eyebrow">— Working pipeline</div>
@@ -13203,9 +13347,42 @@ window.SubmissionsPage = (function() {
         </div>
       </div>
 
+      ${(() => {
+        // Lifecycle-status pills, matching the Timeline page. Counts are computed over
+        // the rows the OTHER filters already allow, so a pill never promises rows you
+        // can't get to. Hidden entirely until the stage definitions have loaded —
+        // otherwise every submission would read "Upcoming" and the pills would lie.
+        try {
+          const api = window.KeelStageStrip;
+          if (!api || !api.ready()) return '';
+          let pool = _all;
+          if (_filter.status === 'active') pool = pool.filter(s => !s.archived);
+          else if (_filter.status === 'archived') pool = pool.filter(s => s.archived);
+          if (_filter.retailer) pool = pool.filter(s => s.retailer === _filter.retailer);
+          if (_filter.year) pool = pool.filter(s => getYearForSubmission(s) === Number(_filter.year));
+          const counts = new Map();
+          const labels = new Map();
+          for (const s of pool) {
+            const st = api.status(s); if (!st) continue;
+            counts.set(st.key, (counts.get(st.key) || 0) + 1);
+            labels.set(st.key, st.label);
+          }
+          if (!counts.size) return '';
+          const pill = (key, label, n, on) => `<button class="hl-pill ${on ? 'active' : ''}" data-stage="${esc(key || '')}">${esc(label)}${n != null ? ` <span style="opacity:0.6;">${n}</span>` : ''}</button>`;
+          const order = [...counts.keys()];
+          return `<div style="margin:14px 0 0;">
+            <div class="hl-filter-label">STAGE</div>
+            <div class="hl-pill-group" id="hl-subs-stage-filter" style="flex-wrap:wrap;">
+              ${pill('', 'All', pool.length, !_filter.stage)}
+              ${order.map(k => pill(k, labels.get(k), counts.get(k), _filter.stage === k)).join('')}
+            </div>
+          </div>`;
+        } catch (e) { return ''; }
+      })()}
+
       <div class="hl-filter-bar" style="display:flex;flex-wrap:wrap;gap:14px;margin:18px 0 22px;align-items:center;">
         <div>
-          <div class="hl-filter-label">STATUS</div>
+          <div class="hl-filter-label">SHOW</div>
           <div class="hl-pill-group" id="hl-subs-status-filter">
             <button class="hl-pill ${_filter.status === 'active' ? 'active' : ''}" data-status="active">Active</button>
             <button class="hl-pill ${_filter.status === 'archived' ? 'active' : ''}" data-status="archived">Archived</button>
@@ -13254,6 +13431,8 @@ window.SubmissionsPage = (function() {
               <th>Status</th>
               <th>Submission due</th>
               <th>Reset date</th>
+              <th>Broker</th>
+              <th>Owner</th>
               <th></th>
             </tr>
           </thead>
@@ -13268,9 +13447,11 @@ window.SubmissionsPage = (function() {
                   <td class="text"><strong>${esc(s.retailer)}</strong>${s.category ? `<br><span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(s.category)}</span>` : ''}</td>
                   <td>${itemDisp}</td>
                   <td style="font-family:var(--mono);">${year || '—'}</td>
-                  <td><span class="hl-docs-status ${status.cls}">${esc(status.label)}</span></td>
+                  <td>${statusPill(s, status)}</td>
                   <td>${fmtDate(s.submission_due)}</td>
                   <td>${fmtDate(s.reset_date)}</td>
+                  <td>${esc(s.broker || '—')}</td>
+                  <td style="font-family:var(--mono);font-size:11px;">${esc((s.owner_email || '').split('@')[0] || '—')}</td>
                   <td style="text-align:right;">
                     <button class="hl-btn-secondary hl-subs-open-btn" data-id="${esc(s.id)}" style="font-size:12px;padding:6px 12px;">Open</button>
                   </td>
@@ -13283,6 +13464,12 @@ window.SubmissionsPage = (function() {
     `;
 
     // Wire filters
+    document.querySelectorAll('#hl-subs-stage-filter button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        _filter.stage = btn.dataset.stage || null;
+        renderList();
+      });
+    });
     document.querySelectorAll('#hl-subs-status-filter button').forEach(btn => {
       btn.addEventListener('click', () => {
         _filter.status = btn.dataset.status;
@@ -13640,6 +13827,7 @@ window.SubmissionsPage = (function() {
       </div>
 
       <div id="hl-subs-docs-host"></div>
+      <div id="hl-subs-comments"></div>
     `;
 
     // Stage strip, moved here from the Timeline rows. Painted AFTER the markup so a
@@ -13654,6 +13842,8 @@ window.SubmissionsPage = (function() {
         slot.innerHTML = api.html(sub);
       } catch (e) { console.warn('[subs] stage strip skipped:', e); }
     })();
+
+    paintSubmissionComments(sub);
 
     // Render the existing docs panel into the host
     const host = document.getElementById('hl-subs-docs-host');
