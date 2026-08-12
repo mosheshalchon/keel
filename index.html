@@ -1731,6 +1731,9 @@ body::before {
     padding-top: 12px;
     border-top: 1px dashed var(--rule-softer);
   }
+  /* On its own card (submission page) the strip is the whole point, so it gets
+     air instead of the hairline it needed when it sat under a Timeline row. */
+  .hl-stage-card .hl-stage-strip { margin-top: 4px; padding-top: 0; border-top: none; }
   .hl-stage-cell {
     display: flex;
     flex-direction: column;
@@ -1765,6 +1768,18 @@ body::before {
   }
   .hl-stage-cell.done .hl-stage-name { color: var(--ink-3); }
   .hl-stage-cell.current .hl-stage-name { color: var(--lost); font-weight: 600; }
+  .hl-stage-cell .hl-stage-date {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    color: var(--ink-4);
+    text-align: center;
+    line-height: 1.2;
+    margin-top: 2px;
+    white-space: nowrap;
+  }
+  .hl-stage-cell.done .hl-stage-date { color: var(--ink-3); }
+  .hl-stage-cell.current .hl-stage-date { color: var(--lost); font-weight: 600; }
+  .hl-stage-cell.skipped .hl-stage-date { opacity: 0.45; }
   .hl-stage-line {
     position: absolute;
     top: 4px;
@@ -12412,12 +12427,20 @@ function renderTimelinePage() {
         if (i > decisionIdx) cls = 'skipped';
       }
       const d = activations[sd.stage_key];
-      const dateLabel = d ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+      // Include the YEAR when the stage falls outside the current one — a bare
+      // "May 10" on a reset date 9 months out reads as this year at a glance.
+      const thisYear = new Date().getFullYear();
+      const dateLabel = d
+        ? d.toLocaleDateString('en-US', d.getFullYear() === thisYear
+            ? { month: 'short', day: 'numeric' }
+            : { month: 'short', day: 'numeric', year: 'numeric' })
+        : '';
       return `
         <div class="hl-stage-cell ${cls}" title="${escapeHtml(sd.label)}${dateLabel ? ' · ' + dateLabel : ''}">
           <div class="hl-stage-line"></div>
           <div class="hl-stage-dot"></div>
           <div class="hl-stage-name">${escapeHtml(sd.label)}</div>
+          <div class="hl-stage-date">${dateLabel || '&nbsp;'}</div>
         </div>
       `;
     }).join('');
@@ -13823,6 +13846,13 @@ window.SubmissionsPage = (function() {
             <div class="hl-docs-value">${esc((sub.owner_email || '').split('@')[0] || '—')}</div>
           </div>
         </div>
+      </div>
+
+      <!-- Progress is its own card: the detail strip above answers "what is this",
+           the timeline answers "where is it". Two questions, two cards. -->
+      <div class="hl-settings-section hl-stage-card">
+        <h2 style="margin-bottom:2px;">Progress</h2>
+        <p class="hl-sub" style="margin-bottom:10px;">Planned dates for each stage, from the schedule in Settings.</p>
         <div id="hl-subs-stage-strip"></div>
       </div>
 
