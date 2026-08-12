@@ -7125,8 +7125,8 @@ window.SpinsConverter = (function() {
 
   // Pages subscribe to be redrawn when defs or comments land, replacing the
   // direct render() call this code made while it lived inside Timeline.
-  const _subs = [];
-  const _notify = () => { for (const fn of _subs) { try { fn(); } catch (e) { console.warn('[KeelStages] subscriber failed', e); } } };
+  const _subs = new Map();   // key -> fn, so re-registering replaces rather than stacks
+  const _notify = () => { for (const fn of _subs.values()) { try { fn(); } catch (e) { console.warn('[KeelStages] subscriber failed', e); } } };
 
   let _stageDefs = [];        // 9-stage definitions, loaded from stage_definitions table
   let _commentsBySubmission = new Map();  // submission_id -> [comment, ...]
@@ -7375,7 +7375,14 @@ window.SpinsConverter = (function() {
     commentsMap: () => _commentsBySubmission,
     commentsFor: (id) => (_commentsBySubmission.get(id) || []).slice(),
     post: postComment,
-    onChange: (fn) => { if (typeof fn === 'function') _subs.push(fn); },
+    // Keyed, not appended: renderTimelinePage runs on EVERY navigation to that
+    // route, so a plain push accumulated one subscriber per visit and a single
+    // data load then fired N re-renders — visible as the page flickering.
+    onChange: (key, fn) => {
+      if (typeof key === 'function') { fn = key; key = 'anon:' + _subs.length; }
+      if (typeof fn === 'function') _subs.set(key, fn);
+    },
+    offChange: (key) => _subs.delete(key),
   };
 
   // Back-compat shapes the Submissions page already calls.
@@ -9492,7 +9499,16 @@ function renderTimelinePage() {
   const REJECTED_STATUS = _KS.REJECTED_STATUS;
   const STATUS_FILTERS = _KS.STATUS_FILTERS;
   // The loaders used to call render() directly; they now notify subscribers.
-  _KS.onChange(() => { try { if (_loadState === 'ready') render(); } catch (e) {} });
+  // Route-guarded: this subscriber outlives the page (nothing unsubscribes on
+  // navigation), so without the hash check a comment post or a stage-defs load
+  // fired while the user is on Submissions would repaint #main-content with the
+  // timeline — which is exactly how the Submissions header vanished until reload.
+  _KS.onChange('timeline', () => {
+    try {
+      if (!String(window.location.hash || '').startsWith('#timeline')) return;
+      if (_loadState === 'ready') render();
+    } catch (e) {}
+  });
 
   // Auth gate first — mounts the H&L sidebar/header shell when authed.
   const session = HL.mountPage('timeline');
