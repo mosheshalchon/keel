@@ -51846,14 +51846,21 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     rows = sheet('Ordering Data');
     if (rows) {
       const hi = hrow(rows, ['customer', 'sku', 'cases ordered']); const h = rows[hi];
-      const c = { iid: col(h, 'internal id'), so: _frSoCol(h), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled'), sched: col(h, 'scheduled') };
+      const c = { iid: col(h, 'internal id'), so: _frSoCol(h), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled'),
+        // 'scheduled' first, then looser fallbacks — the analyst's header wording
+        // isn't fixed and a miss here shows up as a silent zero on the recon table.
+        sched: [ 'scheduled', 'sched', 'pickup date', 'pick up date' ].reduce((f, n) => f >= 0 ? f : col(h, n), -1) };
+      console.log('[freight upload] Ordering Data headers:', h.map(x => String(x).trim()).filter(Boolean));
+      console.log('[freight upload] scheduled column index:', c.sched, c.sched >= 0 ? `("${String(h[c.sched]).trim()}")` : '\u2190 NOT FOUND in the headers above');
       const cust2 = c.cust; // 'Customer' (not 'Customer DC') — findIndex picks first match; 'customer dc' handled separately
       const recs = [];
       for (let i = hi + 1; i < rows.length; i++) {
         const r = rows[i]; const cust = _frClean(r[cust2]); const sku = _frClean(r[c.sku]); if (!cust && !sku) continue;
         recs.push({ brand_id: brandId, internal_id: _frClean(r[c.iid]), so_num: _frClean(r[c.so]), po_num: _frClean(r[c.po]), customer: cust, customer_dc: _frClean(r[c.dc]), po_date: _frDate(r[c.pod]), projected_ship_date: _frDate(r[c.psd]), actual_ship_date: _frDate(r[c.asd]), sku: sku, cases_ordered: _frNum(r[c.cases]), uom: _frClean(r[c.uom]), sales: _frNum(r[c.sales]), on_hand: _frNum(r[c.oh]), available: _frNum(r[c.avail]), status: _frClean(r[c.status]), qty_fulfilled: _frNum(r[c.qf]), scheduled: _frClean(r[c.sched]) });
       }
-      onMsg(`Loading ${recs.length.toLocaleString()} order lines…`);
+      const nSched = recs.filter(r => String(r.scheduled ?? '').trim() !== '').length;
+      console.log(`[freight upload] rows with a Scheduled value: ${nSched} of ${recs.length}`);
+      onMsg(`Loading ${recs.length.toLocaleString()} order lines… (${nSched} scheduled)`);
       await wipe('freight_orders');
       const C = 500; for (let i = 0; i < recs.length; i += C) { const { error } = await sb.from('freight_orders').insert(recs.slice(i, i + C)); if (error) throw new Error(`freight_orders: ${error.message}`); onMsg(`Saving orders ${Math.min(i + C, recs.length).toLocaleString()} / ${recs.length.toLocaleString()}…`); }
       out.orders = recs.length;
