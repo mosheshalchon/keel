@@ -9497,6 +9497,16 @@ function renderTimelinePage() {
   // registers on page load rather than only when this tab is opened. These
   // aliases keep the ~40 call sites below unchanged.
   const _KS = window.KeelStages;
+  // Set when this page was opened purely to host the new-submission form, so
+  // cancelling or saving hands the user back to Submissions instead of leaving
+  // them on a page that's been removed from the sidebar.
+  let _cameFromSubmissions = false;
+  const _returnToSubmissions = () => {
+    if (!_cameFromSubmissions) return false;
+    _cameFromSubmissions = false;
+    window.location.hash = '#submission-docs';   // real navigation, fires hashchange
+    return true;
+  };
   const loadStageDefs = () => _KS.load();
   const loadComments = () => _KS.commentsLoad();
   const postComment = (id, body, meta) => _KS.post(id, body, meta);
@@ -9613,8 +9623,14 @@ function renderTimelinePage() {
       if (h.includes('?new=1') || h.includes('&new=1')) {
         _newDraft = { status: 'upcoming', submission_due: new Date().toISOString().slice(0,10) };
         _editingId = null;
-        // Clear the flag so a refresh doesn't keep re-opening the form
+        // Clear the ?new=1 flag so a refresh doesn't re-open the form, but keep the
+        // hash on THIS page: pointing it at #submission-docs while the Timeline is
+        // what's rendered made the URL and the view disagree, and then the sidebar
+        // link to Submissions set an already-current hash, fired no hashchange and
+        // appeared dead — the page seemed to rotate between the two views.
         history.replaceState(null, '', '#timeline');
+        // Remember we came from Submissions so closing the form returns there.
+        _cameFromSubmissions = true;
       }
     } catch {}
     render();
@@ -12984,6 +13000,7 @@ function renderTimelinePage() {
           return;
         }
         _newDraft = null;
+        if (_returnToSubmissions()) return;
         render();
       });
     }
@@ -12991,6 +13008,7 @@ function renderTimelinePage() {
     if (cancelNew) {
       cancelNew.addEventListener('click', () => {
         _newDraft = null;
+        if (_returnToSubmissions()) return;
         render();
       });
     }
@@ -12998,6 +13016,7 @@ function renderTimelinePage() {
     if (cancelNew2) {
       cancelNew2.addEventListener('click', () => {
         _newDraft = null;
+        if (_returnToSubmissions()) return;
         render();
       });
     }
@@ -13005,7 +13024,7 @@ function renderTimelinePage() {
     const modalBg = document.getElementById('tl2-new-modal-bg');
     if (modalBg) {
       modalBg.addEventListener('click', (e) => {
-        if (e.target === modalBg) { _newDraft = null; render(); }
+        if (e.target === modalBg) { _newDraft = null; if (_returnToSubmissions()) return; render(); }
       });
     }
     // ESC closes the modal (one-shot listener)
@@ -13014,6 +13033,7 @@ function renderTimelinePage() {
         if (e.key === 'Escape') {
           _newDraft = null;
           document.removeEventListener('keydown', escHandler);
+          if (_returnToSubmissions()) return;
           render();
         }
       };
@@ -13144,6 +13164,10 @@ function renderTimelinePage() {
   // Reset master deadlines cache so Settings updates flow through
   _masterDeadlines = null;
   _brandProducts = null;
+  // Drop any subscription left over from a previous mount before opening a new one.
+  // The teardown below hooks hashchange, which replaceState does NOT fire, so a
+  // stale channel could otherwise survive and keep pushing renders.
+  try { unsubscribeRealtime(); } catch (e) {}
   subscribeRealtime();
 
   // Tear down realtime when navigating away. The router doesn't give
@@ -42192,13 +42216,31 @@ render();
 
     // Hide items with zero sales across the last 3 (display) months — keeps the
     // table focused on active items, dropping discontinued/never-sold SKUs.
+    // The TOTAL row sums only what survives this, so a discontinued SKU takes its
+    // whole history out of every earlier column too. That is why the product and
+    // customer views disagreed on old months while recent ones matched exactly
+    // (Aug 2026: Jul-2025 read 39,605 u by product vs 47,429 by customer — 22
+    // dropped SKUs worth 8,094 u against 25 dormant customers worth 270). Count
+    // what's hidden so the footer can say so instead of quietly under-reporting.
+    let _hiddenEntities = 0, _hiddenInWindow = 0;
     {
       const last3 = windowMonths.slice(-3).map(w => w.key);
-      entities = entities.filter(e => {
+      const before = entities.length;
+      const kept = entities.filter(e => {
         const m = byEntity.get(e) || {};
         return last3.some(k => Math.abs(Number(m[k] || 0)) > 0);
       });
+      for (const e of entities) {
+        if (kept.includes(e)) continue;
+        const m = byEntity.get(e) || {};
+        for (const w of windowMonths) _hiddenInWindow += Number(m[w.key] || 0);
+      }
+      _hiddenEntities = before - kept.length;
+      entities = kept;
     }
+    _spState.hiddenNote = _hiddenEntities
+      ? { n: _hiddenEntities, amount: _hiddenInWindow, dim: dim }
+      : null;
 
     // Comparison period drives the variance columns + headline.
     const periods = spComparisonPeriods(anchor, _spState.comparison);
@@ -42271,7 +42313,13 @@ render();
           ? `<span style="color:var(--won, #3a7a3a);">✓ Product and customer totals reconcile (${fmtMetric(prodGrand)}).</span>`
           : `<span style="color:var(--lost);">⚠ Product total is ${reconGap < 0 ? 'short' : 'over'} by ${fmtMetric(Math.abs(reconGap))} vs customer (${fmtMetric(prodGrand)} vs ${fmtMetric(custGrand)}) — some rows are missing. Re-upload, or that metric isn't loaded for one side.</span>`)
       : '';
-    const diag = `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-4);margin-top:12px;letter-spacing:0.04em;line-height:1.5;">Loaded: ${prodCount.toLocaleString()} product cells · ${custCount.toLocaleString()} customer cells · latest month ${escapeHtml(latestLbl)}. Showing ${_spState.metric === 'units' ? 'units' : 'dollars'}.<br>${reconLine}</div>`;
+    // Disclose the active-items filter. It's the reason the two dimensions can show
+    // different totals for the same month, and without this the table just reads low.
+    const hn = _spState.hiddenNote;
+    const hiddenLine = hn
+      ? `<br><span style="color:#b8860b;">${hn.n} ${hn.dim === 'product' ? 'item' : 'customer'}${hn.n === 1 ? '' : 's'} hidden (no sales in the last 3 months) \u2014 ${fmtMetric(Math.abs(hn.amount))} of history not counted in the columns above.</span>`
+      : '';
+    const diag = `<div style="font-family:var(--mono);font-size:9px;color:var(--ink-4);margin-top:12px;letter-spacing:0.04em;line-height:1.5;">Loaded: ${prodCount.toLocaleString()} product cells · ${custCount.toLocaleString()} customer cells · latest month ${escapeHtml(latestLbl)}. Showing ${_spState.metric === 'units' ? 'units' : 'dollars'}.<br>${reconLine}${hiddenLine}</div>`;
 
     body.innerHTML = `
       ${spControlsHtml(allRows)}
