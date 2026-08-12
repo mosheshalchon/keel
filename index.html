@@ -12424,7 +12424,9 @@ function renderTimelinePage() {
       // ever "done" or "current"; everything after is "skipped".
       if (r.buyer_decision === 'rejected') {
         const decisionIdx = _stageDefs.findIndex(s => s.stage_key === 'buyer_decision');
-        if (i > decisionIdx) cls = 'skipped';
+        // -1 means the stage was deleted in Settings; without this guard every
+        // node would compare `i > -1` and the whole strip would grey out.
+        if (decisionIdx >= 0 && i > decisionIdx) cls = 'skipped';
       }
       const d = activations[sd.stage_key];
       // Include the YEAR when the stage falls outside the current one — a bare
@@ -44763,6 +44765,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             <th style="width:100px;">Offset Days</th>
             <th>Action</th>
             <th>Action Description</th>
+            <th style="width:40px;"></th>
           </tr>
         </thead>
         <tbody>
@@ -44782,14 +44785,24 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                 </select>
               </td>
               <td><input type="text" data-field="action_label" value="${esc(sd.action_label || '')}" /></td>
+              <td style="text-align:center;">
+                <button class="hl-stage-del" data-del-id="${sd.id}" data-del-label="${esc(sd.label)}" data-del-key="${esc(sd.stage_key || '')}"
+                        title="Remove this stage"
+                        style="background:transparent;border:none;cursor:pointer;color:var(--ink-4);font-size:15px;line-height:1;padding:4px 6px;">×</button>
+              </td>
             </tr>
           `).join('')}
         </tbody>
       </table>
       <div class="hl-btn-row">
         <button class="hl-btn-primary" id="hl-save-stages">Save changes</button>
+        <button class="hl-btn-secondary" id="hl-add-stage">+ Add stage</button>
         <span class="hl-status-msg" id="hl-save-stages-status"></span>
       </div>
+      <p style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.6;max-width:900px;">
+        Stages apply to <b>every</b> submission, past and present — the strip on each submission is drawn from this list, so adding or removing one changes them all.
+        A stage with no anchor field never activates on its own; it sits on the strip as a manual step.
+      </p>
     `;
     document.getElementById('hl-save-stages').addEventListener('click', async () => {
       const status = document.getElementById('hl-save-stages-status');
@@ -44813,6 +44826,72 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
       if (failed) { status.textContent = `Saved with ${failed} error(s). Check console.`; status.style.color = 'var(--lost)'; }
       else { status.textContent = `Saved ${rows.length} stages.`; status.style.color = 'var(--won)'; }
     });
+
+    // ── Add / remove stages ────────────────────────────────────────────────
+    // Add and delete write immediately and re-render, rather than staging in the
+    // DOM for "Save changes". Row EDITS are still batched by Save. Mixing the two
+    // would need row diffing for no benefit — and a half-saved stage list is worse
+    // than an extra round trip.
+    const bust = () => { try { window.KeelCache.invalidate(/^sd:/); } catch (e) {} };
+
+    // stage_key is what the CODE matches on (buyer_decision drives the rejection
+    // freeze; STAGE_TO_STATUS maps keys to header statuses). Derive a stable slug
+    // from the label and keep it unique.
+    const keyFrom = (label, taken) => {
+      let base = String(label || 'stage').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'stage';
+      let k = base, n = 2;
+      while (taken.has(k)) { k = base + '_' + n; n++; }
+      return k;
+    };
+
+    document.getElementById('hl-add-stage').addEventListener('click', async () => {
+      const label = (prompt('Name for the new stage:', '') || '').trim();
+      if (!label) return;
+      status.textContent = 'Adding…'; status.style.color = 'var(--ink-3)';
+      const taken = new Set(defs.map(d => d.stage_key).filter(Boolean));
+      const maxSeq = defs.reduce((m, d) => Math.max(m, Number(d.sequence) || 0), 0);
+      const row = {
+        label,
+        stage_key: keyFrom(label, taken),
+        sequence: maxSeq + 10,          // gaps of 10 leave room to reorder later
+        anchor_field: null,             // manual until someone anchors it
+        offset_days: null,
+        action_type: null,
+        action_label: null,
+      };
+      if (Object.prototype.hasOwnProperty.call(defs[0] || {}, 'brand_id')) row.brand_id = defs[0].brand_id;
+      const { error } = await sb.from('stage_definitions').insert(row);
+      if (error) {
+        status.textContent = 'Could not add: ' + error.message;
+        status.style.color = 'var(--lost)';
+        return;
+      }
+      bust();
+      renderSettingsStages();
+    });
+
+    document.querySelectorAll('.hl-stage-del').forEach(btn => btn.addEventListener('click', async () => {
+      const id = btn.dataset.delId, label = btn.dataset.delLabel, key = btn.dataset.delKey;
+      if (defs.length <= 1) { alert('At least one stage has to remain.'); return; }
+      // buyer_decision is referenced by name in the accept/reject logic; losing it
+      // doesn't crash anything (the strip guards for it) but the decision panel
+      // stops advancing the row, so say so rather than let it fail quietly.
+      const extra = key === 'buyer_decision'
+        ? '\n\nThis is the stage the accept/reject flow keys on — removing it means a buyer decision no longer moves a submission forward.'
+        : '';
+      if (!confirm('Remove the "' + label + '" stage?\n\nIt disappears from every submission\u2019s timeline, past and present.' + extra)) return;
+      status.textContent = 'Removing…'; status.style.color = 'var(--ink-3)';
+      // count-verified: a silent zero-row delete means an RLS policy is missing
+      const { data, error } = await sb.from('stage_definitions').delete().eq('id', id).select('id');
+      if (error) { status.textContent = 'Could not remove: ' + error.message; status.style.color = 'var(--lost)'; return; }
+      if (!data || !data.length) {
+        status.textContent = 'Nothing was removed — the delete was refused, most likely an RLS policy on stage_definitions.';
+        status.style.color = 'var(--lost)';
+        return;
+      }
+      bust();
+      renderSettingsStages();
+    }));
   }
 
   // ────────────────────────────────────────────────────────
