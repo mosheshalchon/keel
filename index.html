@@ -4959,13 +4959,13 @@ window.BrandLibrary = (function() {
           context: 'Bread/Baking · David Brown', linkTab: 'submission-docs' },
         { id: 't3', priority: 'med',  due: '2026-05-18',
           title: 'Whole Foods Plant-Based Dairy sign-off',
-          context: 'Internal sign-off · Marcus Chen', linkTab: 'timeline' },
+          context: 'Internal sign-off · Marcus Chen', linkTab: 'submission-docs' },
         { id: 't4', priority: 'med',  due: '2026-05-22',
           title: 'Sprouts Pasta Sauces submission',
           context: 'Better-For-You · Renata Vasquez', linkTab: 'submission-docs' },
         { id: 't5', priority: 'low',  due: '2026-06-03',
           title: 'Kroger Salty Snacks internal sign-off',
-          context: 'Premium · Daniel Reeves', linkTab: 'timeline' },
+          context: 'Premium · Daniel Reeves', linkTab: 'submission-docs' },
       ],
 
       // SPINS-style velocity (Dashboard analytics)
@@ -5010,7 +5010,7 @@ window.BrandLibrary = (function() {
       todos: [
         { id: 'kf-t1', priority: 'med', due: '2026-05-24',
           title: 'Whole Foods Heritage Grains sign-off',
-          context: 'Internal sign-off · Aisha Patel', linkTab: 'timeline' },
+          context: 'Internal sign-off · Aisha Patel', linkTab: 'submission-docs' },
       ],
       velocity: {
         thirteenWeek: 6.8, fiftyTwoWeek: 4.2,
@@ -5179,10 +5179,6 @@ HL.NAV_ITEMS = [
   { id: 'ask-keel',        label: 'Ask Keel',        href: './ask-keel.html' },
   { id: 'brand-library',   label: 'Brand Library',   href: './brand-library.html' },
   { id: 'retailer-library',label: 'Retailer Library',href: './retailer-library.html' },
-  // Timeline is HIDDEN from the sidebar (Aug 2026) — Submissions now carries the
-  // stage strip, the stage-derived status pill, the STAGE/SHOW filters and the
-  // Activity log. The route still resolves, so old links and bookmarks work.
-  { id: 'timeline',        label: 'Timeline',        href: './timeline.html', hidden: true },
   { id: 'submission-docs', label: 'Submissions',     href: './submission-docs.html' },
   { id: 'forecasts',       label: 'Forecasts',       href: './forecasts.html' },
   { id: 'promos',          label: 'Promos',          href: './promos.html' },
@@ -8584,7 +8580,7 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
           <h2 class="section-title">In motion</h2>
           <p class="section-desc">Reviews you're tracking and the work that needs you next.</p>
         </div>
-        <a href="#timeline" class="pill">Open Timeline →</a>
+        <a href="#submission-docs" class="pill">Open Submissions →</a>
       </div>
 
       <div class="two-col">
@@ -8696,7 +8692,7 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
       const next = nextDate(r);
       const urgent = next && next.days <= 7;
       return `
-        <a href="#timeline" class="pending-item">
+        <a href="#submission-docs" class="pending-item">
           <div>
             <div class="pending-cat">${r.category}</div>
             <div class="pending-sub">${r.retailer} · Buyer: ${r.buyer}</div>
@@ -9492,7 +9488,19 @@ render();
 }
 
 
-function renderTimelinePage() {
+// ── Document-generation panel ────────────────────────────────────────────────
+// This WAS renderTimelinePage, the Submission Timeline page. The page is gone as
+// of Aug 12 2026: no route, no nav entry, nothing links to it. What survives is
+// the document-generation flow — loadDocsPanel and its ~130 helpers — which the
+// Submissions detail page calls through window.SubmissionDocsPanel.
+//
+// It runs ONCE at load and renders nothing. The old page machinery (render(),
+// loadEntries(), realtime, the hashchange teardown) is no longer invoked; those
+// functions remain defined but unreachable, left in place because deleting 3,000
+// interdependent lines is a far riskier edit than not calling them. loadDocsPanel
+// fetches its submission from Supabase when it isn't in _entries, so it never
+// needed the list this page used to load.
+function initSubmissionDocsPanel() {
   // The stage/status/comments machinery moved to the KeelStages module so it
   // registers on page load rather than only when this tab is opened. These
   // aliases keep the ~40 call sites below unchanged.
@@ -9524,16 +9532,12 @@ function renderTimelinePage() {
   // navigation), so without the hash check a comment post or a stage-defs load
   // fired while the user is on Submissions would repaint #main-content with the
   // timeline — which is exactly how the Submissions header vanished until reload.
-  _KS.onChange('timeline', () => {
-    try {
-      if (!String(window.location.hash || '').startsWith('#timeline')) return;
-      if (_loadState === 'ready') render();
-    } catch (e) {}
-  });
+  // No subscriber: there is no page here to redraw.
 
   // Auth gate first — mounts the H&L sidebar/header shell when authed.
-  const session = HL.mountPage('timeline');
-  if (!session) throw new Error('Auth required');
+  // Was HL.mountPage('timeline'), which also ran the tab-permission check and
+  // could redirect. This is not a page any more, so it must never navigate.
+  const session = (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
   const main = document.getElementById('main-content');
 
   // ─── Module-local state ──────────────────────────────
@@ -9616,23 +9620,8 @@ function renderTimelinePage() {
       _entries = data || [];
       _loadState = 'ready';
     }
-    // If we landed here from "+ New submission" on the Submissions page,
-    // auto-open the new-submission form.
-    try {
-      const h = window.location.hash || '';
-      if (h.includes('?new=1') || h.includes('&new=1')) {
-        _newDraft = { status: 'upcoming', submission_due: new Date().toISOString().slice(0,10) };
-        _editingId = null;
-        // Clear the ?new=1 flag so a refresh doesn't re-open the form, but keep the
-        // hash on THIS page: pointing it at #submission-docs while the Timeline is
-        // what's rendered made the URL and the view disagree, and then the sidebar
-        // link to Submissions set an already-current hash, fired no hashchange and
-        // appeared dead — the page seemed to rotate between the two views.
-        history.replaceState(null, '', '#timeline');
-        // Remember we came from Submissions so closing the form returns there.
-        _cameFromSubmissions = true;
-      }
-    } catch {}
+    // The ?new=1 hand-off is gone: the Submissions page owns the create form,
+    // and this page no longer exists to be handed off to.
     render();
   }
 
@@ -13156,29 +13145,8 @@ function renderTimelinePage() {
     if (retry) retry.addEventListener('click', loadEntries);
   }
 
-  // ─── Mount ──────────────────────────────────────────
-  render();
-  loadEntries();
-  loadStageDefs();
-  loadComments();
-  // Reset master deadlines cache so Settings updates flow through
-  _masterDeadlines = null;
-  _brandProducts = null;
-  // Drop any subscription left over from a previous mount before opening a new one.
-  // The teardown below hooks hashchange, which replaceState does NOT fire, so a
-  // stale channel could otherwise survive and keep pushing renders.
-  try { unsubscribeRealtime(); } catch (e) {}
-  subscribeRealtime();
-
-  // Tear down realtime when navigating away. The router doesn't give
-  // us an unmount hook, so we hook into hashchange.
-  const onLeave = () => {
-    if (!window.location.hash.startsWith('#timeline')) {
-      unsubscribeRealtime();
-      window.removeEventListener('hashchange', onLeave);
-    }
-  };
-  window.addEventListener('hashchange', onLeave);
+  // No mount step: nothing is rendered, no entries are loaded, no realtime
+  // subscription is opened. Those were the page's behaviours and the page is gone.
 
   // Expose the docs panel to other pages (e.g. SubmissionsPage).
   // It's safe to call into these functions even outside a Timeline
@@ -13191,6 +13159,11 @@ function renderTimelinePage() {
     },
   };
 }
+
+// Register the panel at load. Wrapped: if this ever throws, every other page must
+// still work — only document generation would be unavailable.
+try { initSubmissionDocsPanel(); }
+catch (e) { console.error('[docs-panel] failed to initialise:', e); }
 
 
 // =============================================================
@@ -14235,25 +14208,18 @@ window.SubmissionsPage = (function() {
       }
     } else {
       // SubmissionDocsPanel is registered inside the Timeline module's closure.
-      // If the user navigated straight here (without visiting Timeline first),
-      // bootstrap it silently by running Timeline's render, then swing back to
-      // re-render this submission detail.
+      // The panel registers at load now, so there's nothing to bootstrap — this
+      // used to force a Timeline render just to define window.SubmissionDocsPanel,
+      // which was the whole reason that page had to stay reachable.
       try {
-        // Stash the URL hash so renderTimelinePage doesn't think we want Timeline
-        const desiredHash = window.location.hash;
-        // Briefly switch hash so Timeline renders cleanly
-        history.replaceState(null, '', '#timeline');
-        renderTimelinePage();
-        // Wait a tick for the module to register
+        initSubmissionDocsPanel();
         await new Promise(resolve => setTimeout(resolve, 50));
-        // Restore the submissions hash and re-render
-        history.replaceState(null, '', desiredHash);
-        window.SubmissionsPage.render();
-        return;
+        if (window.SubmissionDocsPanel) { window.SubmissionsPage.render(); return; }
+        throw new Error('documents engine did not register');
       } catch (err) {
         host.innerHTML = `<div style="color:var(--lost);padding:20px;background:var(--bone-2);border-radius:8px;">
           <strong>Could not load the documents engine.</strong><br>
-          Try visiting <a href="#timeline" style="color:var(--ink);">Timeline</a> once, then come back here.<br>
+          Reload the page; if it persists there'll be a [docs-panel] error in the console.<br>
           <small style="color:var(--ink-3);">${esc(err.message || err)}</small>
         </div>`;
       }
@@ -52108,7 +52074,6 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     'ask-keel':        renderAskKeelPage,
     'brand-library':   renderBrandLibraryV2Page,
     'retailer-library':renderRetailerLibraryPage,
-    'timeline':        renderTimelinePage,
     'submission-docs': renderSubmissionDocsPage,
     'forecasts':       renderForecastsPage,
     'forecast':        renderForecastDetailPage,
