@@ -5318,8 +5318,19 @@ HL.renderSidebar = function(activeId) {
 HL.mountPage = function(activeId) {
   const session = BrandLibrary.requireAuth();
   if (!session) return null;
-  if (session.tabAllow && activeId && activeId !== 'dashboard' && !session.tabAllow.includes(activeId)) {
-    location.href = './dashboard.html';   // tab not permitted for this department
+  // HIDDEN routes bypass the permission gate. They aren't in the sidebar and the
+  // Team matrix deliberately won't offer them, so they can never appear in
+  // tabAllow — gating them meant #timeline was permanently denied, and since the
+  // redirect is a FULL page navigation the app rebooted, landed on the route
+  // again and redirected again: a reload loop that reads as the page flickering.
+  const _hiddenIds = new Set(((window.HL && HL.NAV_ITEMS) || []).filter(n => n.hidden).map(n => n.id));
+  // Never redirect to the page we're already on, whatever the cause.
+  const _onDashboard = /(^|#)dashboard\b/.test(window.location.hash || '') || !window.location.hash;
+  if (session.tabAllow && activeId && activeId !== 'dashboard' && !_hiddenIds.has(activeId)
+      && !session.tabAllow.includes(activeId)) {
+    if (_onDashboard) { console.warn('[mountPage] blocked', activeId, 'but already at dashboard — not redirecting'); return session; }
+    console.warn('[mountPage] tab not permitted for this department:', activeId);
+    location.href = './dashboard.html';
     return session;
   }
   const root = document.getElementById('app-root');
