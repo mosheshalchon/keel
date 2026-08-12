@@ -50779,6 +50779,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           return v !== '' && v !== 'no' && v !== 'n' && v !== 'false' && v !== '0' && v !== '-';
         };
         const schedOrders = (orders || []).filter(_isSched);
+        // Diagnostic: a silent zero here is ambiguous — no column, column present but
+        // empty, or genuinely nothing scheduled. Log which, once per render.
+        try {
+          const sample = (orders || [])[0] || {};
+          const hasCol = Object.prototype.hasOwnProperty.call(sample, 'scheduled');
+          const nonEmpty = (orders || []).filter(o => String(o.scheduled ?? '').trim() !== '').length;
+          console.log('[freight] scheduled column present on rows:', hasCol,
+                      '| rows with a value:', nonEmpty, 'of', (orders || []).length,
+                      '| counted as scheduled:', schedOrders.length,
+                      hasCol ? '' : '\u2190 re-upload the freight file, or the column is missing from freight_orders');
+        } catch (e) {}
         const schedSos = new Set(schedOrders.map(o => o.so_num).filter(Boolean));
         const schedCases = schedOrders.reduce((a2, o) => a2 + (Number(o.cases_ordered) || 0), 0);
         const schedSales = schedOrders.reduce((a2, o) => a2 + (Number(o.sales) || 0), 0);
@@ -50796,23 +50807,38 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           schedPlt += (Number(t.plan) || 0) * share;
         }
 
+        // EXCLUDED — pickup / 3PL / not-serviced. These orders are real Pending
+        // Fulfillment but were never routed, so they have no truck and therefore no
+        // weight or pallets. Cases come straight off the unassigned order rows.
+        const _exOrders = (orders || []).filter(o => !o.so_num || !_assignedSo.has(o.so_num));
+        const exCases = _exOrders.reduce((a2, o) => a2 + (Number(o.cases_ordered) || 0), 0);
+        const exSos = new Set(_exOrders.map(o => o.so_num).filter(Boolean));
+
         const dollars = v => '$' + Math.round(v).toLocaleString();
         const rbRow = (name, count, cases, plan, weight, sales) => `<tr>${td(name)}${td(count, true)}${td(cases.toLocaleString(), true)}${td(plan, true)}${td(money(weight), true)}${td(dollars(sales), true)}</tr>`;
-        const reconTable = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${['Bucket', 'Count', 'Cases', 'Plan plt', 'Weight (lb)', '$ Sales'].map((h, i) => th(h, i >= 1)).join('')}</tr></thead><tbody>
+        const reconTable = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr>${['Bucket', 'Count', 'Cases', 'Plan plt', 'Weight (lb)', '$ Sales'].map((h, i) => th(h, i >= 1)).join('')}</tr></thead><tbody>
           ${rbRow('FTL trucks', P.trucks.length, P.totals.casesFTL, P.totals.palletsFTL, P.totals.weightFTL, salesFTL)}
           ${rbRow('LTL', P.ltl.length, P.totals.casesLTL, P.totals.palletsLTL, P.totals.weightLTL, salesLTL)}
           ${rbRow('Dedicated trucks', P.dedicated.length, P.totals.casesDed, P.totals.palletsDed, P.totals.weightDed, salesDed)}
+          <tr title="Orders in Pending Fulfillment that were never routed onto a truck — customer pickup, 3PL, or lanes we don't service. No truck means no weight or pallets.">
+            <td style="padding:8px 9px;">Excluded <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">pickup / 3PL / not-serviced</span></td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);">${exSos.size}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);">${Math.round(exCases).toLocaleString()}</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">—</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">—</td>
+            <td style="padding:8px 9px;text-align:right;font-family:var(--mono);">${dollars(salesExcluded)}</td>
+          </tr>
           ${P.manual.length ? rbRow('Manual review', P.manual.length, P.totals.casesManual, manPlan, manWt, salesMan) : ''}
           ${P.needsDc.length ? rbRow('Needs ship-to DC', P.needsDc.length, P.totals.casesNeed, needPlan, needWt, salesNeed) : ''}
           <tr title="POs marked Scheduled in the freight file (column T) — already booked for pickup. Cases and dollars are summed from those POs; weight and pallets are each truck's share whose POs are scheduled, since one truck can carry both scheduled and unscheduled POs.">
-            <td style="padding:8px 9px;color:#2e7d32;">Scheduled for pickup${schedTrucks ? ` <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${schedTrucks} full truck${schedTrucks === 1 ? '' : 's'}</span>` : ''}</td>
+            <td style="padding:8px 9px;color:#2e7d32;">Scheduled for pickup${schedTrucks ? ` <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${schedTrucks} full truck${schedTrucks === 1 ? '' : 's'}</span>` : ''}${!schedOrders.length && !(orders || []).some(o => String(o.scheduled ?? '').trim() !== '') ? ` <span style="font-family:var(--mono);font-size:11px;color:#b8860b;">no Scheduled values in the loaded data \u2014 re-upload the file</span>` : ''}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${schedSos.size}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${Math.round(schedCases).toLocaleString()}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${Math.round(schedPlt)}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${money(schedWt)}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${dollars(schedSales)}${salesPlanned > 0 ? ` <span style="color:var(--ink-3);font-size:11px;">${Math.round(schedSales / salesPlanned * 100)}%</span>` : ''}</td>
           </tr>
-          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-size:11px;font-weight:700;text-transform:uppercase;">Total (booked)</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${sumCases.toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${dollars(salesPlanned)}</td></tr></tfoot></table></div>
+          </tbody><tfoot><tr style="border-top:2px solid var(--ink);"><td style="padding:8px 9px;font-family:var(--mono);font-weight:700;text-transform:uppercase;">Total pending fulfillment</td><td></td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${(sumCases + Math.round(exCases)).toLocaleString()}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${P.totals.plan}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${money(P.totals.weight)}</td><td style="padding:8px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${dollars(salesAll)}</td></tr></tfoot></table></div>
           <div style="font-family:var(--mono);font-size:11px;margin-top:8px;color:${reconOK ? '#2e7d32' : '#b8860b'};">${reconOK ? `✓ Reconciled — all ${P.totals.cases.toLocaleString()} pending cases are accounted for across the buckets.` : `⚠ Mismatch — buckets sum to ${sumCases.toLocaleString()} vs ${P.totals.cases.toLocaleString()} pending.`}</div>
           <div style="font-family:var(--mono);font-size:11px;margin-top:4px;color:var(--ink-3);">$ Sales — booked ${dollars(salesPlanned)}${salesExcluded > 1 ? ` + excluded (pickup / 3PL / not-serviced) ${dollars(salesExcluded)}` : ''} = <b style="color:var(--ink);">${dollars(salesAll)}</b> total Pending Fulfillment (ties to the Excel file).</div>`;
         body.innerHTML = srcToggle + `
