@@ -43122,15 +43122,32 @@ render();
   async function _rvImportTemplate(file, brandId, sb) {
     const buf = await file.arrayBuffer();
     const wb = XLSX.read(buf, { type: 'array', cellDates: true });
-    const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '', raw: false });
-    let hi = -1;
-    for (let i = 0; i < Math.min(15, aoa.length); i++) {
-      const j = aoa[i].map(x => String(x || '').toLowerCase()).join('|');
-      if (j.includes('review start date') && (j.includes('key account') || j.includes('category review id'))) { hi = i; break; }
-    }
-    if (hi < 0) throw new Error('Could not find the header row (needs "Review Start Date" and "Key Account")');
+    // Pick the sheet deliberately. The workbook's FIRST sheet is a working copy
+    // with a million mostly-blank rows; the schedule lives on its own tab. Prefer
+    // a sheet named like the schedule, else the smallest one with a usable header.
+    const findHeader = (rows) => {
+      for (let i = 0; i < Math.min(15, rows.length); i++) {
+        const j = rows[i].map(x => String(x || '').toLowerCase()).join('|');
+        if (j.includes('review start date') && (j.includes('key account') || j.includes('category review id'))) return i;
+      }
+      return -1;
+    };
+    const cands = wb.SheetNames.map(n => {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '', raw: false });
+      return { n, rows, hi: findHeader(rows) };
+    }).filter(c => c.hi >= 0);
+    if (!cands.length) throw new Error('No sheet has a header row with "Review Start Date" and "Key Account"');
+    const named = cands.find(c => /category review schedule/i.test(c.n));
+    const pick = named || cands.sort((a2, b2) => a2.rows.length - b2.rows.length)[0];
+    const aoa = pick.rows, hi = pick.hi;
+    console.log('[reviews] importing sheet:', pick.n, '| header row', hi + 1, '| rows', aoa.length);
     const H = aoa[hi].map(x => String(x || '').trim().toLowerCase());
-    const c = (...n) => H.findIndex(h => n.some(x => h.includes(x)));
+    // Exact match first, then contains. Without the exact pass, 'category' hits
+    // "Category Review ID" (column A) and every row's category becomes the ID.
+    const c = (...n) => {
+      for (const x of n) { const i = H.findIndex(h => h === x); if (i >= 0) return i; }
+      return H.findIndex(h => n.some(x => h.includes(x)));
+    };
     const ci = {
       rid: c('category review id'), acct: c('key account'), mcat: c('master category'),
       cat: c('category'), status: c('category review status'), comments: c('category comments'),
@@ -43154,12 +43171,14 @@ render();
     for (let i = hi + 1; i < aoa.length; i++) {
       const r = aoa[i]; if (!r) continue;
       const acct = g(r, ci.acct); if (!acct) continue;
+      const rev = toDate(g(r, ci.rev)), rst = toDate(g(r, ci.reset));
+      if (!rev && !rst) continue;   // no dates = not a scheduled review
       rows.push({
         brand_id: brandId, review_id: g(r, ci.rid) || null, key_account: acct,
         master_category: g(r, ci.mcat) || null, category: g(r, ci.cat) || null,
         review_status: g(r, ci.status) || null, category_comments: g(r, ci.comments) || null,
         anchor_accounts: g(r, ci.anchor) || null,
-        review_start_date: toDate(g(r, ci.rev)), reset_start_date: toDate(g(r, ci.reset)),
+        review_start_date: rev, reset_start_date: rst,
         retailer_update: g(r, ci.upd) || null, buyer_name: g(r, ci.buyer) || null,
         retailer_address: g(r, ci.addr) || null, conv_nat: g(r, ci.cn) || null,
         region: g(r, ci.region) || null,
@@ -43170,9 +43189,13 @@ render();
     }
     if (!rows.length) throw new Error('No rows with a Key Account');
 
+    // The template is a full snapshot, so replace rather than upsert. Avoids
+    // depending on a conflict target — the unique index uses coalesce()
+    // expressions, which Postgres won't accept as an ON CONFLICT spec.
+    const del = await sb.from('category_reviews').delete().eq('brand_id', brandId);
+    if (del.error) throw del.error;
     for (let i = 0; i < rows.length; i += 400) {
-      const { error } = await sb.from('category_reviews')
-        .upsert(rows.slice(i, i + 400), { onConflict: 'brand_id,review_id,category,key_account' });
+      const { error } = await sb.from('category_reviews').insert(rows.slice(i, i + 400));
       if (error) throw error;
     }
 
