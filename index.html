@@ -42973,6 +42973,8 @@ render();
   let _rvReviews = [];      // category_reviews rows
   let _rvCatFilter = null;  // master category shown in the calendar
   let _rvSubStage = null;   // stage pill selected on the Submissions sub-tab
+  let _rvSubCat = null;     // category (within master) on the calendar
+  let _rvDf = { retailer: '', master: '', category: '', cn: '', revMonth: '', resetMonth: '' };  // Details filters
 
   async function renderBuyerReviewsPage() {
     const session = HL.mountPage('buyer-reviews');
@@ -43031,9 +43033,15 @@ render();
   // Review band and a Reset band per row. Grouped by master category because
   // the same retailer reviews Frozen and Gluten Free on different dates.
   function _rvCalendar(body, brandId, sb) {
+    // Two levels: master category (Frozen / Gluten Free) as pills, and the
+    // category inside it (Pizzas, Frozen Bread, Entrees…) as a dropdown — the
+    // template carries both and only the master level was offered before.
     const cats = [...new Set(_rvReviews.map(r => r.master_category).filter(Boolean))].sort();
     if (!_rvCatFilter || !cats.includes(_rvCatFilter)) _rvCatFilter = cats[0] || null;
-    const rows = _rvReviews.filter(r => !_rvCatFilter || r.master_category === _rvCatFilter);
+    const inMaster = _rvReviews.filter(r => !_rvCatFilter || r.master_category === _rvCatFilter);
+    const subCats = [...new Set(inMaster.map(r => r.category).filter(Boolean))].sort();
+    if (_rvSubCat && !subCats.includes(_rvSubCat)) _rvSubCat = null;
+    const rows = inMaster.filter(r => !_rvSubCat || r.category === _rvSubCat);
 
     // 24-month window starting at the earliest review month in view.
     const dates = rows.flatMap(r => [r.review_start_date, r.reset_start_date]).filter(Boolean).sort();
@@ -43056,6 +43064,10 @@ render();
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
         <span style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);">Category:</span>
         ${cats.map(c => `<button class="hl-pill ${c === _rvCatFilter ? 'active' : ''}" data-rvcat="${_brEsc(c)}">${_brEsc(c)}</button>`).join('') || '<span style="font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No calendar uploaded yet.</span>'}
+        ${subCats.length ? `<select id="hl-rv-subcat" style="font-family:var(--mono);font-size:11px;padding:5px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+          <option value="">All categories (${subCats.length})</option>
+          ${subCats.map(c => `<option value="${_brEsc(c)}" ${c === _rvSubCat ? 'selected' : ''}>${_brEsc(c)}</option>`).join('')}
+        </select>` : ''}
         <button class="hl-btn-primary" id="hl-rv-upload-btn" style="margin-left:auto;">↑ Upload review calendar</button>
         <input type="file" id="hl-rv-upload" accept=".xlsx,.xls,.csv" style="display:none;">
       </div>
@@ -43093,7 +43105,9 @@ render();
         : `<div style="text-align:center;padding:44px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
              No review calendar yet. Upload the retailer template to build the grid.</div>`}`;
 
-    body.querySelectorAll('[data-rvcat]').forEach(b => b.addEventListener('click', () => { _rvCatFilter = b.dataset.rvcat; _rvCalendar(body, brandId, sb); }));
+    body.querySelectorAll('[data-rvcat]').forEach(b => b.addEventListener('click', () => { _rvCatFilter = b.dataset.rvcat; _rvSubCat = null; _rvCalendar(body, brandId, sb); }));
+    const sc = document.getElementById('hl-rv-subcat');
+    if (sc) sc.addEventListener('change', () => { _rvSubCat = sc.value || null; _rvCalendar(body, brandId, sb); });
     body.querySelectorAll('[data-rvcell]').forEach(td => td.addEventListener('click', () => {
       const r = _rvReviews.find(x => x.id === td.dataset.rvcell);
       if (r) _rvOpenReview(r, brandId, sb);
@@ -43240,18 +43254,67 @@ render();
       ['buyer_name', 'Buyer'], ['conv_nat', 'Conv/Nat'], ['region', 'Region'],
       ['anchor_accounts', 'Anchor'], ['category_comments', 'Comments'],
     ];
+    // Each dropdown's options come from the rows the OTHER filters already allow,
+    // so a combination that returns nothing can't be picked.
+    const pass = (r, skip) =>
+      (skip === 'retailer' || !_rvDf.retailer || r.key_account === _rvDf.retailer) &&
+      (skip === 'master' || !_rvDf.master || r.master_category === _rvDf.master) &&
+      (skip === 'category' || !_rvDf.category || r.category === _rvDf.category) &&
+      (skip === 'cn' || !_rvDf.cn || r.conv_nat === _rvDf.cn) &&
+      (skip === 'revMonth' || !_rvDf.revMonth || String(r.review_start_date || '').slice(0, 7) === _rvDf.revMonth) &&
+      (skip === 'resetMonth' || !_rvDf.resetMonth || String(r.reset_start_date || '').slice(0, 7) === _rvDf.resetMonth);
+    const opts = (key, field, isMonth) => {
+      const vals = [...new Set(_rvReviews.filter(r => pass(r, key))
+        .map(r => isMonth ? String(r[field] || '').slice(0, 7) : r[field])
+        .filter(Boolean))].sort();
+      return vals;
+    };
+    const monthLabel = (ym) => {
+      const [y, mo] = ym.split('-');
+      return new Date(Number(y), Number(mo) - 1, 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+    };
+    const sel = (key, label, field, isMonth) => {
+      const vals = opts(key, field, isMonth);
+      return `<div>
+        <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:4px;">${label}</div>
+        <select data-rvdf="${key}" style="font-family:var(--sans);font-size:12px;padding:5px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);min-width:130px;max-width:220px;">
+          <option value="">All${vals.length ? ` (${vals.length})` : ''}</option>
+          ${vals.map(v => `<option value="${_brEsc(v)}" ${_rvDf[key] === v ? 'selected' : ''}>${_brEsc(isMonth ? monthLabel(v) : v)}</option>`).join('')}
+        </select></div>`;
+    };
+
+    const shown = _rvReviews.filter(r => pass(r, null));
+    const anyFilter = Object.values(_rvDf).some(Boolean);
+
     body.innerHTML = _rvReviews.length ? `
-      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:8px;">${_rvReviews.length} review rows from the template</div>
-      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px;">
+        ${sel('retailer', 'Retailer', 'key_account', false)}
+        ${sel('master', 'Master category', 'master_category', false)}
+        ${sel('category', 'Category', 'category', false)}
+        ${sel('cn', 'Conv / Nat', 'conv_nat', false)}
+        ${sel('revMonth', 'Review month', 'review_start_date', true)}
+        ${sel('resetMonth', 'Reset month', 'reset_start_date', true)}
+        ${anyFilter ? `<button id="hl-rvdf-clear" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);background:none;border:none;cursor:pointer;text-decoration:underline;padding-bottom:6px;">Clear</button>` : ''}
+        <span style="margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--ink-3);padding-bottom:6px;">${shown.length} of ${_rvReviews.length} rows</span>
+      </div>
+      ${shown.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
         <thead><tr style="background:#efe9dd;">${cols.map(c => `<th style="padding:7px 9px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;">${c[1]}</th>`).join('')}</tr></thead>
-        <tbody>${_rvReviews.map(r => `<tr data-rvrow="${r.id}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
+        <tbody>${shown.map(r => `<tr data-rvrow="${r.id}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
           ${cols.map(c => {
             const v = r[c[0]];
             const txt = (c[0].endsWith('_date') && v) ? _brDate(v) : (v || '—');
             return `<td style="padding:6px 9px;font-family:${c[0] === 'category_comments' ? 'var(--serif)' : 'var(--sans)'};font-size:12px;color:var(--ink-2);max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${_brEsc(txt)}</td>`;
           }).join('')}
         </tr>`).join('')}</tbody></table></div>`
+        : `<div style="text-align:center;padding:36px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">No rows match these filters.</div>`}`
       : `<div style="text-align:center;padding:44px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">Nothing imported yet — upload the template on the Review calendar tab.</div>`;
+
+    body.querySelectorAll('[data-rvdf]').forEach(el => el.addEventListener('change', () => {
+      _rvDf[el.dataset.rvdf] = el.value || '';
+      _rvDetails(body, brandId, sb);
+    }));
+    const clr = document.getElementById('hl-rvdf-clear');
+    if (clr) clr.addEventListener('click', () => { _rvDf = { retailer: '', master: '', category: '', cn: '', revMonth: '', resetMonth: '' }; _rvDetails(body, brandId, sb); });
     body.querySelectorAll('[data-rvrow]').forEach(tr => tr.addEventListener('click', () => {
       const r = _rvReviews.find(x => x.id === tr.dataset.rvrow);
       if (r) _rvOpenReview(r, brandId, sb);
