@@ -42953,6 +42953,26 @@ render();
     _brState.loaded = true;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // REVIEWS — six sub-tabs, all hanging off one thing: a REVIEW is a retailer
+  // plus a date.
+  //   1 Calendar   the year grid, by master category (uploaded template)
+  //   2 Details    the template rows behind that grid
+  //   3 Submissions new items for the selected retailer (lives in Submissions)
+  //   4 Prep       assembled before the meeting
+  //   5 Feedback   captured at the meeting
+  //   6 Follow-ups what we owe afterwards
+  // Tabs 4-6 were one stacked page before; they're now independent sub-tabs
+  // driven by whichever review is selected.
+  // ═══════════════════════════════════════════════════════════════════════
+  const RV_TABS = [
+    ['calendar', 'Review calendar'], ['details', 'Details'], ['submissions', 'Submissions'],
+    ['prep', 'Meeting prep'], ['feedback', 'Buyer feedback'], ['followups', 'Follow-ups'],
+  ];
+  let _rvTab = (() => { try { return localStorage.getItem('keel_rv_tab') || 'calendar'; } catch (e) { return 'calendar'; } })();
+  let _rvReviews = [];      // category_reviews rows
+  let _rvCatFilter = null;  // master category shown in the calendar
+
   async function renderBuyerReviewsPage() {
     const session = HL.mountPage('buyer-reviews');
     if (!session) return;
@@ -42962,79 +42982,314 @@ render();
 
     main.innerHTML = `
       <div class="eyebrow">— Accounts</div>
-      <h1 class="page-title">Buyer Reviews.</h1>
-      <p class="page-meta">Every meeting with a buyer — what to bring, what they said, and what we owe them.</p>
-      <div id="hl-br-body" style="margin-top:22px;"><div class="hl-loading">Loading meetings…</div></div>`;
+      <h1 class="page-title">Reviews.</h1>
+      <p class="page-meta">Category reviews and resets by retailer — the calendar, the meeting, and everything owed after it.</p>
+      <div style="display:flex;gap:2px;border-bottom:1px solid var(--rule-soft);margin:22px 0 0;flex-wrap:wrap;">
+        ${RV_TABS.map(t => `<button class="hl-rv-tab" data-rvtab="${t[0]}" style="background:transparent;border:none;font-family:var(--mono);font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:10px 14px;cursor:pointer;border-bottom:2px solid transparent;color:var(--ink-3);">${t[1]}</button>`).join('')}
+      </div>
+      <div id="hl-rv-body" style="margin-top:20px;"><div class="hl-loading">Loading…</div></div>`;
 
-    const body = document.getElementById('hl-br-body');
+    main.querySelectorAll('.hl-rv-tab').forEach(b => b.addEventListener('click', () => {
+      _rvTab = b.dataset.rvtab;
+      try { localStorage.setItem('keel_rv_tab', _rvTab); } catch (e) {}
+      _rvPaint(brandId, sb);
+    }));
+
     try {
       await loadBuyerReviews(brandId, sb);
+      const { data } = await sb.from('category_reviews').select('*').eq('brand_id', brandId)
+        .order('review_start_date', { ascending: true });
+      _rvReviews = data || [];
     } catch (err) {
       const missing = /relation .* does not exist|could not find the table|schema cache/i.test(err.message || '');
-      body.innerHTML = `<div style="padding:24px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;font-family:var(--serif);font-size:15px;">
-        ${missing ? 'The Buyer Reviews tables aren\u2019t set up yet — run <b>buyer-reviews.sql</b> in Supabase, then reload.'
-                  : 'Couldn\u2019t load meetings: ' + _brEsc(err.message || String(err))}</div>`;
+      document.getElementById('hl-rv-body').innerHTML = `<div style="padding:24px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;font-family:var(--serif);font-size:15px;">
+        ${missing ? 'The Reviews tables aren\u2019t set up yet — run <b>buyer-reviews.sql</b> and <b>category-reviews.sql</b> in Supabase, then reload.'
+                  : 'Couldn\u2019t load: ' + _brEsc(err.message || String(err))}</div>`;
       return;
     }
-    _brRenderList(brandId, sb);
+    _rvPaint(brandId, sb);
   }
 
-  function _brRenderList(brandId, sb) {
-    const body = document.getElementById('hl-br-body');
+  function _rvPaint(brandId, sb) {
+    document.querySelectorAll('.hl-rv-tab').forEach(b => {
+      const on = b.dataset.rvtab === _rvTab;
+      b.style.color = on ? 'var(--ink)' : 'var(--ink-3)';
+      b.style.borderBottomColor = on ? 'var(--ink)' : 'transparent';
+      b.style.fontWeight = on ? '700' : '400';
+    });
+    const body = document.getElementById('hl-rv-body');
     if (!body) return;
-    const today = _brToday();
-    const ms = _brState.meetings;
-    const openFu = _brState.followups.filter(f => !f.done_at);
-    const overdue = openFu.filter(f => f.due_date && f.due_date < today);
-    const needNotes = ms.filter(m => m.status !== 'logged' && m.status !== 'closed' && m.status !== 'cancelled' && m.meeting_date <= today);
-    const upcoming = ms.filter(m => m.meeting_date > today && m.status !== 'cancelled');
+    if (_rvTab === 'calendar') return _rvCalendar(body, brandId, sb);
+    if (_rvTab === 'details') return _rvDetails(body, brandId, sb);
+    if (_rvTab === 'submissions') return _rvSubmissions(body, brandId, sb);
+    return _rvMeetingTab(body, brandId, sb, _rvTab);   // prep | feedback | followups
+  }
 
-    const stat = (label, val, sub, tone) => `
-      <div style="background:var(--bone-2);border-radius:8px;padding:12px 14px;">
-        <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">${label}</div>
-        <div style="font-family:var(--mono);font-size:22px;margin-top:2px;${tone === 'warn' && val ? 'color:#b8860b;' : ''}">${val}</div>
-        <div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);">${sub}</div>
-      </div>`;
+  // ── 1 · Review calendar ────────────────────────────────────────────────
+  // The grid from the retailer template: retailers down, months across, a
+  // Review band and a Reset band per row. Grouped by master category because
+  // the same retailer reviews Frozen and Gluten Free on different dates.
+  function _rvCalendar(body, brandId, sb) {
+    const cats = [...new Set(_rvReviews.map(r => r.master_category).filter(Boolean))].sort();
+    if (!_rvCatFilter || !cats.includes(_rvCatFilter)) _rvCatFilter = cats[0] || null;
+    const rows = _rvReviews.filter(r => !_rvCatFilter || r.master_category === _rvCatFilter);
 
-    const row = (m) => {
-      const fu = openFu.filter(f => f.meeting_id === m.id).length;
-      const late = m.meeting_date <= today && !['logged', 'closed', 'cancelled'].includes(m.status);
-      return `<tr data-br-open="${m.id}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
-        <td style="padding:9px 10px;font-family:var(--mono);font-size:11px;white-space:nowrap;">${_brDate(m.meeting_date)}</td>
-        <td style="padding:9px 10px;font-family:var(--sans);font-size:13px;">${_brEsc(m.retailer)}</td>
-        <td style="padding:9px 10px;font-family:var(--sans);font-size:12px;color:var(--ink-3);">${_brEsc((BR_TYPES.find(t => t[0] === m.meeting_type) || [])[1] || m.meeting_type)}</td>
-        <td style="padding:9px 10px;font-family:var(--sans);font-size:12px;color:var(--ink-3);">${_brEsc(m.buyer_name || '—')}</td>
-        <td style="padding:9px 10px;">${late
-          ? `<span style="font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px;background:#faf0d7;color:#8d650f;">Needs notes</span>`
-          : `<span style="font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px;background:var(--bone-2);color:var(--ink-3);">${_brEsc(m.status)}</span>`}</td>
-        <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:${fu ? '#b8860b' : 'var(--ink-4)'};">${fu || '—'}</td>
-      </tr>`;
-    };
+    // 24-month window starting at the earliest review month in view.
+    const dates = rows.flatMap(r => [r.review_start_date, r.reset_start_date]).filter(Boolean).sort();
+    const start = dates.length ? new Date(dates[0] + 'T12:00:00') : new Date();
+    start.setDate(1);
+    const months = [];
+    for (let i = 0; i < 24; i++) {
+      const d = new Date(start.getFullYear(), start.getMonth() + i, 1);
+      months.push({ key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, y: d.getFullYear(), label: d.toLocaleDateString('en-US', { month: 'short' }) });
+    }
+    const mk = (d) => d ? String(d).slice(0, 7) : null;
+    const byRetailer = new Map();
+    for (const r of rows) {
+      const list = byRetailer.get(r.key_account) || [];
+      list.push(r); byRetailer.set(r.key_account, list);
+    }
+    const years = [...new Set(months.map(m => m.y))];
 
     body.innerHTML = `
-      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px;">
-        <div style="flex:1;min-width:150px;">${stat('Needs notes', needNotes.length, 'meetings held, not logged', 'warn')}</div>
-        <div style="flex:1;min-width:150px;">${stat('Open follow-ups', openFu.length, `${overdue.length} overdue`, overdue.length ? 'warn' : '')}</div>
-        <div style="flex:1;min-width:150px;">${stat('Upcoming', upcoming.length, 'scheduled ahead', '')}</div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
+        <span style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);">Category:</span>
+        ${cats.map(c => `<button class="hl-pill ${c === _rvCatFilter ? 'active' : ''}" data-rvcat="${_brEsc(c)}">${_brEsc(c)}</button>`).join('') || '<span style="font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No calendar uploaded yet.</span>'}
+        <button class="hl-btn-primary" id="hl-rv-upload-btn" style="margin-left:auto;">↑ Upload review calendar</button>
+        <input type="file" id="hl-rv-upload" accept=".xlsx,.xls,.csv" style="display:none;">
       </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <div style="font-family:var(--serif);font-size:17px;">Meetings</div>
-        <button class="hl-btn-primary" id="hl-br-new">+ New meeting</button>
-      </div>
-      ${ms.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
-        <thead><tr style="background:#efe9dd;">
-          ${['Date', 'Retailer', 'Type', 'Buyer', 'Status', 'Open'].map((h, i) => `<th style="padding:7px 10px;text-align:${i === 5 ? 'right' : 'left'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${h}</th>`).join('')}
-        </tr></thead><tbody>${ms.map(row).join('')}</tbody></table></div>`
-        : `<div style="text-align:center;padding:40px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">No meetings yet. Add one to start the log.</div>`}
-      <div id="hl-br-detail" style="margin-top:22px;"></div>`;
+      ${byRetailer.size ? `<div style="overflow-x:auto;border:1px solid var(--rule-soft);border-radius:8px;background:var(--paper);">
+        <table style="border-collapse:collapse;min-width:100%;font-variant-numeric:tabular-nums;">
+          <thead>
+            <tr>
+              <th rowspan="2" style="position:sticky;left:0;background:#efe9dd;z-index:2;padding:6px 10px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);min-width:190px;">Retailer</th>
+              ${years.map(y => `<th colspan="${months.filter(m => m.y === y).length}" style="padding:5px 8px;text-align:center;font-family:var(--mono);font-size:10px;background:#efe9dd;border-left:1px solid var(--rule-soft);">${y}</th>`).join('')}
+            </tr>
+            <tr>${months.map(m => `<th style="padding:4px 2px;text-align:center;font-family:var(--mono);font-size:9px;color:var(--ink-3);background:#efe9dd;min-width:34px;">${m.label}</th>`).join('')}</tr>
+          </thead>
+          <tbody>
+            ${[...byRetailer.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([ret, list]) => {
+              const rev = new Set(list.map(r => mk(r.review_start_date)).filter(Boolean));
+              const res = new Set(list.map(r => mk(r.reset_start_date)).filter(Boolean));
+              return `<tr style="border-top:1px solid var(--rule-soft);">
+                <td style="position:sticky;left:0;background:var(--paper);z-index:1;padding:6px 10px;font-family:var(--sans);font-size:12px;white-space:nowrap;">${_brEsc(ret)}</td>
+                ${months.map(m => {
+                  const isRev = rev.has(m.key), isRes = res.has(m.key);
+                  const bg = isRev ? 'background:#cfe0f0;' : isRes ? 'background:#cfe6d2;' : '';
+                  const txt = isRev ? 'Review' : isRes ? 'Reset' : '';
+                  const hit = list.find(r => mk(isRev ? r.review_start_date : r.reset_start_date) === m.key);
+                  return `<td ${hit ? `data-rvcell="${hit.id}" title="${_brEsc(ret)} · ${_brEsc(hit.category || '')}"` : ''} style="padding:5px 2px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.03em;border-left:1px solid var(--rule-softer);${bg}${hit ? 'cursor:pointer;' : ''}">${txt}</td>`;
+                }).join('')}
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table></div>
+        <div style="margin-top:10px;display:flex;gap:16px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">
+          <span><span style="display:inline-block;width:10px;height:10px;background:#cfe0f0;vertical-align:-1px;"></span> Review</span>
+          <span><span style="display:inline-block;width:10px;height:10px;background:#cfe6d2;vertical-align:-1px;"></span> Reset</span>
+          <span>Click a cell to open that review.</span>
+        </div>`
+        : `<div style="text-align:center;padding:44px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">
+             No review calendar yet. Upload the retailer template to build the grid.</div>`}`;
 
-    document.getElementById('hl-br-new').addEventListener('click', () => _brNewMeeting(brandId, sb));
-    body.querySelectorAll('[data-br-open]').forEach(tr => tr.addEventListener('click', () => {
-      _brState.openId = tr.dataset.brOpen;
-      _brRenderDetail(brandId, sb);
-      document.getElementById('hl-br-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    body.querySelectorAll('[data-rvcat]').forEach(b => b.addEventListener('click', () => { _rvCatFilter = b.dataset.rvcat; _rvCalendar(body, brandId, sb); }));
+    body.querySelectorAll('[data-rvcell]').forEach(td => td.addEventListener('click', () => {
+      const r = _rvReviews.find(x => x.id === td.dataset.rvcell);
+      if (r) _rvOpenReview(r, brandId, sb);
     }));
-    if (_brState.openId) _brRenderDetail(brandId, sb);
+    const inp = document.getElementById('hl-rv-upload');
+    document.getElementById('hl-rv-upload-btn').addEventListener('click', () => inp.click());
+    inp.addEventListener('change', async (e) => {
+      const f = (e.target.files || [])[0]; inp.value = '';
+      if (!f) return;
+      body.innerHTML = `<div class="hl-loading">Reading “${_brEsc(f.name)}”…</div>`;
+      try {
+        const res = await _rvImportTemplate(f, brandId, sb);
+        alert(`Imported ${res.rows} review rows · ${res.meetings} meetings created.`);
+        const { data } = await sb.from('category_reviews').select('*').eq('brand_id', brandId).order('review_start_date');
+        _rvReviews = data || [];
+        await loadBuyerReviews(brandId, sb);
+      } catch (err) {
+        alert('Import failed: ' + (err.message || err));
+      }
+      _rvPaint(brandId, sb);
+    });
+  }
+
+  // Template import. Header row is found by looking for "Category Review ID",
+  // so the banner rows above it in the file are skipped.
+  async function _rvImportTemplate(file, brandId, sb) {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+    const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '', raw: false });
+    let hi = -1;
+    for (let i = 0; i < Math.min(15, aoa.length); i++) {
+      const j = aoa[i].map(x => String(x || '').toLowerCase()).join('|');
+      if (j.includes('review start date') && (j.includes('key account') || j.includes('category review id'))) { hi = i; break; }
+    }
+    if (hi < 0) throw new Error('Could not find the header row (needs "Review Start Date" and "Key Account")');
+    const H = aoa[hi].map(x => String(x || '').trim().toLowerCase());
+    const c = (...n) => H.findIndex(h => n.some(x => h.includes(x)));
+    const ci = {
+      rid: c('category review id'), acct: c('key account'), mcat: c('master category'),
+      cat: c('category'), status: c('category review status'), comments: c('category comments'),
+      anchor: c('anchor account'), rev: c('review start date'), reset: c('reset start date'),
+      upd: c('retailer update'), buyer: c('buyer name'), addr: c('retailer address'),
+      cn: c('conv/nat', 'conv nat'), region: c('region'),
+      pmi: c('account exec pmi'), dpi: c('account exec dpi'), nbc: c('account exec nbc'),
+      cva: c('account exec conv a'), cvb: c('account exec conv b'),
+    };
+    if (ci.acct < 0) throw new Error('No "Key Account" column found');
+    const g = (r, k) => k >= 0 ? String(r[k] ?? '').trim() : '';
+    const toDate = (v) => {
+      const s = String(v ?? '').trim(); if (!s) return null;
+      let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+      m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+      if (m) { let y = m[3]; if (y.length === 2) y = '20' + y; return `${y}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`; }
+      const d = new Date(s); return isNaN(d) ? null : d.toISOString().slice(0, 10);
+    };
+
+    const rows = [];
+    for (let i = hi + 1; i < aoa.length; i++) {
+      const r = aoa[i]; if (!r) continue;
+      const acct = g(r, ci.acct); if (!acct) continue;
+      rows.push({
+        brand_id: brandId, review_id: g(r, ci.rid) || null, key_account: acct,
+        master_category: g(r, ci.mcat) || null, category: g(r, ci.cat) || null,
+        review_status: g(r, ci.status) || null, category_comments: g(r, ci.comments) || null,
+        anchor_accounts: g(r, ci.anchor) || null,
+        review_start_date: toDate(g(r, ci.rev)), reset_start_date: toDate(g(r, ci.reset)),
+        retailer_update: g(r, ci.upd) || null, buyer_name: g(r, ci.buyer) || null,
+        retailer_address: g(r, ci.addr) || null, conv_nat: g(r, ci.cn) || null,
+        region: g(r, ci.region) || null,
+        ae_pmi: g(r, ci.pmi) || null, ae_dpi: g(r, ci.dpi) || null, ae_nbc: g(r, ci.nbc) || null,
+        ae_conv_a: g(r, ci.cva) || null, ae_conv_b: g(r, ci.cvb) || null,
+        source: 'template', updated_at: new Date().toISOString(),
+      });
+    }
+    if (!rows.length) throw new Error('No rows with a Key Account');
+
+    for (let i = 0; i < rows.length; i += 400) {
+      const { error } = await sb.from('category_reviews')
+        .upsert(rows.slice(i, i + 400), { onConflict: 'brand_id,review_id,category,key_account' });
+      if (error) throw error;
+    }
+
+    // Every dated review gets a scheduled meeting, so prep/feedback/follow-ups
+    // have something to attach to. Skipped when one already exists for that
+    // retailer + date, so re-importing doesn't duplicate.
+    const existing = new Set(_brState.meetings.map(m => `${m.retailer}|${m.meeting_date}`));
+    const newMeetings = [];
+    for (const r of rows) {
+      if (!r.review_start_date) continue;
+      const key = `${r.key_account}|${r.review_start_date}`;
+      if (existing.has(key)) continue;
+      existing.add(key);
+      newMeetings.push({
+        brand_id: brandId, retailer: r.key_account, meeting_date: r.review_start_date,
+        meeting_type: 'category_review', category: r.category || null,
+        buyer_name: r.buyer_name || null, source: 'calendar',
+        status: r.review_start_date > _brToday() ? 'scheduled' : 'held',
+      });
+    }
+    if (newMeetings.length) {
+      const { error } = await sb.from('buyer_meetings').insert(newMeetings);
+      if (error) console.warn('[reviews] meeting creation failed', error);
+    }
+    return { rows: rows.length, meetings: newMeetings.length };
+  }
+
+  function _rvOpenReview(r, brandId, sb) {
+    const m = _brState.meetings.find(x => x.retailer === r.key_account && x.meeting_date === r.review_start_date);
+    if (!m) { alert('No meeting record for that review yet — re-import the calendar to create one.'); return; }
+    _brState.openId = m.id;
+    _rvTab = 'prep';
+    try { localStorage.setItem('keel_rv_tab', _rvTab); } catch (e) {}
+    _rvPaint(brandId, sb);
+  }
+
+  // ── 2 · Details ────────────────────────────────────────────────────────
+  function _rvDetails(body, brandId, sb) {
+    const cols = [
+      ['review_id', 'ID'], ['key_account', 'Key account'], ['master_category', 'Master cat'],
+      ['category', 'Category'], ['review_start_date', 'Review'], ['reset_start_date', 'Reset'],
+      ['buyer_name', 'Buyer'], ['conv_nat', 'Conv/Nat'], ['region', 'Region'],
+      ['anchor_accounts', 'Anchor'], ['category_comments', 'Comments'],
+    ];
+    body.innerHTML = _rvReviews.length ? `
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:8px;">${_rvReviews.length} review rows from the template</div>
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+        <thead><tr style="background:#efe9dd;">${cols.map(c => `<th style="padding:7px 9px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;">${c[1]}</th>`).join('')}</tr></thead>
+        <tbody>${_rvReviews.map(r => `<tr data-rvrow="${r.id}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
+          ${cols.map(c => {
+            const v = r[c[0]];
+            const txt = (c[0].endsWith('_date') && v) ? _brDate(v) : (v || '—');
+            return `<td style="padding:6px 9px;font-family:${c[0] === 'category_comments' ? 'var(--serif)' : 'var(--sans)'};font-size:12px;color:var(--ink-2);max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${_brEsc(txt)}</td>`;
+          }).join('')}
+        </tr>`).join('')}</tbody></table></div>`
+      : `<div style="text-align:center;padding:44px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">Nothing imported yet — upload the template on the Review calendar tab.</div>`;
+    body.querySelectorAll('[data-rvrow]').forEach(tr => tr.addEventListener('click', () => {
+      const r = _rvReviews.find(x => x.id === tr.dataset.rvrow);
+      if (r) _rvOpenReview(r, brandId, sb);
+    }));
+  }
+
+  // ── 3 · Submissions ────────────────────────────────────────────────────
+  // Deliberately a pointer, not a copy: the Submissions page owns this and is
+  // unchanged. Here it's filtered to the selected review's retailer.
+  async function _rvSubmissions(body, brandId, sb) {
+    const m = _brState.meetings.find(x => x.id === _brState.openId);
+    body.innerHTML = `<div class="hl-loading">Loading submissions…</div>`;
+    let q = sb.from('timeline_entries').select('id, retailer, item_description, category, submission_due, reset_date')
+      .eq('brand_id', brandId).neq('archived', true).order('submission_due', { ascending: true });
+    if (m) q = q.eq('retailer', m.retailer);
+    const { data, error } = await q;
+    if (error) { body.innerHTML = `<div class="hl-empty" style="color:var(--lost);">${_brEsc(error.message)}</div>`; return; }
+    const subs = data || [];
+    body.innerHTML = `
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:10px;">
+        ${m ? `New-item submissions for ${_brEsc(m.retailer)}` : 'All open new-item submissions'} · managed on the Submissions page</div>
+      ${subs.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+        <thead><tr style="background:#efe9dd;">${['Retailer', 'Item', 'Category', 'Submission due', 'Reset'].map(h => `<th style="padding:7px 10px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${h}</th>`).join('')}</tr></thead>
+        <tbody>${subs.map(s => `<tr style="border-top:1px solid var(--rule-soft);">
+          <td style="padding:7px 10px;font-family:var(--sans);font-size:12px;">${_brEsc(s.retailer)}</td>
+          <td style="padding:7px 10px;font-family:var(--sans);font-size:12px;"><a href="#submission-docs?id=${s.id}" style="color:var(--ink);">${_brEsc(s.item_description || '—')}</a></td>
+          <td style="padding:7px 10px;font-family:var(--sans);font-size:12px;color:var(--ink-3);">${_brEsc(s.category || '—')}</td>
+          <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;">${_brDate(s.submission_due)}</td>
+          <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_brDate(s.reset_date)}</td>
+        </tr>`).join('')}</tbody></table></div>`
+        : `<div style="text-align:center;padding:40px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">No open submissions${m ? ' for ' + _brEsc(m.retailer) : ''}.</div>`}`;
+  }
+
+  // ── 4/5/6 · Prep · Feedback · Follow-ups ───────────────────────────────
+  // Each is now its own sub-tab rather than a stacked card. All three need a
+  // selected review, so each shows the picker when none is chosen.
+  function _rvMeetingTab(body, brandId, sb, which) {
+    const m = _brState.meetings.find(x => x.id === _brState.openId);
+    const today = _brToday();
+    const pick = () => {
+      const ms = _brState.meetings.slice(0, 40);
+      return `<div style="margin-bottom:14px;">
+        <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:6px;">Review</div>
+        <select id="hl-rv-pick" style="min-width:340px;padding:7px 10px;font-family:var(--sans);font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+          <option value="">— choose a review —</option>
+          ${ms.map(x => `<option value="${x.id}" ${x.id === _brState.openId ? 'selected' : ''}>${_brEsc(x.retailer)}${x.category ? ' · ' + _brEsc(x.category) : ''} · ${_brDate(x.meeting_date)}${x.meeting_date <= today && !['logged', 'closed'].includes(x.status) ? '  (needs notes)' : ''}</option>`).join('')}
+        </select>
+        <button class="hl-btn-secondary" id="hl-rv-newm" style="margin-left:8px;">+ New</button>
+      </div>`;
+    };
+    body.innerHTML = pick() + `<div id="hl-rv-sub"></div>`;
+    document.getElementById('hl-rv-pick').addEventListener('change', (e) => {
+      _brState.openId = e.target.value || null;
+      _rvPaint(brandId, sb);
+    });
+    document.getElementById('hl-rv-newm').addEventListener('click', () => _brNewMeeting(brandId, sb));
+    const host = document.getElementById('hl-rv-sub');
+    if (!m) {
+      host.innerHTML = `<div style="text-align:center;padding:40px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">Pick a review above, or open one from the calendar.</div>`;
+      return;
+    }
+    _brRenderPhase(host, brandId, sb, m, which);
   }
 
   async function _brNewMeeting(brandId, sb) {
@@ -43098,14 +43353,16 @@ render();
       close();
       _brState.meetings = [data, ..._brState.meetings];
       _brState.openId = data.id;
-      _brRenderList(brandId, sb);
+      if (_rvTab === 'calendar' || _rvTab === 'details') { _rvTab = 'prep'; try { localStorage.setItem('keel_rv_tab', _rvTab); } catch (e) {} }
+      _rvPaint(brandId, sb);
     });
   }
 
   // ── Detail: the three phases ───────────────────────────────────────────
-  async function _brRenderDetail(brandId, sb) {
-    const host = document.getElementById('hl-br-detail');
-    const m = _brState.meetings.find(x => x.id === _brState.openId);
+  // Renders ONE phase into a host element. Was a single stacked detail view;
+  // split so Prep, Feedback and Follow-ups can each be their own sub-tab while
+  // sharing the same data load and wiring.
+  async function _brRenderPhase(host, brandId, sb, m, which) {
     if (!host || !m) return;
     host.innerHTML = `<div class="hl-loading">Loading meeting…</div>`;
 
@@ -43257,15 +43514,17 @@ render();
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_brDate(m.meeting_date)}${m.buyer_name ? ' · ' + _brEsc(m.buyer_name) : ''}</div>
         <button class="hl-btn-secondary" id="hl-br-close" style="margin-left:auto;font-size:12px;">Close</button>
       </div>
-      ${card('1', 'Pre-meeting prep', 'Assembled by Keel — nothing to fill in.', prepInner, '')}
-      ${card('2', 'Meeting feedback', 'Tap what applies. One box at the end for anything else.', fbInner, '')}
-      ${card('3', 'Post-meeting follow-ups', 'Commitments with an owner and a date. Open ones appear in the next prep.', fuInner, `${myFu.filter(f => f.done_at).length} of ${myFu.length} done`)}`;
+      ${which === 'prep' ? card('1', 'Pre-meeting prep', 'Assembled by Keel — nothing to fill in.', prepInner, '') : ''}
+      ${which === 'feedback' ? card('2', 'Meeting feedback', 'Tap what applies. One box at the end for anything else.', fbInner, '') : ''}
+      ${which === 'followups' ? card('3', 'Post-meeting follow-ups', 'Commitments with an owner and a date. Open ones appear in the next prep.', fuInner, `${myFu.filter(f => f.done_at).length} of ${myFu.length} done`) : ''}`;
 
-    _brWireDetail(brandId, sb, m, fb);
+    _brWireDetail(brandId, sb, m, fb, host);
   }
 
-  function _brWireDetail(brandId, sb, m, fb) {
-    const host = document.getElementById('hl-br-detail');
+  function _brWireDetail(brandId, sb, m, fb, host) {
+    // Each phase renders only its own controls, so every lookup here is
+    // optional — a missing element means that phase isn't on screen.
+    const on = (sel, ev, fn) => { const el = host.querySelector(sel); if (el) el.addEventListener(ev, fn); };
     const saved = () => { const el = document.getElementById('hl-br-saved'); if (el) { el.textContent = 'Saved'; setTimeout(() => { el.textContent = ''; }, 1500); } };
     const patch = async (fields) => {
       const { error } = await sb.from('buyer_meetings').update({ ...fields, updated_at: new Date().toISOString() }).eq('id', m.id);
@@ -43284,20 +43543,20 @@ render();
       } else {
         await sb.from('meeting_feedback').insert({ brand_id: brandId, meeting_id: m.id, ...row });
       }
-      _brRenderDetail(brandId, sb);
+      _brRenderPhase(host, brandId, sb, m, which);
     };
 
-    host.querySelector('#hl-br-close').addEventListener('click', () => { _brState.openId = null; _brRenderList(brandId, sb); });
+    on('#hl-br-close', 'click', () => { _brState.openId = null; _rvPaint(brandId, sb); });
 
     host.querySelectorAll('[data-br-temp]').forEach(b => b.addEventListener('click', async () => {
       const v = b.dataset.brTemp;
-      if (await patch({ temperature: m.temperature === v ? null : v })) _brRenderDetail(brandId, sb);
+      if (await patch({ temperature: m.temperature === v ? null : v })) _brRenderPhase(host, brandId, sb, m, which);
     }));
     host.querySelectorAll('[data-br-topic]').forEach(b => b.addEventListener('click', async () => {
       const t = b.dataset.brTopic;
       const cur = m.topics || [];
       const next = cur.includes(t) ? cur.filter(x => x !== t) : [...cur, t];
-      if (await patch({ topics: next })) _brRenderDetail(brandId, sb);
+      if (await patch({ topics: next })) _brRenderPhase(host, brandId, sb, m, which);
     }));
     host.querySelectorAll('[data-br-sv]').forEach(b => b.addEventListener('click', () =>
       setVerdict(x => x.submission_id === b.dataset.brSub,
@@ -43306,13 +43565,13 @@ render();
       setVerdict(x => !x.submission_id && x.item_label === b.dataset.brItem,
                  { item_label: b.dataset.brItem, verdict: b.dataset.brIv })));
 
-    host.querySelector('#hl-br-prep').addEventListener('blur', async (e) => { await patch({ prep_notes: e.target.value }); saved(); });
-    host.querySelector('#hl-br-log').addEventListener('click', async () => {
-      const notes = document.getElementById('hl-br-notes').value;
-      if (await patch({ notes, status: 'logged' })) { saved(); _brRenderList(brandId, sb); }
+    on('#hl-br-prep', 'blur', async (e) => { await patch({ prep_notes: e.target.value }); saved(); });
+    on('#hl-br-log', 'click', async () => {
+      const notes = (document.getElementById('hl-br-notes') || {}).value || '';
+      if (await patch({ notes, status: 'logged' })) saved();
     });
 
-    host.querySelector('#hl-br-fu-add').addEventListener('click', async () => {
+    on('#hl-br-fu-add', 'click', async () => {
       const title = document.getElementById('hl-br-fu-title').value.trim();
       if (!title) return;
       const { data, error } = await sb.from('meeting_followups').insert({
@@ -43323,7 +43582,7 @@ render();
       }).select().single();
       if (error) { alert('Could not add: ' + error.message); return; }
       _brState.followups = [..._brState.followups, data];
-      _brRenderDetail(brandId, sb);
+      _brRenderPhase(host, brandId, sb, m, which);
     });
     host.querySelectorAll('[data-br-fu]').forEach(cb => cb.addEventListener('change', async () => {
       const id = cb.dataset.brFu;
@@ -43333,7 +43592,7 @@ render();
       if (error) { alert('Could not update: ' + error.message); cb.checked = !cb.checked; return; }
       const f = _brState.followups.find(x => x.id === id);
       if (f) { f.done_at = done; }
-      _brRenderDetail(brandId, sb);
+      _brRenderPhase(host, brandId, sb, m, which);
     }));
   }
 
