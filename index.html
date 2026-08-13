@@ -5180,7 +5180,7 @@ HL.NAV_ITEMS = [
   { id: 'brand-library',   label: 'Brand Library',   href: './brand-library.html' },
   { id: 'retailer-library',label: 'Retailer Library',href: './retailer-library.html' },
   { id: 'submission-docs', label: 'Submissions',     href: './submission-docs.html' },
-  { id: 'buyer-reviews',   label: 'Buyer Reviews',   href: './buyer-reviews.html' },
+  { id: 'buyer-reviews',   label: 'Reviews',         href: './buyer-reviews.html' },
   { id: 'forecasts',       label: 'Forecasts',       href: './forecasts.html' },
   { id: 'promos',          label: 'Promos',          href: './promos.html' },
   { id: 'sales-pacing',    label: 'Sales Pacing',    href: './sales-pacing.html' },
@@ -42972,6 +42972,7 @@ render();
   let _rvTab = (() => { try { return localStorage.getItem('keel_rv_tab') || 'calendar'; } catch (e) { return 'calendar'; } })();
   let _rvReviews = [];      // category_reviews rows
   let _rvCatFilter = null;  // master category shown in the calendar
+  let _rvSubStage = null;   // stage pill selected on the Submissions sub-tab
 
   async function renderBuyerReviewsPage() {
     const session = HL.mountPage('buyer-reviews');
@@ -43238,27 +43239,73 @@ render();
   // Deliberately a pointer, not a copy: the Submissions page owns this and is
   // unchanged. Here it's filtered to the selected review's retailer.
   async function _rvSubmissions(body, brandId, sb) {
+    // Mirrors the Submissions page: same columns, same stage pills, same Open
+    // button. Deliberately a READ-ONLY view — creating and editing still happen
+    // on the Submissions page, which is unchanged. When a review is selected the
+    // list is scoped to that retailer, otherwise it shows everything open.
     const m = _brState.meetings.find(x => x.id === _brState.openId);
     body.innerHTML = `<div class="hl-loading">Loading submissions…</div>`;
-    let q = sb.from('timeline_entries').select('id, retailer, item_description, category, submission_due, reset_date')
-      .eq('brand_id', brandId).neq('archived', true).order('submission_due', { ascending: true });
-    if (m) q = q.eq('retailer', m.retailer);
-    const { data, error } = await q;
+
+    const { data, error } = await sb.from('timeline_entries').select('*')
+      .eq('brand_id', brandId).order('submission_due', { ascending: true });
     if (error) { body.innerHTML = `<div class="hl-empty" style="color:var(--lost);">${_brEsc(error.message)}</div>`; return; }
-    const subs = data || [];
+    let all = (data || []).filter(s2 => !s2.archived);
+    if (m) all = all.filter(s2 => s2.retailer === m.retailer);
+
+    // Stage pills need the shared stage definitions; ask once and redraw when
+    // they land rather than blocking the table on a fetch.
+    const api = window.KeelStageStrip;
+    if (api && !api.ready()) {
+      Promise.resolve(api.load()).then(() => { if (_rvTab === 'submissions') _rvSubmissions(body, brandId, sb); }).catch(() => {});
+    }
+    const statusOf = (s2) => {
+      try { const st = api && api.ready() ? api.status(s2) : null; return st || null; } catch (e) { return null; }
+    };
+    if (_rvSubStage && !all.some(s2 => (statusOf(s2) || {}).key === _rvSubStage)) _rvSubStage = null;
+    const counts = new Map(), labels = new Map();
+    for (const s2 of all) {
+      const st = statusOf(s2); if (!st) continue;
+      counts.set(st.key, (counts.get(st.key) || 0) + 1); labels.set(st.key, st.label);
+    }
+    const shown = _rvSubStage ? all.filter(s2 => (statusOf(s2) || {}).key === _rvSubStage) : all;
+    const yr = (s2) => { const d = s2.reset_date || s2.target_launch || s2.submission_due; return d ? String(d).slice(0, 4) : '—'; };
+
     body.innerHTML = `
-      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:10px;">
-        ${m ? `New-item submissions for ${_brEsc(m.retailer)}` : 'All open new-item submissions'} · managed on the Submissions page</div>
-      ${subs.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
-        <thead><tr style="background:#efe9dd;">${['Retailer', 'Item', 'Category', 'Submission due', 'Reset'].map(h => `<th style="padding:7px 10px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${h}</th>`).join('')}</tr></thead>
-        <tbody>${subs.map(s => `<tr style="border-top:1px solid var(--rule-soft);">
-          <td style="padding:7px 10px;font-family:var(--sans);font-size:12px;">${_brEsc(s.retailer)}</td>
-          <td style="padding:7px 10px;font-family:var(--sans);font-size:12px;"><a href="#submission-docs?id=${s.id}" style="color:var(--ink);">${_brEsc(s.item_description || '—')}</a></td>
-          <td style="padding:7px 10px;font-family:var(--sans);font-size:12px;color:var(--ink-3);">${_brEsc(s.category || '—')}</td>
-          <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;">${_brDate(s.submission_due)}</td>
-          <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_brDate(s.reset_date)}</td>
-        </tr>`).join('')}</tbody></table></div>`
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">
+          ${m ? `New-item submissions for <b>${_brEsc(m.retailer)}</b>` : 'All open new-item submissions'} · created and edited on the Submissions page</div>
+        <a href="#submission-docs" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Open Submissions →</a>
+      </div>
+      ${counts.size ? `<div style="margin-bottom:12px;">
+        <div class="hl-filter-label">STAGE</div>
+        <div class="hl-pill-group" style="flex-wrap:wrap;">
+          <button class="hl-pill ${!_rvSubStage ? 'active' : ''}" data-rvss="">All <span style="opacity:0.6;">${all.length}</span></button>
+          ${[...counts.keys()].map(k => `<button class="hl-pill ${_rvSubStage === k ? 'active' : ''}" data-rvss="${_brEsc(k)}">${_brEsc(labels.get(k))} <span style="opacity:0.6;">${counts.get(k)}</span></button>`).join('')}
+        </div></div>` : ''}
+      ${shown.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+        <thead><tr style="background:#efe9dd;">
+          ${['Retailer', 'Product', 'Year', 'Status', 'Submission due', 'Reset date', 'Broker', 'Owner', ''].map((h, i) => `<th style="padding:7px 10px;text-align:${i === 8 ? 'right' : 'left'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${shown.map(s2 => {
+          const st = statusOf(s2);
+          return `<tr style="border-top:1px solid var(--rule-soft);">
+            <td style="padding:9px 10px;font-family:var(--serif);font-size:14px;">${_brEsc(s2.retailer)}<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_brEsc(s2.category || '')}</div></td>
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;">${_brEsc(s2.item_description || '—')}</td>
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${_brEsc(yr(s2))}</td>
+            <td style="padding:9px 10px;">${st ? `<span class="tl2-status ${st.cls}" style="cursor:default;">${_brEsc(st.label)}</span>` : '—'}</td>
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;">${_brDate(s2.submission_due)}</td>
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;">${_brDate(s2.reset_date)}</td>
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${_brEsc(s2.broker || '—')}</td>
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:12px;color:var(--ink-3);">${_brEsc((s2.owner_email || '').split('@')[0] || '—')}</td>
+            <td style="padding:9px 10px;text-align:right;"><a href="#submission-docs?id=${s2.id}" class="hl-btn-secondary" style="text-decoration:none;font-size:12px;padding:4px 12px;">Open</a></td>
+          </tr>`;
+        }).join('')}</tbody></table></div>`
         : `<div style="text-align:center;padding:40px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">No open submissions${m ? ' for ' + _brEsc(m.retailer) : ''}.</div>`}`;
+
+    body.querySelectorAll('[data-rvss]').forEach(b => b.addEventListener('click', () => {
+      _rvSubStage = b.dataset.rvss || null;
+      _rvSubmissions(body, brandId, sb);
+    }));
   }
 
   // ── 4/5/6 · Prep · Feedback · Follow-ups ───────────────────────────────
