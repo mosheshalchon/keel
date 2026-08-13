@@ -5180,6 +5180,7 @@ HL.NAV_ITEMS = [
   { id: 'brand-library',   label: 'Brand Library',   href: './brand-library.html' },
   { id: 'retailer-library',label: 'Retailer Library',href: './retailer-library.html' },
   { id: 'submission-docs', label: 'Submissions',     href: './submission-docs.html' },
+  { id: 'buyer-reviews',   label: 'Buyer Reviews',   href: './buyer-reviews.html' },
   { id: 'forecasts',       label: 'Forecasts',       href: './forecasts.html' },
   { id: 'promos',          label: 'Promos',          href: './promos.html' },
   { id: 'sales-pacing',    label: 'Sales Pacing',    href: './sales-pacing.html' },
@@ -5202,7 +5203,7 @@ HL.NAV_GROUPS = [
   { type: 'item',  id: 'dashboard' },
   { type: 'item',  id: 'ask-keel' },
   { type: 'item',  id: 'brand-library' },
-  { type: 'group', label: 'Sales',      children: ['retailer-library', 'submission-docs', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
+  { type: 'group', label: 'Sales',      children: ['retailer-library', 'submission-docs', 'buyer-reviews', 'forecasts', 'promos', 'sales-pacing', 'insights', 'sales-tools'] },
   { type: 'group', label: 'Operations', children: ['mrp', 'production', 'freight', 'service-levels', 'distribution'] },
   { type: 'item',  id: 'finance' },
   { type: 'item',  id: 'settings' },
@@ -8129,7 +8130,23 @@ function renderDashboardPage() {
         stageReminders = sr || [];
       } catch (e) { /* non-fatal */ }
 
-      _liveTodos = { awaitingMe, needsRework, approachingDeadline, stageReminders };
+      // Buyer-review commitments. Open ones due within a week (or already past)
+      // belong on the same list as everything else you owe someone.
+      let followups = [];
+      try {
+        const { data: fu } = await sb.from('meeting_followups')
+          .select('id, retailer, title, due_date, owner_email')
+          .eq('brand_id', session.brandId).is('done_at', null)
+          .order('due_date', { ascending: true });
+        const soon = new Date(); soon.setDate(soon.getDate() + 7);
+        const soonKey = soon.toISOString().slice(0, 10);
+        followups = (fu || []).filter(f => {
+          if ((f.owner_email || '').toLowerCase() !== userEmail && f.owner_email) return false;
+          return !f.due_date || f.due_date <= soonKey;
+        });
+      } catch (e) { /* table may not exist yet — non-fatal */ }
+
+      _liveTodos = { awaitingMe, needsRework, approachingDeadline, stageReminders, followups };
       doRender();
     } catch (err) {
       console.warn('To-do load failed:', err);
@@ -8387,8 +8404,8 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
         </section>
       `;
     }
-    const { awaitingMe, needsRework, approachingDeadline, stageReminders = [] } = liveTodos;
-    const totalCount = awaitingMe.length + needsRework.length + approachingDeadline.length + stageReminders.length;
+    const { awaitingMe, needsRework, approachingDeadline, stageReminders = [], followups = [] } = liveTodos;
+    const totalCount = awaitingMe.length + needsRework.length + approachingDeadline.length + stageReminders.length + followups.length;
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const daysUntil = (iso) => {
       const d = new Date(iso); d.setHours(0,0,0,0);
@@ -8488,6 +8505,19 @@ function renderDashboardBody(session, main, TODAY, decisions, reviews, todos, ve
         <div>
           <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:8px;">Timeline stages (${stageReminders.length})</div>
           ${stageReminders.map(n => itemRow('#5b7c9d', 'Stage', esc(n.title || 'Stage active'), esc(n.body || ''), esc(n.link_hash || '#'))).join('')}
+        </div>
+      `;
+    }
+
+    if (followups.length > 0) {
+      html += `
+        <div>
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin:18px 0 8px;">Promised to a buyer</div>
+          ${followups.map(f => {
+            const late = f.due_date && f.due_date < TODAY.toISOString().slice(0, 10);
+            return itemRow(late ? 'var(--lost)' : '#8a7320', late ? 'Overdue' : 'Follow-up',
+              esc(f.title), esc(f.retailer) + (f.due_date ? ' · due ' + esc(f.due_date) : ''), '#buyer-reviews');
+          }).join('')}
         </div>
       `;
     }
@@ -42876,6 +42906,437 @@ render();
     }));
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // BUYER REVIEWS — meetings with buyers, in three phases.
+  //   1 Prep      assembled from data Keel already holds; nothing to type
+  //   2 Feedback  tap-to-answer; one free-text box at the end
+  //   3 Follow-ups commitments that outlive the meeting and belong to the retailer
+  // Anchored on the retailer because buyers change.
+  // ═══════════════════════════════════════════════════════════════════════
+  const BR_TYPES = [
+    ['category_review', 'Category review'], ['new_item', 'New item'],
+    ['business_review', 'Business review'], ['check_in', 'Check-in'], ['other', 'Other'],
+  ];
+  const BR_TEMPS = [['positive', 'Positive'], ['neutral', 'Neutral'], ['concerned', 'Concerned'], ['at_risk', 'At risk']];
+  const BR_TOPICS = ['Pricing', 'Promo', 'Distribution', 'Packaging', 'Supply', 'Category review'];
+  const BR_SUB_VERDICTS = [['accepted', 'Accepted'], ['rejected', 'Rejected'], ['wants_info', 'Wants more info'], ['deferred', 'Deferred']];
+  const BR_ITEM_VERDICTS = [['growing', 'Growing'], ['at_risk', 'At risk'], ['wants_support', 'Wants support'], ['delist_risk', 'Delist risk']];
+  const BR_VERDICT_CLS = {
+    accepted: 'won', growing: 'won',
+    rejected: 'lost', at_risk: 'lost', delist_risk: 'lost',
+    wants_info: 'info', wants_support: 'info', deferred: 'muted', comment: 'muted',
+  };
+
+  let _brState = { meetings: [], followups: [], openId: null, loaded: false };
+
+  const _brEsc = (s) => escapeHtml(String(s == null ? '' : s));
+  const _brDate = (d) => d ? new Date(String(d) + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+  const _brToday = () => new Date().toISOString().slice(0, 10);
+  const _brMoney = (v) => '$' + Math.round(Number(v) || 0).toLocaleString();
+  const _brChip = (label, on, attrs, tone) => {
+    const bg = on ? (tone === 'won' ? 'background:#e6f0e6;color:#2f6b3f;border-color:#bcd8bf;'
+                   : tone === 'lost' ? 'background:#f6e3de;color:#a8381f;border-color:#e6c3b8;'
+                   : tone === 'info' ? 'background:#e7eef6;color:#2b4d7a;border-color:#c2d4e8;'
+                   : 'background:var(--ink);color:var(--paper);border-color:var(--ink);')
+                 : 'background:var(--paper);color:var(--ink-3);';
+    return `<button type="button" ${attrs} style="font-family:var(--sans);font-size:12px;padding:4px 11px;border:1px solid var(--rule-soft);border-radius:14px;cursor:pointer;${bg}">${_brEsc(label)}</button>`;
+  };
+
+  async function loadBuyerReviews(brandId, sb) {
+    const [m, f] = await Promise.all([
+      sb.from('buyer_meetings').select('*').eq('brand_id', brandId).order('meeting_date', { ascending: false }),
+      sb.from('meeting_followups').select('*').eq('brand_id', brandId).order('due_date', { ascending: true }),
+    ]);
+    if (m.error) throw m.error;
+    _brState.meetings = m.data || [];
+    _brState.followups = (f.data || []);
+    _brState.loaded = true;
+  }
+
+  async function renderBuyerReviewsPage() {
+    const session = HL.mountPage('buyer-reviews');
+    if (!session) return;
+    const sb = window.Auth.getClient();
+    const brandId = session.brandId;
+    const main = document.getElementById('main-content');
+
+    main.innerHTML = `
+      <div class="eyebrow">— Accounts</div>
+      <h1 class="page-title">Buyer Reviews.</h1>
+      <p class="page-meta">Every meeting with a buyer — what to bring, what they said, and what we owe them.</p>
+      <div id="hl-br-body" style="margin-top:22px;"><div class="hl-loading">Loading meetings…</div></div>`;
+
+    const body = document.getElementById('hl-br-body');
+    try {
+      await loadBuyerReviews(brandId, sb);
+    } catch (err) {
+      const missing = /relation .* does not exist|could not find the table|schema cache/i.test(err.message || '');
+      body.innerHTML = `<div style="padding:24px;border:1px solid var(--rule-soft);border-radius:8px;background:#fbf6ee;font-family:var(--serif);font-size:15px;">
+        ${missing ? 'The Buyer Reviews tables aren\u2019t set up yet — run <b>buyer-reviews.sql</b> in Supabase, then reload.'
+                  : 'Couldn\u2019t load meetings: ' + _brEsc(err.message || String(err))}</div>`;
+      return;
+    }
+    _brRenderList(brandId, sb);
+  }
+
+  function _brRenderList(brandId, sb) {
+    const body = document.getElementById('hl-br-body');
+    if (!body) return;
+    const today = _brToday();
+    const ms = _brState.meetings;
+    const openFu = _brState.followups.filter(f => !f.done_at);
+    const overdue = openFu.filter(f => f.due_date && f.due_date < today);
+    const needNotes = ms.filter(m => m.status !== 'logged' && m.status !== 'closed' && m.status !== 'cancelled' && m.meeting_date <= today);
+    const upcoming = ms.filter(m => m.meeting_date > today && m.status !== 'cancelled');
+
+    const stat = (label, val, sub, tone) => `
+      <div style="background:var(--bone-2);border-radius:8px;padding:12px 14px;">
+        <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">${label}</div>
+        <div style="font-family:var(--mono);font-size:22px;margin-top:2px;${tone === 'warn' && val ? 'color:#b8860b;' : ''}">${val}</div>
+        <div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);">${sub}</div>
+      </div>`;
+
+    const row = (m) => {
+      const fu = openFu.filter(f => f.meeting_id === m.id).length;
+      const late = m.meeting_date <= today && !['logged', 'closed', 'cancelled'].includes(m.status);
+      return `<tr data-br-open="${m.id}" style="border-top:1px solid var(--rule-soft);cursor:pointer;">
+        <td style="padding:9px 10px;font-family:var(--mono);font-size:11px;white-space:nowrap;">${_brDate(m.meeting_date)}</td>
+        <td style="padding:9px 10px;font-family:var(--sans);font-size:13px;">${_brEsc(m.retailer)}</td>
+        <td style="padding:9px 10px;font-family:var(--sans);font-size:12px;color:var(--ink-3);">${_brEsc((BR_TYPES.find(t => t[0] === m.meeting_type) || [])[1] || m.meeting_type)}</td>
+        <td style="padding:9px 10px;font-family:var(--sans);font-size:12px;color:var(--ink-3);">${_brEsc(m.buyer_name || '—')}</td>
+        <td style="padding:9px 10px;">${late
+          ? `<span style="font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px;background:#faf0d7;color:#8d650f;">Needs notes</span>`
+          : `<span style="font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px;background:var(--bone-2);color:var(--ink-3);">${_brEsc(m.status)}</span>`}</td>
+        <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:${fu ? '#b8860b' : 'var(--ink-4)'};">${fu || '—'}</td>
+      </tr>`;
+    };
+
+    body.innerHTML = `
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px;">
+        <div style="flex:1;min-width:150px;">${stat('Needs notes', needNotes.length, 'meetings held, not logged', 'warn')}</div>
+        <div style="flex:1;min-width:150px;">${stat('Open follow-ups', openFu.length, `${overdue.length} overdue`, overdue.length ? 'warn' : '')}</div>
+        <div style="flex:1;min-width:150px;">${stat('Upcoming', upcoming.length, 'scheduled ahead', '')}</div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <div style="font-family:var(--serif);font-size:17px;">Meetings</div>
+        <button class="hl-btn-primary" id="hl-br-new">+ New meeting</button>
+      </div>
+      ${ms.length ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--rule-soft);border-radius:8px;">
+        <thead><tr style="background:#efe9dd;">
+          ${['Date', 'Retailer', 'Type', 'Buyer', 'Status', 'Open'].map((h, i) => `<th style="padding:7px 10px;text-align:${i === 5 ? 'right' : 'left'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);">${h}</th>`).join('')}
+        </tr></thead><tbody>${ms.map(row).join('')}</tbody></table></div>`
+        : `<div style="text-align:center;padding:40px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">No meetings yet. Add one to start the log.</div>`}
+      <div id="hl-br-detail" style="margin-top:22px;"></div>`;
+
+    document.getElementById('hl-br-new').addEventListener('click', () => _brNewMeeting(brandId, sb));
+    body.querySelectorAll('[data-br-open]').forEach(tr => tr.addEventListener('click', () => {
+      _brState.openId = tr.dataset.brOpen;
+      _brRenderDetail(brandId, sb);
+      document.getElementById('hl-br-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }));
+    if (_brState.openId) _brRenderDetail(brandId, sb);
+  }
+
+  async function _brNewMeeting(brandId, sb) {
+    const retailers = [...new Set(_brState.meetings.map(m => m.retailer))].sort();
+    let libRetailers = [];
+    try {
+      const { data } = await sb.from('retailers').select('name').eq('brand_id', brandId).order('name');
+      libRetailers = [...new Set((data || []).map(r => r.name).filter(Boolean))];
+    } catch (e) { /* fall back to what's already on meetings */ }
+    const list = libRetailers.length ? libRetailers : retailers;
+
+    document.getElementById('hl-br-modal')?.remove();
+    document.body.insertAdjacentHTML('beforeend', `
+      <div id="hl-br-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
+        <div style="background:var(--paper);border-radius:12px;max-width:520px;width:100%;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+          <div style="padding:16px 20px;border-bottom:1px solid var(--rule-soft);font-family:var(--serif);font-size:19px;">New meeting</div>
+          <div style="padding:18px 20px;">
+            <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Retailer *</div>
+            <input list="hl-br-rets" id="hl-br-ret" placeholder="Start typing…" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);margin-bottom:14px;">
+            <datalist id="hl-br-rets">${list.map(r => `<option value="${_brEsc(r)}"></option>`).join('')}</datalist>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+              <div>
+                <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Date *</div>
+                <input type="date" id="hl-br-date" value="${_brToday()}" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);margin-bottom:14px;">
+              </div>
+              <div>
+                <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Type</div>
+                <select id="hl-br-type" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);margin-bottom:14px;">
+                  ${BR_TYPES.map(t => `<option value="${t[0]}">${t[1]}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Buyer</div>
+            <input type="text" id="hl-br-buyer" placeholder="Optional" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+            <div id="hl-br-err" style="font-family:var(--mono);font-size:11px;color:var(--lost);min-height:16px;margin-top:8px;"></div>
+          </div>
+          <div style="padding:0 20px 18px;display:flex;justify-content:flex-end;gap:10px;">
+            <button class="hl-btn-secondary" data-brclose>Cancel</button>
+            <button class="hl-btn-primary" id="hl-br-save">Add meeting</button>
+          </div>
+        </div>
+      </div>`);
+    const modal = document.getElementById('hl-br-modal');
+    const close = () => modal.remove();
+    modal.addEventListener('click', e => { if (e.target === modal || e.target.closest('[data-brclose]')) close(); });
+    document.getElementById('hl-br-ret').focus();
+    document.getElementById('hl-br-save').addEventListener('click', async () => {
+      const ret = document.getElementById('hl-br-ret').value.trim();
+      const date = document.getElementById('hl-br-date').value;
+      const err = document.getElementById('hl-br-err');
+      if (!ret) { err.textContent = 'Retailer is required.'; return; }
+      if (!date) { err.textContent = 'Date is required.'; return; }
+      const { data, error } = await sb.from('buyer_meetings').insert({
+        brand_id: brandId, retailer: ret, meeting_date: date,
+        meeting_type: document.getElementById('hl-br-type').value,
+        buyer_name: document.getElementById('hl-br-buyer').value.trim() || null,
+        status: date > _brToday() ? 'scheduled' : 'held',
+        created_by: (window.Auth.getSession() || {}).email || null,
+      }).select().single();
+      if (error) { err.textContent = 'Could not save: ' + error.message; return; }
+      close();
+      _brState.meetings = [data, ..._brState.meetings];
+      _brState.openId = data.id;
+      _brRenderList(brandId, sb);
+    });
+  }
+
+  // ── Detail: the three phases ───────────────────────────────────────────
+  async function _brRenderDetail(brandId, sb) {
+    const host = document.getElementById('hl-br-detail');
+    const m = _brState.meetings.find(x => x.id === _brState.openId);
+    if (!host || !m) return;
+    host.innerHTML = `<div class="hl-loading">Loading meeting…</div>`;
+
+    // Everything the prep panel needs, plus this meeting's own feedback rows.
+    const [fbRes, subRes, prior] = await Promise.all([
+      sb.from('meeting_feedback').select('*').eq('meeting_id', m.id),
+      sb.from('timeline_entries').select('id, retailer, item_description, category, submission_due')
+        .eq('brand_id', brandId).eq('retailer', m.retailer).neq('archived', true).limit(20),
+      sb.from('buyer_meetings').select('id, meeting_date, notes, temperature')
+        .eq('brand_id', brandId).eq('retailer', m.retailer).lt('meeting_date', m.meeting_date)
+        .order('meeting_date', { ascending: false }).limit(1),
+    ]);
+    const fb = fbRes.data || [];
+    const subs = subRes.data || [];
+    const last = (prior.data || [])[0] || null;
+    const fbFor = (key, val) => fb.find(x => x[key] === val) || null;
+
+    // Recent performance for this retailer, from the same sales_actuals rows that
+    // drive Sales Pacing. (SPINS lives in a Storage blob rather than a table —
+    // wiring that in is a follow-on, this gives the same shape of answer today.)
+    let perf = null, topItems = [];
+    try {
+      const { data: sa } = await sb.from('sales_actuals')
+        .select('entity, month, amount, dimension')
+        .eq('brand_id', brandId).eq('dimension', 'customer');
+      const mine = (sa || []).filter(r => String(r.entity || '').toLowerCase() === String(m.retailer).toLowerCase());
+      const cut = new Date(); cut.setMonth(cut.getMonth() - 12);
+      const cutKey = cut.toISOString().slice(0, 10);
+      const py = new Date(); py.setMonth(py.getMonth() - 24);
+      const pyKey = py.toISOString().slice(0, 10);
+      const l12 = mine.filter(r => r.month >= cutKey).reduce((a, r) => a + (Number(r.amount) || 0), 0);
+      const prev = mine.filter(r => r.month >= pyKey && r.month < cutKey).reduce((a, r) => a + (Number(r.amount) || 0), 0);
+      if (l12 || prev) perf = { l12, prev, pct: prev ? (l12 - prev) / prev : null };
+      const { data: cp } = await sb.from('sales_actuals')
+        .select('entity, month, amount').eq('brand_id', brandId).eq('dimension', 'customer_product');
+      const byItem = new Map();
+      for (const r of (cp || [])) {
+        const parts = String(r.entity || '').split(' \u00A7 ');
+        if (parts.length !== 2) continue;
+        if (parts[1].toLowerCase() !== String(m.retailer).toLowerCase()) continue;
+        if (r.month < cutKey) continue;
+        byItem.set(parts[0], (byItem.get(parts[0]) || 0) + (Number(r.amount) || 0));
+      }
+      topItems = [...byItem.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    } catch (e) { console.warn('[buyer-reviews] performance lookup failed', e); }
+
+    const openFu = _brState.followups.filter(f => f.retailer === m.retailer && !f.done_at);
+    const myFu = _brState.followups.filter(f => f.meeting_id === m.id);
+    const today = _brToday();
+
+    const card = (icon, title, sub, inner, right) => `
+      <div class="hl-settings-section" style="margin-top:14px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:15px;color:var(--ink-3);">${icon}</span>
+          <h2 style="margin:0;">${title}</h2>
+          ${right ? `<span style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${right}</span>` : ''}
+        </div>
+        <p class="hl-sub" style="margin:2px 0 12px;">${sub}</p>
+        ${inner}
+      </div>`;
+
+    // ── 1 · Prep ──
+    const prepInner = `
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+        <div style="flex:1;min-width:150px;background:var(--bone-2);border-radius:8px;padding:11px 13px;">
+          <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">L12 at this retailer</div>
+          <div style="font-family:var(--mono);font-size:20px;">${perf ? _brMoney(perf.l12) : '—'}</div>
+          <div style="font-family:var(--serif);font-size:12px;color:${perf && perf.pct != null ? (perf.pct < 0 ? 'var(--lost)' : '#2f6b3f') : 'var(--ink-3)'};">
+            ${perf && perf.pct != null ? (perf.pct >= 0 ? '+' : '') + (perf.pct * 100).toFixed(1) + '% vs prior 12' : 'no sales history'}</div>
+        </div>
+        <div style="flex:1;min-width:150px;background:var(--bone-2);border-radius:8px;padding:11px 13px;">
+          <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">Open submissions</div>
+          <div style="font-family:var(--mono);font-size:20px;">${subs.length}</div>
+          <div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);">for this retailer</div>
+        </div>
+        <div style="flex:1;min-width:150px;background:var(--bone-2);border-radius:8px;padding:11px 13px;">
+          <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);">Open from before</div>
+          <div style="font-family:var(--mono);font-size:20px;${openFu.filter(f => f.meeting_id !== m.id).length ? 'color:#b8860b;' : ''}">${openFu.filter(f => f.meeting_id !== m.id).length}</div>
+          <div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);">promised, not done</div>
+        </div>
+      </div>
+      ${openFu.filter(f => f.meeting_id !== m.id).length ? `<div style="background:#faf0d7;border:1px solid #e0d3b8;border-radius:6px;padding:9px 12px;margin-bottom:10px;font-family:var(--mono);font-size:11px;line-height:1.7;">
+        <b>Still owed to ${_brEsc(m.retailer)}</b><br>${openFu.filter(f => f.meeting_id !== m.id).map(f => `${_brEsc(f.title)} <span style="color:var(--ink-3);">${f.due_date ? _brDate(f.due_date) : ''}</span>`).join('<br>')}
+      </div>` : ''}
+      ${last ? `<div style="font-family:var(--serif);font-size:13px;color:var(--ink-2);border-left:2px solid var(--rule-soft);padding-left:10px;">
+        <b>Last meeting ${_brDate(last.meeting_date)}${last.temperature ? ` · ${last.temperature.replace('_', ' ')}` : ''}</b><br>${_brEsc(last.notes || 'no notes recorded')}</div>` : ''}
+      <div style="margin-top:12px;">
+        <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);margin-bottom:5px;">Talking points</div>
+        <textarea id="hl-br-prep" rows="2" placeholder="Anything you want to raise" style="width:100%;">${_brEsc(m.prep_notes || '')}</textarea>
+      </div>`;
+
+    // ── 2 · Feedback ──
+    const subRows = subs.map(s => {
+      const cur = fbFor('submission_id', s.id);
+      return `<div style="border:1px solid var(--rule-soft);border-radius:6px;padding:9px 11px;margin-bottom:7px;">
+        <div style="font-family:var(--sans);font-size:13px;margin-bottom:6px;">${_brEsc(s.item_description || s.category || 'Submission')}
+          <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">due ${_brDate(s.submission_due)}</span></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          ${BR_SUB_VERDICTS.map(v => _brChip(v[1], cur && cur.verdict === v[0], `data-br-sv="${v[0]}" data-br-sub="${s.id}" data-br-label="${_brEsc(s.item_description || '')}"`, BR_VERDICT_CLS[v[0]])).join('')}
+        </div></div>`;
+    }).join('') || `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;margin-bottom:8px;">No open submissions for this retailer.</div>`;
+
+    const itemRows = topItems.map(([name, amt]) => {
+      const cur = fb.find(x => !x.submission_id && x.item_label === name);
+      return `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid var(--rule-soft);">
+        <div style="font-family:var(--sans);font-size:13px;">${_brEsc(name)} <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_brMoney(amt)}</span></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          ${BR_ITEM_VERDICTS.map(v => _brChip(v[1], cur && cur.verdict === v[0], `data-br-iv="${v[0]}" data-br-item="${_brEsc(name)}"`, BR_VERDICT_CLS[v[0]])).join('')}
+        </div></div>`;
+    }).join('') || `<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);font-size:13px;">No sales history for this retailer yet.</div>`;
+
+    const fbInner = `
+      <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Overall temperature</div>
+      <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:14px;">
+        ${BR_TEMPS.map(t => _brChip(t[1], m.temperature === t[0], `data-br-temp="${t[0]}"`, t[0] === 'positive' ? 'won' : t[0] === 'at_risk' ? 'lost' : '')).join('')}
+      </div>
+      <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Open submissions</div>
+      ${subRows}
+      <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);margin:14px 0 2px;">Existing items <span style="text-transform:none;letter-spacing:0;">— ranked by sales here; tap only what came up</span></div>
+      ${itemRows}
+      <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;color:var(--ink-3);margin:14px 0 6px;">What came up</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+        ${BR_TOPICS.map(t => _brChip(t, (m.topics || []).includes(t), `data-br-topic="${_brEsc(t)}"`)).join('')}
+      </div>
+      <textarea id="hl-br-notes" rows="3" placeholder="Anything worth remembering in six months" style="width:100%;">${_brEsc(m.notes || '')}</textarea>
+      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:10px;">
+        <span id="hl-br-saved" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);align-self:center;"></span>
+        <button class="hl-btn-primary" id="hl-br-log">${m.status === 'logged' || m.status === 'closed' ? 'Save changes' : 'Log meeting'}</button>
+      </div>`;
+
+    // ── 3 · Follow-ups ──
+    const fuInner = `
+      ${myFu.map(f => `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--rule-soft);">
+        <input type="checkbox" data-br-fu="${f.id}" ${f.done_at ? 'checked' : ''} style="cursor:pointer;">
+        <span style="flex:1;font-family:var(--sans);font-size:13px;${f.done_at ? 'color:var(--ink-3);text-decoration:line-through;' : ''}">${_brEsc(f.title)}</span>
+        <span style="font-family:var(--mono);font-size:11px;color:${!f.done_at && f.due_date && f.due_date < today ? 'var(--lost)' : 'var(--ink-3)'};">
+          ${_brEsc((f.owner_email || '').split('@')[0])}${f.due_date ? ' · ' + _brDate(f.due_date) : ''}${!f.done_at && f.due_date && f.due_date < today ? ' · overdue' : ''}</span>
+      </div>`).join('')}
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+        <input type="text" id="hl-br-fu-title" placeholder="What did we promise?" style="flex:2;min-width:200px;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+        <input type="date" id="hl-br-fu-due" style="padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+        <button class="hl-btn-secondary" id="hl-br-fu-add">Add</button>
+      </div>`;
+
+    const typeLabel = (BR_TYPES.find(t => t[0] === m.meeting_type) || [])[1] || m.meeting_type;
+    host.innerHTML = `
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;border-top:2px solid var(--ink);padding-top:16px;">
+        <div style="font-family:var(--serif);font-size:21px;">${_brEsc(m.retailer)} · ${_brEsc(typeLabel)}</div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${_brDate(m.meeting_date)}${m.buyer_name ? ' · ' + _brEsc(m.buyer_name) : ''}</div>
+        <button class="hl-btn-secondary" id="hl-br-close" style="margin-left:auto;font-size:12px;">Close</button>
+      </div>
+      ${card('1', 'Pre-meeting prep', 'Assembled by Keel — nothing to fill in.', prepInner, '')}
+      ${card('2', 'Meeting feedback', 'Tap what applies. One box at the end for anything else.', fbInner, '')}
+      ${card('3', 'Post-meeting follow-ups', 'Commitments with an owner and a date. Open ones appear in the next prep.', fuInner, `${myFu.filter(f => f.done_at).length} of ${myFu.length} done`)}`;
+
+    _brWireDetail(brandId, sb, m, fb);
+  }
+
+  function _brWireDetail(brandId, sb, m, fb) {
+    const host = document.getElementById('hl-br-detail');
+    const saved = () => { const el = document.getElementById('hl-br-saved'); if (el) { el.textContent = 'Saved'; setTimeout(() => { el.textContent = ''; }, 1500); } };
+    const patch = async (fields) => {
+      const { error } = await sb.from('buyer_meetings').update({ ...fields, updated_at: new Date().toISOString() }).eq('id', m.id);
+      if (error) { alert('Could not save: ' + error.message); return false; }
+      Object.assign(m, fields);
+      return true;
+    };
+    // One feedback row per target; tapping the same chip again clears it, so a
+    // mis-tap is undoable and an untouched item stays genuinely unrecorded.
+    const setVerdict = async (match, row) => {
+      const existing = fb.find(match);
+      if (existing && existing.verdict === row.verdict) {
+        await sb.from('meeting_feedback').delete().eq('id', existing.id);
+      } else if (existing) {
+        await sb.from('meeting_feedback').update({ verdict: row.verdict }).eq('id', existing.id);
+      } else {
+        await sb.from('meeting_feedback').insert({ brand_id: brandId, meeting_id: m.id, ...row });
+      }
+      _brRenderDetail(brandId, sb);
+    };
+
+    host.querySelector('#hl-br-close').addEventListener('click', () => { _brState.openId = null; _brRenderList(brandId, sb); });
+
+    host.querySelectorAll('[data-br-temp]').forEach(b => b.addEventListener('click', async () => {
+      const v = b.dataset.brTemp;
+      if (await patch({ temperature: m.temperature === v ? null : v })) _brRenderDetail(brandId, sb);
+    }));
+    host.querySelectorAll('[data-br-topic]').forEach(b => b.addEventListener('click', async () => {
+      const t = b.dataset.brTopic;
+      const cur = m.topics || [];
+      const next = cur.includes(t) ? cur.filter(x => x !== t) : [...cur, t];
+      if (await patch({ topics: next })) _brRenderDetail(brandId, sb);
+    }));
+    host.querySelectorAll('[data-br-sv]').forEach(b => b.addEventListener('click', () =>
+      setVerdict(x => x.submission_id === b.dataset.brSub,
+                 { submission_id: b.dataset.brSub, item_label: b.dataset.brLabel || null, verdict: b.dataset.brSv })));
+    host.querySelectorAll('[data-br-iv]').forEach(b => b.addEventListener('click', () =>
+      setVerdict(x => !x.submission_id && x.item_label === b.dataset.brItem,
+                 { item_label: b.dataset.brItem, verdict: b.dataset.brIv })));
+
+    host.querySelector('#hl-br-prep').addEventListener('blur', async (e) => { await patch({ prep_notes: e.target.value }); saved(); });
+    host.querySelector('#hl-br-log').addEventListener('click', async () => {
+      const notes = document.getElementById('hl-br-notes').value;
+      if (await patch({ notes, status: 'logged' })) { saved(); _brRenderList(brandId, sb); }
+    });
+
+    host.querySelector('#hl-br-fu-add').addEventListener('click', async () => {
+      const title = document.getElementById('hl-br-fu-title').value.trim();
+      if (!title) return;
+      const { data, error } = await sb.from('meeting_followups').insert({
+        brand_id: brandId, retailer: m.retailer, meeting_id: m.id, title,
+        due_date: document.getElementById('hl-br-fu-due').value || null,
+        owner_email: (window.Auth.getSession() || {}).email || null,
+        created_by: (window.Auth.getSession() || {}).email || null,
+      }).select().single();
+      if (error) { alert('Could not add: ' + error.message); return; }
+      _brState.followups = [..._brState.followups, data];
+      _brRenderDetail(brandId, sb);
+    });
+    host.querySelectorAll('[data-br-fu]').forEach(cb => cb.addEventListener('change', async () => {
+      const id = cb.dataset.brFu;
+      const done = cb.checked ? new Date().toISOString() : null;
+      const { error } = await sb.from('meeting_followups')
+        .update({ done_at: done, done_by: done ? ((window.Auth.getSession() || {}).email || null) : null }).eq('id', id);
+      if (error) { alert('Could not update: ' + error.message); cb.checked = !cb.checked; return; }
+      const f = _brState.followups.find(x => x.id === id);
+      if (f) { f.done_at = done; }
+      _brRenderDetail(brandId, sb);
+    }));
+  }
+
   async function renderFinancePage() {
     const session = HL.mountPage('finance');
     if (!session) return;
@@ -50831,7 +51292,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${P.manual.length ? rbRow('Manual review', P.manual.length, P.totals.casesManual, manPlan, manWt, salesMan) : ''}
           ${P.needsDc.length ? rbRow('Needs ship-to DC', P.needsDc.length, P.totals.casesNeed, needPlan, needWt, salesNeed) : ''}
           <tr title="POs marked Scheduled in the freight file (column T) — already booked for pickup. Cases and dollars are summed from those POs; weight and pallets are each truck's share whose POs are scheduled, since one truck can carry both scheduled and unscheduled POs.">
-            <td style="padding:8px 9px;color:#2e7d32;">Scheduled for pickup${schedTrucks ? ` <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${schedTrucks} full truck${schedTrucks === 1 ? '' : 's'}</span>` : ''}${!schedOrders.length && !(orders || []).some(o => String(o.scheduled ?? '').trim() !== '') ? ` <span style="font-family:var(--mono);font-size:11px;color:#b8860b;">no Scheduled values in the loaded data \u2014 re-upload the file</span>` : ''}</td>
+            <td style="padding:8px 9px;color:#2e7d32;">Scheduled for pickup${schedTrucks ? ` <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${schedTrucks} full truck${schedTrucks === 1 ? '' : 's'}</span>` : ''}${!schedOrders.length && !(orders || []).some(o => String(o.scheduled ?? '').trim() !== '') ? ` <span style="font-family:var(--mono);font-size:11px;color:#b8860b;">no Scheduled values in the loaded data \u2014 run sync-freight-orders</span>` : ''}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${schedSos.size}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${Math.round(schedCases).toLocaleString()}</td>
             <td style="padding:8px 9px;text-align:right;font-family:var(--mono);color:#2e7d32;">${Math.round(schedPlt)}</td>
@@ -51846,21 +52307,14 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     rows = sheet('Ordering Data');
     if (rows) {
       const hi = hrow(rows, ['customer', 'sku', 'cases ordered']); const h = rows[hi];
-      const c = { iid: col(h, 'internal id'), so: _frSoCol(h), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled'),
-        // 'scheduled' first, then looser fallbacks — the analyst's header wording
-        // isn't fixed and a miss here shows up as a silent zero on the recon table.
-        sched: [ 'scheduled', 'sched', 'pickup date', 'pick up date' ].reduce((f, n) => f >= 0 ? f : col(h, n), -1) };
-      console.log('[freight upload] Ordering Data headers:', h.map(x => String(x).trim()).filter(Boolean));
-      console.log('[freight upload] scheduled column index:', c.sched, c.sched >= 0 ? `("${String(h[c.sched]).trim()}")` : '\u2190 NOT FOUND in the headers above');
+      const c = { iid: col(h, 'internal id'), so: _frSoCol(h), po: col(h, 'customer po'), cust: h.findIndex(x => String(x).trim().toLowerCase() === 'customer'), dc: col(h, 'customer dc'), pod: col(h, 'po order date'), psd: col(h, 'projected ship'), asd: col(h, 'actual ship'), sku: col(h, 'sku'), cases: col(h, 'cases ordered'), uom: col(h, 'uom'), sales: col(h, 'sales'), oh: col(h, 'on hand'), avail: col(h, 'available'), status: col(h, 'status'), qf: col(h, 'fulfilled') };
       const cust2 = c.cust; // 'Customer' (not 'Customer DC') — findIndex picks first match; 'customer dc' handled separately
       const recs = [];
       for (let i = hi + 1; i < rows.length; i++) {
         const r = rows[i]; const cust = _frClean(r[cust2]); const sku = _frClean(r[c.sku]); if (!cust && !sku) continue;
-        recs.push({ brand_id: brandId, internal_id: _frClean(r[c.iid]), so_num: _frClean(r[c.so]), po_num: _frClean(r[c.po]), customer: cust, customer_dc: _frClean(r[c.dc]), po_date: _frDate(r[c.pod]), projected_ship_date: _frDate(r[c.psd]), actual_ship_date: _frDate(r[c.asd]), sku: sku, cases_ordered: _frNum(r[c.cases]), uom: _frClean(r[c.uom]), sales: _frNum(r[c.sales]), on_hand: _frNum(r[c.oh]), available: _frNum(r[c.avail]), status: _frClean(r[c.status]), qty_fulfilled: _frNum(r[c.qf]), scheduled: _frClean(r[c.sched]) });
+        recs.push({ brand_id: brandId, internal_id: _frClean(r[c.iid]), so_num: _frClean(r[c.so]), po_num: _frClean(r[c.po]), customer: cust, customer_dc: _frClean(r[c.dc]), po_date: _frDate(r[c.pod]), projected_ship_date: _frDate(r[c.psd]), actual_ship_date: _frDate(r[c.asd]), sku: sku, cases_ordered: _frNum(r[c.cases]), uom: _frClean(r[c.uom]), sales: _frNum(r[c.sales]), on_hand: _frNum(r[c.oh]), available: _frNum(r[c.avail]), status: _frClean(r[c.status]), qty_fulfilled: _frNum(r[c.qf]) });
       }
-      const nSched = recs.filter(r => String(r.scheduled ?? '').trim() !== '').length;
-      console.log(`[freight upload] rows with a Scheduled value: ${nSched} of ${recs.length}`);
-      onMsg(`Loading ${recs.length.toLocaleString()} order lines… (${nSched} scheduled)`);
+      onMsg(`Loading ${recs.length.toLocaleString()} order lines…`);
       await wipe('freight_orders');
       const C = 500; for (let i = 0; i < recs.length; i += C) { const { error } = await sb.from('freight_orders').insert(recs.slice(i, i + C)); if (error) throw new Error(`freight_orders: ${error.message}`); onMsg(`Saving orders ${Math.min(i + C, recs.length).toLocaleString()} / ${recs.length.toLocaleString()}…`); }
       out.orders = recs.length;
@@ -52164,6 +52618,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
     'brand-library':   renderBrandLibraryV2Page,
     'retailer-library':renderRetailerLibraryPage,
     'submission-docs': renderSubmissionDocsPage,
+    'buyer-reviews':   renderBuyerReviewsPage,
     'forecasts':       renderForecastsPage,
     'forecast':        renderForecastDetailPage,
     'decks':           renderDecksPage,
