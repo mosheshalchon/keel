@@ -51664,8 +51664,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         // routed — they're pulled out into their own section below Manual
         // adjustments. Only FULLY scheduled trucks move: a truck carrying one
         // scheduled and one unscheduled PO still needs booking for the rest.
-        const _ordersScopeEarly = (orders || []).filter(o => _frOrigin === 'ALL' || !_frOrigin || String(o.ship_from || '').trim() === _frOrigin);
-        const _schedSoSet = new Set(_ordersScopeEarly
+        // Orders for the selected origin. Declared here because the scheduled sets,
+        // the sales lookup and the reconciliation all need it, and the first use is
+        // above where the reconciliation itself is built.
+        const _ordersScope = (orders || []).filter(o => _frOrigin === 'ALL' || !_frOrigin || String(o.ship_from || '').trim() === _frOrigin);
+        const _schedSoSet = new Set(_ordersScope
           .filter(o => { const v = String(o.scheduled == null ? '' : o.scheduled).trim().toLowerCase();
                          return v && !['no', 'n', 'false', '0', '-'].includes(v); })
           .map(o => o.so_num).filter(Boolean));
@@ -51792,9 +51795,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const _bSales = (list) => { let s = 0; (list || []).forEach(t => _getSos(t).forEach(so => { if (!_assignedSo.has(so)) { _assignedSo.add(so); s += salesBySo[so] || 0; } })); return s; };
         const salesFTL = _bSales(P.trucks), salesLTL = _bSales(P.ltl), salesDed = _bSales(P.dedicated), salesMan = _bSales(P.manual), salesNeed = _bSales(P.needsDc);
         const salesPlanned = salesFTL + salesLTL + salesDed + salesMan + salesNeed;
-        // Scoped to the selected origin — the plan below only covers that origin, so
-        // totalling every order here put the other warehouse into "excluded".
-        const _ordersScope = (orders || []).filter(o => _frOrigin === 'ALL' || !_frOrigin || String(o.ship_from || '').trim() === _frOrigin);
+        // Origin-scoped (declared above): the plan only covers the selected origin,
+        // so totalling every order here put the other warehouse into "excluded".
         const salesAll = _ordersScope.reduce((a, o) => a + (Number(o.sales) || 0), 0);
         const salesExcluded = salesAll - salesPlanned;
         // SCHEDULED — column T on the analyst's file. Any non-empty, non-"no"
