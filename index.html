@@ -51705,9 +51705,17 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const _soSalesMap = {}; _ordersScope.forEach(o => { if (o.so_num) _soSalesMap[o.so_num] = (_soSalesMap[o.so_num] || 0) + (Number(o.sales) || 0); });
         const _listSales = (list) => { const seen = new Set(); let v = 0;
           (list || []).forEach(t => _sosOf(t).forEach(so => { if (!seen.has(so)) { seen.add(so); v += _soSalesMap[so] || 0; } })); return v; };
-        const _oppSalesTot = (() => { const seen = new Set(); let v = 0;
-          (_oppRowsAll || []).forEach(r => (r.sos || r.shipments || []).forEach(so => { if (!seen.has(so)) { seen.add(so); v += _soSalesMap[so] || 0; } }));
-          return v || _listSales(pendingAccept); })();
+        // Consolidation dollars come from the OPPORTUNITY GROUPS themselves — anchor
+        // plus members — not from pendingAccept. _oppRowsAll only carries dcs/custs/
+        // date, so the old lookup found no SOs and silently fell back to a different
+        // set of trucks, leaving the held ones in no section at all. Those trucks are
+        // flagged _oppHold, which excludes them from visibleAll and therefore from
+        // every other bucket, so they went missing from the totals entirely.
+        const _oppTrucksAll = [
+          ...(window._frOppGroups || []).flatMap(gp => [gp.anchor, ...gp.members.map(m2 => m2.truck)]),
+          ...acceptRows.map(ar => ar.t),
+        ].filter(Boolean);
+        const _oppSalesTot = _listSales(_oppTrucksAll);
         const _dol = (v) => '$' + Math.round(v || 0).toLocaleString();
         // Every scheduled PO, and the ones NOT covered by a fully-scheduled truck —
         // they sit on part-scheduled trucks or were never routed. Showing both is
@@ -51960,31 +51968,34 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
               ['Already booked', _listSales(bookedTrucks)],
               ['Held from plan', (heldOrders || []).reduce((a2, o) => a2 + (Number(o.sales) || 0), 0)],
               ['Scheduled for pickup', _schedAllSales],
-            ].filter(r => Math.round(r[1]) !== 0);
+            ].filter(r => r[0] !== 'Scheduled for pickup' && Math.round(r[1]) !== 0);
             const shown2 = rows2.reduce((a2, r) => a2 + r[1], 0);
-            const target = salesPlanned;   // booked freight, before subtracting scheduled
-            const gap = target - (shown2 - _schedAllSales);
+            // Sections already exclude scheduled trucks, so the thing they should add
+            // up to is ADJUSTED FOR BOOKING, not booked freight.
+            const target = salesPlanned - _schedAllSales;
+            const gap = target - shown2;
             // Name the gap instead of just sizing it: which trucks appear in none of
             // the sections above, and which routed SOs no section claims.
-            const _inSections = new Set([...visibleTrucks, ...pendingAccept, ...(P.dedicated || []), ...adjTrucks,
+            const _inSections = new Set([...visibleTrucks, ...pendingAccept, ..._oppTrucksAll, ...(P.dedicated || []), ...adjTrucks,
                                          ...indepTrucks, ...bookedTrucks, ...schedTrucksList].flatMap(_sosOf));
             const _orphanSos = [...new Set([...(P.trucks || []), ...(P.ltl || []), ...(P.dedicated || [])].flatMap(_sosOf))]
-              .filter(so => !_inSections.has(so));
+              .filter(so => !_inSections.has(so) && !_schedSoSet.has(so));
             const _orphanSales = _orphanSos.reduce((a2, so) => a2 + (_soSalesMap[so] || 0), 0);
             return `<details style="margin-top:16px;border:1px solid var(--rule-soft);border-radius:6px;padding:10px 14px;">
               <summary style="cursor:pointer;font-family:var(--serif);font-size:14px;">Where the dollars sit${Math.abs(gap) > 1 ? ` <span style="font-family:var(--mono);font-size:11px;color:#b8860b;">${_dol(Math.abs(gap))} unaccounted</span>` : ` <span style="font-family:var(--mono);font-size:11px;color:#2f6b3f;">balanced</span>`}</summary>
-              <table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:10px;">
+              <table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:10px;font-variant-numeric:tabular-nums;">
+                <colgroup><col><col style="width:160px;"></colgroup>
                 <tbody>${rows2.map(r => `<tr style="border-top:1px solid var(--rule-softer);">
-                  <td style="padding:5px 9px;${r[0] === 'Scheduled for pickup' ? 'color:var(--ink-3);' : ''}">${r[0] === 'Scheduled for pickup' ? 'of which scheduled for pickup' : escapeHtml(r[0])}</td>
-                  <td style="padding:5px 9px;text-align:right;font-family:var(--mono);${r[0] === 'Scheduled for pickup' ? 'color:var(--ink-3);' : ''}">${_dol(r[1])}</td></tr>`).join('')}
+                  <td style="padding:5px 9px;">${escapeHtml(r[0])}</td>
+                  <td style="padding:5px 9px;text-align:right;font-family:var(--mono);">${_dol(r[1])}</td></tr>`).join('')}
                   <tr style="border-top:2px solid var(--ink);"><td style="padding:6px 9px;font-family:var(--mono);font-weight:700;text-transform:uppercase;">Sections total</td>
-                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${_dol(shown2 - _schedAllSales)}</td></tr>
-                  <tr><td style="padding:5px 9px;color:var(--ink-3);">Booked freight (FTL + LTL + Dedicated)</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${_dol(shown2)}</td></tr>
+                  <tr><td style="padding:5px 9px;color:var(--ink-3);">Adjusted for booking (booked ${_dol(salesPlanned)} − scheduled ${_dol(_schedAllSales)})</td>
                   <td style="padding:5px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">${_dol(target)}</td></tr>
                   ${Math.abs(gap) > 1 ? `<tr><td style="padding:5px 9px;color:#b8860b;" title="${escapeHtml(_orphanSos.slice(0, 60).join(', '))}">Unaccounted${_orphanSos.length ? ` — ${_orphanSos.length} PO${_orphanSos.length === 1 ? '' : 's'} on planned trucks that no section lists (hover for SOs)` : ' — planned freight not represented in any section above'}</td>
                   <td style="padding:5px 9px;text-align:right;font-family:var(--mono);color:#b8860b;">${_dol(gap)}</td></tr>` : ''}
                 </tbody></table>
-              <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-top:8px;">Scheduled for pickup is a subset of the rows above it, so it isn't added into the sections total.</div>
+              <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-top:8px;">Scheduled trucks are already out of every section above, so these should sum to <b>Adjusted for booking</b> in the reconciliation below.</div>
             </details>`;
           })()}
 
