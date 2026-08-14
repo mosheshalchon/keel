@@ -51664,7 +51664,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         // routed — they're pulled out into their own section below Manual
         // adjustments. Only FULLY scheduled trucks move: a truck carrying one
         // scheduled and one unscheduled PO still needs booking for the rest.
-        const _schedSoSet = new Set((orders || [])
+        const _ordersScopeEarly = (orders || []).filter(o => _frOrigin === 'ALL' || !_frOrigin || String(o.ship_from || '').trim() === _frOrigin);
+        const _schedSoSet = new Set(_ordersScopeEarly
           .filter(o => { const v = String(o.scheduled == null ? '' : o.scheduled).trim().toLowerCase();
                          return v && !['no', 'n', 'false', '0', '-'].includes(v); })
           .map(o => o.so_num).filter(Boolean));
@@ -51698,7 +51699,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const acceptRows = pendingAccept.map(t => ({ t, save: multiStopSavings(t) })).sort((a2, b2) => ((b2.save || 0) - (a2.save || 0)) || (a2.t.minShip || '').localeCompare(b2.t.minShip || ''));
         const _oppRowsAll = [...(window._frOppGroups || []).map(gp => { const us = [gp.anchor, ...gp.members.map(m2 => m2.truck)]; return { dcs: [...new Set(us.flatMap(u => u.stops.map(x => x.dc).filter(Boolean)))], custs: [...new Set(us.flatMap(u => u.stops.map(x => _frCustShort(x.customer)).filter(Boolean)))], date: gp.ship || '' }; }), ...acceptRows.map(ar => ({ dcs: [...new Set(ar.t.stops.map(x => x.dc).filter(Boolean))], custs: [...new Set(ar.t.stops.map(x => _frCustShort(x.customer)).filter(Boolean))], date: ar.t.minShip || '' }))];
         const oppDcOpts = [...new Set(_oppRowsAll.flatMap(r => r.dcs))].sort();
-        const _soSalesMap = {}; (orders || []).forEach(o => { if (o.so_num) _soSalesMap[o.so_num] = (_soSalesMap[o.so_num] || 0) + (Number(o.sales) || 0); });
+        const _soSalesMap = {}; _ordersScope.forEach(o => { if (o.so_num) _soSalesMap[o.so_num] = (_soSalesMap[o.so_num] || 0) + (Number(o.sales) || 0); });
         const _listSales = (list) => { const seen = new Set(); let v = 0;
           (list || []).forEach(t => _sosOf(t).forEach(so => { if (!seen.has(so)) { seen.add(so); v += _soSalesMap[so] || 0; } })); return v; };
         const _oppSalesTot = (() => { const seen = new Set(); let v = 0;
@@ -51708,7 +51709,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         // Every scheduled PO, and the ones NOT covered by a fully-scheduled truck —
         // they sit on part-scheduled trucks or were never routed. Showing both is
         // what makes this section tie to Less: Scheduled in the reconciliation.
-        const _schedAllSos = new Set((orders || []).filter(o => o.so_num && _schedSoSet.has(o.so_num)).map(o => o.so_num));
+        const _schedAllSos = new Set(_ordersScope.filter(o => o.so_num && _schedSoSet.has(o.so_num)).map(o => o.so_num));
         const _schedAllSales = [..._schedAllSos].reduce((a2, so) => a2 + (_soSalesMap[so] || 0), 0);
         const _schedCovered = new Set(schedTrucksList.flatMap(_sosOf));
         const _schedLoose = [..._schedAllSos].filter(so => !_schedCovered.has(so)).sort();
@@ -51791,7 +51792,10 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const _bSales = (list) => { let s = 0; (list || []).forEach(t => _getSos(t).forEach(so => { if (!_assignedSo.has(so)) { _assignedSo.add(so); s += salesBySo[so] || 0; } })); return s; };
         const salesFTL = _bSales(P.trucks), salesLTL = _bSales(P.ltl), salesDed = _bSales(P.dedicated), salesMan = _bSales(P.manual), salesNeed = _bSales(P.needsDc);
         const salesPlanned = salesFTL + salesLTL + salesDed + salesMan + salesNeed;
-        const salesAll = (orders || []).reduce((a, o) => a + (Number(o.sales) || 0), 0);
+        // Scoped to the selected origin — the plan below only covers that origin, so
+        // totalling every order here put the other warehouse into "excluded".
+        const _ordersScope = (orders || []).filter(o => _frOrigin === 'ALL' || !_frOrigin || String(o.ship_from || '').trim() === _frOrigin);
+        const salesAll = _ordersScope.reduce((a, o) => a + (Number(o.sales) || 0), 0);
         const salesExcluded = salesAll - salesPlanned;
         // SCHEDULED — column T on the analyst's file. Any non-empty, non-"no"
         // value counts as scheduled for pickup. Totals are computed from the ORDER
@@ -51802,7 +51806,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           const v = String(o.scheduled == null ? '' : o.scheduled).trim().toLowerCase();
           return v !== '' && v !== 'no' && v !== 'n' && v !== 'false' && v !== '0' && v !== '-';
         };
-        const schedOrders = (orders || []).filter(_isSched);
+        const schedOrders = _ordersScope.filter(_isSched);
         // Diagnostic: a silent zero here is ambiguous — no column, column present but
         // empty, or genuinely nothing scheduled. Log which, once per render.
         try {
@@ -51834,7 +51838,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         // EXCLUDED — pickup / 3PL / not-serviced. These orders are real Pending
         // Fulfillment but were never routed, so they have no truck and therefore no
         // weight or pallets. Cases come straight off the unassigned order rows.
-        const _exOrders = (orders || []).filter(o => !o.so_num || !_assignedSo.has(o.so_num));
+        const _exOrders = _ordersScope.filter(o => !o.so_num || !_assignedSo.has(o.so_num));
         const exCases = _exOrders.reduce((a2, o) => a2 + (Number(o.cases_ordered) || 0), 0);
         const exSos = new Set(_exOrders.map(o => o.so_num).filter(Boolean));
 
@@ -51958,6 +51962,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             const shown2 = rows2.reduce((a2, r) => a2 + r[1], 0);
             const target = salesPlanned;   // booked freight, before subtracting scheduled
             const gap = target - (shown2 - _schedAllSales);
+            // Name the gap instead of just sizing it: which trucks appear in none of
+            // the sections above, and which routed SOs no section claims.
+            const _inSections = new Set([...visibleTrucks, ...pendingAccept, ...(P.dedicated || []), ...adjTrucks,
+                                         ...indepTrucks, ...bookedTrucks, ...schedTrucksList].flatMap(_sosOf));
+            const _orphanSos = [...new Set([...(P.trucks || []), ...(P.ltl || []), ...(P.dedicated || [])].flatMap(_sosOf))]
+              .filter(so => !_inSections.has(so));
+            const _orphanSales = _orphanSos.reduce((a2, so) => a2 + (_soSalesMap[so] || 0), 0);
             return `<details style="margin-top:16px;border:1px solid var(--rule-soft);border-radius:6px;padding:10px 14px;">
               <summary style="cursor:pointer;font-family:var(--serif);font-size:14px;">Where the dollars sit${Math.abs(gap) > 1 ? ` <span style="font-family:var(--mono);font-size:11px;color:#b8860b;">${_dol(Math.abs(gap))} unaccounted</span>` : ` <span style="font-family:var(--mono);font-size:11px;color:#2f6b3f;">balanced</span>`}</summary>
               <table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:10px;">
@@ -51968,7 +51979,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                   <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${_dol(shown2 - _schedAllSales)}</td></tr>
                   <tr><td style="padding:5px 9px;color:var(--ink-3);">Booked freight (FTL + LTL + Dedicated)</td>
                   <td style="padding:5px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">${_dol(target)}</td></tr>
-                  ${Math.abs(gap) > 1 ? `<tr><td style="padding:5px 9px;color:#b8860b;">Unaccounted — trucks in no section above</td>
+                  ${Math.abs(gap) > 1 ? `<tr><td style="padding:5px 9px;color:#b8860b;" title="${escapeHtml(_orphanSos.slice(0, 60).join(', '))}">Unaccounted${_orphanSos.length ? ` — ${_orphanSos.length} PO${_orphanSos.length === 1 ? '' : 's'} on planned trucks that no section lists (hover for SOs)` : ' — planned freight not represented in any section above'}</td>
                   <td style="padding:5px 9px;text-align:right;font-family:var(--mono);color:#b8860b;">${_dol(gap)}</td></tr>` : ''}
                 </tbody></table>
               <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-top:8px;">Scheduled for pickup is a subset of the rows above it, so it isn't added into the sections total.</div>
