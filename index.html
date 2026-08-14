@@ -43380,7 +43380,8 @@ render();
       <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
         <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">
           ${m ? `New-item submissions for <b>${scopeNote}</b>` : 'All open new-item submissions'} · created and edited on the Submissions page</div>
-        <span>${m && all.some(s2 => !s2.category_review_id) ? `<button id="hl-rv-link" class="hl-btn-secondary" style="font-size:11px;margin-right:8px;">Link these to this review</button>` : ''}
+        <span>${m ? `<button id="hl-rv-newsub" class="hl-btn-primary" style="font-size:11px;margin-right:8px;">+ Submission for this review</button>` : ''}
+        ${m && all.some(s2 => !s2.category_review_id) ? `<button id="hl-rv-link" class="hl-btn-secondary" style="font-size:11px;margin-right:8px;">Link these to this review</button>` : ''}
         <a href="#submission-docs" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Open Submissions →</a></span>
       </div>
       ${counts.size ? `<div style="margin-bottom:12px;">
@@ -43408,6 +43409,34 @@ render();
           </tr>`;
         }).join('')}</tbody></table></div>`
         : `<div style="text-align:center;padding:40px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">No open submissions${m ? ' for ' + _brEsc(m.retailer) : ''}.</div>`}`;
+
+    // Creating from here pre-binds retailer, category and review, and takes the
+    // submission due date from the review's own date — the point of adding it
+    // here rather than on the Submissions page.
+    const newSubBtn = document.getElementById('hl-rv-newsub');
+    if (newSubBtn) newSubBtn.addEventListener('click', async () => {
+      if (!m.category_review_id) { alert('This meeting has no review behind it, so a submission can\u2019t be tied to one.'); return; }
+      const rev = _rvReviews.find(x => x.id === m.category_review_id) || {};
+      const label = `${m.category || 'Item'} \u2014 pending items`;
+      if (!confirm(`Add a submission to this review?\n\n${m.retailer}${m.category ? ' · ' + m.category : ''} · ${_brDate(m.meeting_date)}\n\nIt'll be created as "${label}" — open it afterwards to pick the products.`)) return;
+      newSubBtn.disabled = true; newSubBtn.textContent = 'Adding…';
+      const { data, error } = await sb.from('timeline_entries').insert({
+        brand_id: brandId, retailer: m.retailer, category: m.category || null,
+        item_description: label, product_name: label,
+        category_review_id: m.category_review_id,
+        submission_due: rev.submissions_due_by || rev.review_start_date || m.meeting_date || null,
+        reset_date: rev.reset_start_date || null,
+        status: 'upcoming',
+        owner_email: (window.Auth.getSession() || {}).email || null,
+        updated_by: (window.Auth.getSession() || {}).email || null,
+      }).select().single();
+      if (error) {
+        alert('Could not add: ' + error.message);
+        newSubBtn.disabled = false; newSubBtn.textContent = '+ Submission for this review';
+        return;
+      }
+      window.location.hash = `#submission-docs?id=${data.id}`;
+    });
 
     const linkBtn = document.getElementById('hl-rv-link');
     if (linkBtn) linkBtn.addEventListener('click', async () => {
@@ -43457,38 +43486,63 @@ render();
     _brRenderPhase(host, brandId, sb, m, which);
   }
 
+  // Pick a REVIEW, not a retailer. Everything downstream — prep, feedback,
+  // follow-ups, submissions — hangs off retailer + category + date, so choosing
+  // only a retailer would leave the meeting unable to say which review it is.
   async function _brNewMeeting(brandId, sb) {
-    const retailers = [...new Set(_brState.meetings.map(m => m.retailer))].sort();
+    // Reviews from the calendar that don't have a meeting yet.
+    const taken = new Set(_brState.meetings.map(m => m.category_review_id).filter(Boolean));
+    const free = _rvReviews.filter(r => !taken.has(r.id) && r.review_start_date)
+      .sort((a, b) => String(b.review_start_date).localeCompare(String(a.review_start_date)));
+
     let libRetailers = [];
     try {
       const { data } = await sb.from('retailers').select('name').eq('brand_id', brandId).order('name');
       libRetailers = [...new Set((data || []).map(r => r.name).filter(Boolean))];
-    } catch (e) { /* fall back to what's already on meetings */ }
-    const list = libRetailers.length ? libRetailers : retailers;
+    } catch (e) { /* fall back to what's on existing reviews */ }
+    if (!libRetailers.length) libRetailers = [...new Set(_rvReviews.map(r => r.key_account))].sort();
+    const cats = [...new Set(_rvReviews.map(r => r.category).filter(Boolean))].sort();
+    const inp = 'width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);';
+    const lbl = (t) => `<div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">${t}</div>`;
 
     document.getElementById('hl-br-modal')?.remove();
     document.body.insertAdjacentHTML('beforeend', `
       <div id="hl-br-modal" style="position:fixed;inset:0;background:rgba(20,16,12,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;">
-        <div style="background:var(--paper);border-radius:12px;max-width:520px;width:100%;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
+        <div style="background:var(--paper);border-radius:12px;max-width:560px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.35);">
           <div style="padding:16px 20px;border-bottom:1px solid var(--rule-soft);font-family:var(--serif);font-size:19px;">New meeting</div>
           <div style="padding:18px 20px;">
-            <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Retailer *</div>
-            <input list="hl-br-rets" id="hl-br-ret" placeholder="Start typing…" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);margin-bottom:14px;">
-            <datalist id="hl-br-rets">${list.map(r => `<option value="${_brEsc(r)}"></option>`).join('')}</datalist>
+            ${free.length ? `
+              ${lbl('Review from the calendar')}
+              <select id="hl-br-pickrev" style="${inp}margin-bottom:6px;">
+                <option value="">— choose a scheduled review —</option>
+                ${free.map(r => `<option value="${r.id}">${_brEsc(r.key_account)}${r.category ? ' · ' + _brEsc(r.category) : ''} · ${_brDate(r.review_start_date)}</option>`).join('')}
+              </select>
+              <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-bottom:14px;">${free.length} scheduled review${free.length === 1 ? '' : 's'} without a meeting yet.</div>
+              <div style="display:flex;align-items:center;gap:10px;margin:4px 0 14px;">
+                <div style="flex:1;height:1px;background:var(--rule-soft);"></div>
+                <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">or add one that isn't on the calendar</span>
+                <div style="flex:1;height:1px;background:var(--rule-soft);"></div>
+              </div>` : ''}
+            ${lbl('Retailer *')}
+            <input list="hl-br-rets" id="hl-br-ret" placeholder="Start typing…" style="${inp}margin-bottom:14px;">
+            <datalist id="hl-br-rets">${libRetailers.map(r => `<option value="${_brEsc(r)}"></option>`).join('')}</datalist>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
-              <div>
-                <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Date *</div>
-                <input type="date" id="hl-br-date" value="${_brToday()}" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);margin-bottom:14px;">
+              <div>${lbl('Category *')}
+                <input list="hl-br-cats" id="hl-br-cat" placeholder="e.g. Pizzas" style="${inp}margin-bottom:14px;">
+                <datalist id="hl-br-cats">${cats.map(c => `<option value="${_brEsc(c)}"></option>`).join('')}</datalist>
               </div>
-              <div>
-                <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Type</div>
-                <select id="hl-br-type" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);margin-bottom:14px;">
-                  ${BR_TYPES.map(t => `<option value="${t[0]}">${t[1]}</option>`).join('')}
-                </select>
+              <div>${lbl('Review date *')}
+                <input type="date" id="hl-br-date" value="${_brToday()}" style="${inp}margin-bottom:14px;">
               </div>
             </div>
-            <div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:5px;">Buyer</div>
-            <input type="text" id="hl-br-buyer" placeholder="Optional" style="width:100%;padding:7px 10px;font-size:13px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+              <div>${lbl('Type')}
+                <select id="hl-br-type" style="${inp}margin-bottom:14px;">${BR_TYPES.map(t => `<option value="${t[0]}">${t[1]}</option>`).join('')}</select>
+              </div>
+              <div>${lbl('Buyer')}
+                <input type="text" id="hl-br-buyer" placeholder="Optional" style="${inp}">
+              </div>
+            </div>
             <div id="hl-br-err" style="font-family:var(--mono);font-size:11px;color:var(--lost);min-height:16px;margin-top:8px;"></div>
           </div>
           <div style="padding:0 20px 18px;display:flex;justify-content:flex-end;gap:10px;">
@@ -43497,18 +43551,55 @@ render();
           </div>
         </div>
       </div>`);
+
     const modal = document.getElementById('hl-br-modal');
     const close = () => modal.remove();
     modal.addEventListener('click', e => { if (e.target === modal || e.target.closest('[data-brclose]')) close(); });
-    document.getElementById('hl-br-ret').focus();
+    const err = document.getElementById('hl-br-err');
+    const pickRev = document.getElementById('hl-br-pickrev');
+
+    // Choosing a calendar review fills the manual fields, so the two paths can't
+    // silently disagree about what's being created.
+    if (pickRev) pickRev.addEventListener('change', () => {
+      const r = _rvReviews.find(x => x.id === pickRev.value);
+      const on = !!r;
+      ['hl-br-ret', 'hl-br-cat', 'hl-br-date'].forEach(id => { document.getElementById(id).disabled = on; });
+      if (!r) return;
+      document.getElementById('hl-br-ret').value = r.key_account || '';
+      document.getElementById('hl-br-cat').value = r.category || '';
+      document.getElementById('hl-br-date').value = r.review_start_date || '';
+      if (r.buyer_name) document.getElementById('hl-br-buyer').value = r.buyer_name;
+    });
+    (pickRev || document.getElementById('hl-br-ret')).focus();
+
     document.getElementById('hl-br-save').addEventListener('click', async () => {
-      const ret = document.getElementById('hl-br-ret').value.trim();
-      const date = document.getElementById('hl-br-date').value;
-      const err = document.getElementById('hl-br-err');
+      const chosen = pickRev && pickRev.value ? _rvReviews.find(x => x.id === pickRev.value) : null;
+      const ret = chosen ? chosen.key_account : document.getElementById('hl-br-ret').value.trim();
+      const cat = chosen ? (chosen.category || null) : (document.getElementById('hl-br-cat').value.trim() || null);
+      const date = chosen ? chosen.review_start_date : document.getElementById('hl-br-date').value;
       if (!ret) { err.textContent = 'Retailer is required.'; return; }
-      if (!date) { err.textContent = 'Date is required.'; return; }
+      if (!cat) { err.textContent = 'Category is required — a review is a retailer, a category and a date.'; return; }
+      if (!date) { err.textContent = 'Review date is required.'; return; }
+
+      // A meeting that isn't on the calendar still needs a review behind it, so
+      // Details stays the complete picture and next year's import lines up.
+      let reviewId = chosen ? chosen.id : null;
+      if (!reviewId) {
+        const { data: cr, error: crErr } = await sb.from('category_reviews').insert({
+          brand_id: brandId, key_account: ret, category: cat,
+          master_category: (_rvReviews.find(x => x.category === cat) || {}).master_category || null,
+          review_start_date: date, review_year: Number(String(date).slice(0, 4)) || null,
+          buyer_name: document.getElementById('hl-br-buyer').value.trim() || null,
+          source: 'manual',
+        }).select().single();
+        if (crErr) { err.textContent = 'Could not create the review: ' + crErr.message; return; }
+        reviewId = cr.id;
+        _rvReviews = [..._rvReviews, cr];
+      }
+
       const { data, error } = await sb.from('buyer_meetings').insert({
-        brand_id: brandId, retailer: ret, meeting_date: date,
+        brand_id: brandId, retailer: ret, category: cat, meeting_date: date,
+        category_review_id: reviewId,
         meeting_type: document.getElementById('hl-br-type').value,
         buyer_name: document.getElementById('hl-br-buyer').value.trim() || null,
         status: date > _brToday() ? 'scheduled' : 'held',
