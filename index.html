@@ -51658,7 +51658,11 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const _isSchedTruck = (t) => { const so = _sosOf(t); return so.length > 0 && so.every(x => _schedSoSet.has(x)); };
 
         const visibleAll = allTrucks.filter(t => !t._oppHold && !apprOf(sigOf(t)).booked_at);
-        const schedTrucksList = visibleAll.filter(_isSchedTruck);
+        // Across ALL trucks, not just the ones still queued for routing — a fully
+        // scheduled truck that's held or already booked still belongs in this list,
+        // and leaving it out is why the section showed 1 truck against the
+        // reconciliation's 3.
+        const schedTrucksList = allTrucks.filter(_isSchedTruck);
         const _isOwnT = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
         const pendingAccept = visibleAll.filter(t => !_isSchedTruck(t) && !_isOwnT(t) && t.stops.length > 1 && !apprMap[sigOf(t)]);
         const _userShapedT = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return _isOwnT(t) || sos.some(so => /^(with:|own:)/.test(String(moveMap[so] || ''))); };
@@ -51686,6 +51690,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           (_oppRowsAll || []).forEach(r => (r.sos || r.shipments || []).forEach(so => { if (!seen.has(so)) { seen.add(so); v += _soSalesMap[so] || 0; } }));
           return v || _listSales(pendingAccept); })();
         const _dol = (v) => '$' + Math.round(v || 0).toLocaleString();
+        // Every scheduled PO, and the ones NOT covered by a fully-scheduled truck —
+        // they sit on part-scheduled trucks or were never routed. Showing both is
+        // what makes this section tie to Less: Scheduled in the reconciliation.
+        const _schedAllSos = new Set((orders || []).filter(o => o.so_num && _schedSoSet.has(o.so_num)).map(o => o.so_num));
+        const _schedAllSales = [..._schedAllSos].reduce((a2, so) => a2 + (_soSalesMap[so] || 0), 0);
+        const _schedCovered = new Set(schedTrucksList.flatMap(_sosOf));
+        const _schedLoose = [..._schedAllSos].filter(so => !_schedCovered.has(so)).sort();
 
         const oppCustOpts = [...new Set(_oppRowsAll.flatMap(r => r.custs))].sort();
         const oppDateOpts = [...new Set(_oppRowsAll.map(r => r.date).filter(Boolean))].sort();
@@ -51901,9 +51912,9 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             </div>`;
           })()}
 
-          ${schedTrucksList.length ? `<div style="border:1px solid rgba(46,125,50,0.3);background:rgba(46,125,50,0.05);border-radius:6px;padding:12px 14px;margin-top:14px;">
-            <div style="font-family:var(--serif);font-size:16px;margin-bottom:2px;">Scheduled for pickup (${schedTrucksList.length}) <span style="font-family:var(--mono);font-size:13px;color:var(--ink-3);">${_dol(_listSales(schedTrucksList))}</span></div>
-            <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-bottom:10px;">Already booked with a carrier — out of Consolidation opportunities and Get a Quote so they don't ask to be routed again. A truck only lands here when every PO on it is scheduled.</div>
+          ${(schedTrucksList.length || _schedAllSos.size) ? `<div style="border:1px solid rgba(46,125,50,0.3);background:rgba(46,125,50,0.05);border-radius:6px;padding:12px 14px;margin-top:14px;">
+            <div style="font-family:var(--serif);font-size:16px;margin-bottom:2px;">Scheduled for pickup <span style="font-family:var(--mono);font-size:13px;color:var(--ink-3);">${_schedAllSos.size} PO${_schedAllSos.size === 1 ? '' : 's'} · ${_dol(_schedAllSales)}</span></div>
+            <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-bottom:10px;">Already booked with a carrier, so they're out of Consolidation opportunities and Get a Quote. Ties to <b>Less: Scheduled for pickup</b> in the reconciliation below.</div>
             <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
               <thead><tr style="background:rgba(46,125,50,0.08);">
                 ${['Truck', 'Destination', 'POs', 'Cases', 'Pallets', 'Weight', '$ Sales', 'Ship date'].map((h2, i2) => `<th style="padding:6px 9px;text-align:${i2 > 1 ? 'right' : 'left'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;">${h2}</th>`).join('')}
@@ -51924,6 +51935,24 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                   <td style="padding:6px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">${escapeHtml(String(date).slice(0, 10))}</td>
                 </tr>`;
               }).join('')}</tbody>
+              <tfoot>
+                ${_schedLoose.length ? `<tr style="border-top:1px solid var(--rule-soft);">
+                  <td style="padding:6px 9px;font-family:var(--mono);color:var(--ink-3);">—</td>
+                  <td style="padding:6px 9px;color:var(--ink-3);" title="${escapeHtml(_schedLoose.join(', '))}">On part-scheduled trucks, or not routed</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">${_schedLoose.length}</td>
+                  <td colspan="3"></td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">${_dol(_schedLoose.reduce((a2, so) => a2 + (_soSalesMap[so] || 0), 0))}</td>
+                  <td></td>
+                </tr>` : ''}
+                <tr style="border-top:2px solid var(--ink);">
+                  <td style="padding:7px 9px;font-family:var(--mono);font-weight:700;text-transform:uppercase;">Total</td>
+                  <td></td>
+                  <td style="padding:7px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${_schedAllSos.size}</td>
+                  <td colspan="3"></td>
+                  <td style="padding:7px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${_dol(_schedAllSales)}</td>
+                  <td></td>
+                </tr>
+              </tfoot>
             </table></div>
           </div>` : ''}
 
