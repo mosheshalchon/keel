@@ -43120,7 +43120,7 @@ render();
       body.innerHTML = `<div class="hl-loading">Reading “${_brEsc(f.name)}”…</div>`;
       try {
         const res = await _rvImportTemplate(f, brandId, sb);
-        alert(`Imported ${res.rows} review rows · ${res.meetings} meetings created.`);
+        alert(`Imported ${res.rows} review rows for ${(res.years || []).join(', ') || 'no year'} · ${res.meetings} meetings created.\n\nOther years were left untouched.`);
         const { data } = await sb.from('category_reviews').select('*').eq('brand_id', brandId).order('review_start_date');
         _rvReviews = data || [];
         await loadBuyerReviews(brandId, sb);
@@ -43193,6 +43193,7 @@ render();
         review_status: g(r, ci.status) || null, category_comments: g(r, ci.comments) || null,
         anchor_accounts: g(r, ci.anchor) || null,
         review_start_date: rev, reset_start_date: rst,
+        review_year: Number(String(rev || rst).slice(0, 4)) || null,
         retailer_update: g(r, ci.upd) || null, buyer_name: g(r, ci.buyer) || null,
         retailer_address: g(r, ci.addr) || null, conv_nat: g(r, ci.cn) || null,
         region: g(r, ci.region) || null,
@@ -43203,30 +43204,36 @@ render();
     }
     if (!rows.length) throw new Error('No rows with a Key Account');
 
-    // The template is a full snapshot, so replace rather than upsert. Avoids
-    // depending on a conflict target — the unique index uses coalesce()
-    // expressions, which Postgres won't accept as an ON CONFLICT spec.
-    const del = await sb.from('category_reviews').delete().eq('brand_id', brandId);
-    if (del.error) throw del.error;
+    // Replace only the YEARS this file covers. Reviews are annual and repeating,
+    // so wiping the table would throw away last year's record — but re-importing
+    // the same year must not duplicate it either.
+    const years = [...new Set(rows.map(r => r.review_year).filter(Boolean))];
+    if (years.length) {
+      const del = await sb.from('category_reviews').delete().eq('brand_id', brandId).in('review_year', years);
+      if (del.error) throw del.error;
+    }
     for (let i = 0; i < rows.length; i += 400) {
       const { error } = await sb.from('category_reviews').insert(rows.slice(i, i + 400));
       if (error) throw error;
     }
 
-    // Every dated review gets a scheduled meeting, so prep/feedback/follow-ups
-    // have something to attach to. Skipped when one already exists for that
-    // retailer + date, so re-importing doesn't duplicate.
-    const existing = new Set(_brState.meetings.map(m => `${m.retailer}|${m.meeting_date}`));
+    // ONE MEETING PER CATEGORY. Harmons reviewing Entrees and Pizzas on the same
+    // day is two reviews and two meetings — the feedback differs. Keyed on
+    // retailer + category + date so a re-import doesn't duplicate, and linked
+    // back by category_review_id so every tab can find its review.
+    const saved = await sb.from('category_reviews').select('id, key_account, category, review_start_date, buyer_name')
+      .eq('brand_id', brandId).in('review_year', years.length ? years : [-1]);
+    const existing = new Set(_brState.meetings.map(m => `${m.retailer}|${m.category || ''}|${m.meeting_date}`));
     const newMeetings = [];
-    for (const r of rows) {
+    for (const r of (saved.data || [])) {
       if (!r.review_start_date) continue;
-      const key = `${r.key_account}|${r.review_start_date}`;
+      const key = `${r.key_account}|${r.category || ''}|${r.review_start_date}`;
       if (existing.has(key)) continue;
       existing.add(key);
       newMeetings.push({
         brand_id: brandId, retailer: r.key_account, meeting_date: r.review_start_date,
         meeting_type: 'category_review', category: r.category || null,
-        buyer_name: r.buyer_name || null, source: 'calendar',
+        category_review_id: r.id, buyer_name: r.buyer_name || null, source: 'calendar',
         status: r.review_start_date > _brToday() ? 'scheduled' : 'held',
       });
     }
@@ -43234,11 +43241,12 @@ render();
       const { error } = await sb.from('buyer_meetings').insert(newMeetings);
       if (error) console.warn('[reviews] meeting creation failed', error);
     }
-    return { rows: rows.length, meetings: newMeetings.length };
+    return { rows: rows.length, meetings: newMeetings.length, years };
   }
 
   function _rvOpenReview(r, brandId, sb) {
-    const m = _brState.meetings.find(x => x.retailer === r.key_account && x.meeting_date === r.review_start_date);
+    const m = _brState.meetings.find(x => x.category_review_id === r.id)
+          || _brState.meetings.find(x => x.retailer === r.key_account && (x.category || '') === (r.category || '') && x.meeting_date === r.review_start_date);
     if (!m) { alert('No meeting record for that review yet — re-import the calendar to create one.'); return; }
     _brState.openId = m.id;
     _rvTab = 'prep';
@@ -43336,7 +43344,19 @@ render();
       .eq('brand_id', brandId).order('submission_due', { ascending: true });
     if (error) { body.innerHTML = `<div class="hl-empty" style="color:var(--lost);">${_brEsc(error.message)}</div>`; return; }
     let all = (data || []).filter(s2 => !s2.archived);
-    if (m) all = all.filter(s2 => s2.retailer === m.retailer);
+    // Scope to the REVIEW, not just the account. A submission is linked once
+    // (category_review_id); until then we match on retailer + category, which is
+    // what the review is. Falling back to retailer-only would put Gluten Free
+    // items in the Frozen/Pizzas review.
+    let scopeNote = '';
+    if (m) {
+      const linked = all.filter(s2 => s2.category_review_id && s2.category_review_id === m.category_review_id);
+      const guessed = all.filter(s2 => !s2.category_review_id && s2.retailer === m.retailer
+        && (!m.category || !s2.category || String(s2.category).toLowerCase() === String(m.category).toLowerCase()));
+      all = [...linked, ...guessed];
+      scopeNote = m.category ? `${_brEsc(m.retailer)} · ${_brEsc(m.category)} · ${_brDate(m.meeting_date)}` : _brEsc(m.retailer);
+      if (guessed.length) scopeNote += ` <span style="color:var(--ink-4);">(${guessed.length} matched by category, not yet linked)</span>`;
+    }
 
     // Stage pills need the shared stage definitions; ask once and redraw when
     // they land rather than blocking the table on a fetch.
@@ -43359,8 +43379,9 @@ render();
     body.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
         <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">
-          ${m ? `New-item submissions for <b>${_brEsc(m.retailer)}</b>` : 'All open new-item submissions'} · created and edited on the Submissions page</div>
-        <a href="#submission-docs" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Open Submissions →</a>
+          ${m ? `New-item submissions for <b>${scopeNote}</b>` : 'All open new-item submissions'} · created and edited on the Submissions page</div>
+        <span>${m && all.some(s2 => !s2.category_review_id) ? `<button id="hl-rv-link" class="hl-btn-secondary" style="font-size:11px;margin-right:8px;">Link these to this review</button>` : ''}
+        <a href="#submission-docs" style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Open Submissions →</a></span>
       </div>
       ${counts.size ? `<div style="margin-bottom:12px;">
         <div class="hl-filter-label">STAGE</div>
@@ -43387,6 +43408,17 @@ render();
           </tr>`;
         }).join('')}</tbody></table></div>`
         : `<div style="text-align:center;padding:40px;font-family:var(--serif);font-style:italic;color:var(--ink-3);background:var(--bone-2);border-radius:8px;">No open submissions${m ? ' for ' + _brEsc(m.retailer) : ''}.</div>`}`;
+
+    const linkBtn = document.getElementById('hl-rv-link');
+    if (linkBtn) linkBtn.addEventListener('click', async () => {
+      const ids = all.filter(s2 => !s2.category_review_id).map(s2 => s2.id);
+      if (!ids.length || !m || !m.category_review_id) { alert('Nothing to link — this meeting has no review row behind it.'); return; }
+      if (!confirm(`Link ${ids.length} submission(s) to this review?\n\nThey'll stay attached even if the category or retailer name changes later.`)) return;
+      linkBtn.disabled = true; linkBtn.textContent = 'Linking…';
+      const { error } = await sb.from('timeline_entries').update({ category_review_id: m.category_review_id }).in('id', ids);
+      if (error) { alert('Could not link: ' + error.message); linkBtn.disabled = false; linkBtn.textContent = 'Link these to this review'; return; }
+      _rvSubmissions(body, brandId, sb);
+    });
 
     body.querySelectorAll('[data-rvss]').forEach(b => b.addEventListener('click', () => {
       _rvSubStage = b.dataset.rvss || null;
