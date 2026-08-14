@@ -51644,12 +51644,26 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           if (a && !b) a.flags.push(moveMap[target] === 'hold' ? 'manual move: target order ' + target + ' is held from plan — clear its hold to combine' : 'manual move: target order ' + target + ' is no longer in the plan');
         });
         const bookedTrucks = allTrucks.filter(t => apprOf(sigOf(t)).booked_at && !t._oppHold);
+        // SCHEDULED FOR PICKUP. These POs are already booked with a carrier, so they
+        // shouldn't sit in Consolidation opportunities or Get a Quote asking to be
+        // routed — they're pulled out into their own section below Manual
+        // adjustments. Only FULLY scheduled trucks move: a truck carrying one
+        // scheduled and one unscheduled PO still needs booking for the rest.
+        const _schedSoSet = new Set((orders || [])
+          .filter(o => { const v = String(o.scheduled == null ? '' : o.scheduled).trim().toLowerCase();
+                         return v && !['no', 'n', 'false', '0', '-'].includes(v); })
+          .map(o => o.so_num).filter(Boolean));
+        const _sosOf = (t) => t.stops ? [...new Set(t.stops.flatMap(x => x.ships || []))]
+                            : (t.ships ? [...new Set(t.ships)] : (t.so_num ? [t.so_num] : []));
+        const _isSchedTruck = (t) => { const so = _sosOf(t); return so.length > 0 && so.every(x => _schedSoSet.has(x)); };
+
         const visibleAll = allTrucks.filter(t => !t._oppHold && !apprOf(sigOf(t)).booked_at);
+        const schedTrucksList = visibleAll.filter(_isSchedTruck);
         const _isOwnT = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return sos.length === 1 && moveMap[sos[0]] === 'own'; };
-        const pendingAccept = visibleAll.filter(t => !_isOwnT(t) && t.stops.length > 1 && !apprMap[sigOf(t)]);
+        const pendingAccept = visibleAll.filter(t => !_isSchedTruck(t) && !_isOwnT(t) && t.stops.length > 1 && !apprMap[sigOf(t)]);
         const _userShapedT = t => { const sos = [...new Set(t.stops.flatMap(st => st.ships || []))]; return _isOwnT(t) || sos.some(so => /^(with:|own:)/.test(String(moveMap[so] || ''))); };
-        const adjTrucks = visibleAll.filter(t => !pendingAccept.includes(t) && _userShapedT(t)); // manual-adjustment results — shown under the Manual adjustments section
-        const visibleTrucks = visibleAll.filter(t => !pendingAccept.includes(t) && !_userShapedT(t));
+        const adjTrucks = visibleAll.filter(t => !_isSchedTruck(t) && !pendingAccept.includes(t) && _userShapedT(t)); // manual-adjustment results — shown under the Manual adjustments section
+        const visibleTrucks = visibleAll.filter(t => !_isSchedTruck(t) && !pendingAccept.includes(t) && !_userShapedT(t));
         const indepTrucks = visibleAll.filter(_isOwnT);
         const oppGroups = window._frOppGroups || [];
         const oppCount = oppGroups.length;
@@ -51665,10 +51679,18 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         const acceptRows = pendingAccept.map(t => ({ t, save: multiStopSavings(t) })).sort((a2, b2) => ((b2.save || 0) - (a2.save || 0)) || (a2.t.minShip || '').localeCompare(b2.t.minShip || ''));
         const _oppRowsAll = [...(window._frOppGroups || []).map(gp => { const us = [gp.anchor, ...gp.members.map(m2 => m2.truck)]; return { dcs: [...new Set(us.flatMap(u => u.stops.map(x => x.dc).filter(Boolean)))], custs: [...new Set(us.flatMap(u => u.stops.map(x => _frCustShort(x.customer)).filter(Boolean)))], date: gp.ship || '' }; }), ...acceptRows.map(ar => ({ dcs: [...new Set(ar.t.stops.map(x => x.dc).filter(Boolean))], custs: [...new Set(ar.t.stops.map(x => _frCustShort(x.customer)).filter(Boolean))], date: ar.t.minShip || '' }))];
         const oppDcOpts = [...new Set(_oppRowsAll.flatMap(r => r.dcs))].sort();
+        const _soSalesMap = {}; (orders || []).forEach(o => { if (o.so_num) _soSalesMap[o.so_num] = (_soSalesMap[o.so_num] || 0) + (Number(o.sales) || 0); });
+        const _listSales = (list) => { const seen = new Set(); let v = 0;
+          (list || []).forEach(t => _sosOf(t).forEach(so => { if (!seen.has(so)) { seen.add(so); v += _soSalesMap[so] || 0; } })); return v; };
+        const _oppSalesTot = (() => { const seen = new Set(); let v = 0;
+          (_oppRowsAll || []).forEach(r => (r.sos || r.shipments || []).forEach(so => { if (!seen.has(so)) { seen.add(so); v += _soSalesMap[so] || 0; } }));
+          return v || _listSales(pendingAccept); })();
+        const _dol = (v) => '$' + Math.round(v || 0).toLocaleString();
+
         const oppCustOpts = [...new Set(_oppRowsAll.flatMap(r => r.custs))].sort();
         const oppDateOpts = [...new Set(_oppRowsAll.map(r => r.date).filter(Boolean))].sort();
         const oppPanel = (oppCount || nOvr || acceptRows.length) ? `<div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.3);border-radius:6px;padding:12px 14px;margin-bottom:16px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--mono);font-size:15px;font-weight:700;background:var(--ink);color:var(--paper);padding:9px 18px;border-radius:4px;display:inline-block;white-space:nowrap;">&#9889; Consolidation opportunities${(oppCount + acceptRows.length) ? ` (${oppCount + acceptRows.length})` : ''}</div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><button id="fr-rerun-plan" title="Re-optimize proposals from scratch — until then, your edits never reshuffle other rows" style="font-family:var(--mono);font-size:12px;font-weight:700;padding:9px 18px;border:1px solid var(--ink);border-radius:4px;background:var(--ink);cursor:pointer;color:var(--paper);white-space:nowrap;">⟳ Rerun plan</button>${nOvr ? `<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);" title="Undo all Combine date-changes and return those trucks to proposals">Reset consolidations (${nOvr})</button>` : ''}</div></div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:12px;flex-wrap:wrap;"><div style="font-family:var(--mono);font-size:15px;font-weight:700;background:var(--ink);color:var(--paper);padding:9px 18px;border-radius:4px;display:inline-block;white-space:nowrap;">&#9889; Consolidation opportunities${(oppCount + acceptRows.length) ? ` (${oppCount + acceptRows.length})` : ''}${_oppSalesTot ? ` <span style="font-weight:400;opacity:0.75;">${_dol(_oppSalesTot)}</span>` : ''}</div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><button id="fr-rerun-plan" title="Re-optimize proposals from scratch — until then, your edits never reshuffle other rows" style="font-family:var(--mono);font-size:12px;font-weight:700;padding:9px 18px;border:1px solid var(--ink);border-radius:4px;background:var(--ink);cursor:pointer;color:var(--paper);white-space:nowrap;">⟳ Rerun plan</button>${nOvr ? `<button id="hl-fr-reset-ovr" style="font-family:var(--mono);font-size:11px;padding:4px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;cursor:pointer;color:var(--ink);" title="Undo all Combine date-changes and return those trucks to proposals">Reset consolidations (${nOvr})</button>` : ''}</div></div>
           <div style="display:flex;gap:10px;align-items:center;margin:8px 0 10px;flex-wrap:wrap;">${_frMs('odc', 'DC', oppDcOpts)}${_frMs('ocust', 'Customer', oppCustOpts)}${_frMs('odate', 'Ship date', oppDateOpts)}</div>
           
           ${(oppCount || acceptRows.length) ? `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr>${['', 'Proposed truck', 'DC', 'Customers', 'Pallets', 'Weight (lb)', 'Ship date', 'Result', 'Action'].map((h, i) => th(h, i === 4 || i === 5 || i === 7)).join('')}</tr></thead><tbody>${oppGroups.map((g, gi) => {
@@ -51850,8 +51872,8 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           ${oppPanel}
 
           ${P.needsDc.length ? `<div style="background:rgba(184,134,11,0.08);border:1px solid rgba(184,134,11,0.3);border-radius:6px;padding:10px 14px;margin-bottom:18px;font-family:var(--sans);font-size:12px;line-height:1.5;"><b>${P.needsDc.length} shipments awaiting ship-to DC.</b> Multi-DC customers (UNFI, KeHE, C&S, Kroger) can't be lane-assigned without a destination — these orders are missing a DC value in the feed.</div>` : ''}
-          <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Get a Quote (${visibleTrucks.length})</div>
-          ${(() => { const nHold = allTrucks.filter(t => t._oppHold).length; const nAuto = acceptRows.length; const sum = nHold + nAuto + visibleTrucks.length + adjTrucks.length + bookedTrucks.length; const ok = sum === allTrucks.length; if (ok) return ''; return `<div style="font-family:var(--mono);font-size:10px;color:var(--lost);margin:-2px 0 8px;">⚠ Freight accounting MISMATCH — ${allTrucks.length} trucks but sections sum to ${sum}: ${nHold + nAuto} in proposals (${nHold} combine · ${nAuto} auto) · ${visibleTrucks.length} here${adjTrucks.length ? ` · ${adjTrucks.length} adjusted` : ''} · ${bookedTrucks.length} booked${heldOrders.length ? ` · ${[...new Set(heldOrders.map(o => o.so_num))].length} POs held` : ''}</div>`; })()}
+          <div style="font-family:var(--serif);font-size:16px;margin:6px 0 4px;">Get a Quote (${visibleTrucks.length}) <span style="font-family:var(--mono);font-size:13px;color:var(--ink-3);">${_dol(_listSales(visibleTrucks))}</span></div>
+          ${(() => { const nHold = allTrucks.filter(t => t._oppHold).length; const nAuto = acceptRows.length; const sum = nHold + nAuto + visibleTrucks.length + adjTrucks.length + bookedTrucks.length + schedTrucksList.length; const ok = sum === allTrucks.length; if (ok) return ''; return `<div style="font-family:var(--mono);font-size:10px;color:var(--lost);margin:-2px 0 8px;">⚠ Freight accounting MISMATCH — ${allTrucks.length} trucks but sections sum to ${sum}: ${nHold + nAuto} in proposals (${nHold} combine · ${nAuto} auto) · ${visibleTrucks.length} here${adjTrucks.length ? ` · ${adjTrucks.length} adjusted` : ''} · ${bookedTrucks.length} booked${heldOrders.length ? ` · ${[...new Set(heldOrders.map(o => o.so_num))].length} POs held` : ''}</div>`; })()}
           
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">${filterRow}<button id="fr-why-tgl" style="font-family:var(--mono);font-size:12px;font-weight:700;padding:9px 18px;border:1px solid var(--ink);border-radius:4px;background:${window._frShowWhy ? 'var(--paper)' : 'var(--ink)'};color:${window._frShowWhy ? 'var(--ink)' : 'var(--paper)'};cursor:pointer;margin-left:auto;margin-right:8px;white-space:nowrap;">💬 Why not combined</button><button id="hl-fr-dl" class="hl-btn-primary" style="background:transparent;color:var(--ink);border:1px solid var(--rule-soft);white-space:nowrap;">↓ Download plan (CSV)</button></div>
           ${visibleTrucks.length ? `<div style="background:rgba(46,125,50,0.05);border:1px solid rgba(46,125,50,0.25);border-radius:6px;padding:10px 12px;">${truckTable(visibleTrucks)}</div>` : `<div style="color:var(--ink-3);font-family:var(--mono);font-size:11px;">${allTrucks.length ? 'All trucks are up top (proposed multi-stop / undecided consolidations / awaiting buyer) or booked below.' : 'No trucks yet — needs resolved destinations.'}</div>`}
@@ -51878,6 +51900,33 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
               </div>
             </div>`;
           })()}
+
+          ${schedTrucksList.length ? `<div style="border:1px solid rgba(46,125,50,0.3);background:rgba(46,125,50,0.05);border-radius:6px;padding:12px 14px;margin-top:14px;">
+            <div style="font-family:var(--serif);font-size:16px;margin-bottom:2px;">Scheduled for pickup (${schedTrucksList.length}) <span style="font-family:var(--mono);font-size:13px;color:var(--ink-3);">${_dol(_listSales(schedTrucksList))}</span></div>
+            <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-bottom:10px;">Already booked with a carrier — out of Consolidation opportunities and Get a Quote so they don't ask to be routed again. A truck only lands here when every PO on it is scheduled.</div>
+            <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
+              <thead><tr style="background:rgba(46,125,50,0.08);">
+                ${['Truck', 'Destination', 'POs', 'Cases', 'Pallets', 'Weight', '$ Sales', 'Ship date'].map((h2, i2) => `<th style="padding:6px 9px;text-align:${i2 > 1 ? 'right' : 'left'};font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;">${h2}</th>`).join('')}
+              </tr></thead>
+              <tbody>${schedTrucksList.map(t => {
+                const sos = _sosOf(t);
+                const dest = (t.stops || []).map(x => x.dc || x.name || '').filter(Boolean).join(' → ') || (t.customer_dc || '—');
+                const cases = (t.stops || []).reduce((a2, x) => a2 + (Number(x.cases) || 0), 0) || Number(t.cases) || 0;
+                const date = (t.stops || [])[0]?.date || t.ship_date || '';
+                return `<tr style="border-top:1px solid var(--rule-soft);">
+                  <td style="padding:6px 9px;font-family:var(--mono);">#${t._num ?? '—'}</td>
+                  <td style="padding:6px 9px;">${escapeHtml(dest)}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);" title="${escapeHtml(sos.join(', '))}">${sos.length}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);">${Math.round(cases).toLocaleString()}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);">${t.plan ?? '—'}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);">${money(Number(t.weight) || 0)}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);">${_dol(_listSales([t]))}</td>
+                  <td style="padding:6px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">${escapeHtml(String(date).slice(0, 10))}</td>
+                </tr>`;
+              }).join('')}</tbody>
+            </table></div>
+          </div>` : ''}
+
           ${heldOrders.length ? `<div style="border:1px solid rgba(184,134,11,0.35);background:rgba(184,134,11,0.05);border-radius:6px;padding:10px 14px;margin-top:14px;"><button id="fr-held-tgl" style="background:none;border:none;cursor:pointer;font-family:var(--serif);font-size:14px;color:var(--ink);padding:0;">▸ Held from plan (${[...new Set(heldOrders.map(o => o.so_num))].length})</button><div id="fr-held-list" style="display:none;margin-top:8px;">${[...new Set(heldOrders.map(o => o.so_num))].map(so => { const o = heldOrders.find(x => x.so_num === so); return `<div style="font-family:var(--mono);font-size:11px;padding:3px 0;">${escapeHtml(so)}${o ? ' · ' + escapeHtml(_frCustShort(o.customer)) : ''}<button class="fr-unhold" data-so="${escapeHtml(so)}" title="Return this PO to the plan" style="font-family:var(--mono);font-size:10px;padding:2px 8px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;margin-left:8px;">Unhold</button></div>`; }).join('')}</div></div>` : ''}
           ${bookedTrucks.length ? `<div style="border:1px solid rgba(124,58,237,0.3);background:rgba(124,58,237,0.04);border-radius:6px;padding:12px 16px;margin-top:14px;"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;"><button id="fr-booked-tgl" style="background:none;border:none;cursor:pointer;font-family:var(--serif);font-size:16px;color:var(--ink);padding:0;">▾ Booked — awaiting pickup (${bookedTrucks.length})</button><input id="fr-booked-q" type="text" placeholder="Search booked — location, customer, date, PO" style="font-family:var(--mono);font-size:11px;padding:5px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);color:var(--ink);width:280px;margin-left:auto;"></div><div id="fr-booked-list" style="display:block;margin-top:6px;">${bookedTrucks.map(t => { const ap = apprOf(sigOf(t)); const dcs = [...new Set(t.stops.map(x => x.dc || _frCustShort(x.customer)))].join(' → '); const custs = [...new Set(t.stops.map(x => _frCustShort(x.customer)))].join(', '); const sts = [...new Set(t.stops.map(x => x.state).filter(Boolean))].join(' '); const sos9 = [...new Set(t.stops.flatMap(x => x.ships || []))]; const q = (dcs + ' ' + sts + ' ' + custs + ' ' + (ap.pickup_date || '') + ' ' + (t.minShip || '') + ' ' + sos9.join(' ') + ' #' + t._num).toLowerCase(); return `<div class="fr-bk-row" data-q="${escapeHtml(q)}" style="display:flex;gap:20px;align-items:baseline;flex-wrap:wrap;padding:10px 0 8px;border-top:1px solid rgba(124,58,237,0.15);font-family:var(--mono);font-size:12px;"><b style="font-size:15px;">#${t._num}</b><span style="font-size:14px;font-weight:600;">${escapeHtml(dcs)}</span><span style="color:var(--ink-3);">${escapeHtml(custs)}</span><span>${t.cases} cs · <b>${t.plan} plt</b> · ${money(t.weight)} lb</span><span>quote <b>$${Number(ap.quote_cost || 0).toLocaleString()}</b></span><span>pickup <b>${ap.pickup_date || '—'}</b></span><span style="color:var(--ink-3);font-size:10px;">${sos9.map(x => escapeHtml(x)).join(' · ')}</span><span style="margin-left:auto;"><button class="fr-unbook" data-sig="${sigOf(t)}" style="font-family:var(--mono);font-size:10px;padding:3px 10px;border:1px solid var(--rule-soft);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;">Unbook</button></span></div>`; }).join('')}<div id="fr-booked-none" style="display:none;font-family:var(--mono);font-size:11px;color:var(--ink-3);padding:8px 0;">No booked trucks match.</div></div></div>` : ''}
           ${P.manual.length ? `<div style="font-family:var(--serif);font-size:16px;margin:24px 0 8px;">Manual review — over cap (${P.manual.length})</div><div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:8px;">Oversized orders are auto-split into full trucks + a remainder above; anything here still exceeds a single truck on weight and needs an analyst.</div>${listTable(manualRows, ['SO #', 'Customer', 'DC', 'Proj Ship', 'Cases', 'Plan plt', 'Weight (lb)', 'Reason'].map((h, i) => th(h, i >= 4 && i <= 6)).join(''))}` : ''}
