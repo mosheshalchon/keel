@@ -51953,36 +51953,48 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           })()}
 
           ${(() => {
-            // SECTION RECONCILIATION. Get a Quote + Consolidation don't equal the
-            // adjusted total on their own — dedicated trucks, manual adjustments,
-            // own/independent trucks, already-booked trucks, held orders, manual
-            // review and needs-ship-to-DC all carry dollars too. Rather than leave
-            // that as a hand-check in a spreadsheet, list every bucket and show
-            // what's unaccounted for.
+            // SECTION RECONCILIATION — a true partition, not a list of totals.
+            //
+            // The buckets overlap: "Dedicated" is a MODE, so those trucks already sit
+            // inside Consolidation or Get a Quote, and a PO can be split across two
+            // trucks. Summing each bucket independently therefore double-counts, which
+            // is why this panel kept disagreeing with the reconciliation.
+            //
+            // So: walk the buckets in priority order with ONE shared set of SOs
+            // already claimed. Each PO is counted exactly once, and whatever is left
+            // at the end is genuinely in no section.
+            const _claimed = new Set();
+            const _take = (list) => {
+              let v = 0;
+              for (const t of (list || [])) for (const so of _sosOf(t)) {
+                if (_claimed.has(so)) continue;
+                _claimed.add(so); v += _soSalesMap[so] || 0;
+              }
+              return v;
+            };
+            // Scheduled comes off the top: it's subtracted in the reconciliation, so
+            // claim those POs first and don't report them as a section.
+            _take(schedTrucksList);
+            for (const so of _schedAllSos) _claimed.add(so);
+
             const rows2 = [
-              ['Consolidation opportunities', _oppSalesTot],
-              ['Get a Quote', _listSales(visibleTrucks)],
-              ['Dedicated trucks', _listSales(P.dedicated || [])],
-              ['Manual adjustments', _listSales(adjTrucks)],
-              ['Own / independent trucks', _listSales(indepTrucks)],
-              ['Already booked', _listSales(bookedTrucks)],
-              ['Held from plan', (heldOrders || []).reduce((a2, o) => a2 + (Number(o.sales) || 0), 0)],
-              ['Scheduled for pickup', _schedAllSales],
-            ].filter(r => r[0] !== 'Scheduled for pickup' && Math.round(r[1]) !== 0);
+              ['Consolidation opportunities', _take(_oppTrucksAll)],
+              ['Get a Quote', _take(visibleTrucks)],
+              ['Manual adjustments', _take(adjTrucks)],
+              ['Own / independent trucks', _take(indepTrucks)],
+              ['Already booked', _take(bookedTrucks)],
+            ].filter(r => Math.round(r[1]) !== 0);
             const shown2 = rows2.reduce((a2, r) => a2 + r[1], 0);
-            // Sections already exclude scheduled trucks, so the thing they should add
-            // up to is ADJUSTED FOR BOOKING, not booked freight.
             const target = salesPlanned - _schedAllSales;
             const gap = target - shown2;
-            // Name the gap instead of just sizing it: which trucks appear in none of
-            // the sections above, and which routed SOs no section claims.
-            const _inSections = new Set([...visibleTrucks, ...pendingAccept, ..._oppTrucksAll, ...(P.dedicated || []), ...adjTrucks,
-                                         ...indepTrucks, ...bookedTrucks, ...schedTrucksList].flatMap(_sosOf));
+            // Anything on a planned truck that no bucket claimed.
             const _orphanSos = [...new Set([...(P.trucks || []), ...(P.ltl || []), ...(P.dedicated || [])].flatMap(_sosOf))]
-              .filter(so => !_inSections.has(so) && !_schedSoSet.has(so));
-            const _orphanSales = _orphanSos.reduce((a2, so) => a2 + (_soSalesMap[so] || 0), 0);
+              .filter(so => !_claimed.has(so));
+            const _dedTot = (() => { const seen = new Set(); let v = 0;
+              for (const t of (P.dedicated || [])) for (const so of _sosOf(t)) { if (!seen.has(so)) { seen.add(so); v += _soSalesMap[so] || 0; } } return v; })();
+
             return `<details style="margin-top:16px;border:1px solid var(--rule-soft);border-radius:6px;padding:10px 14px;">
-              <summary style="cursor:pointer;font-family:var(--serif);font-size:14px;">Where the dollars sit${Math.abs(gap) > 1 ? ` <span style="font-family:var(--mono);font-size:11px;color:#b8860b;">${_dol(Math.abs(gap))} unaccounted</span>` : ` <span style="font-family:var(--mono);font-size:11px;color:#2f6b3f;">balanced</span>`}</summary>
+              <summary style="cursor:pointer;font-family:var(--serif);font-size:14px;">Where the dollars sit${Math.abs(gap) > 1 ? ` <span style="font-family:var(--mono);font-size:11px;color:#b8860b;">${_dol(Math.abs(gap))} ${gap > 0 ? 'unaccounted' : 'over'}</span>` : ` <span style="font-family:var(--mono);font-size:11px;color:#2f6b3f;">balanced</span>`}</summary>
               <table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:10px;font-variant-numeric:tabular-nums;">
                 <colgroup><col><col style="width:160px;"></colgroup>
                 <tbody>${rows2.map(r => `<tr style="border-top:1px solid var(--rule-softer);">
@@ -51992,10 +52004,13 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
                   <td style="padding:6px 9px;text-align:right;font-family:var(--mono);font-weight:700;">${_dol(shown2)}</td></tr>
                   <tr><td style="padding:5px 9px;color:var(--ink-3);">Adjusted for booking (booked ${_dol(salesPlanned)} − scheduled ${_dol(_schedAllSales)})</td>
                   <td style="padding:5px 9px;text-align:right;font-family:var(--mono);color:var(--ink-3);">${_dol(target)}</td></tr>
-                  ${Math.abs(gap) > 1 ? `<tr><td style="padding:5px 9px;color:#b8860b;" title="${escapeHtml(_orphanSos.slice(0, 60).join(', '))}">Unaccounted${_orphanSos.length ? ` — ${_orphanSos.length} PO${_orphanSos.length === 1 ? '' : 's'} on planned trucks that no section lists (hover for SOs)` : ' — planned freight not represented in any section above'}</td>
+                  ${Math.abs(gap) > 1 ? `<tr><td style="padding:5px 9px;color:#b8860b;" title="${escapeHtml(_orphanSos.slice(0, 60).join(', '))}">${gap > 0 ? `Unaccounted${_orphanSos.length ? ` — ${_orphanSos.length} PO${_orphanSos.length === 1 ? '' : 's'} in no section (hover for SOs)` : ''}` : 'Over-counted — a PO is claimed twice'}</td>
                   <td style="padding:5px 9px;text-align:right;font-family:var(--mono);color:#b8860b;">${_dol(gap)}</td></tr>` : ''}
                 </tbody></table>
-              <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-top:8px;">Scheduled trucks are already out of every section above, so these should sum to <b>Adjusted for booking</b> in the reconciliation below.</div>
+              <div style="font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);margin-top:8px;">
+                Each PO is counted once, in the first section that claims it, so these sum to <b>Adjusted for booking</b>.
+                Dedicated isn't a section — it's a truck <i>mode</i>, so those trucks already sit inside the rows above (${_dol(_dedTot)} of them).
+              </div>
             </details>`;
           })()}
 
