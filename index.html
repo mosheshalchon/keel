@@ -51433,6 +51433,25 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
         // SO in the source, so first non-empty wins. Empty until sync-freight-orders is
         // redeployed with po_num, and every call site degrades to just the SO.
         const _frPoBySo = {}; (orders || []).forEach(o => { if (o.so_num && o.po_num && !_frPoBySo[o.so_num]) _frPoBySo[o.so_num] = String(o.po_num).trim(); });
+        // FRESHNESS. Two independent clocks, and conflating them cost a full session:
+        //   lastSync   = max(updated_at) — when sync-freight-orders last WROTE. Green
+        //                cron rows do NOT prove this; pg_cron logs the http_post
+        //                returning a request id, not what the function did after.
+        //   newestOrd  = max(po_date)    — how fresh the FILE was when it ran.
+        // A healthy sync reading a frozen Dropbox export looks like: lastSync today,
+        // newestOrd days back. That is the case this caption exists to make visible.
+        const _frLastSync = (orders || []).reduce((m, o) => (o.updated_at && (!m || o.updated_at > m)) ? o.updated_at : m, null);
+        const _frNewestOrd = (orders || []).reduce((m, o) => (o.po_date && (!m || o.po_date > m)) ? o.po_date : m, null);
+        const _frDaysAgo = d => { if (!d) return null; const ms = Date.now() - new Date(d).getTime(); return Math.floor(ms / 86400000); };
+        const _frAgoTxt = d => { if (!d) return 'never'; const h = Math.floor((Date.now() - new Date(d).getTime()) / 3600000); return h < 1 ? 'just now' : h < 24 ? h + 'h ago' : Math.floor(h / 24) + 'd ago'; };
+        const _frOrdAge = _frDaysAgo(_frNewestOrd);
+        const _frStale = _frOrdAge != null && _frOrdAge >= 2;
+        const _frFreshBar = `<div style="display:flex;gap:16px;align-items:baseline;flex-wrap:wrap;font-family:var(--mono);font-size:11px;margin-bottom:10px;padding:7px 12px;border-radius:5px;border:1px solid ${_frStale ? 'rgba(184,134,11,0.45)' : 'var(--rule-soft)'};background:${_frStale ? 'rgba(184,134,11,0.07)' : 'transparent'};color:var(--ink-3);">
+          <span title="When sync-freight-orders last wrote to freight_orders">Synced <b style="color:var(--ink);">${_frAgoTxt(_frLastSync)}</b>${_frLastSync ? ` <span style="opacity:0.7;">(${String(_frLastSync).slice(0, 16).replace('T', ' ')})</span>` : ''}</span>
+          <span title="Newest order date in the file the sync read. If this lags while Synced is current, the Dropbox export is stale — not the sync.">Newest order <b style="color:${_frStale ? '#b8860b' : 'var(--ink)'};">${_frNewestOrd || '—'}</b>${_frOrdAge != null ? ` <span style="opacity:0.7;">(${_frOrdAge}d)</span>` : ''}</span>
+          <span>${(orders || []).length.toLocaleString()} lines</span>
+          ${_frStale ? `<span style="color:#b8860b;font-weight:700;">&#9888; the sync is running — the Dropbox file itself has not changed in ${_frOrdAge} days</span>` : ''}
+        </div>`;
         const _frPo = so => _frPoBySo[so] || '';
         const _frPoTag = so => { const p = _frPo(so); return p ? ` <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);font-weight:400;" title="Customer PO">PO ${escapeHtml(p)}</span>` : ''; };
         const _frSoPo = so => { const p = _frPo(so); return p ? `${so} (PO ${p})` : String(so); };
@@ -52011,7 +52030,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
             </div>`;
         })();
 
-        body.innerHTML = srcToggle + _orgPills + `
+        body.innerHTML = srcToggle + _orgPills + _frFreshBar + `
           <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
             ${card('Pending cases', P.totals.cases.toLocaleString())}${card('FTL trucks', P.trucks.length)}${card('LTL', P.ltl.length)}${card('Dedicated', P.dedicated.length)}${card('Manual', P.manual.length)}${card('Planning pallets', P.totals.plan)}${card('Needs DC', P.needsDc.length, 'awaiting ship-to')}
           </div>
