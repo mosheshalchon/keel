@@ -27168,6 +27168,173 @@ render();
     return out;
   }
 
+  // ── PROMO YEARS: 2027+ = Keel-built promos (calculator); 2025–2026 = Vividly plan lines.
+  // Vividly is the plan source until the team builds plans in Keel; promo_plan_lines carries a
+  // source column so a future "publish from calculator" feeds the same table.
+  let _promoYear = (() => { const y = Number(localStorage.getItem('keel_promo_year')); return [2025, 2026, 2027].includes(y) ? y : 2026; })();
+
+  function _vvNorm(h) { return String(h == null ? '' : h).replace(/[\s\u00a0]+/g, ' ').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim(); }
+  function _vvNum(v) { if (v == null || v === '') return null; const n = Number(String(v).replace(/[$,%\s]/g, '')); return isFinite(n) ? n : null; }
+  function _vvDate(v) {
+    if (v == null || v === '') return null;
+    if (v instanceof Date) return v.getFullYear() + '-' + String(v.getMonth() + 1).padStart(2, '0') + '-' + String(v.getDate()).padStart(2, '0');
+    if (typeof v === 'number') { const d = new Date(Math.round((v - 25569) * 86400 * 1000)); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'); }
+    const m = String(v).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (m) return m[3] + '-' + m[1].padStart(2, '0') + '-' + m[2].padStart(2, '0');
+    const m2 = String(v).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return m2 ? m2[0] : null;
+  }
+
+  async function handleVividlyUpload(file) {
+    const sb = window.Auth.getClient();
+    const brandId = window.BrandLibrary.getSession().brandId;
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+      const shName = wb.SheetNames.find(n => _vvNorm(n).includes('promotion breakdown'));
+      if (!shName) { alert('Could not find a "Promotion Breakdown" sheet in this file — is this the Vividly promotion export?'); return; }
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[shName], { header: 1, raw: true });
+      const hdr = (aoa[0] || []).map(_vvNorm);
+      // Header binding by normalized name (never trust exact keys on exports)
+      const col = {}; const bind = (field, ...aliases) => { for (const a of aliases) { const i = hdr.indexOf(a); if (i > -1) { col[field] = i; return; } } col[field] = -1; };
+      bind('customer', 'customer name'); bind('first_receiver', 'first receiver');
+      bind('promotion_key', 'promotion key'); bind('promo_name', 'promotion name'); bind('promo_type', 'promotion type');
+      bind('gl_account', 'account'); bind('status', 'status'); bind('closed', 'closed'); bind('line_key', 'line key');
+      bind('start_date', 'start date'); bind('end_date', 'end date');
+      bind('buyin_start', 'buy in start date'); bind('buyin_end', 'buy in end date');
+      bind('instore_start', 'in store start date'); bind('instore_end', 'in store end date');
+      bind('scanback_start', 'scan back start date'); bind('scanback_end', 'scan back end date');
+      bind('month', 'month'); bind('year', 'year');
+      bind('product_name', 'product name'); bind('product_group', 'product group');
+      bind('spend_rate', 'spend rate'); bind('lump_sum', 'lump sum spend'); bind('discount', 'discount');
+      bind('base_price', 'base price'); bind('retail_price', 'retail price');
+      bind('expected_lift', 'expected lift'); bind('actual_lift', 'actual lift'); bind('compliance_pct', 'compliance', 'compliance ');
+      bind('expected_units', 'total expected unit sales'); bind('expected_spend', 'total expected spend');
+      bind('expected_revenue', 'expected revenue'); bind('expected_trade_rate', 'expected trade rate');
+      bind('actual_spend', 'actual spend');
+      const missing = Object.keys(col).filter(k => col[k] < 0);
+      if (missing.includes('line_key') || missing.includes('customer') || missing.includes('year')) { alert('Required columns not found: ' + missing.join(', ') + ' — headers may have changed in the export.'); return; }
+      const g = (row, f) => col[f] > -1 ? row[col[f]] : null;
+      const rows = [];
+      const yearCounts = {};
+      for (let i = 1; i < aoa.length; i++) {
+        const r = aoa[i]; if (!r || !g(r, 'line_key')) continue;
+        const yr = _vvNum(g(r, 'year'));
+        if (!yr) continue;
+        yearCounts[yr] = (yearCounts[yr] || 0) + 1;
+        rows.push({
+          brand_id: brandId, source: 'vividly', line_key: String(g(r, 'line_key')).trim(),
+          promotion_key: g(r, 'promotion_key') || null, promo_name: g(r, 'promo_name') || null, promo_type: g(r, 'promo_type') || null,
+          gl_account: g(r, 'gl_account') || null, status: g(r, 'status') || null,
+          closed: /^true$/i.test(String(g(r, 'closed') || '')),
+          customer: g(r, 'customer') || null, first_receiver: g(r, 'first_receiver') || null,
+          product_name: g(r, 'product_name') || null, product_group: g(r, 'product_group') || null,
+          start_date: _vvDate(g(r, 'start_date')), end_date: _vvDate(g(r, 'end_date')),
+          buyin_start: _vvDate(g(r, 'buyin_start')), buyin_end: _vvDate(g(r, 'buyin_end')),
+          instore_start: _vvDate(g(r, 'instore_start')), instore_end: _vvDate(g(r, 'instore_end')),
+          scanback_start: _vvDate(g(r, 'scanback_start')), scanback_end: _vvDate(g(r, 'scanback_end')),
+          month: _vvNum(g(r, 'month')), year: yr,
+          spend_rate: _vvNum(g(r, 'spend_rate')), lump_sum: _vvNum(g(r, 'lump_sum')), discount: _vvNum(g(r, 'discount')),
+          base_price: _vvNum(g(r, 'base_price')), retail_price: _vvNum(g(r, 'retail_price')),
+          expected_lift: _vvNum(g(r, 'expected_lift')), actual_lift: _vvNum(g(r, 'actual_lift')), compliance_pct: _vvNum(g(r, 'compliance_pct')),
+          expected_units: _vvNum(g(r, 'expected_units')), expected_spend: _vvNum(g(r, 'expected_spend')),
+          expected_revenue: _vvNum(g(r, 'expected_revenue')), expected_trade_rate: _vvNum(g(r, 'expected_trade_rate')),
+          actual_spend: _vvNum(g(r, 'actual_spend')),
+          updated_at: new Date().toISOString(),
+        });
+      }
+      if (!rows.length) { alert('No promo lines found in the Promotion Breakdown sheet.'); return; }
+      // Dedupe by line_key (last wins) so the unique key can never trip inside one batch
+      const byKey = new Map(); for (const r of rows) byKey.set(r.line_key, r);
+      const finalRows = [...byKey.values()];
+      if (!confirm('Replace the Vividly plan with ' + finalRows.length.toLocaleString() + ' lines (' + Object.entries(yearCounts).map(([y, n]) => y + ': ' + n.toLocaleString()).join(' · ') + ')? Existing Vividly lines are removed first; Keel-built promos are untouched.')) return;
+      const { data: delRows, error: delErr } = await sb.from('promo_plan_lines').delete().eq('brand_id', brandId).eq('source', 'vividly').select('id');
+      if (delErr) { alert('Could not clear the old plan: ' + delErr.message + (delErr.message && /policy|row-level/i.test(delErr.message) ? '\n\nHas the promo_plan_lines migration (with its authenticated_all policy) been run?' : '')); return; }
+      for (let i = 0; i < finalRows.length; i += 500) {
+        const { error } = await sb.from('promo_plan_lines').insert(finalRows.slice(i, i + 500));
+        if (error) { alert('Insert failed at row ' + i + ': ' + error.message); return; }
+      }
+      alert('Vividly plan loaded: ' + finalRows.length.toLocaleString() + ' lines (' + Object.entries(yearCounts).map(([y, n]) => y + ': ' + n.toLocaleString()).join(' · ') + '), replaced ' + ((delRows || []).length).toLocaleString() + ' prior lines.');
+      renderPromosPage();
+    } catch (err) { console.error('[VIVIDLY]', err); alert('Upload failed: ' + (err && err.message || err)); }
+  }
+
+  async function renderVividlyPlan(summaryEl, filtersEl, year) {
+    const sb = window.Auth.getClient();
+    const brandId = window.BrandLibrary.getSession().brandId;
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
+    const num = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
+    filtersEl.innerHTML = '';
+    summaryEl.innerHTML = '<div class="hl-loading">Loading the ' + year + ' plan…</div>';
+    const { data: lines, error } = await sb.from('promo_plan_lines').select('*').eq('brand_id', brandId).eq('year', year);
+    if (error) { summaryEl.innerHTML = '<div style="font-family:var(--mono);font-size:12px;color:#a8381f;padding:24px;">Could not load promo_plan_lines — has the migration run? (' + esc(error.message) + ')</div>'; return; }
+    if (!lines || !lines.length) { summaryEl.innerHTML = '<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:32px;text-align:center;background:var(--bone-2);border-radius:8px;">No ' + year + ' plan loaded yet — use "↥ Upload Vividly export" above (the export carries 2025 and 2026 together).</div>'; return; }
+    // Customer rollup with expandable promo-type rows
+    const byCust = new Map();
+    let tExp = 0, tAct = 0, tUnits = 0;
+    for (const l of lines) {
+      const c = l.customer || '(no customer)';
+      if (!byCust.has(c)) byCust.set(c, { n: 0, units: 0, exp: 0, act: 0, types: new Map() });
+      const b = byCust.get(c);
+      b.n++; b.units += l.expected_units || 0; b.exp += l.expected_spend || 0; b.act += l.actual_spend || 0;
+      const t = l.promo_type || '(no type)';
+      if (!b.types.has(t)) b.types.set(t, { n: 0, exp: 0, act: 0 });
+      const tb = b.types.get(t); tb.n++; tb.exp += l.expected_spend || 0; tb.act += l.actual_spend || 0;
+      tExp += l.expected_spend || 0; tAct += l.actual_spend || 0; tUnits += l.expected_units || 0;
+    }
+    const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
+    const rowsHtml = custs.map(([c, b], ci) => {
+      const dl = b.act - b.exp;
+      const typeRows = [...b.types.entries()].sort((x, y) => y[1].exp - x[1].exp).map(([t, tb]) => {
+        const td = tb.act - tb.exp;
+        return '<tr class="hl-vp-typerow hl-vp-t' + ci + '" style="display:none;background:var(--bone-2);border-top:1px solid var(--rule-soft);">'
+          + '<td style="padding:5px 10px 5px 34px;font-family:var(--mono);font-size:11px;color:var(--ink-2);">' + esc(t) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + tb.n + '</td>'
+          + '<td></td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(tb.exp) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(tb.act) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (td > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (tb.act ? money(td) : '—') + '</td></tr>';
+      }).join('');
+      return '<tr class="hl-vp-custrow" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
+        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span class="hl-vp-car" id="hl-vp-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + b.n + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(b.units) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(b.exp) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(b.act) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (dl > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b.act ? money(dl) : '—') + '</td></tr>'
+        + typeRows;
+    }).join('');
+    summaryEl.innerHTML = `
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;">${year} Vividly plan · ${lines.length.toLocaleString()} lines · expected ${money(tExp)} · actual ${money(tAct)}${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year — not reconciled</span>' : ''}</div>
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="background:#efe9dd;">
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Customer · click for promo types</th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lines</th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected units</th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected spend</th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Actual spend</th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Δ act − exp</th>
+        </tr></thead>
+        <tbody>${rowsHtml}</tbody>
+        <tfoot><tr style="border-top:2px solid var(--rule-soft);font-weight:700;">
+          <td style="padding:8px 10px;font-family:var(--mono);font-size:11px;">Total</td>
+          <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${lines.length.toLocaleString()}</td>
+          <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${num(tUnits)}</td>
+          <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${money(tExp)}</td>
+          <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${money(tAct)}</td>
+          <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${money(tAct - tExp)}</td>
+        </tr></tfoot>
+      </table></div>`;
+    summaryEl.querySelectorAll('.hl-vp-custrow').forEach(tr => tr.addEventListener('click', () => {
+      const ci = tr.dataset.ci;
+      const open = summaryEl.querySelector('.hl-vp-t' + ci);
+      const showing = open && open.style.display !== 'none';
+      summaryEl.querySelectorAll('.hl-vp-t' + ci).forEach(r => { r.style.display = showing ? 'none' : ''; });
+      const car = document.getElementById('hl-vp-car' + ci); if (car) car.textContent = showing ? '▶' : '▼';
+    }));
+  }
+
   async function renderPromosPage() {
     const session = HL.mountPage('promos');
     if (!session) return;
@@ -27192,23 +27359,40 @@ render();
           <input type="file" id="hl-promo-upload-input" accept=".xlsx,.xls,.csv" style="display:none;" />
         </div>
       </div>
+      <div id="hl-promo-years" style="margin-top:18px;display:flex;gap:6px;align-items:center;">
+        ${[2025, 2026, 2027].map(y => `<button class="hl-promo-year" data-y="${y}" style="font-family:var(--mono);font-size:11px;padding:7px 16px;border-radius:5px;border:1px solid ${y === _promoYear ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${y === _promoYear ? 'var(--ink)' : 'transparent'};color:${y === _promoYear ? 'var(--paper)' : 'var(--ink-3)'};font-weight:${y === _promoYear ? '700' : '400'};">${y}</button>`).join('')}
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:10px;">${_promoYear >= 2027 ? 'Keel-built promos' : 'Vividly plan' + (_promoYear === 2025 ? ' · reference only' : '')}</span>
+      </div>
       <div id="hl-promo-filters" style="margin-top:16px;"></div>
       <div id="hl-promo-summary" style="margin-top:14px;"><div class="hl-loading">Loading promos…</div></div>
     `;
 
-    document.getElementById('hl-promo-add').addEventListener('click', () => openPromoCard(null));
-    document.getElementById('hl-promo-upload').addEventListener('click', () => document.getElementById('hl-promo-upload-input').click());
+    document.querySelectorAll('.hl-promo-year').forEach(b => b.addEventListener('click', () => {
+      const y = Number(b.dataset.y);
+      if (y !== _promoYear) { _promoYear = y; try { localStorage.setItem('keel_promo_year', String(y)); } catch (e) {} renderPromosPage(); }
+    }));
+    const _planYear = _promoYear < 2027;
+    const addBtn = document.getElementById('hl-promo-add');
+    const upBtn = document.getElementById('hl-promo-upload');
+    if (_planYear) { addBtn.style.display = 'none'; upBtn.textContent = '↥ Upload Vividly export'; }
+    addBtn.addEventListener('click', () => openPromoCard(null));
+    upBtn.addEventListener('click', () => document.getElementById('hl-promo-upload-input').click());
     document.getElementById('hl-promo-upload-input').addEventListener('change', (e) => {
       const f = e.target.files?.[0];
-      if (f) handlePromoExcelUpload(f);
+      if (f) { if (_planYear) handleVividlyUpload(f); else handlePromoExcelUpload(f); }
       e.target.value = '';
     });
+    if (_planYear) {
+      await renderVividlyPlan(document.getElementById('hl-promo-summary'), document.getElementById('hl-promo-filters'), _promoYear);
+      return;
+    }
 
     // Load promos + retailer names
-    const [{ data: promos }, { data: retailers }] = await Promise.all([
+    const [{ data: promosAll }, { data: retailers }] = await Promise.all([
       sb.from('promos').select('*').eq('brand_id', brandId),
       sb.from('retailers').select('id, name').eq('brand_id', brandId),
     ]);
+    const promos = (promosAll || []).filter(p => (p.plan_year || 2027) === _promoYear);
     const retById = new Map((retailers || []).map(r => [r.id, r.name]));
     const summaryEl = document.getElementById('hl-promo-summary');
     const filtersEl = document.getElementById('hl-promo-filters');
