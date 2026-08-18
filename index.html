@@ -27267,8 +27267,13 @@ render();
     const num = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
     filtersEl.innerHTML = '';
     summaryEl.innerHTML = '<div class="hl-loading">Loading the ' + year + ' plan…</div>';
-    const { data: lines, error } = await sb.from('promo_plan_lines').select('*').eq('brand_id', brandId).eq('year', year);
-    if (error) { summaryEl.innerHTML = '<div style="font-family:var(--mono);font-size:12px;color:#a8381f;padding:24px;">Could not load promo_plan_lines — has the migration run? (' + esc(error.message) + ')</div>'; return; }
+    let lines = [];
+    for (let from9 = 0; ; from9 += 1000) {
+      const { data, error } = await sb.from('promo_plan_lines').select('*').eq('brand_id', brandId).eq('year', year).order('line_key').range(from9, from9 + 999);
+      if (error) { summaryEl.innerHTML = '<div style="font-family:var(--mono);font-size:12px;color:#a8381f;padding:24px;">Could not load promo_plan_lines — has the migration run? (' + esc(error.message) + ')</div>'; return; }
+      lines = lines.concat(data || []);
+      if (!data || data.length < 1000) break;   // Supabase returns 1,000 max per call
+    }
     if (!lines || !lines.length) { summaryEl.innerHTML = '<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:32px;text-align:center;background:var(--bone-2);border-radius:8px;">No ' + year + ' plan loaded yet — use "↥ Upload Vividly export" above (the export carries 2025 and 2026 together).</div>'; return; }
     // Customer rollup with expandable promo-type rows
     const byCust = new Map();
@@ -27326,13 +27331,16 @@ render();
           <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${money(tAct - tExp)}</td>
         </tr></tfoot>
       </table></div>`;
-    summaryEl.querySelectorAll('.hl-vp-custrow').forEach(tr => tr.addEventListener('click', () => {
+    summaryEl.addEventListener('click', (ev) => {
+      const tr = ev.target.closest('.hl-vp-custrow');
+      if (!tr || !summaryEl.contains(tr)) return;
       const ci = tr.dataset.ci;
-      const open = summaryEl.querySelector('.hl-vp-t' + ci);
-      const showing = open && open.style.display !== 'none';
-      summaryEl.querySelectorAll('.hl-vp-t' + ci).forEach(r => { r.style.display = showing ? 'none' : ''; });
+      const rows9 = summaryEl.querySelectorAll('.hl-vp-t' + ci);
+      if (!rows9.length) return;
+      const showing = rows9[0].style.display !== 'none';
+      rows9.forEach(r => { r.style.display = showing ? 'none' : ''; });
       const car = document.getElementById('hl-vp-car' + ci); if (car) car.textContent = showing ? '▶' : '▼';
-    }));
+    });
   }
 
   async function renderPromosPage() {
