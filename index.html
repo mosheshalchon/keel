@@ -27284,22 +27284,34 @@ render();
       const b = byCust.get(c);
       b.n++; b.units += l.expected_units || 0; b.exp += l.expected_spend || 0; b.act += l.actual_spend || 0;
       const t = l.promo_type || '(no type)';
-      if (!b.types.has(t)) b.types.set(t, { n: 0, exp: 0, act: 0 });
-      const tb = b.types.get(t); tb.n++; tb.exp += l.expected_spend || 0; tb.act += l.actual_spend || 0;
+      if (!b.types.has(t)) b.types.set(t, { n: 0, units: 0, exp: 0, act: 0, lines: [] });
+      const tb = b.types.get(t); tb.n++; tb.units += l.expected_units || 0; tb.exp += l.expected_spend || 0; tb.act += l.actual_spend || 0; tb.lines.push(l);
       tExp += l.expected_spend || 0; tAct += l.actual_spend || 0; tUnits += l.expected_units || 0;
     }
     const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
     const rowsHtml = custs.map(([c, b], ci) => {
       const dl = b.act - b.exp;
-      const typeRows = [...b.types.entries()].sort((x, y) => y[1].exp - x[1].exp).map(([t, tb]) => {
+      const typeRows = [...b.types.entries()].sort((x, y) => y[1].exp - x[1].exp).map(([t, tb], ti) => {
         const td = tb.act - tb.exp;
-        return '<tr class="hl-vp-typerow hl-vp-t' + ci + '" style="display:none;background:var(--bone-2);border-top:1px solid var(--rule-soft);">'
-          + '<td style="padding:5px 10px 5px 34px;font-family:var(--mono);font-size:11px;color:var(--ink-2);">' + esc(t) + '</td>'
+        const lineRows = tb.lines.sort((x, y) => (y.expected_spend || 0) - (x.expected_spend || 0)).map(l => {
+          const ld = (l.actual_spend || 0) - (l.expected_spend || 0);
+          const dates = (l.start_date || '') + (l.end_date ? ' → ' + l.end_date : '');
+          return '<tr class="hl-vp-linerow hl-vp-lr-' + ci + ' hl-vp-lrt-' + ci + '-' + ti + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
+            + '<td style="padding:5px 10px 5px 58px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">' + esc(l.promo_name || l.line_key) + '</div><div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(l.product_group || '(no group)') + (dates ? ' · ' + dates : '') + '</div></td>'
+            + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + esc(l.status || '') + '</td>'
+            + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (l.expected_units ? num(l.expected_units) : '—') + '</td>'
+            + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(l.expected_spend) + '</td>'
+            + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (l.actual_spend ? money(l.actual_spend) : '—') + '</td>'
+            + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (ld > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (l.actual_spend ? money(ld) : '—') + '</td></tr>';
+        }).join('');
+        return '<tr class="hl-vp-typerow hl-vp-t' + ci + '" data-ci="' + ci + '" data-ti="' + ti + '" style="display:none;background:var(--bone-2);border-top:1px solid var(--rule-soft);cursor:pointer;">'
+          + '<td style="padding:5px 10px 5px 34px;font-family:var(--mono);font-size:11px;color:var(--ink-2);"><span class="hl-vp-tcar" id="hl-vp-tcar' + ci + '-' + ti + '" style="font-size:9px;color:var(--ink-3);margin-right:6px;">▶</span>' + esc(t) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + tb.n + '</td>'
-          + '<td></td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (tb.units ? num(tb.units) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(tb.exp) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(tb.act) + '</td>'
-          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (td > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (tb.act ? money(td) : '—') + '</td></tr>';
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (td > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (tb.act ? money(td) : '—') + '</td></tr>'
+          + lineRows;
       }).join('');
       return '<tr class="hl-vp-custrow" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
         + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span class="hl-vp-car" id="hl-vp-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + '</td>'
@@ -27332,6 +27344,16 @@ render();
         </tr></tfoot>
       </table></div>`;
     summaryEl.addEventListener('click', (ev) => {
+      const ty = ev.target.closest('.hl-vp-typerow');
+      if (ty && summaryEl.contains(ty)) {
+        const ci = ty.dataset.ci, ti = ty.dataset.ti;
+        const lr = summaryEl.querySelectorAll('.hl-vp-lrt-' + ci + '-' + ti);
+        if (!lr.length) return;
+        const showing = lr[0].style.display !== 'none';
+        lr.forEach(r => { r.style.display = showing ? 'none' : ''; });
+        const tcar = document.getElementById('hl-vp-tcar' + ci + '-' + ti); if (tcar) tcar.textContent = showing ? '▶' : '▼';
+        return;
+      }
       const tr = ev.target.closest('.hl-vp-custrow');
       if (!tr || !summaryEl.contains(tr)) return;
       const ci = tr.dataset.ci;
@@ -27339,6 +27361,7 @@ render();
       if (!rows9.length) return;
       const showing = rows9[0].style.display !== 'none';
       rows9.forEach(r => { r.style.display = showing ? 'none' : ''; });
+      if (showing) { summaryEl.querySelectorAll('.hl-vp-lr-' + ci).forEach(r => { r.style.display = 'none'; }); summaryEl.querySelectorAll('[id^="hl-vp-tcar' + ci + '-"]').forEach(c => { c.textContent = '▶'; }); }
       const car = document.getElementById('hl-vp-car' + ci); if (car) car.textContent = showing ? '▶' : '▼';
     });
   }
