@@ -27298,6 +27298,21 @@ render();
   const _taCache = {};
   const _taLinesCache = {};
   let _taOpenMs = null;
+  // The panels are absolutely positioned OVER the table, so the only way to close one used to
+  // be hitting its own button again — everywhere else on the page was dead. One document-level
+  // listener in the CAPTURE phase closes any open panel on a click outside `.ta-ms` (a click
+  // inside is a checkbox tick and must survive) or on Escape. Wired once, not per render.
+  let _taMsDocWired = false;
+  function _taCloseMsPanels() {
+    document.querySelectorAll('.ta-ms-panel').forEach(p => { p.style.display = 'none'; });
+    _taOpenMs = null;
+  }
+  function _taWireMsDismiss() {
+    if (_taMsDocWired) return;
+    _taMsDocWired = true;
+    document.addEventListener('click', (ev) => { if (!(ev.target.closest && ev.target.closest('.ta-ms'))) _taCloseMsPanels(); }, true);
+    document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') _taCloseMsPanels(); });
+  }
   const _taFilt = { cust: new Set(), prod: new Set(), type: new Set(), month: new Set() };
   const _taProdShort = (l) => {
     let g = String(l.product_group || '').replace(/^atg\s*-\s*/i, '').trim();
@@ -27552,6 +27567,66 @@ render();
     return allFam ? allFam.key : null;
   }
 
+  // Always-on programs have no off-program baseline: EDLP runs continuously, so "lift vs the
+  // surrounding weeks" is EDLP measured against itself and lands near zero no matter what
+  // happened. Report it as not measurable rather than printing a number that means nothing.
+  const _taAlwaysOn = (t) => /edlp/i.test(String(t || ''));
+
+  // PER-PRODUCT weekly series for Whole Foods, built once per load and cached on `src`.
+  // WHY THIS EXISTS: line rows used to measure lift against the BANNER-WIDE series — total ATG
+  // units at the retailer — so a baguette promo, a 12" promo and a singles promo running the
+  // same weeks all reported the identical number, diluted toward the banner average. A real
+  // +30% on one third of the volume reads as +6% once you divide by everything else.
+  // wfm_sales is the only source with per-item rows today; UNFI weekly has them unparsed.
+  function _taWfmFamSeries(src, allLines) {
+    if (src._famSeries) return src._famSeries;
+    const fams = _taFamilies(allLines);
+    const byFam = new Map();
+    for (const [item, wkMap] of src.wfmItems) {
+      const fk = _taItemFamily(item, fams);
+      if (!fk) continue;                        // shells — never promoted, the control group
+      let e = byFam.get(fk);
+      if (!e) { e = { map: new Map(), items: new Set() }; byFam.set(fk, e); }
+      e.items.add(item);
+      for (const [wk, c] of wkMap) { const t = e.map.get(wk) || { u: 0, d: 0 }; t.u += c.u; t.d += c.d; e.map.set(wk, t); }
+    }
+    src._famSeries = { fams, byFam };
+    return src._famSeries;
+  }
+
+  // The series a LINE should be measured against — its own product where the source carries
+  // item detail, otherwise null so the caller can fall back to the banner AND SAY SO.
+  function _taLineSeries(l, src, allLines) {
+    if (_taIsFee(l.promo_type)) return null;                       // fees have no units
+    if (!_taNorm(l.customer).includes('wholefoods')) return null;  // only WFM has item rows today
+    const fk = l.product_group || String(l.product_name || '').split('|')[0].trim() || 'group';
+    if (/all products/i.test(fk)) return null;                     // genuinely banner-wide
+    const { byFam } = _taWfmFamSeries(src, allLines);
+    const e = byFam.get(fk);
+    if (!e || !e.map.size) return null;
+    return { map: e.map, tag: 'WFM · ' + fk, units: true, items: [...e.items] };
+  }
+
+  // Another promo on the SAME product at the same customer overlapping these weeks means the
+  // measured lift is the combined effect of both, attributed to each. Legs of one event share a
+  // promotion_key and are not a collision.
+  function _taOverlaps(l, w, allLines) {
+    if (!w) return 0;
+    const fk = l.product_group || String(l.product_name || '').split('|')[0].trim() || 'group';
+    const cn = l.customer || '';
+    const seen = new Set();
+    for (const o of allLines) {
+      if ((o.customer || '') !== cn) continue;
+      if (o.promotion_key && o.promotion_key === l.promotion_key) continue;
+      if (_taIsFee(o.promo_type) || _taAlwaysOn(o.promo_type)) continue;
+      const ofk = o.product_group || String(o.product_name || '').split('|')[0].trim() || 'group';
+      if (ofk !== fk && !/all products/i.test(ofk) && !/all products/i.test(fk)) continue;
+      const ow = _taWindow(o); if (!ow) continue;
+      if (ow[0] <= w[1] && ow[1] >= w[0]) seen.add(o.promotion_key || ofk + ow[0]);
+    }
+    return seen.size;
+  }
+
   function _taShowAudit(pk, lk, lines, src) {
     const esc = (x) => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
@@ -27574,33 +27649,45 @@ render();
     if (!w) { alert('This promotion has no usable date window.'); return; }
     const fams = _taFamilies(evLines);
     // per-item window + nearest-6 base from the WFM item series
-    const famRows = fams.map(f => ({ f, items: [], actU: 0, actD: 0, baseUwk: 0, promoPrice: null, basePrice: null }));
+    const famRows = fams.map(f => ({ f, items: [], actU: 0, actD: 0, baseUwk: 0, baseWks: 0, promoPrice: null, basePrice: null }));
     const wks9 = Math.max(1, Math.round((new Date(w[1] + 'T12:00:00') - new Date(w[0] + 'T12:00:00')) / 864e5 + 1) / 7);
+    // The baseline must skip weeks that were themselves promoted, exactly as the main table does.
+    // This call used to pass [] — so a March promo's "off-promo" baseline quietly included the
+    // February event's elevated weeks and lift collapsed toward zero.
+    const cust0 = evLines[0].customer || '';
+    const excl9 = [];
+    for (const l2 of lines) {
+      if ((l2.customer || '') !== cust0) continue;
+      if (/edlp|merch|slotting|fee|admin|freight/i.test(String(l2.promo_type || ''))) continue;
+      const w2 = _taWindow(l2); if (w2) excl9.push(w2);
+    }
     for (const [item, wkMap] of src.wfmItems) {
       const famKey = _taItemFamily(item, fams);
       if (!famKey) continue;
       const fr = famRows.find(x => x.f.key === famKey);
       const win = _taSum(wkMap, w[0], w[1]);
-      const base = _taBaseNearest(wkMap, w[0], [], 6);
+      const base = _taBaseNearest(wkMap, w[0], excl9, 6);   // off-promo weeks only
       if (!win || !win.weeks) continue;
       fr.items.push(item);
       fr.actU += win.u; fr.actD += win.d;
-      if (base && base.weeks) fr.baseUwk += base.u / base.weeks;
+      if (base && base.weeks) { fr.baseUwk += base.u / base.weeks; fr.baseWks = Math.max(fr.baseWks || 0, base.weeks); }
       const pP = win.u > 0 ? win.d / win.u : null, bP = base && base.u > 0 ? base.d / base.u : null;
       fr.promoPrice = fr.promoPrice == null ? pP : Math.min(fr.promoPrice, pP == null ? Infinity : pP);
       fr.basePrice = fr.basePrice == null ? bP : Math.max(fr.basePrice, bP == null ? -Infinity : bP);
     }
     let physTot = 0, expSTot = 0, actSTot = 0, expUTot = 0, actUTot = 0;
-    const rows = famRows.map(({ f, items, actU, actD, baseUwk, promoPrice, basePrice }) => {
+    const rows = famRows.map(({ f, items, actU, actD, baseUwk, baseWks, promoPrice, basePrice }) => {
       const phys = actU * f.rate;
       physTot += phys; expSTot += f.expS; actSTot += f.actS; expUTot += f.expU; actUTot += actU;
       const liftF = baseUwk > 0 ? ((actU / wks9) - baseUwk) / baseUwk : null;
+      // A lift computed off 1-2 clean weeks is not the same claim as one off 6 — say which.
+      const baseNote = baseWks ? baseWks + ' off-promo wk' + (baseWks === 1 ? '' : 's') : 'no clean base';
       return `<tr style="border-top:1px solid var(--rule-soft);">
         <td style="padding:6px 10px;"><div style="font-family:var(--serif);font-size:12.5px;">${esc(f.key)}</div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">${items.length ? esc(items.join(' · ').slice(0, 90)) : '<span style="color:#8a6d1f;">no WFM items matched</span>'}</div></td>
         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">$${f.rate.toFixed(2)}<div style="font-size:9px;color:var(--ink-3);">${f.legs} legs</div></td>
         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${num(f.expU)}</td>
         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;">${num(actU)}</td>
-        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:${liftF != null && liftF > 0 ? '#3f6f4a' : 'var(--ink-3)'};">${liftF == null ? '—' : (liftF > 0 ? '+' : '') + Math.round(liftF * 100) + '%'}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:${liftF != null && liftF > 0 ? '#3f6f4a' : 'var(--ink-3)'};">${liftF == null ? '—' : (liftF > 0 ? '+' : '') + Math.round(liftF * 100) + '%'}<div style="font-size:8.5px;color:${baseWks >= 4 ? 'var(--ink-3)' : '#8a6d1f'};font-weight:400;">${baseNote}</div></td>
         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${basePrice ? '$' + basePrice.toFixed(2) : '—'} → ${promoPrice ? '$' + promoPrice.toFixed(2) : '—'}</td>
         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(phys)}</td>
         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${money(f.expS)}</td>
@@ -27655,7 +27742,19 @@ render();
         </tr></tfoot>
       </table></div>` : ''}
       ${feeHtml}
-      <p style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:10px;line-height:1.7;"><b>Keel actual $</b> = units actually sold (Whole Foods weekly data) × the stacked scan rates — what the deduction SHOULD cost, computed from Keel\'s own sales. <b>Planned $</b> is Vividly\'s budget; <b>Deducted $</b> is what Vividly recorded as posted — money, not sales. A gap between Keel actual and Deducted is either timing or a dispute. Expected u repeats per rate leg in Vividly, so it\'s taken once per line. Items resolve to lines by name; shells never match (control).</p>
+      <div style="margin-top:12px;padding:11px 13px;background:rgba(0,0,0,0.035);border-radius:6px;">
+        <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);letter-spacing:0.06em;margin-bottom:7px;">WHERE EACH COLUMN COMES FROM</div>
+        <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10px;line-height:1.55;">
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Scan rate</b></td><td style="padding:3px 0;color:var(--ink-2);">VIVIDLY. Sum of the event&#39;s stacked rate legs for this product line — Vividly splits one scan into two or more legs at different rates, so they are added. Leg count shows beneath.</td></tr>
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Expected u</b></td><td style="padding:3px 0;color:var(--ink-2);">VIVIDLY, its own forecast field. It is REPEATED identically on every rate leg, so it is taken ONCE per product line — summing the legs would double it. This field has proven unreliable: it ran ~40% under what the promo actually cost.</td></tr>
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Actual u</b></td><td style="padding:3px 0;color:var(--ink-2);">KEEL, from <code>wfm_sales</code> — the Whole Foods weekly export you upload. Unit sales for every item matched to this product line, summed across all regions over the promo window. Items match by name; PIZZA SHELL never matches and acts as the control.</td></tr>
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Lift</b></td><td style="padding:3px 0;color:var(--ink-2);">KEEL, derived. The line&#39;s weekly rate during the window against its rate over the nearest 6 OFF-promo weeks in the prior 12 (seasonally local — a raw 12-week base reached into holiday volume and diluted true lift). EDLP and fee weeks count as off-promo: EDLP is the everyday state and scan lift sits on top of it.</td></tr>
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Price base→promo</b></td><td style="padding:3px 0;color:var(--ink-2);">KEEL, derived — <code>wfm_sales</code> net sales ÷ unit sales, per item per week. Base is the off-promo weeks, promo is the window. This is what verifies the retailer actually dropped the shelf price.</td></tr>
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Keel actual $</b></td><td style="padding:3px 0;color:var(--ink-2);">COMPUTED — Actual u × Scan rate. What the deduction SHOULD cost given the units that really sold. This is the number to argue from.</td></tr>
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Planned $</b></td><td style="padding:3px 0;color:var(--ink-2);">VIVIDLY&#39;s budget for the line.</td></tr>
+          <tr><td style="padding:3px 10px 3px 0;white-space:nowrap;vertical-align:top;"><b>Deducted $</b></td><td style="padding:3px 0;color:var(--ink-2);">VIVIDLY&#39;s posted actual — MONEY TAKEN, not sales. A gap against Keel actual $ is timing, a missing item mapping, or a genuine over-deduction to dispute.</td></tr>
+        </table>
+      </div>
     </div>`;
     document.body.appendChild(ov);
     ov.addEventListener('click', (e) => { if (e.target === ov || e.target.id === 'hl-ta-audit-x') ov.remove(); });
@@ -27700,19 +27799,21 @@ render();
       const opts = [...cnt.entries()].sort((a, b) => key === 'month' ? 'JanFebMarAprMayJunJulAugSepOctNovDec'.indexOf(a[0]) - 'JanFebMarAprMayJunJulAugSepOctNovDec'.indexOf(b[0]) : b[1] - a[1]);
       const sel = _taFilt[key];
       return `<span class="ta-ms" style="position:relative;display:inline-block;">
-        <button class="ta-ms-btn" data-f="${key}" style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:5px;border:1px solid ${sel.size ? 'var(--ink)' : 'var(--rule-soft)'};background:transparent;color:${sel.size ? 'var(--ink)' : 'var(--ink-3)'};cursor:pointer;">${label}${sel.size ? ' · ' + sel.size : ''} ▾</button>
+        <button class="ta-ms-btn" data-f="${key}" style="font-family:var(--mono);font-size:12px;font-weight:${sel.size ? '700' : '500'};padding:8px 16px;border-radius:6px;border:1.5px solid ${sel.size ? 'var(--ink)' : 'var(--ink-3)'};background:${sel.size ? 'var(--ink)' : 'transparent'};color:${sel.size ? 'var(--paper)' : 'var(--ink-2)'};cursor:pointer;">${label}${sel.size ? ' · ' + sel.size : ''} ▾</button>
         <div class="ta-ms-panel" data-f="${key}" style="display:none;position:absolute;top:110%;left:0;z-index:40;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:7px;box-shadow:0 10px 30px rgba(0,0,0,0.18);padding:10px 12px;min-width:220px;max-height:290px;overflow-y:auto;">
-          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-bottom:7px;"><a href="#" class="ta-ms-all" data-f="${key}" style="color:var(--ink-3);margin-right:10px;">Select all</a><a href="#" class="ta-ms-clear" data-f="${key}" style="color:var(--ink-3);">Clear</a></div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-bottom:7px;display:flex;align-items:center;gap:10px;"><a href="#" class="ta-ms-all" data-f="${key}" style="color:var(--ink-3);">Select all</a><a href="#" class="ta-ms-clear" data-f="${key}" style="color:var(--ink-3);">Clear</a><a href="#" class="ta-ms-close" style="color:var(--ink-2);margin-left:auto;font-weight:700;">Close ✕</a></div>
           ${opts.map(([v, n]) => `<label style="display:flex;gap:7px;align-items:center;font-family:var(--mono);font-size:10.5px;padding:2.5px 0;cursor:pointer;white-space:nowrap;"><input type="checkbox" class="ta-ms-cb" data-f="${key}" value="${esc(v)}" ${sel.has(v) ? 'checked' : ''} style="cursor:pointer;"> ${esc(v)} <span style="color:var(--ink-3);">· ${n}</span></label>`).join('')}
         </div></span>`;
     }).join('');
     filtersEl.innerHTML = `
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-        <label style="font-family:var(--mono);font-size:11px;color:var(--ink-2);cursor:pointer;display:flex;align-items:center;gap:7px;"><input type="checkbox" id="hl-ta-completed" ${_taCompletedOnly ? 'checked' : ''} style="cursor:pointer;"> Completed only <span style="color:var(--ink-3);">(${all.filter(l => /completed/i.test(String(l.status || ''))).length}/${all.length})</span></label>
+        <label style="font-family:var(--mono);font-size:12px;color:var(--ink-2);cursor:pointer;display:flex;align-items:center;gap:7px;"><input type="checkbox" id="hl-ta-completed" ${_taCompletedOnly ? 'checked' : ''} style="cursor:pointer;"> Completed only <span style="color:var(--ink-3);">(${all.filter(l => /completed/i.test(String(l.status || ''))).length}/${all.length})</span></label>
         ${msHtml}
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${lines.length.toLocaleString()} of ${lines0.length.toLocaleString()} lines</span>
-      </div>
-      <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:8px;">Sell-through joins: UNFI cases+$ · KeHE $ only · Whole Foods units+$ · Kroger units+$ (≈ fiscal weeks) · NetSuite billed $+units (monthly ≈, fallback) · SPINS in v2${src.errors.length ? ' · <span style="color:#a8381f;">' + esc(src.errors.join(' · ')) + '</span>' : ''}</div>`;
+        <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${lines.length.toLocaleString()} of ${lines0.length.toLocaleString()} lines</span>
+      </div>${src.errors.length ? `
+      <div style="font-family:var(--mono);font-size:10px;color:#a8381f;margin-top:8px;">${esc(src.errors.join(' · '))}</div>` : ''}`;
+    _taWireMsDismiss();
+    filtersEl.querySelectorAll('.ta-ms-close').forEach(a => a.addEventListener('click', (e) => { e.preventDefault(); _taCloseMsPanels(); }));
     filtersEl.querySelector('#hl-ta-completed').addEventListener('change', (e) => { _taCompletedOnly = e.target.checked; renderTradeAnalyzer(summaryEl, filtersEl, year); });
     filtersEl.querySelectorAll('.ta-ms-btn').forEach(b => b.addEventListener('click', () => {
       const pn = filtersEl.querySelector('.ta-ms-panel[data-f="' + b.dataset.f + '"]');
@@ -27762,7 +27863,16 @@ render();
       const b = byCust.get(c);
       b.n++; b.exp += l.expected_spend || 0; b.act += l.actual_spend || 0;
       const w = _taWindow(l);
-      const series = _taSeriesFor(l, src);
+      // TWO series, deliberately. The CUSTOMER row is a banner total, so its union of measured
+      // weeks stays banner-wide. The LINE row is a claim about one product, so it is measured
+      // against that product's own weekly series where the source carries item detail. Using the
+      // banner for both is what made every line in a window print the same diluted percentage.
+      const bannerSeries = _taSeriesFor(l, src);
+      const prodSeries = _taLineSeries(l, src, all);
+      const series = prodSeries || bannerSeries;
+      const scoped = !!prodSeries;
+      const alwaysOn = _taAlwaysOn(l.promo_type);
+      const overlaps = _taOverlaps(l, w, all);
       let win = null, base = null, tag = null, hasU = false;
       let bsI = null, beI = null, winWks = null;
       if (w) {
@@ -27772,20 +27882,31 @@ render();
         beI = _taIso(new Date(ws.getTime() - 864e5));
       }
       const excl9 = custWins.get(c) || [];
-      let lift9 = null;
+      let lift9 = null, baseWks9 = 0, liftBasis9 = null;
       const isFee9 = _taIsFee(l.promo_type);
       if (w && series && !isFee9) {
         tag = series.tag; hasU = series.units;
         win = _taSum(series.map, w[0], w[1]);
         base = _taBaseNearest(series.map, w[0], excl9, 6);   // nearest 6 off-promo weeks (seasonally local)
         if (win && win.weeks > 0) {
-          const wr = win.d / win.weeks, br = (base && base.weeks > 0) ? base.d / base.weeks : null;
-          if (br > 0) lift9 = (wr - br) / br;
+          // Lift is a VOLUME claim, so measure it in units wherever the source carries them.
+          // Dollars move with the promo price itself — a deep TPR can shift units up and dollars
+          // down in the same week, which reads as negative lift on a promo that worked.
+          const useU = hasU && (base && base.u > 0);
+          const wr = useU ? win.u / win.weeks : win.d / win.weeks;
+          const br = (base && base.weeks > 0) ? (useU ? base.u / base.weeks : base.d / base.weeks) : null;
+          if (br > 0 && !alwaysOn) lift9 = (wr - br) / br;
+          baseWks9 = base ? base.weeks : 0;
+          liftBasis9 = useU ? 'units' : 'dollars';
           if (hasU) b.anyU = true;
           // Customer-level sell-through counts each week ONCE even when promo windows overlap:
-          // union of (source, week) keys, not a sum of per-line sums.
-          for (const [wkk, cc] of series.map) {
-            if (wkk >= w[0] && wkk <= w[1]) b.wk.set(tag + '|' + wkk, cc);
+          // union of (source, week) keys, not a sum of per-line sums. This stays on the BANNER
+          // series — the customer row is a banner total, and summing product series would drop
+          // every item that didn't resolve to a promoted family.
+          if (bannerSeries) {
+            for (const [wkk, cc] of bannerSeries.map) {
+              if (wkk >= w[0] && wkk <= w[1]) b.wk.set(bannerSeries.tag + '|' + wkk, cc);
+            }
           }
           b.cov++;   // measured = sales weeks actually overlapped the window
         }
@@ -27807,7 +27928,7 @@ render();
         }
       }
       if (isFee9 && !tag) { const s9 = _taSeriesFor(l, src); if (s9) tag = s9.tag; }
-      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9, fee: isFee9 });
+      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9, fee: isFee9, scoped, alwaysOn, overlaps, baseWks: baseWks9, basis: liftBasis9 });
     }
     const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
     // Monthly pacing strip (expected vs actual dollars)
@@ -27816,13 +27937,23 @@ render();
       const he = Math.round(46 * m.exp / mMax), ha = Math.round(46 * m.act / mMax);
       return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;"><div style="display:flex;align-items:flex-end;gap:2px;height:48px;"><div title="Expected ${money(m.exp)}" style="width:12px;height:${he}px;background:var(--rule-soft);border-radius:2px 2px 0 0;"></div><div title="Actual ${money(m.act)}" style="width:12px;height:${ha}px;background:#534AB7;border-radius:2px 2px 0 0;"></div></div><div style="font-family:var(--mono);font-size:8.5px;color:var(--ink-3);">${['J','F','M','A','M','J','J','A','S','O','N','D'][i]}</div></div>`;
     }).join('');
+    // Totals-row accumulators, filled while the customer rows render.
+    const _gWk = new Map();
+    let _gAnyU = false, _gLiftW = 0, _gLiftS = 0, _gCov = 0, _gN = 0;
     const rowsHtml = custs.map(([c, b], ci) => {
       let md = 0, mu = 0;
       for (const cc of b.wk.values()) { md += cc.d; mu += cc.u; }
+      // Roll the customer's union keys into a GLOBAL union so the totals row can't double-count
+      // a week that two customers both measured — "UNFI" and "UNFI All Other" both resolve to
+      // the same distributor-wide series, so summing the customer rows overstates sell-through.
+      for (const [k, cc] of b.wk) { const ex = _gWk.get(k); if (!ex || cc.d > ex.d) _gWk.set(k, cc); }
+      if (b.anyU) _gAnyU = true;
       let lw = 0, lsum = 0;
       for (const e9 of b.lines) if (e9.lift != null && e9.win && e9.win.d > 0) { lw += e9.win.d; lsum += e9.lift * e9.win.d; }
       const lift = lw > 0 ? lsum / lw : null;
-      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift, fee }) => {
+      _gLiftW += lw; _gLiftS += lsum;
+      _gCov += b.cov; _gN += b.n;
+      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift, fee, scoped, alwaysOn, overlaps, baseWks, basis }) => {
         const ld = (l.actual_spend || 0) - (l.expected_spend || 0);
         const llift = lift;
         const canAudit = !!(l.promotion_key && tag && tag.indexOf('WFM') === 0);
@@ -27830,7 +27961,10 @@ render();
           ? '<span class="hl-ta-auditbtn" data-pk="' + esc(l.promotion_key) + '" data-lk="' + esc(l.line_key) + '" title="Audit this number — plan vs Keel-measured actual for this product" style="border-bottom:1px dotted var(--ink-3);cursor:pointer;">' + (l.actual_spend ? money(l.actual_spend) : '—') + '</span>'
           : (l.actual_spend ? money(l.actual_spend) : '—');
         return '<tr class="hl-ta-lr hl-ta-lr' + ci + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
-          + '<td style="padding:5px 10px 5px 40px;" title="' + esc(l.promo_name || l.line_key) + '"><div style="font-family:var(--mono);font-size:11.5px;">' + (w ? w[0].slice(5) + ' → ' + w[1].slice(5) : '(no dates)') + '</div>' + (!tag ? '<div style="font-family:var(--mono);font-size:9px;color:#8a6d1f;">no sales match</div>' : (tag !== 'WFM' ? '<div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + esc(tag) + '</div>' : '')) + '</td>'
+          + '<td style="padding:5px 10px 5px 40px;" title="' + esc(l.promo_name || l.line_key) + '"><div style="font-family:var(--mono);font-size:11.5px;">' + (w ? w[0].slice(5) + ' → ' + w[1].slice(5) : '(no dates)') + '</div>' + (!tag
+             ? '<div style="font-family:var(--mono);font-size:9px;color:#8a6d1f;">no sales match</div>'
+             : '<div style="font-family:var(--mono);font-size:9px;color:' + (scoped ? 'var(--ink-3)' : '#8a6d1f') + ';" title="' + (scoped ? 'Measured against this product\'s own weekly item series.' : 'No per-item detail for this source or product — measured against the whole banner, so the number is diluted by every other item.') + '">' + esc(tag) + (scoped ? '' : ' · banner-wide') + '</div>')
+           + '</td>'
           + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10.5px;">' + esc(_taProdShort(l)) + '</td>'
           + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(_taMonName(l)) + '</td>'
           + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);">' + esc(_taTypeShort(l.promo_type)) + '</td>'
@@ -27839,7 +27973,15 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (ld > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (l.actual_spend ? money(ld) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win ? money(win.d) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win && hasU ? num(win.u) : '—') + '</td>'
-          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (llift != null && llift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + (fee ? '<span style="font-size:9px;color:var(--ink-3);">fixed fee</span>' : pct(llift)) + '</td></tr>';
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (llift != null && llift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">'
+             + (fee
+                 ? '<span style="font-size:9px;color:var(--ink-3);">fixed fee</span>'
+                 : alwaysOn
+                   ? '<span style="font-size:9px;color:#8a6d1f;" title="EDLP runs continuously, so the surrounding weeks are also EDLP. There is no off-program baseline to measure against — a number here would be EDLP compared with itself.">always-on</span>'
+                   : pct(llift)
+                     + (llift != null ? '<div style="font-size:8px;font-weight:400;color:' + (baseWks >= 4 ? 'var(--ink-3)' : '#8a6d1f') + ';">' + (baseWks || 0) + ' base wk' + (baseWks === 1 ? '' : 's') + (basis === 'dollars' ? ' · $' : '') + '</div>' : '')
+                     + (overlaps ? '<div style="font-size:8px;font-weight:400;color:#8a6d1f;" title="' + overlaps + ' other promo(s) on this product ran in the same weeks — this lift is their combined effect.">\u26a0 ' + overlaps + ' overlap</div>' : ''))
+             + '</td></tr>';
       }).join('');
       return '<tr class="hl-ta-cr" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
         + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-ta-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + b.cov + '/' + b.n + ' measured</span></td>'
@@ -27871,9 +28013,23 @@ render();
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Δ spend</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through $ (windows)</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through units</th>
-          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lift vs 12-wk base</th>
-        </tr></thead><tbody>${rowsHtml}</tbody></table></div>
-      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.7;">Sell-through sums each promo line\'s governing window (scans → scan-back window, MCB/EDLP → in-store, fees → buy-in) from Keel\'s weekly sales; <b>Lift</b> compares the promo window\'s weekly sales rate to the customer\'s rate over the 12 weeks before the promo, counting only OFF-promo weeks in that baseline (weeks inside other promo windows are excluded; NetSuite≈ month-grain baselines can\'t exclude and read approximately). Customer lift is the sales-weighted mean of its lines. Units show where the source carries them (UNFI cases, WFM, Kroger — KeHE reports dollars only). "no sales match" = the plan customer couldn\'t be found in the sales data — the customer crosswalk tightens in the deduction phase. Customer rows count overlapping promo weeks ONCE (union), and sell-through is banner-wide until the product-group mapping lands. <b>0/N measured</b> usually means the weekly sales history doesn\'t reach back to those promo windows — UNFI/KeHE weekly history starts when their weekly uploads began — those windows fall back to <b>NetSuite≈</b>: your own billed revenue and units by customer-month, prorated to the window\'s days (month-grain, so short promos read approximately).</p>`;
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Promo-window weekly rate vs the nearest 6 OFF-promo weeks in the prior 12, measured in units where the source carries them. Line rows use the promoted product's own series; customer rows are the sales-weighted mean of their lines.">Lift vs off-promo base</th>
+        </tr></thead><tbody>${rowsHtml}</tbody>
+        <tfoot>${(() => {
+          let gd = 0, gu = 0;
+          for (const cc of _gWk.values()) { gd += cc.d; gu += cc.u; }
+          const gLift = _gLiftW > 0 ? _gLiftS / _gLiftW : null;
+          return `<tr style="border-top:2px solid var(--ink);background:#efe9dd;font-weight:700;">
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:11.5px;">TOTAL <span style="font-weight:400;color:var(--ink-3);font-size:9.5px;">${_gCov}/${_gN} measured · ${custs.length} retailers</span></td>
+            <td></td><td></td><td></td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${money(mExp)}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${money(mAct)}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:${mAct - mExp > 0 ? '#a8381f' : '#3f6f4a'};">${money(mAct - mExp)}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;" title="Union of measured weeks across every retailer — a week two retailers both measured counts once. Distributor-wide rollups can still overlap a named chain from the same distributor.">${gd ? money(gd) : '—'}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${_gAnyU && gu ? num(gu) : '—'}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:${gLift != null && gLift > 0 ? '#3f6f4a' : 'var(--ink-3)'};" title="Sales-weighted mean of every measured line's lift. Fixed fees are excluded.">${pct(gLift)}</td>
+          </tr>`;
+        })()}</tfoot></table></div>`;
     summaryEl.onclick = (ev) => {
       const ab = ev.target.closest('.hl-ta-auditbtn');
       if (ab && summaryEl.contains(ab)) { _taShowAudit(ab.dataset.pk, ab.dataset.lk, lines, src); return; }
