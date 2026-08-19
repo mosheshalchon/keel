@@ -27301,7 +27301,7 @@ render();
     const brandId = window.BrandLibrary.getSession().brandId;
     const lo = (year - 1) + '-10-01', hi = year + '-12-31';   // includes baseline runway
     const paged = async (q) => { let out = []; for (let f = 0; ; f += 1000) { const { data, error } = await q.range(f, f + 999); if (error) return { rows: out, error }; out = out.concat(data || []); if (!data || data.length < 1000 || f > 60000) break; } return { rows: out, error: null }; };
-    const src = { unfi: new Map(), kehe: new Map(), wfm: new Map(), kroger: new Map(), unfiAll: new Map(), keheAll: new Map(), errors: [] };
+    const src = { unfi: new Map(), kehe: new Map(), wfm: new Map(), kroger: new Map(), unfiAll: new Map(), keheAll: new Map(), ns: new Map(), wfmItems: new Map(), errors: [] };
     const add = (map, key, wk, u, d) => { let m = map.get(key); if (!m) { m = new Map(); map.set(key, m); } const c = m.get(wk) || { u: 0, d: 0 }; c.u += u || 0; c.d += d || 0; m.set(wk, c); };
     const addFlat = (map, wk, u, d) => { const c = map.get(wk) || { u: 0, d: 0 }; c.u += u || 0; c.d += d || 0; map.set(wk, c); };
     // UNFI + KeHE weekly
@@ -27314,11 +27314,13 @@ render();
       addFlat(isK ? src.keheAll : src.unfiAll, wk, r.quantity, r.sales);
     }
     // Whole Foods weekly (ATG scope; regions summed)
-    const wf = await paged(sb.from('wfm_sales').select('week_end, unit_sales, net_sales, brand').eq('brand_id', brandId).gte('week_end', lo).lte('week_end', hi).order('week_end'));
+    const wf = await paged(sb.from('wfm_sales').select('week_end, unit_sales, net_sales, brand, item_desc').eq('brand_id', brandId).gte('week_end', lo).lte('week_end', hi).order('week_end'));
     if (wf.error) src.errors.push('WFM: ' + wf.error.message);
     for (const r of wf.rows) {
       if (r.brand && !/against|atg/i.test(String(r.brand))) continue;
-      addFlat(src.wfm, String(r.week_end).slice(0, 10), r.unit_sales, r.net_sales);
+      const wkE = String(r.week_end).slice(0, 10);
+      addFlat(src.wfm, wkE, r.unit_sales, r.net_sales);
+      add(src.wfmItems, String(r.item_desc || '?'), wkE, r.unit_sales, r.net_sales);
     }
     // Kroger — fiscal week ≈ calendar (FY starts the first Sunday of February)
     const kr = await paged(sb.from('kroger_sales').select('fiscal_year, week, ty_units, ty_revenue').eq('brand_id', brandId).order('week'));
@@ -27328,14 +27330,79 @@ render();
       const d = new Date(fy, 1, 1); d.setDate(d.getDate() + ((7 - d.getDay()) % 7) + (Number(r.week) - 1) * 7);
       addFlat(src.kroger, _taIso(d), r.ty_units, r.ty_revenue);
     }
+    // NetSuite billed revenue + units by customer-month (sales_actuals) — years of depth,
+    // used when the weekly files don't reach a promo's window. Closed months count
+    // Billed/Closed only (the app's standing rule); the open month counts everything.
+    const nsq = await paged(sb.from('sales_actuals').select('entity, month, amount, units, status').eq('brand_id', brandId).eq('dimension', 'customer').gte('month', lo).lte('month', hi).order('month'));
+    if (nsq.error) src.errors.push('NetSuite: ' + nsq.error.message);
+    const nowD = new Date();
+    const curKey = nowD.getFullYear() + '-' + String(nowD.getMonth() + 1).padStart(2, '0') + '-01';
+    for (const r of nsq.rows) {
+      const mk = String(r.month).slice(0, 10);
+      const st = String(r.status || '').trim().toLowerCase();
+      if (mk < curKey && st && st !== 'billed' && st !== 'closed') continue;
+      add(src.ns, _taNorm(r.entity), mk, Number(r.units) || 0, Number(r.amount) || 0);
+    }
     _taCache[year] = src;
     return src;
   }
 
-  function _taSum(weekMap, ws, we) {
+  function _taSumMonthsProrated(monthMap, ws, we) {
+    if (!monthMap) return null;
+    const a = new Date(ws + 'T12:00:00'), b = new Date(we + 'T12:00:00');
+    let u = 0, d = 0, hit = 0; const parts = [];
+    for (const [mk, c] of monthMap) {
+      const ms = new Date(mk + 'T12:00:00');
+      const me = new Date(ms.getFullYear(), ms.getMonth() + 1, 0, 12);
+      const os = Math.max(a.getTime(), ms.getTime()), oe = Math.min(b.getTime(), me.getTime());
+      if (oe < os) continue;
+      const frac = (Math.round((oe - os) / 864e5) + 1) / me.getDate();
+      const cu = c.u * frac, cd = c.d * frac;
+      u += cu; d += cd; hit++; parts.push([mk, { u: cu, d: cd }]);
+    }
+    return { u, d, weeks: hit, parts };
+  }
+
+  function _taNsFor(l, src) {
+    const cn = _taNorm(l.customer);
+    const fr = _taNorm(String(l.first_receiver || ''));
+    let want = null;
+    if (cn.includes('wholefoods')) want = 'wholefoods';
+    else if (cn.includes('kroger')) want = 'kroger';
+    else if (cn === 'unfi' || (/allother|allcustomers/.test(cn) && fr.includes('unfi'))) want = 'unfi';
+    else if (cn === 'kehe' || (/allother|allcustomers/.test(cn) && fr.includes('kehe'))) want = 'kehe';
+    const merged = new Map(); let found = 0;
+    for (const [ent, mm] of src.ns) {
+      const m = want ? ent.includes(want) : (ent === cn || ent.includes(cn) || cn.includes(ent));
+      if (!m) continue;
+      found++;
+      for (const [mk, c] of mm) { const t = merged.get(mk) || { u: 0, d: 0 }; t.u += c.u; t.d += c.d; merged.set(mk, t); }
+    }
+    return found ? { map: merged, found } : null;
+  }
+
+  function _taBaseNearest(weekMap, wsIso, excl, n) {
+    // Seasonally LOCAL baseline: the nearest off-promo weeks before the promo (within 12 wks),
+    // so a February promo is judged against January — not Thanksgiving. (Full seasonal index /
+    // YoY same-weeks comes when history covers two years.)
+    if (!weekMap) return null;
+    const lo = _taIso(new Date(new Date(wsIso + 'T12:00:00').getTime() - 84 * 864e5));
+    const cand = [];
+    for (const [wk, c] of weekMap) { if (wk >= lo && wk < wsIso && !(excl && excl.some(x => wk >= x[0] && wk <= x[1]))) cand.push([wk, c]); }
+    cand.sort((a, b) => b[0].localeCompare(a[0]));
+    const take = cand.slice(0, n || 6);
+    let u = 0, d = 0; for (const [, c] of take) { u += c.u; d += c.d; }
+    return { u, d, weeks: take.length };
+  }
+
+  function _taSum(weekMap, ws, we, excl) {
     if (!weekMap) return null;
     let u = 0, d = 0, hit = 0;
-    for (const [wk, c] of weekMap) { if (wk >= ws && wk <= we) { u += c.u; d += c.d; hit++; } }
+    for (const [wk, c] of weekMap) {
+      if (wk < ws || wk > we) continue;
+      if (excl && excl.some(x => wk >= x[0] && wk <= x[1])) continue;   // off-promo baseline: skip weeks inside other promos
+      u += c.u; d += c.d; hit++;
+    }
     return hit ? { u, d, weeks: hit } : { u: 0, d: 0, weeks: 0 };
   }
 
@@ -27345,6 +27412,8 @@ render();
     if (cn.includes('kroger')) return { map: src.kroger, tag: 'Kroger≈', units: true };
     const fr = String(l.first_receiver || '') + ' ' + String(l.customer || '');
     const isKehe = /kehe/i.test(fr), isUnfi = /unfi/i.test(fr);
+    if (cn === 'unfi') return { map: src.unfiAll, tag: 'UNFI all', units: true };
+    if (cn === 'kehe') return { map: src.keheAll, tag: 'KeHE all', units: false };
     if (/allother|allcustomers/.test(cn)) {
       if (isUnfi) return { map: src.unfiAll, tag: 'UNFI all', units: true };
       if (isKehe) return { map: src.keheAll, tag: 'KeHE all', units: false };
@@ -27362,6 +27431,121 @@ render();
       if (found) return { map: merged, tag: nm.toUpperCase() + (found > 1 ? ' ×' + found : ''), units: hasU };
     }
     return null;
+  }
+
+  function _taFamilies(lines) {
+    const fams = new Map();
+    for (const l of lines) {
+      const key = l.product_group || String(l.product_name || '').split('|')[0].trim() || 'group';
+      if (!fams.has(key)) fams.set(key, { key, names: new Set(), rate: 0, legs: 0, expU: 0, expS: 0, actS: 0 });
+      const f = fams.get(key);
+      String(l.product_name || '').split('|').forEach(n => { n = n.trim(); if (n) f.names.add(n); });
+      f.rate += Number(l.spend_rate) || 0; f.legs++;
+      f.expU = Math.max(f.expU, Number(l.expected_units) || 0);   // legs repeat the family's units — don't double count
+      f.expS += Number(l.expected_spend) || 0; f.actS += Number(l.actual_spend) || 0;
+    }
+    return [...fams.values()];
+  }
+  function _taItemFamily(item, fams) {
+    const it = _taNorm(item);
+    if (it.includes('shell')) return null;   // shells are never on these promos — the control group
+    let best = null, bestScore = 0;
+    for (const f of fams) {
+      let score = 0;
+      const g = _taNorm(f.key);
+      for (const n of f.names) {
+        for (const t of String(n).toLowerCase().split(/[^a-z0-9]+/)) {
+          if (t.length > 3 && t !== 'pizza' && it.includes(t)) score++;
+        }
+      }
+      if (g.includes('single') && it.includes('single')) score += 4;
+      if (!g.includes('single') && it.includes('single')) score -= 3;
+      if ((g.includes('12') || g.includes('pizza')) && !g.includes('single') && it.includes('pizza') && !it.includes('single')) score += 2;
+      if ([...f.names].some(n => /baguette|roll/i.test(n)) && /baguette|roll/.test(it)) score += 4;
+      if (score > bestScore) { best = f; bestScore = score; }
+    }
+    return bestScore > 0 ? best.key : null;
+  }
+
+  function _taShowAudit(pk, lines, src) {
+    const esc = (x) => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
+    const num = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
+    const evLines = lines.filter(l => l.promotion_key === pk);
+    if (!evLines.length) return;
+    const w = _taWindow(evLines[0]);
+    if (!w) { alert('This promotion has no usable date window.'); return; }
+    const fams = _taFamilies(evLines);
+    // per-item window + nearest-6 base from the WFM item series
+    const famRows = fams.map(f => ({ f, items: [], actU: 0, actD: 0, baseUwk: 0, promoPrice: null, basePrice: null }));
+    const wks9 = Math.max(1, Math.round((new Date(w[1] + 'T12:00:00') - new Date(w[0] + 'T12:00:00')) / 864e5 + 1) / 7);
+    for (const [item, wkMap] of src.wfmItems) {
+      const famKey = _taItemFamily(item, fams);
+      if (!famKey) continue;
+      const fr = famRows.find(x => x.f.key === famKey);
+      const win = _taSum(wkMap, w[0], w[1]);
+      const base = _taBaseNearest(wkMap, w[0], [], 6);
+      if (!win || !win.weeks) continue;
+      fr.items.push(item);
+      fr.actU += win.u; fr.actD += win.d;
+      if (base && base.weeks) fr.baseUwk += base.u / base.weeks;
+      const pP = win.u > 0 ? win.d / win.u : null, bP = base && base.u > 0 ? base.d / base.u : null;
+      fr.promoPrice = fr.promoPrice == null ? pP : Math.min(fr.promoPrice, pP == null ? Infinity : pP);
+      fr.basePrice = fr.basePrice == null ? bP : Math.max(fr.basePrice, bP == null ? -Infinity : bP);
+    }
+    let physTot = 0, expSTot = 0, actSTot = 0, expUTot = 0, actUTot = 0;
+    const rows = famRows.map(({ f, items, actU, actD, baseUwk, promoPrice, basePrice }) => {
+      const phys = actU * f.rate;
+      physTot += phys; expSTot += f.expS; actSTot += f.actS; expUTot += f.expU; actUTot += actU;
+      const liftF = baseUwk > 0 ? ((actU / wks9) - baseUwk) / baseUwk : null;
+      return `<tr style="border-top:1px solid var(--rule-soft);">
+        <td style="padding:6px 10px;"><div style="font-family:var(--serif);font-size:12.5px;">${esc(f.key)}</div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">${items.length ? esc(items.join(' · ').slice(0, 90)) : '<span style="color:#8a6d1f;">no WFM items matched</span>'}</div></td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">$${f.rate.toFixed(2)}<div style="font-size:9px;color:var(--ink-3);">${f.legs} legs</div></td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${num(f.expU)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;">${num(actU)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:${liftF != null && liftF > 0 ? '#3f6f4a' : 'var(--ink-3)'};">${liftF == null ? '—' : (liftF > 0 ? '+' : '') + Math.round(liftF * 100) + '%'}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${basePrice ? '$' + basePrice.toFixed(2) : '—'} → ${promoPrice ? '$' + promoPrice.toFixed(2) : '—'}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(phys)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${money(f.expS)}</td>
+        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${f.actS ? money(f.actS) : '—'}</td>
+      </tr>`;
+    }).join('');
+    const old9 = document.getElementById('hl-ta-audit'); if (old9) old9.remove();
+    const ov = document.createElement('div');
+    ov.id = 'hl-ta-audit';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:80;background:rgba(30,26,20,0.45);display:flex;align-items:center;justify-content:center;padding:24px;';
+    ov.innerHTML = `<div style="background:var(--paper,#f4efe6);border-radius:10px;box-shadow:0 18px 60px rgba(0,0,0,0.3);max-width:1040px;width:100%;max-height:86vh;overflow-y:auto;padding:22px 26px;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:16px;">
+        <div><div style="font-family:var(--serif);font-size:16px;">${esc(evLines[0].promo_name || pk)}</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">${esc(evLines[0].promo_type || '')} · window ${w[0]} → ${w[1]} (${wks9.toFixed(1)} wks) · measured from Whole Foods weekly sell-through · lift vs nearest 6 off-promo weeks</div></div>
+        <button id="hl-ta-audit-x" style="background:none;border:none;font-size:18px;color:var(--ink-3);cursor:pointer;">×</button>
+      </div>
+      <div style="overflow-x:auto;margin-top:14px;"><table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="background:#efe9dd;">
+          <th style="padding:7px 10px;text-align:left;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Product line · matched items</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Scan rate</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Expected u</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Actual u</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Lift</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Price base→promo</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Physics $ (u×rate)</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Vividly exp $</th>
+          <th style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">Vividly act $</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+        <tfoot><tr style="border-top:2px solid var(--rule-soft);font-weight:700;">
+          <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;">Event total</td><td></td>
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${num(expUTot)}</td>
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${num(actUTot)}</td><td></td><td></td>
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(physTot)}</td>
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(expSTot)}</td>
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(actSTot)}</td>
+        </tr></tfoot>
+      </table></div>
+      <p style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:10px;line-height:1.7;">Physics $ = actual scanned units × the event\'s stacked scan rates — what the deduction SHOULD cost. Compare against Vividly act $ when the deduction posts: a gap is either timing or a dispute. Expected u repeats per rate leg in Vividly, so it\'s taken once per line. Items resolve to lines by name; shells never match (control).</p>
+    </div>`;
+    document.body.appendChild(ov);
+    ov.addEventListener('click', (e) => { if (e.target === ov || e.target.id === 'hl-ta-audit-x') ov.remove(); });
   }
 
   async function renderTradeAnalyzer(summaryEl, filtersEl, year) {
@@ -27382,9 +27566,22 @@ render();
     filtersEl.innerHTML = `
       <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;">
         <label style="font-family:var(--mono);font-size:11px;color:var(--ink-2);cursor:pointer;display:flex;align-items:center;gap:7px;"><input type="checkbox" id="hl-ta-completed" ${_taCompletedOnly ? 'checked' : ''} style="cursor:pointer;"> Completed promos only <span style="color:var(--ink-3);">(${all.filter(l => /completed/i.test(String(l.status || ''))).length} of ${all.length} lines — Running/Approved promos haven\'t spent yet and pollute the read)</span></label>
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through joins: UNFI cases+$ · KeHE $ only · Whole Foods units+$ · Kroger units+$ (≈ fiscal weeks) · SPINS in v2${src.errors.length ? ' · <span style="color:#a8381f;">' + esc(src.errors.join(' · ')) + '</span>' : ''}</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through joins: UNFI cases+$ · KeHE $ only · Whole Foods units+$ · Kroger units+$ (≈ fiscal weeks) · NetSuite billed $+units (monthly ≈, deep-history fallback) · SPINS in v2${src.errors.length ? ' · <span style="color:#a8381f;">' + esc(src.errors.join(' · ')) + '</span>' : ''}</span>
       </div>`;
     filtersEl.querySelector('#hl-ta-completed').addEventListener('change', (e) => { _taCompletedOnly = e.target.checked; renderTradeAnalyzer(summaryEl, filtersEl, year); });
+    // Every promo window per customer — the off-promo baseline excludes these weeks
+    // Baselines exclude only EVENT promos (scans/TPR/ads/coupons). Always-on programs —
+    // EDLP, merchandising and slotting fees — ARE the everyday state: with monthly EDLP
+    // running continuously, excluding them starves the baseline to zero weeks (proven on
+    // WFM 2026 data: base_wks 12→8→…→null by April). Scan lift is measured ON TOP of EDLP.
+    const custWins = new Map();
+    for (const l of all) {
+      if (/edlp|merch|slotting|fee|admin|freight/i.test(String(l.promo_type || ''))) continue;
+      const w0 = _taWindow(l); if (!w0) continue;
+      const k0 = l.customer || '(no customer)';
+      if (!custWins.has(k0)) custWins.set(k0, []);
+      custWins.get(k0).push(w0);
+    }
     // Per-line measurement
     let mExp = 0, mAct = 0;
     const monthly = Array.from({ length: 12 }, () => ({ exp: 0, act: 0 }));
@@ -27394,23 +27591,54 @@ render();
       const mi = (l.month >= 1 && l.month <= 12) ? l.month - 1 : (l.start_date ? Number(l.start_date.slice(5, 7)) - 1 : null);
       if (mi != null && mi >= 0 && mi < 12) { monthly[mi].exp += l.expected_spend || 0; monthly[mi].act += l.actual_spend || 0; }
       const c = l.customer || '(no customer)';
-      if (!byCust.has(c)) byCust.set(c, { n: 0, exp: 0, act: 0, mu: 0, md: 0, bu: 0, bd: 0, cov: 0, lines: [] });
+      if (!byCust.has(c)) byCust.set(c, { n: 0, exp: 0, act: 0, cov: 0, lines: [], wk: new Map(), bk: new Map(), anyU: false });
       const b = byCust.get(c);
       b.n++; b.exp += l.expected_spend || 0; b.act += l.actual_spend || 0;
       const w = _taWindow(l);
       const series = _taSeriesFor(l, src);
       let win = null, base = null, tag = null, hasU = false;
+      let bsI = null, beI = null, winWks = null;
+      if (w) {
+        const ws = new Date(w[0] + 'T12:00:00'), we = new Date(w[1] + 'T12:00:00');
+        winWks = Math.max(1, Math.round((we - ws) / 864e5 + 1) / 7);
+        bsI = _taIso(new Date(ws.getTime() - 84 * 864e5));   // 12-week baseline, per Moshe's methodology
+        beI = _taIso(new Date(ws.getTime() - 864e5));
+      }
+      const excl9 = custWins.get(c) || [];
+      let lift9 = null;
       if (w && series) {
         tag = series.tag; hasU = series.units;
         win = _taSum(series.map, w[0], w[1]);
-        const ws = new Date(w[0] + 'T12:00:00'), we = new Date(w[1] + 'T12:00:00');
-        const days = Math.max(6, Math.round((we - ws) / 864e5));
-        const bs = new Date(ws.getTime() - (days + 1) * 864e5), be = new Date(ws.getTime() - 864e5);
-        base = _taSum(series.map, _taIso(bs), _taIso(be));
-        if (win) { b.mu += win.u; b.md += win.d; b.cov++; }
-        if (base) { b.bu += base.u; b.bd += base.d; }
+        base = _taBaseNearest(series.map, w[0], excl9, 6);   // nearest 6 off-promo weeks (seasonally local)
+        if (win && win.weeks > 0) {
+          const wr = win.d / win.weeks, br = (base && base.weeks > 0) ? base.d / base.weeks : null;
+          if (br > 0) lift9 = (wr - br) / br;
+          if (hasU) b.anyU = true;
+          // Customer-level sell-through counts each week ONCE even when promo windows overlap:
+          // union of (source, week) keys, not a sum of per-line sums.
+          for (const [wkk, cc] of series.map) {
+            if (wkk >= w[0] && wkk <= w[1]) b.wk.set(tag + '|' + wkk, cc);
+          }
+          b.cov++;   // measured = sales weeks actually overlapped the window
+        }
       }
-      b.lines.push({ l, w, win, base, tag, hasU });
+      // Deep-history fallback: NetSuite billed customer-months, prorated to the window's days.
+      if (w && (!win || win.weeks === 0)) {
+        const ns = _taNsFor(l, src);
+        if (ns) {
+          const winN = _taSumMonthsProrated(ns.map, w[0], w[1]);
+          if (winN && winN.weeks > 0) {
+            win = winN; base = _taSumMonthsProrated(ns.map, bsI, beI);
+            tag = 'NetSuite≈' + (ns.found > 1 ? ' ×' + ns.found : '');
+            const wr9 = winN.d / winWks, br9 = (base && base.d > 0) ? base.d / 12 : null;
+            if (br9 > 0) lift9 = (wr9 - br9) / br9;
+            hasU = true; b.anyU = true; b.cov++;
+            for (const [mk, cc] of winN.parts) { const k = 'NS|' + mk; const ex = b.wk.get(k); if (!ex || cc.d > ex.d) b.wk.set(k, cc); }
+            if (base && base.parts) for (const [mk, cc] of base.parts) { const k = 'NS|' + mk; const ex = b.bk.get(k); if (!ex || cc.d > ex.d) b.bk.set(k, cc); }
+          }
+        }
+      }
+      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9 });
     }
     const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
     // Monthly pacing strip (expected vs actual dollars)
@@ -27420,12 +27648,16 @@ render();
       return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;"><div style="display:flex;align-items:flex-end;gap:2px;height:48px;"><div title="Expected ${money(m.exp)}" style="width:12px;height:${he}px;background:var(--rule-soft);border-radius:2px 2px 0 0;"></div><div title="Actual ${money(m.act)}" style="width:12px;height:${ha}px;background:#534AB7;border-radius:2px 2px 0 0;"></div></div><div style="font-family:var(--mono);font-size:8.5px;color:var(--ink-3);">${['J','F','M','A','M','J','J','A','S','O','N','D'][i]}</div></div>`;
     }).join('');
     const rowsHtml = custs.map(([c, b], ci) => {
-      const lift = (b.bd > 0) ? (b.md - b.bd) / b.bd : null;
-      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU }) => {
+      let md = 0, mu = 0;
+      for (const cc of b.wk.values()) { md += cc.d; mu += cc.u; }
+      let lw = 0, lsum = 0;
+      for (const e9 of b.lines) if (e9.lift != null && e9.win && e9.win.d > 0) { lw += e9.win.d; lsum += e9.lift * e9.win.d; }
+      const lift = lw > 0 ? lsum / lw : null;
+      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift }) => {
         const ld = (l.actual_spend || 0) - (l.expected_spend || 0);
-        const llift = (base && base.d > 0 && win) ? (win.d - base.d) / base.d : null;
+        const llift = lift;
         return '<tr class="hl-ta-lr hl-ta-lr' + ci + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
-          + '<td style="padding:5px 10px 5px 40px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">' + esc(l.promo_name || l.line_key) + '</div><div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(l.promo_type || '') + (w ? ' · ' + w[0] + ' → ' + w[1] : ' · no window') + (tag ? ' · ' + esc(tag) : ' · <span style="color:#8a6d1f;">no sales match</span>') + '</div></td>'
+          + '<td style="padding:5px 10px 5px 40px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">' + esc(l.promo_name || l.line_key) + ((/scan/i.test(String(l.promo_type || '')) && tag && tag.indexOf('WFM') === 0 && l.promotion_key) ? ' <button class="hl-ta-auditbtn" data-pk="' + esc(l.promotion_key) + '" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border-radius:4px;border:1px solid var(--rule-soft);background:transparent;color:var(--ink-3);cursor:pointer;">⚖ audit</button>' : '') + '</div><div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(l.promo_type || '') + (w ? ' · ' + w[0] + ' → ' + w[1] : ' · no window') + (tag ? ' · ' + esc(tag) : ' · <span style="color:#8a6d1f;">no sales match</span>') + '</div></td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(l.expected_spend) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (l.actual_spend ? money(l.actual_spend) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (ld > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (l.actual_spend ? money(ld) : '—') + '</td>'
@@ -27434,12 +27666,12 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (llift != null && llift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(llift) + '</td></tr>';
       }).join('');
       return '<tr class="hl-ta-cr" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
-        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-ta-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + b.cov + '/' + b.n + ' joined</span></td>'
+        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-ta-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + b.cov + '/' + b.n + ' measured</span></td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(b.exp) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(b.act) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (b.act - b.exp > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b.act ? money(b.act - b.exp) : '—') + '</td>'
-        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (b.cov ? money(b.md) : '—') + '</td>'
-        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (b.cov && b.mu ? num(b.mu) : '—') + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (b.cov ? money(md) : '—') + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (b.cov && b.anyU && mu ? num(mu) : '—') + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (lift != null && lift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(lift) + '</td></tr>'
         + lineRows;
     }).join('');
@@ -27456,10 +27688,12 @@ render();
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Δ spend</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through $ (windows)</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through units</th>
-          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">$ lift vs prior period</th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lift vs 12-wk base</th>
         </tr></thead><tbody>${rowsHtml}</tbody></table></div>
-      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.7;">Sell-through sums each promo line\'s governing window (scans → scan-back window, MCB/EDLP → in-store, fees → buy-in) from Keel\'s weekly sales; <b>$ lift</b> compares the window to the equal-length period before it. Units show where the source carries them (UNFI cases, WFM, Kroger — KeHE reports dollars only). "no sales match" = the plan customer couldn\'t be found in the sales data — the customer crosswalk tightens in the deduction phase.</p>`;
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.7;">Sell-through sums each promo line\'s governing window (scans → scan-back window, MCB/EDLP → in-store, fees → buy-in) from Keel\'s weekly sales; <b>Lift</b> compares the promo window\'s weekly sales rate to the customer\'s rate over the 12 weeks before the promo, counting only OFF-promo weeks in that baseline (weeks inside other promo windows are excluded; NetSuite≈ month-grain baselines can\'t exclude and read approximately). Customer lift is the sales-weighted mean of its lines. Units show where the source carries them (UNFI cases, WFM, Kroger — KeHE reports dollars only). "no sales match" = the plan customer couldn\'t be found in the sales data — the customer crosswalk tightens in the deduction phase. Customer rows count overlapping promo weeks ONCE (union), and sell-through is banner-wide until the product-group mapping lands. <b>0/N measured</b> usually means the weekly sales history doesn\'t reach back to those promo windows — UNFI/KeHE weekly history starts when their weekly uploads began — those windows fall back to <b>NetSuite≈</b>: your own billed revenue and units by customer-month, prorated to the window\'s days (month-grain, so short promos read approximately).</p>`;
     summaryEl.addEventListener('click', (ev) => {
+      const ab = ev.target.closest('.hl-ta-auditbtn');
+      if (ab && summaryEl.contains(ab)) { _taShowAudit(ab.dataset.pk, lines, src); return; }
       const tr = ev.target.closest('.hl-ta-cr');
       if (!tr || !summaryEl.contains(tr)) return;
       const ci = tr.dataset.ci;
