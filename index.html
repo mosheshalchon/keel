@@ -27279,6 +27279,17 @@ render();
   let _promoView = localStorage.getItem('keel_promo_view') === 'analyzer' ? 'analyzer' : 'plan';
   let _taCompletedOnly = true;
   const _taCache = {};
+  const _taFilt = { cust: new Set(), prod: new Set(), type: new Set(), month: new Set() };
+  const _taProdShort = (l) => {
+    let g = String(l.product_group || '').replace(/^atg\s*-\s*/i, '').trim();
+    if (/all products/i.test(g)) return 'All products';
+    if (g) return g.replace(/^pizza\s*-\s*/i, 'Pizza ');
+    const names = String(l.product_name || '').split('|').map(x => x.trim()).filter(Boolean);
+    if (!names.length) return '—';
+    const short = names.slice(0, 2).map(n => n.replace(/\s*-\s*\d+ct.*$/i, '')).join(' + ');
+    return short.slice(0, 26) + (names.length > 2 ? '…' : '');
+  };
+  const _taMonName = (l) => { const m = l.month || (l.start_date ? Number(String(l.start_date).slice(5, 7)) : null); return (m >= 1 && m <= 12) ? ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m - 1] : '—'; };
   const _taNorm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const _taIso = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 
@@ -27597,13 +27608,55 @@ render();
     const src = await _taLoadSales(year);
     const all = lines;
     if (_taCompletedOnly) lines = lines.filter(l => /completed/i.test(String(l.status || '')));
+    // Filters: apply the checkbox multi-selects to the post-completed line set
+    const lines0 = lines;
+    const cv = (l) => l.customer || '(no customer)';
+    lines = lines.filter(l =>
+      (!_taFilt.cust.size || _taFilt.cust.has(cv(l))) &&
+      (!_taFilt.prod.size || _taFilt.prod.has(_taProdShort(l))) &&
+      (!_taFilt.type.size || _taFilt.type.has(_taTypeShort(l.promo_type))) &&
+      (!_taFilt.month.size || _taFilt.month.has(_taMonName(l))));
     // Controls + coverage legend
+    const msDef = [
+      ['cust', 'Retailer', cv],
+      ['prod', 'Product', _taProdShort],
+      ['type', 'Promo type', (l) => _taTypeShort(l.promo_type)],
+      ['month', 'Period', _taMonName],
+    ];
+    const msHtml = msDef.map(([key, label, fn]) => {
+      const cnt = new Map();
+      for (const l of lines0) { const v = fn(l); cnt.set(v, (cnt.get(v) || 0) + 1); }
+      const opts = [...cnt.entries()].sort((a, b) => key === 'month' ? 'JanFebMarAprMayJunJulAugSepOctNovDec'.indexOf(a[0]) - 'JanFebMarAprMayJunJulAugSepOctNovDec'.indexOf(b[0]) : b[1] - a[1]);
+      const sel = _taFilt[key];
+      return `<span class="ta-ms" style="position:relative;display:inline-block;">
+        <button class="ta-ms-btn" data-f="${key}" style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:5px;border:1px solid ${sel.size ? 'var(--ink)' : 'var(--rule-soft)'};background:transparent;color:${sel.size ? 'var(--ink)' : 'var(--ink-3)'};cursor:pointer;">${label}${sel.size ? ' · ' + sel.size : ''} ▾</button>
+        <div class="ta-ms-panel" data-f="${key}" style="display:none;position:absolute;top:110%;left:0;z-index:40;background:var(--paper,#f4efe6);border:1px solid var(--rule-soft);border-radius:7px;box-shadow:0 10px 30px rgba(0,0,0,0.18);padding:10px 12px;min-width:220px;max-height:290px;overflow-y:auto;">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-bottom:7px;"><a href="#" class="ta-ms-clear" data-f="${key}" style="color:var(--ink-3);">Clear</a></div>
+          ${opts.map(([v, n]) => `<label style="display:flex;gap:7px;align-items:center;font-family:var(--mono);font-size:10.5px;padding:2.5px 0;cursor:pointer;white-space:nowrap;"><input type="checkbox" class="ta-ms-cb" data-f="${key}" value="${esc(v)}" ${sel.has(v) ? 'checked' : ''} style="cursor:pointer;"> ${esc(v)} <span style="color:var(--ink-3);">· ${n}</span></label>`).join('')}
+        </div></span>`;
+    }).join('');
     filtersEl.innerHTML = `
-      <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;">
-        <label style="font-family:var(--mono);font-size:11px;color:var(--ink-2);cursor:pointer;display:flex;align-items:center;gap:7px;"><input type="checkbox" id="hl-ta-completed" ${_taCompletedOnly ? 'checked' : ''} style="cursor:pointer;"> Completed promos only <span style="color:var(--ink-3);">(${all.filter(l => /completed/i.test(String(l.status || ''))).length} of ${all.length} lines — Running/Approved promos haven\'t spent yet and pollute the read)</span></label>
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through joins: UNFI cases+$ · KeHE $ only · Whole Foods units+$ · Kroger units+$ (≈ fiscal weeks) · NetSuite billed $+units (monthly ≈, deep-history fallback) · SPINS in v2${src.errors.length ? ' · <span style="color:#a8381f;">' + esc(src.errors.join(' · ')) + '</span>' : ''}</span>
-      </div>`;
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <label style="font-family:var(--mono);font-size:11px;color:var(--ink-2);cursor:pointer;display:flex;align-items:center;gap:7px;"><input type="checkbox" id="hl-ta-completed" ${_taCompletedOnly ? 'checked' : ''} style="cursor:pointer;"> Completed only <span style="color:var(--ink-3);">(${all.filter(l => /completed/i.test(String(l.status || ''))).length}/${all.length})</span></label>
+        ${msHtml}
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${lines.length.toLocaleString()} of ${lines0.length.toLocaleString()} lines</span>
+      </div>
+      <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:8px;">Sell-through joins: UNFI cases+$ · KeHE $ only · Whole Foods units+$ · Kroger units+$ (≈ fiscal weeks) · NetSuite billed $+units (monthly ≈, fallback) · SPINS in v2${src.errors.length ? ' · <span style="color:#a8381f;">' + esc(src.errors.join(' · ')) + '</span>' : ''}</div>`;
     filtersEl.querySelector('#hl-ta-completed').addEventListener('change', (e) => { _taCompletedOnly = e.target.checked; renderTradeAnalyzer(summaryEl, filtersEl, year); });
+    filtersEl.querySelectorAll('.ta-ms-btn').forEach(b => b.addEventListener('click', () => {
+      const pn = filtersEl.querySelector('.ta-ms-panel[data-f="' + b.dataset.f + '"]');
+      const open = pn.style.display !== 'none';
+      filtersEl.querySelectorAll('.ta-ms-panel').forEach(x => { x.style.display = 'none'; });
+      pn.style.display = open ? 'none' : 'block';
+    }));
+    filtersEl.querySelectorAll('.ta-ms-cb').forEach(cb => cb.addEventListener('change', () => {
+      const set9 = _taFilt[cb.dataset.f];
+      if (cb.checked) set9.add(cb.value); else set9.delete(cb.value);
+      renderTradeAnalyzer(summaryEl, filtersEl, year);
+    }));
+    filtersEl.querySelectorAll('.ta-ms-clear').forEach(a => a.addEventListener('click', (e) => {
+      e.preventDefault(); _taFilt[a.dataset.f].clear(); renderTradeAnalyzer(summaryEl, filtersEl, year);
+    }));
     // Every promo window per customer — the off-promo baseline excludes these weeks
     // Baselines exclude only EVENT promos (scans/TPR/ads/coupons). Always-on programs —
     // EDLP, merchandising and slotting fees — ARE the everyday state: with monthly EDLP
@@ -27698,7 +27751,9 @@ render();
           ? '<span class="hl-ta-auditbtn" data-pk="' + esc(l.promotion_key) + '" title="Audit this number — expected vs actual by product line" style="border-bottom:1px dotted var(--ink-3);cursor:pointer;">' + (l.actual_spend ? money(l.actual_spend) : '—') + '</span>'
           : (l.actual_spend ? money(l.actual_spend) : '—');
         return '<tr class="hl-ta-lr hl-ta-lr' + ci + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
-          + '<td style="padding:5px 10px 5px 40px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">' + esc(l.promo_name || l.line_key) + '</div><div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(l.promo_type || '') + (w ? ' · ' + w[0] + ' → ' + w[1] : ' · no window') + (tag ? ' · ' + esc(tag) : ' · <span style="color:#8a6d1f;">no sales match</span>') + '</div></td>'
+          + '<td style="padding:5px 10px 5px 40px;" title="' + esc(l.promo_name || l.line_key) + '"><div style="font-family:var(--mono);font-size:11.5px;">' + (w ? w[0].slice(5) + ' → ' + w[1].slice(5) : '(no dates)') + '</div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + (tag ? esc(tag) : '<span style="color:#8a6d1f;">no sales match</span>') + '</div></td>'
+          + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10.5px;">' + esc(_taProdShort(l)) + '</td>'
+          + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(_taMonName(l)) + '</td>'
           + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);">' + esc(_taTypeShort(l.promo_type)) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(l.expected_spend) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + actCell + '</td>'
@@ -27709,7 +27764,7 @@ render();
       }).join('');
       return '<tr class="hl-ta-cr" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
         + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-ta-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + b.cov + '/' + b.n + ' measured</span></td>'
-        + '<td></td>'
+        + '<td></td><td></td><td></td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(b.exp) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(b.act) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (b.act - b.exp > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b.act ? money(b.act - b.exp) : '—') + '</td>'
@@ -27725,7 +27780,9 @@ render();
       </div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
-          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Customer · click for lines</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Customer · promo dates</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Products</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Month</th>
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Type</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected $</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Actual $ (Vividly)</th>
@@ -27735,7 +27792,7 @@ render();
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lift vs 12-wk base</th>
         </tr></thead><tbody>${rowsHtml}</tbody></table></div>
       <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;max-width:900px;line-height:1.7;">Sell-through sums each promo line\'s governing window (scans → scan-back window, MCB/EDLP → in-store, fees → buy-in) from Keel\'s weekly sales; <b>Lift</b> compares the promo window\'s weekly sales rate to the customer\'s rate over the 12 weeks before the promo, counting only OFF-promo weeks in that baseline (weeks inside other promo windows are excluded; NetSuite≈ month-grain baselines can\'t exclude and read approximately). Customer lift is the sales-weighted mean of its lines. Units show where the source carries them (UNFI cases, WFM, Kroger — KeHE reports dollars only). "no sales match" = the plan customer couldn\'t be found in the sales data — the customer crosswalk tightens in the deduction phase. Customer rows count overlapping promo weeks ONCE (union), and sell-through is banner-wide until the product-group mapping lands. <b>0/N measured</b> usually means the weekly sales history doesn\'t reach back to those promo windows — UNFI/KeHE weekly history starts when their weekly uploads began — those windows fall back to <b>NetSuite≈</b>: your own billed revenue and units by customer-month, prorated to the window\'s days (month-grain, so short promos read approximately).</p>`;
-    summaryEl.addEventListener('click', (ev) => {
+    summaryEl.onclick = (ev) => {
       const ab = ev.target.closest('.hl-ta-auditbtn');
       if (ab && summaryEl.contains(ab)) { _taShowAudit(ab.dataset.pk, lines, src); return; }
       const tr = ev.target.closest('.hl-ta-cr');
@@ -27746,7 +27803,7 @@ render();
       const showing = rows9[0].style.display !== 'none';
       rows9.forEach(r => { r.style.display = showing ? 'none' : ''; });
       const car = document.getElementById('hl-ta-car' + ci); if (car) car.textContent = showing ? '▶' : '▼';
-    });
+    };
   }
 
   async function renderVividlyPlan(summaryEl, filtersEl, year) {
