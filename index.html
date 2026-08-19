@@ -27433,9 +27433,24 @@ render();
     return null;
   }
 
+  const _taIsFee = (t) => /\bads?\b|fee|merch|slott|display|admin|freight|return|early pay/i.test(String(t || ''));
+  const _taTypeShort = (t) => {
+    t = String(t || '');
+    if (/scan/i.test(t)) return 'TPR scan';
+    if (/ads|display/i.test(t)) return 'Ad fee';
+    if (/merch/i.test(t)) return 'Merch fee';
+    if (/slott/i.test(t)) return 'Slotting';
+    if (/edlp/i.test(t)) return 'EDLP';
+    if (/mcb/i.test(t)) return 'MCB';
+    if (/early pay/i.test(t)) return 'Early pay';
+    if (/coupon/i.test(t)) return 'Coupon';
+    return t.slice(0, 12);
+  };
+
   function _taFamilies(lines) {
     const fams = new Map();
     for (const l of lines) {
+      if (_taIsFee(l.promo_type)) continue;   // fees are fixed $ — they never match items
       const key = l.product_group || String(l.product_name || '').split('|')[0].trim() || 'group';
       if (!fams.has(key)) fams.set(key, { key, names: new Set(), rate: 0, legs: 0, expU: 0, expS: 0, actS: 0 });
       const f = fams.get(key);
@@ -27444,6 +27459,7 @@ render();
       f.expU = Math.max(f.expU, Number(l.expected_units) || 0);   // legs repeat the family's units — don't double count
       f.expS += Number(l.expected_spend) || 0; f.actS += Number(l.actual_spend) || 0;
     }
+    for (const f of fams.values()) f.all = /all products/i.test(f.key) || f.names.size > 20;
     return [...fams.values()];
   }
   function _taItemFamily(item, fams) {
@@ -27451,6 +27467,7 @@ render();
     if (it.includes('shell')) return null;   // shells are never on these promos — the control group
     let best = null, bestScore = 0;
     for (const f of fams) {
+      if (f.all) continue;   // "All Products" families match by fallback only — never by tokens
       let score = 0;
       const g = _taNorm(f.key);
       for (const n of f.names) {
@@ -27464,7 +27481,9 @@ render();
       if ([...f.names].some(n => /baguette|roll/i.test(n)) && /baguette|roll/.test(it)) score += 4;
       if (score > bestScore) { best = f; bestScore = score; }
     }
-    return bestScore > 0 ? best.key : null;
+    if (bestScore > 0) return best.key;
+    const allFam = fams.find(f => f.all);
+    return allFam ? allFam.key : null;
   }
 
   function _taShowAudit(pk, lines, src) {
@@ -27510,6 +27529,21 @@ render();
         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${f.actS ? money(f.actS) : '—'}</td>
       </tr>`;
     }).join('');
+    const feeLines = evLines.filter(l => _taIsFee(l.promo_type));
+    let feeExp = 0, feeAct = 0;
+    const feeHtml = feeLines.length ? `
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin:16px 0 6px;">FIXED FEES ON THIS EVENT — no units, no lift; validate amount only</div>
+      <table style="width:100%;border-collapse:collapse;">
+        ${feeLines.map(l => { feeExp += l.expected_spend || 0; feeAct += l.actual_spend || 0; return `<tr style="border-top:1px solid var(--rule-soft);">
+          <td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);width:110px;">${esc(_taTypeShort(l.promo_type))}</td>
+          <td style="padding:5px 10px;font-family:var(--sans,sans-serif);font-size:11px;">${esc(l.promo_name || l.line_key)}</td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;width:110px;">${money(l.expected_spend)}</td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;width:110px;">${l.actual_spend ? money(l.actual_spend) : '—'}</td>
+        </tr>`; }).join('')}
+        <tr style="border-top:2px solid var(--rule-soft);font-weight:700;"><td style="padding:5px 10px;font-family:var(--mono);font-size:10px;">Fees total</td><td></td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(feeExp)}</td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(feeAct)}</td></tr>
+      </table>` : '';
     const old9 = document.getElementById('hl-ta-audit'); if (old9) old9.remove();
     const ov = document.createElement('div');
     ov.id = 'hl-ta-audit';
@@ -27542,6 +27576,7 @@ render();
           <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(actSTot)}</td>
         </tr></tfoot>
       </table></div>
+      ${feeHtml}
       <p style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:10px;line-height:1.7;">Physics $ = actual scanned units × the event\'s stacked scan rates — what the deduction SHOULD cost. Compare against Vividly act $ when the deduction posts: a gap is either timing or a dispute. Expected u repeats per rate leg in Vividly, so it\'s taken once per line. Items resolve to lines by name; shells never match (control).</p>
     </div>`;
     document.body.appendChild(ov);
@@ -27606,7 +27641,8 @@ render();
       }
       const excl9 = custWins.get(c) || [];
       let lift9 = null;
-      if (w && series) {
+      const isFee9 = _taIsFee(l.promo_type);
+      if (w && series && !isFee9) {
         tag = series.tag; hasU = series.units;
         win = _taSum(series.map, w[0], w[1]);
         base = _taBaseNearest(series.map, w[0], excl9, 6);   // nearest 6 off-promo weeks (seasonally local)
@@ -27623,7 +27659,7 @@ render();
         }
       }
       // Deep-history fallback: NetSuite billed customer-months, prorated to the window's days.
-      if (w && (!win || win.weeks === 0)) {
+      if (w && !isFee9 && (!win || win.weeks === 0)) {
         const ns = _taNsFor(l, src);
         if (ns) {
           const winN = _taSumMonthsProrated(ns.map, w[0], w[1]);
@@ -27638,7 +27674,8 @@ render();
           }
         }
       }
-      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9 });
+      if (isFee9 && !tag) { const s9 = _taSeriesFor(l, src); if (s9) tag = s9.tag; }
+      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9, fee: isFee9 });
     }
     const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
     // Monthly pacing strip (expected vs actual dollars)
@@ -27653,20 +27690,26 @@ render();
       let lw = 0, lsum = 0;
       for (const e9 of b.lines) if (e9.lift != null && e9.win && e9.win.d > 0) { lw += e9.win.d; lsum += e9.lift * e9.win.d; }
       const lift = lw > 0 ? lsum / lw : null;
-      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift }) => {
+      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift, fee }) => {
         const ld = (l.actual_spend || 0) - (l.expected_spend || 0);
         const llift = lift;
+        const canAudit = !!(l.promotion_key && tag && tag.indexOf('WFM') === 0);
+        const actCell = canAudit
+          ? '<span class="hl-ta-auditbtn" data-pk="' + esc(l.promotion_key) + '" title="Audit this number — expected vs actual by product line" style="border-bottom:1px dotted var(--ink-3);cursor:pointer;">' + (l.actual_spend ? money(l.actual_spend) : '—') + '</span>'
+          : (l.actual_spend ? money(l.actual_spend) : '—');
         return '<tr class="hl-ta-lr hl-ta-lr' + ci + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
-          + '<td style="padding:5px 10px 5px 40px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">' + esc(l.promo_name || l.line_key) + ((/scan/i.test(String(l.promo_type || '')) && tag && tag.indexOf('WFM') === 0 && l.promotion_key) ? ' <button class="hl-ta-auditbtn" data-pk="' + esc(l.promotion_key) + '" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border-radius:4px;border:1px solid var(--rule-soft);background:transparent;color:var(--ink-3);cursor:pointer;">⚖ audit</button>' : '') + '</div><div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(l.promo_type || '') + (w ? ' · ' + w[0] + ' → ' + w[1] : ' · no window') + (tag ? ' · ' + esc(tag) : ' · <span style="color:#8a6d1f;">no sales match</span>') + '</div></td>'
+          + '<td style="padding:5px 10px 5px 40px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">' + esc(l.promo_name || l.line_key) + '</div><div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(l.promo_type || '') + (w ? ' · ' + w[0] + ' → ' + w[1] : ' · no window') + (tag ? ' · ' + esc(tag) : ' · <span style="color:#8a6d1f;">no sales match</span>') + '</div></td>'
+          + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);">' + esc(_taTypeShort(l.promo_type)) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(l.expected_spend) + '</td>'
-          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (l.actual_spend ? money(l.actual_spend) : '—') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + actCell + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (ld > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (l.actual_spend ? money(ld) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win ? money(win.d) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win && hasU ? num(win.u) : '—') + '</td>'
-          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (llift != null && llift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(llift) + '</td></tr>';
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (llift != null && llift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + (fee ? '<span style="font-size:9px;color:var(--ink-3);">fixed fee</span>' : pct(llift)) + '</td></tr>';
       }).join('');
       return '<tr class="hl-ta-cr" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
         + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-ta-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + b.cov + '/' + b.n + ' measured</span></td>'
+        + '<td></td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(b.exp) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(b.act) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (b.act - b.exp > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b.act ? money(b.act - b.exp) : '—') + '</td>'
@@ -27683,6 +27726,7 @@ render();
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Customer · click for lines</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Type</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected $</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Actual $ (Vividly)</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Δ spend</th>
