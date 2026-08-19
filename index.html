@@ -27263,12 +27263,28 @@ render();
   async function _vvFetchLines(year) {
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary.getSession().brandId;
-    let lines = [];
-    for (let from9 = 0; ; from9 += 1000) {
-      const { data, error } = await sb.from('promo_plan_lines').select('*').eq('brand_id', brandId).eq('year', year).order('line_key').range(from9, from9 + 999);
-      if (error) return { lines: [], error };
-      lines = lines.concat(data || []);
-      if (!data || data.length < 1000) break;   // Supabase caps selects at 1,000 rows
+    // Supabase caps selects at 1,000 rows. Page 1 carries an exact count so the rest fire in
+    // parallel; line_key is unique per brand+source so the sort is stable across pages.
+    const mk = () => sb.from('promo_plan_lines').select('*', { count: 'exact' }).eq('brand_id', brandId).eq('year', year).order('source').order('line_key');
+    const first = await mk().range(0, 999);
+    if (first.error) return { lines: [], error: first.error };
+    let lines = first.data || [];
+    if (lines.length === 1000) {
+      const total = Number(first.count);
+      if (isFinite(total) && total > 1000) {
+        const npages = Math.min(Math.ceil(total / 1000), 40);
+        const res = await Promise.all(Array.from({ length: npages - 1 }, (_, i) => mk().range((i + 1) * 1000, (i + 1) * 1000 + 999)));
+        const bad = res.find(r => r.error);
+        if (bad) return { lines: [], error: bad.error };
+        for (const r of res) lines = lines.concat(r.data || []);
+      } else {
+        for (let from9 = 1000; ; from9 += 1000) {
+          const { data, error } = await mk().range(from9, from9 + 999);
+          if (error) return { lines: [], error };
+          lines = lines.concat(data || []);
+          if (!data || data.length < 1000) break;
+        }
+      }
     }
     return { lines, error: null };
   }
@@ -27314,17 +27330,51 @@ render();
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary.getSession().brandId;
     const lo = (year - 1) + '-10-01', hi = year + '-12-31';   // includes baseline runway
-    const paged = async (q) => { let out = []; for (let f = 0; ; f += 1000) { const { data, error } = await q.range(f, f + 999); if (error) return { rows: out, error }; out = out.concat(data || []); if (!data || data.length < 1000 || f > 60000) break; } return { rows: out, error: null }; };
+    // Paging is the analyzer's dominant cost. Supabase caps EVERY select at 1,000 rows, so a
+    // 40k-row weekly table used to cost 40 SEQUENTIAL round trips before the first paint.
+    // Now page 1 carries an exact count and every remaining page fires in PARALLEL.
+    // `mk` MUST be a factory: a supabase query builder is single-use, and reusing one across
+    // parallel .range() calls has each request overwrite the others' offsets.
+    const paged = async (mk, label) => {
+      const t0 = (window.performance || Date).now();
+      const first = await mk().range(0, 999);
+      if (first.error) return { rows: [], error: first.error };
+      let out = first.data || [];
+      if (out.length === 1000) {
+        const total = Number(first.count);
+        if (isFinite(total) && total > 1000) {
+          const npages = Math.min(Math.ceil(total / 1000), 80);
+          const res = await Promise.all(Array.from({ length: npages - 1 }, (_, i) => mk().range((i + 1) * 1000, (i + 1) * 1000 + 999)));
+          const bad = res.find(r => r.error);
+          if (bad) return { rows: out, error: bad.error };
+          for (const r of res) out = out.concat(r.data || []);
+        } else {
+          for (let f = 1000; ; f += 1000) {   // no count came back — fall back to sequential
+            const { data, error } = await mk().range(f, f + 999);
+            if (error) return { rows: out, error };
+            out = out.concat(data || []);
+            if (!data || data.length < 1000 || f > 60000) break;
+          }
+        }
+      }
+      console.log('[analyzer] ' + label + ': ' + out.length + ' rows in ' + Math.round((window.performance || Date).now() - t0) + 'ms');
+      return { rows: out, error: null };
+    };
     const src = { unfi: new Map(), kehe: new Map(), wfm: new Map(), kroger: new Map(), unfiAll: new Map(), keheAll: new Map(), ns: new Map(), wfmItems: new Map(), errors: [] };
     const add = (map, key, wk, u, d) => { let m = map.get(key); if (!m) { m = new Map(); map.set(key, m); } const c = m.get(wk) || { u: 0, d: 0 }; c.u += u || 0; c.d += d || 0; m.set(wk, c); };
     const addFlat = (map, wk, u, d) => { const c = map.get(wk) || { u: 0, d: 0 }; c.u += u || 0; c.d += d || 0; map.set(wk, c); };
     // The four sources load in PARALLEL — cuts the first paint to the slowest single source
+    // Secondary .order() columns are deliberate: OFFSET paging over a NON-UNIQUE sort key can
+    // skip or repeat rows between pages, and that risk grows once the pages fetch in parallel.
+    // Kroger is bounded to the promo year + the prior one (it used to pull all history).
+    const tAll = (window.performance || Date).now();
     const [dcs, wf, kr, nsq] = await Promise.all([
-      paged(sb.from('distributor_customer_sales').select('distributor, chain_name, week_starting, sales, quantity').eq('brand_id', brandId).eq('report_type', 'weekly').gte('week_starting', lo).lte('week_starting', hi).order('week_starting')),
-      paged(sb.from('wfm_sales').select('week_end, unit_sales, net_sales, brand, item_desc').eq('brand_id', brandId).gte('week_end', lo).lte('week_end', hi).order('week_end')),
-      paged(sb.from('kroger_sales').select('fiscal_year, week, ty_units, ty_revenue').eq('brand_id', brandId).order('week')),
-      paged(sb.from('sales_actuals').select('entity, month, amount, units, status').eq('brand_id', brandId).eq('dimension', 'customer').gte('month', lo).lte('month', hi).order('month')),
+      paged(() => sb.from('distributor_customer_sales').select('distributor, chain_name, week_starting, sales, quantity', { count: 'exact' }).eq('brand_id', brandId).eq('report_type', 'weekly').gte('week_starting', lo).lte('week_starting', hi).order('week_starting').order('distributor').order('chain_name'), 'UNFI/KeHE weekly'),
+      paged(() => sb.from('wfm_sales').select('week_end, unit_sales, net_sales, brand, item_desc', { count: 'exact' }).eq('brand_id', brandId).gte('week_end', lo).lte('week_end', hi).order('week_end').order('region').order('scan_code'), 'WFM'),
+      paged(() => sb.from('kroger_sales').select('fiscal_year, week, ty_units, ty_revenue', { count: 'exact' }).eq('brand_id', brandId).gte('fiscal_year', year - 1).lte('fiscal_year', year).order('fiscal_year').order('week').order('upc'), 'Kroger'),
+      paged(() => sb.from('sales_actuals').select('entity, month, amount, units, status', { count: 'exact' }).eq('brand_id', brandId).eq('dimension', 'customer').gte('month', lo).lte('month', hi).order('month').order('entity').order('status'), 'NetSuite'),
     ]);
+    console.log('[analyzer] all four sales sources loaded in ' + Math.round((window.performance || Date).now() - tAll) + 'ms');
     if (dcs.error) src.errors.push('UNFI/KeHE weekly: ' + dcs.error.message);
     for (const r of dcs.rows) {
       const wk = String(r.week_starting).slice(0, 10);
@@ -27804,7 +27854,10 @@ render();
     }).join('');
     summaryEl.innerHTML = `
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;">
-        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${year} trade analyzer · ${lines.length.toLocaleString()} lines · expected ${money(mExp)} · actual ${money(mAct)} · <b style="color:${mAct - mExp > 0 ? '#a8381f' : 'var(--ink)'}">${money(mAct - mExp)}</b>${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year</span>' : ''}</div>
+        <div style="max-width:660px;">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${year} trade analyzer · ${lines.length.toLocaleString()} lines · planned ${money(mExp)} · deducted ${money(mAct)} · <b style="color:${mAct - mExp > 0 ? '#a8381f' : 'var(--ink)'}">${money(mAct - mExp)}</b>${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year</span>' : ''}</div>
+        ${(() => { const aE = all.reduce((s, l) => s + (l.expected_spend || 0), 0); const off = aE - mExp; return off > 1 ? `<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:3px;">A SUBSET of the plan — ${money(off)} planned across ${(all.length - lines.length).toLocaleString()} lines is filtered out (not Completed, or excluded by a filter above). Plan view shows all ${all.length.toLocaleString()} lines / ${money(aE)}.</div>` : ''; })()}
+        </div>
         <div style="display:flex;gap:5px;align-items:flex-end;">${strip}<span style="font-family:var(--mono);font-size:8.5px;color:var(--ink-3);margin-left:8px;">▮ expected<br>▮ <span style="color:#534AB7;">actual</span></span></div>
       </div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
@@ -27895,7 +27948,8 @@ render();
         + typeRows;
     }).join('');
     summaryEl.innerHTML = `
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:10px;">${year} Vividly plan · ${lines.length.toLocaleString()} lines · expected ${money(tExp)} · actual ${money(tAct)}${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year — not reconciled</span>' : ''}</div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:4px;">${year} Vividly plan · ${lines.length.toLocaleString()} lines · expected ${money(tExp)} · actual ${money(tAct)}${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year — not reconciled</span>' : ''}</div>
+      <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-bottom:10px;">THE WHOLE BOOK — every promo line at every status (Completed · Approved · Running), dollars straight from Vividly, no sales measurement. Expected units are Vividly's own field and are REPEATED on each stacked rate leg of a scan event, so unique promoted units run about half this figure. The Trade analyzer measures a subset of these lines against Keel's sales.</div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Customer · click for promo types</th>
@@ -45837,6 +45891,446 @@ render();
   }
 
 
+  // ─── Settings: System audit ──────────────────────────────────────────────
+  // WHY THIS EXISTS. Almost every silent failure in Keel has had the same shape:
+  // a string used as a foreign key with nothing enforcing it (tab_key → a route id,
+  // chain_name → a plan customer, product_id → a Brand Library product), combined
+  // with defaults that fail OPEN and QUIET (a delete with no RLS policy returns
+  // success with 0 rows; a select past 1,000 rows returns 1,000 rows and no error;
+  // an empty permission set means "ungated" while a non-empty one means
+  // "deny-by-default"). The result is a system whose response to being
+  // misconfigured is to look fine — so the detection layer has been Moshe reading
+  // a screen and noticing a wrong number. That does not survive multi-brand.
+  //
+  // Each check below is a past failure turned into a standing invariant. ADDING A
+  // CHECK IS ONE OBJECT in _AUDIT_CHECKS — that is the whole point; when something
+  // new breaks silently, it gets an entry here so it can only happen once.
+  //
+  // Rules for a check: read-only (never writes), independently wrapped (one broken
+  // check must not blank the page), and it must return actionable rows, not a
+  // verdict. A missing table is 'skip', not 'fail'.
+
+  const _AUDIT_SEV = {
+    fail: { label: 'FAIL', color: '#a8381f', bg: 'rgba(168,56,31,0.08)' },
+    warn: { label: 'WARN', color: '#8a6d1f', bg: 'rgba(138,109,31,0.09)' },
+    ok:   { label: 'OK',   color: '#3f6f4a', bg: 'rgba(63,111,74,0.07)' },
+    skip: { label: 'SKIP', color: '#7b7367', bg: 'rgba(0,0,0,0.04)' },
+  };
+
+  // A relation PostgREST doesn't know about comes back as 42P01 / a 404. That is a
+  // "this check doesn't apply here" signal, not a failure — other brands may not
+  // have every table.
+  function _auditMissingTable(err) {
+    if (!err) return false;
+    const m = String(err.message || '') + ' ' + String(err.code || '') + ' ' + String(err.details || '');
+    return /42P01/.test(m) || /does not exist/i.test(m) || /could not find the table/i.test(m);
+  }
+
+  async function _auditCount(sb, table, tweak) {
+    let q = sb.from(table).select('*', { count: 'exact', head: true });
+    if (tweak) q = tweak(q);
+    const { count, error } = await q;
+    if (error) return { count: null, error };
+    return { count: count == null ? null : Number(count), error: null };
+  }
+
+  async function _auditPaged(sb, mk, cap) {
+    let out = [];
+    for (let f = 0; ; f += 1000) {
+      const { data, error } = await mk().range(f, f + 999);
+      if (error) return { rows: out, error };
+      out = out.concat(data || []);
+      if (!data || data.length < 1000 || f >= (cap || 20000)) break;
+    }
+    return { rows: out, error: null };
+  }
+
+  const _AUDIT_CHECKS = [
+    {
+      id: 'perm-dead-keys',
+      title: 'Tab permissions point at pages that exist',
+      why: 'tab_key is free text compared to a route id at runtime — nothing rejects a wrong value, so a typo or a renamed route leaves a ticked checkbox that grants nothing. This is what hid the Sales department\u2019s access for months.',
+      async run(ctx) {
+        const { data, error } = await ctx.sb.from('role_tab_permissions')
+          .select('department, tab_key, can_access').eq('brand_id', ctx.brandId);
+        if (_auditMissingTable(error)) return { status: 'skip', summary: 'role_tab_permissions not present.' };
+        if (error) return { status: 'skip', summary: 'Could not read role_tab_permissions: ' + error.message };
+        const dead = (data || []).filter(r => !ctx.navIds.has(r.tab_key));
+        if (!dead.length) return { status: 'ok', summary: (data || []).length + ' permission rows, every tab_key resolves to a real page.' };
+        const byKey = new Map();
+        for (const r of dead) {
+          if (!byKey.has(r.tab_key)) byKey.set(r.tab_key, []);
+          byKey.get(r.tab_key).push(r.department + (r.can_access ? '' : ' (off)'));
+        }
+        return {
+          status: 'fail',
+          summary: byKey.size + ' tab_key value(s) match no page — those rows grant nothing, however they look in the Team matrix.',
+          cols: ['tab_key (dead)', 'departments'],
+          rows: [...byKey.entries()].map(([k, d]) => [k, d.join(', ')]),
+          sql: "delete from role_tab_permissions\nwhere brand_id = '" + ctx.brandId + "'\n  and tab_key not in (" + [...ctx.navIds].map(x => "'" + x + "'").join(', ') + ");",
+        };
+      },
+    },
+    {
+      id: 'perm-missing-rows',
+      title: 'No tab is hidden purely by omission',
+      why: 'A department with at least one permission row switches to deny-by-default. Every tab added after that department was configured is therefore denied with no row, no warning and no way to notice — a new page ships invisible to real users.',
+      async run(ctx) {
+        const { data, error } = await ctx.sb.from('role_tab_permissions')
+          .select('department, tab_key, can_access').eq('brand_id', ctx.brandId);
+        if (_auditMissingTable(error) || error) return { status: 'skip', summary: 'Could not read role_tab_permissions.' };
+        const byDept = new Map();
+        for (const r of (data || [])) {
+          if (!byDept.has(r.department)) byDept.set(r.department, new Set());
+          byDept.get(r.department).add(r.tab_key);
+        }
+        if (!byDept.size) return { status: 'ok', summary: 'No department is gated — nothing can be hidden by omission.' };
+        const gapRows = [];
+        for (const [dept, keys] of byDept) {
+          const missing = ctx.gateable.filter(id => !keys.has(id));
+          if (missing.length) gapRows.push([dept, String(missing.length), missing.join(', ')]);
+        }
+        if (!gapRows.length) return { status: 'ok', summary: byDept.size + ' gated department(s), each with a row for every current tab.' };
+        return {
+          status: 'warn',
+          summary: gapRows.length + ' gated department(s) have tabs with no permission row at all — those tabs are hidden right now.',
+          cols: ['department', 'hidden', 'tabs with no row'],
+          rows: gapRows,
+        };
+      },
+    },
+    {
+      id: 'perm-ungated',
+      title: 'Gating is deliberate, not accidental',
+      why: 'Zero permission rows for a department means ungated — every user in it sees every tab including Finance and Settings. That is the intended fail-open, but on a commercial deployment it should be a decision someone made, not a default nobody noticed.',
+      async run(ctx) {
+        const { data: acc, error } = await ctx.sb.from('user_brand_access')
+          .select('user_id, role, department').eq('brand_id', ctx.brandId);
+        if (_auditMissingTable(error) || error) return { status: 'skip', summary: 'Could not read user_brand_access.' };
+        const { data: perms } = await ctx.sb.from('role_tab_permissions')
+          .select('department').eq('brand_id', ctx.brandId);
+        const configured = new Set((perms || []).map(p => p.department));
+        const counts = new Map();
+        for (const a of (acc || [])) {
+          if (a.role === 'admin') continue;
+          const d = a.department || 'all';
+          counts.set(d, (counts.get(d) || 0) + 1);
+        }
+        const open = [...counts.entries()].filter(([d]) => d === 'all' || !configured.has(d));
+        if (!open.length) return { status: 'ok', summary: 'Every non-admin department is explicitly gated.' };
+        return {
+          status: 'warn',
+          summary: open.reduce((s, x) => s + x[1], 0) + ' non-admin user(s) sit in a department that sees every tab.',
+          cols: ['department', 'non-admin users', 'reason'],
+          rows: open.map(([d, n]) => [d, String(n), d === 'all' ? "department 'all' is never gated" : 'no permission rows configured']),
+        };
+      },
+    },
+    {
+      id: 'brand-has-admin',
+      title: 'Brand has a reachable admin',
+      why: 'A brand with no admin cannot manage its own team, domains or permissions — and nobody notices until someone needs to grant access.',
+      async run(ctx) {
+        const { data, error } = await ctx.sb.from('user_brand_access')
+          .select('user_id, role').eq('brand_id', ctx.brandId);
+        if (_auditMissingTable(error) || error) return { status: 'skip', summary: 'Could not read user_brand_access.' };
+        const admins = (data || []).filter(a => a.role === 'admin').length;
+        if (admins >= 2) return { status: 'ok', summary: admins + ' admins on this brand.' };
+        if (admins === 1) return { status: 'warn', summary: 'Only ONE admin on this brand — no fallback if that account is lost.' };
+        return { status: 'fail', summary: 'This brand has NO admin. Team, domains and permissions cannot be managed from the app.' };
+      },
+    },
+    {
+      id: 'signup-domains',
+      title: 'Sign-up domains are ones you control',
+      why: 'A listed domain lets anyone with an address at it create an account and read this brand\u2019s data. A public provider on this list is an open door.',
+      async run(ctx) {
+        const { data, error } = await ctx.sb.from('brand_domains')
+          .select('domain, auto_join, default_role').eq('brand_id', ctx.brandId);
+        if (_auditMissingTable(error)) return { status: 'skip', summary: 'brand_domains not present.' };
+        if (error) return { status: 'skip', summary: 'Could not read brand_domains: ' + error.message };
+        const PUBLIC = /^(gmail|googlemail|yahoo|hotmail|outlook|live|msn|icloud|me|mac|aol|proton|protonmail|gmx|mail|zoho|yandex|fastmail|hey)\./i;
+        const bad = (data || []).filter(d => PUBLIC.test(String(d.domain || '')));
+        if (!bad.length) return { status: 'ok', summary: (data || []).length + ' domain(s), none of them a public email provider.' };
+        return {
+          status: 'fail',
+          summary: bad.length + ' public email provider(s) can self-register on this brand.',
+          cols: ['domain', 'self sign-up', 'default role'],
+          rows: bad.map(d => [d.domain, d.auto_join ? 'ON' : 'off', d.default_role || '—']),
+        };
+      },
+    },
+    {
+      id: 'row-cap',
+      title: 'Tables past the 1,000-row select cap are known',
+      why: 'Supabase silently caps every select at 1,000 rows — no error, just a short answer. This has quietly truncated a total twice. Any table over the line must be read through a pager, everywhere it is read.',
+      async run(ctx) {
+        const tables = ['promo_plan_lines', 'distributor_customer_sales', 'wfm_sales', 'kroger_sales', 'sales_actuals', 'fg_inventory', 'products', 'category_reviews'];
+        const rows = [];
+        let over = 0;
+        for (const t of tables) {
+          const { count, error } = await _auditCount(ctx.sb, t, q => q.eq('brand_id', ctx.brandId));
+          if (error) { if (!_auditMissingTable(error)) rows.push([t, '—', 'unreadable: ' + error.message]); continue; }
+          if (count > 1000) over++;
+          rows.push([t, (count || 0).toLocaleString(), count > 1000 ? 'MUST be paged' : 'single select is safe']);
+        }
+        if (!rows.length) return { status: 'skip', summary: 'No countable tables.' };
+        return {
+          status: over ? 'warn' : 'ok',
+          summary: over ? over + ' table(s) exceed the cap — every read of these must page.' : 'No table exceeds the 1,000-row cap yet.',
+          cols: ['table', 'rows (this brand)', 'read requirement'],
+          rows,
+        };
+      },
+    },
+    {
+      id: 'sales-actuals-dupes',
+      title: 'sales_actuals has one row per cell',
+      why: 'The Dropbox sync once stacked a fresh copy on every run and overstated pacing by $176,690 for weeks. The identity of a cell is dimension + entity + month + STATUS — a duplicate on that key is double-counted money.',
+      async run(ctx) {
+        const got = await _auditPaged(ctx.sb, () => ctx.sb.from('sales_actuals')
+          .select('dimension, entity, month, status, source').eq('brand_id', ctx.brandId)
+          .neq('dimension', 'customer_product').order('month'), 12000);
+        if (_auditMissingTable(got.error)) return { status: 'skip', summary: 'sales_actuals not present.' };
+        if (got.error) return { status: 'skip', summary: 'Could not read sales_actuals: ' + got.error.message };
+        const seen = new Map();
+        for (const r of got.rows) {
+          const k = r.dimension + '|' + r.entity + '|' + String(r.month).slice(0, 10) + '|' + (r.status || '');
+          seen.set(k, (seen.get(k) || 0) + 1);
+        }
+        const dupes = [...seen.entries()].filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]);
+        if (!dupes.length) return { status: 'ok', summary: got.rows.length.toLocaleString() + ' cells, no duplicate on dimension+entity+month+status.' };
+        return {
+          status: 'fail',
+          summary: dupes.length + ' duplicated cell(s) — every total that touches them is overstated.',
+          cols: ['dimension | entity | month | status', 'copies'],
+          rows: dupes.slice(0, 40).map(([k, n]) => [k, String(n)]),
+          sql: "-- keep the newest row per cell\ndelete from sales_actuals a\nusing (select dimension, entity, month, status, max(updated_at) mx\n       from sales_actuals where brand_id = '" + ctx.brandId + "'\n       group by 1,2,3,4) k\nwhere a.brand_id = '" + ctx.brandId + "'\n  and a.dimension = k.dimension and a.entity = k.entity\n  and a.month = k.month and a.status is not distinct from k.status\n  and a.updated_at < k.mx;",
+        };
+      },
+    },
+    {
+      id: 'fg-phantom-merge',
+      title: 'No product_id merges two different items',
+      why: 'The fuzzy FG matcher mapped genuinely distinct items (8-pack and 12-pack, 10\u2033 and 12\u2033) onto one product_id, pooling their inventory and hiding a SKU that was really down to 2 weeks of supply. The UI shows these as one quiet row, so SQL is the only detector.',
+      async run(ctx) {
+        const got = await _auditPaged(ctx.sb, () => ctx.sb.from('fg_inventory')
+          .select('item, product_id').eq('brand_id', ctx.brandId).not('product_id', 'is', null).order('product_id'), 8000);
+        if (_auditMissingTable(got.error)) return { status: 'skip', summary: 'fg_inventory not present.' };
+        if (got.error) return { status: 'skip', summary: 'Could not read fg_inventory: ' + got.error.message };
+        const byPid = new Map();
+        for (const r of got.rows) {
+          if (!byPid.has(r.product_id)) byPid.set(r.product_id, new Set());
+          byPid.get(r.product_id).add(String(r.item || '').trim());
+        }
+        const merged = [...byPid.entries()].filter(([, s]) => s.size > 1);
+        if (!merged.length) return { status: 'ok', summary: byPid.size + ' mapped product_ids, each owning exactly one item.' };
+        const shellOnly = merged.filter(([, s]) => [...s].every(i => /shell/i.test(i)));
+        return {
+          status: merged.length > shellOnly.length ? 'fail' : 'warn',
+          summary: merged.length + ' product_id(s) own more than one item' + (shellOnly.length ? ' (' + shellOnly.length + ' are shells, which is legitimate)' : '') + '. Inventory for these is pooled.',
+          cols: ['product_id', 'items sharing it'],
+          rows: merged.map(([p, s]) => [p, [...s].join('  ·  ')]),
+        };
+      },
+    },
+    {
+      id: 'fg-orphan-product',
+      title: 'Every referenced product_id exists',
+      why: 'A product_id pointing at a deleted Brand Library product is a dangling reference the database never rejects — the row simply stops resolving and drops out of every join.',
+      async run(ctx) {
+        const prods = await _auditPaged(ctx.sb, () => ctx.sb.from('products').select('id').eq('brand_id', ctx.brandId).order('id'), 5000);
+        if (_auditMissingTable(prods.error) || prods.error) return { status: 'skip', summary: 'Could not read products.' };
+        const ids = new Set((prods.rows || []).map(p => String(p.id)));
+        const fg = await _auditPaged(ctx.sb, () => ctx.sb.from('fg_inventory')
+          .select('item, product_id').eq('brand_id', ctx.brandId).not('product_id', 'is', null).order('product_id'), 8000);
+        if (_auditMissingTable(fg.error) || fg.error) return { status: 'skip', summary: 'Could not read fg_inventory.' };
+        const orphans = new Map();
+        for (const r of fg.rows) {
+          if (ids.has(String(r.product_id))) continue;
+          if (!orphans.has(r.product_id)) orphans.set(r.product_id, new Set());
+          orphans.get(r.product_id).add(String(r.item || '').trim());
+        }
+        if (!orphans.size) return { status: 'ok', summary: fg.rows.length.toLocaleString() + ' mapped inventory rows, every product_id resolves.' };
+        return {
+          status: 'fail',
+          summary: orphans.size + ' product_id(s) referenced by inventory do not exist in the Brand Library.',
+          cols: ['missing product_id', 'items pointing at it'],
+          rows: [...orphans.entries()].map(([p, s]) => [p, [...s].join('  ·  ')]),
+        };
+      },
+    },
+    {
+      id: 'promo-customer-join',
+      title: 'Plan customers resolve to a sales source',
+      why: 'The trade analyzer joins a promo line to sales on the customer name. An unmatched name does not error — the line just reads as unmeasured forever, which looks identical to a promo that genuinely had no sales.',
+      async run(ctx) {
+        const yr = new Date().getFullYear();
+        const plan = await _auditPaged(ctx.sb, () => ctx.sb.from('promo_plan_lines')
+          .select('customer, first_receiver, expected_spend').eq('brand_id', ctx.brandId).eq('year', yr).order('line_key'), 8000);
+        if (_auditMissingTable(plan.error)) return { status: 'skip', summary: 'promo_plan_lines not present.' };
+        if (plan.error) return { status: 'skip', summary: 'Could not read promo_plan_lines: ' + plan.error.message };
+        if (!plan.rows.length) return { status: 'skip', summary: 'No ' + yr + ' plan loaded.' };
+        const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const ns = await _auditPaged(ctx.sb, () => ctx.sb.from('sales_actuals')
+          .select('entity').eq('brand_id', ctx.brandId).eq('dimension', 'customer').order('entity'), 6000);
+        const dcs = await _auditPaged(ctx.sb, () => ctx.sb.from('distributor_customer_sales')
+          .select('chain_name').eq('brand_id', ctx.brandId).eq('report_type', 'weekly').order('chain_name'), 60000);
+        const known = new Set();
+        for (const r of (ns.rows || [])) known.add(norm(r.entity));
+        for (const r of (dcs.rows || [])) known.add(norm(r.chain_name));
+        const hit = (c) => {
+          const n = norm(c);
+          if (!n) return false;
+          if (n.includes('wholefoods') || n.includes('kroger')) return true;      // own weekly tables
+          if (/^(unfi|kehe)$/.test(n) || /allother|allcustomers/.test(n)) return true;  // distributor rollups
+          for (const k of known) { if (k && (k === n || k.includes(n) || n.includes(k))) return true; }
+          return false;
+        };
+        const miss = new Map();
+        for (const l of plan.rows) {
+          const c = l.customer || '(no customer)';
+          if (hit(c)) continue;
+          const m = miss.get(c) || { n: 0, $: 0, fr: l.first_receiver || '' };
+          m.n++; m.$ += l.expected_spend || 0;
+          miss.set(c, m);
+        }
+        if (!miss.size) return { status: 'ok', summary: 'Every ' + yr + ' plan customer resolves to a sales source.' };
+        const tot = [...miss.values()].reduce((s, m) => s + m.$, 0);
+        return {
+          status: 'warn',
+          summary: miss.size + ' plan customer(s) match no sales source — ' + Math.round(tot).toLocaleString() + ' of planned spend can never be measured.',
+          cols: ['plan customer', 'lines', 'planned $', 'first receiver'],
+          rows: [...miss.entries()].sort((a, b) => b[1].$ - a[1].$).slice(0, 40)
+            .map(([c, m]) => [c, String(m.n), '$' + Math.round(m.$).toLocaleString(), m.fr]),
+        };
+      },
+    },
+    {
+      id: 'superseded-tables',
+      title: 'Superseded tables are gone',
+      why: 'A replaced table that still exists is a live trap: old code paths keep reading it, and the stale copy looks exactly as authoritative as the real one.',
+      async run(ctx) {
+        const dead = ['promo_lines'];
+        const rows = [];
+        for (const t of dead) {
+          const { count, error } = await _auditCount(ctx.sb, t, q => q.eq('brand_id', ctx.brandId));
+          if (_auditMissingTable(error)) continue;              // dropped — good
+          if (error) { rows.push([t, '—', 'present but unreadable: ' + error.message]); continue; }
+          rows.push([t, (count || 0).toLocaleString(), count ? 'STILL HAS ROWS — superseded by promo_plan_lines' : 'empty, safe to drop']);
+        }
+        if (!rows.length) return { status: 'ok', summary: 'No superseded table remains.' };
+        return {
+          status: rows.some(r => /STILL HAS ROWS/.test(r[2])) ? 'fail' : 'warn',
+          summary: rows.length + ' superseded table(s) still exist.',
+          cols: ['table', 'rows', 'state'],
+          rows,
+          sql: dead.map(t => 'drop table if exists public.' + t + ';').join('\n'),
+        };
+      },
+    },
+  ];
+
+  async function renderSettingsAudit() {
+    const host = document.getElementById('settings-audit-body');
+    if (!host) return;
+    try { await _renderSettingsAuditInner(host); }
+    catch (err) {
+      console.error('[audit] render failed:', err);
+      host.innerHTML = '<div class="hl-empty" style="color:var(--lost);">System audit failed to render: ' + escapeHtml(err && err.message || String(err)) + ' — details in the console.</div>';
+    }
+  }
+
+  async function _renderSettingsAuditInner(host) {
+    // Bare Auth/isAdmin are NOT in scope in this block — go through window.* like
+    // the neighbouring settings renderers, or the first line throws before any
+    // inner try and the panel sits on "Loading…" forever.
+    let sb, session, brandId, admin;
+    try {
+      sb = window.Auth.getClient();
+      session = (window.BrandLibrary && window.BrandLibrary.getSession && window.BrandLibrary.getSession())
+             || (window.Auth.getSession && window.Auth.getSession()) || {};
+      brandId = session.brandId;
+      admin = session.accessRole === 'admin' || session.roleLabel === 'admin';
+    } catch (e) {
+      host.innerHTML = '<div class="hl-empty" style="color:var(--lost);">Couldn\'t read your session: ' + escapeHtml(e.message || String(e)) + '</div>';
+      return;
+    }
+    if (!brandId) { host.innerHTML = '<div class="hl-empty">No brand on this session.</div>'; return; }
+    if (!admin) { host.innerHTML = '<div class="hl-empty">Admins only.</div>'; return; }
+
+    const navItems = (window.HL && HL.NAV_ITEMS) || [];
+    const ctx = {
+      sb, brandId,
+      navIds: new Set(navItems.map(n => n.id)),
+      // Dashboard is always visible and hidden routes bypass the gate, so neither
+      // can ever appear in a permission set — they are not "missing".
+      gateable: navItems.filter(n => n.id !== 'dashboard' && !n.hidden).map(n => n.id),
+    };
+
+    host.innerHTML = '<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">Running ' + _AUDIT_CHECKS.length + ' checks…</div>';
+
+    const results = [];
+    for (const chk of _AUDIT_CHECKS) {
+      let res;
+      try { res = await chk.run(ctx); }
+      catch (e) {
+        console.error('[audit] check "' + chk.id + '" threw:', e);
+        res = { status: 'skip', summary: 'Check threw: ' + (e && e.message || String(e)) };
+      }
+      results.push({ chk, res: res || { status: 'skip', summary: 'No result.' } });
+    }
+
+    const tally = { fail: 0, warn: 0, ok: 0, skip: 0 };
+    for (const r of results) tally[r.res.status] = (tally[r.res.status] || 0) + 1;
+
+    const chip = (s, n) => '<span style="font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;background:' + _AUDIT_SEV[s].bg + ';color:' + _AUDIT_SEV[s].color + ';font-weight:700;">' + n + ' ' + _AUDIT_SEV[s].label + '</span>';
+
+    const body = results.map(({ chk, res }, i) => {
+      const sev = _AUDIT_SEV[res.status] || _AUDIT_SEV.skip;
+      const open = res.status === 'fail' || res.status === 'warn';
+      const table = (res.rows && res.rows.length)
+        ? '<div style="overflow-x:auto;margin-top:10px;"><table style="width:100%;border-collapse:collapse;">'
+          + '<thead><tr>' + (res.cols || []).map(c => '<th style="text-align:left;padding:5px 9px;font-family:var(--mono);font-size:9px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">' + escapeHtml(c) + '</th>').join('') + '</tr></thead><tbody>'
+          + res.rows.map(r => '<tr>' + r.map(c => '<td style="padding:4px 9px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">' + escapeHtml(String(c)) + '</td>').join('') + '</tr>').join('')
+          + '</tbody></table></div>'
+        : '';
+      const sql = res.sql
+        ? '<div style="margin-top:10px;"><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-bottom:4px;">SUGGESTED FIX — read it before you run it</div>'
+          + '<pre style="margin:0;padding:9px 11px;background:rgba(0,0,0,0.05);border-radius:5px;font-family:var(--mono);font-size:10px;white-space:pre-wrap;overflow-x:auto;">' + escapeHtml(res.sql) + '</pre></div>'
+        : '';
+      return '<div class="hl-audit-row" data-i="' + i + '" style="border:1px solid var(--rule-soft);border-left:3px solid ' + sev.color + ';border-radius:6px;padding:11px 13px;margin-bottom:9px;background:' + sev.bg + ';">'
+        + '<div class="hl-audit-head" data-i="' + i + '" style="display:flex;gap:11px;align-items:baseline;cursor:pointer;">'
+        + '<span style="font-family:var(--mono);font-size:9.5px;font-weight:700;color:' + sev.color + ';min-width:34px;">' + sev.label + '</span>'
+        + '<span style="flex:1;"><span style="font-family:var(--sans,sans-serif);font-size:13px;">' + escapeHtml(chk.title) + '</span>'
+        + '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-2);margin-top:3px;">' + escapeHtml(res.summary || '') + '</div></span>'
+        + '<span class="hl-audit-car" id="hl-audit-car' + i + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (open ? '▼' : '▶') + '</span></div>'
+        + '<div class="hl-audit-detail" id="hl-audit-d' + i + '" style="display:' + (open ? 'block' : 'none') + ';margin-top:10px;padding-top:10px;border-top:1px solid var(--rule-soft);">'
+        + '<div style="font-family:var(--serif,serif);font-style:italic;font-size:12.5px;color:var(--ink-2);line-height:1.5;">' + escapeHtml(chk.why) + '</div>'
+        + table + sql + '</div></div>';
+    }).join('');
+
+    host.innerHTML = '<div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">'
+      + (tally.fail ? chip('fail', tally.fail) : '') + (tally.warn ? chip('warn', tally.warn) : '')
+      + chip('ok', tally.ok) + (tally.skip ? chip('skip', tally.skip) : '')
+      + '<button id="hl-audit-rerun" style="margin-left:auto;background:transparent;border:1px solid var(--rule-soft);border-radius:5px;padding:5px 13px;font-family:var(--mono);font-size:10px;cursor:pointer;color:var(--ink-2);">⟳ Re-run</button></div>'
+      + body;
+
+    // ONE delegated handler assigned (not addEventListener) — stacking a listener
+    // per render is how the analyzer ended up with dead expanders twice.
+    host.onclick = (ev) => {
+      if (ev.target.closest('#hl-audit-rerun')) { renderSettingsAudit(); return; }
+      const h = ev.target.closest('.hl-audit-head');
+      if (!h || !host.contains(h)) return;
+      const d = document.getElementById('hl-audit-d' + h.dataset.i);
+      const c = document.getElementById('hl-audit-car' + h.dataset.i);
+      if (!d) return;
+      const showing = d.style.display !== 'none';
+      d.style.display = showing ? 'none' : 'block';
+      if (c) c.textContent = showing ? '▶' : '▼';
+    };
+  }
+
   async function renderSettingsPage() {
     const session = HL.mountPage('settings');
     if (!session) return;
@@ -45852,6 +46346,17 @@ render();
         <h2>Your identity</h2>
         <p class="hl-sub">Link your login to a Sales Contact in the Brand Library. This is what the approval flow uses to know who you are — independent of your login email.</p>
         <div id="settings-identity-body">Loading…</div>
+      </div>
+      <div class="hl-settings-section" id="settings-audit" style="margin-top:48px;">
+        <h2>System audit</h2>
+        <p class="hl-sub">
+          Standing checks against this brand's live data. Each one is a failure that already
+          happened once and was invisible until someone noticed a wrong number on a screen —
+          a permission row pointing at a page that doesn't exist, a total silently truncated at
+          the 1,000-row cap, two inventory items pooled onto one product. <strong>Read-only.</strong>
+          Anything it can fix, it shows you the SQL for rather than running it.
+        </p>
+        <div id="settings-audit-body">Loading…</div>
       </div>
       <div class="hl-settings-section" id="settings-team" style="margin-top:48px;">
         <h2>Team</h2>
@@ -45887,6 +46392,7 @@ render();
       </div>
     `;
     renderSettingsIdentity();
+    renderSettingsAudit();
     renderSettingsTeam();
     renderSettingsDomains();
     renderSettingsStages();
