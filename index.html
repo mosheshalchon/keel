@@ -27695,6 +27695,18 @@ render();
     const unitLbl = useU ? 'units' : '$';
     const val = (c) => useU ? c.u : c.d;
 
+    // Which promo blocked each skipped week. "Excluded" with no reason is an assertion;
+    // naming the event that occupied the week is evidence.
+    const blockers = [];
+    for (const l2 of lines) {
+      if ((l2.customer || '') !== (rec.l.customer || '')) continue;
+      if (/edlp|merch|slotting|fee|admin|freight/i.test(String(l2.promo_type || ''))) continue;
+      if (l2.promotion_key && rec.l.promotion_key && l2.promotion_key === rec.l.promotion_key) continue;
+      const w2 = _taWindow(l2); if (!w2) continue;
+      blockers.push({ w: w2, name: l2.promo_name || l2.line_key || 'promo', type: l2.promo_type || '' });
+    }
+    const blockerFor = (wk) => { const b = blockers.find(x => wk >= x.w[0] && wk <= x.w[1]); return b ? b.name : null; };
+
     const winWks = [];
     if (rec.lineMap && rec.w) for (const [wk, c] of rec.lineMap) if (wk >= rec.w[0] && wk <= rec.w[1]) winWks.push([wk, c]);
     winWks.sort((a, b) => a[0].localeCompare(b[0]));
@@ -27723,10 +27735,17 @@ render();
     const lifts = sensU.map(x => x.lift).filter(x => x != null);
     const spread = lifts.length > 1 ? Math.max(...lifts) - Math.min(...lifts) : 0;
 
-    const row = (wk, c, kind) => '<tr style="border-top:1px solid var(--rule-soft);">'
+    const wkPrice = (c) => (c.u > 0 && c.d > 0) ? c.d / c.u : null;
+    const row = (wk, c, kind) => {
+      const p = wkPrice(c);
+      const blk = kind === 'skip' ? blockerFor(wk) : null;
+      return '<tr style="border-top:1px solid var(--rule-soft);">'
       + '<td style="padding:4px 10px;font-family:var(--mono);font-size:10.5px;">' + wk + '</td>'
-      + '<td style="padding:4px 10px;font-family:var(--mono);font-size:9.5px;color:' + (kind === 'promo' ? '#534AB7' : kind === 'skip' ? '#8a6d1f' : 'var(--ink-3)') + ';">' + kind.toUpperCase() + '</td>'
-      + '<td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;' + (kind === 'skip' ? 'color:var(--ink-3);text-decoration:line-through;' : '') + '">' + (useU ? n0(c.u) : money(c.d)) + '</td></tr>';
+      + '<td style="padding:4px 10px;font-family:var(--mono);font-size:9.5px;color:' + (kind === 'promo' ? '#534AB7' : kind === 'skip' ? '#8a6d1f' : 'var(--ink-3)') + ';">' + kind.toUpperCase()
+        + (blk ? '<div style="font-size:8.5px;color:var(--ink-3);">' + esc(blk) + '</div>' : '') + '</td>'
+      + '<td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;' + (kind === 'skip' ? 'color:var(--ink-3);text-decoration:line-through;' : '') + '">' + (useU ? n0(c.u) : money(c.d)) + '</td>'
+      + '<td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;' + (kind === 'skip' ? 'color:var(--ink-3);' : kind === 'promo' ? 'color:#534AB7;' : '') + '">' + (p == null ? '\u2014' : '$' + p.toFixed(2)) + '</td></tr>';
+    };
 
     const ov = document.createElement('div');
     ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.42);z-index:200;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;';
@@ -27745,6 +27764,13 @@ render();
           base rate &nbsp;&nbsp;= ${useU ? n0(bSum) : money(bSum)} ${unitLbl} \u00f7 ${baseWks.length} wks &nbsp;= <b>${useU ? n1(bRate) : money(bRate)}</b> / wk<br>
           <span style="color:var(--ink-3);">\u2500\u2500\u2500</span><br>
           lift &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= (${useU ? n1(wRate) : money(wRate)} \u2212 ${useU ? n1(bRate) : money(bRate)}) \u00f7 ${useU ? n1(bRate) : money(bRate)} = <b style="color:${lift > 0 ? '#3f6f4a' : '#a8381f'};font-size:14px;">${lift == null ? '\u2014' : (lift > 0 ? '+' : '') + Math.round(lift * 100) + '%'}</b>
+          ${(() => {
+            const bD = baseWks.reduce((s, [, c]) => s + c.d, 0), bU = baseWks.reduce((s, [, c]) => s + c.u, 0);
+            const wD = winWks.reduce((s, [, c]) => s + c.d, 0), wU = winWks.reduce((s, [, c]) => s + c.u, 0);
+            if (!(bU > 0 && bD > 0 && wU > 0 && wD > 0)) return '';
+            const bp = bD / bU, wp = wD / wU;
+            return '<br><span style="color:var(--ink-3);">\u2500\u2500\u2500</span><br>avg price&nbsp;&nbsp;= <b>$' + bp.toFixed(2) + '</b> base \u2192 <b style="color:#534AB7;">$' + wp.toFixed(2) + '</b> promo &nbsp;<span style="color:' + (wp < bp ? '#3f6f4a' : '#a8381f') + ';">(' + (wp < bp ? '' : '+') + Math.round((wp - bp) / bp * 100) + '%)</span>';
+          })()}
         </div>
 
         ${sensU.length > 1 ? `
@@ -27766,6 +27792,7 @@ render();
               <th style="padding:6px 10px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Week</th>
               <th style="padding:6px 10px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Role</th>
               <th style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-3);">${useU ? 'Units' : 'Sales $'}</th>
+              <th style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-3);" title="Realized shelf price that week = net sales / units. Watch it drop into the promo weeks and snap back after.">Price / unit</th>
             </tr></thead>
             <tbody>
               ${baseWks.map(([wk, c]) => row(wk, c, 'base')).join('')}
@@ -27777,7 +27804,7 @@ render();
 
         <div style="margin-top:12px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);line-height:1.75;">
           <b>BASE</b> \u2014 the nearest ${baseWks.length} off-promo week${baseWks.length === 1 ? '' : 's'} before the promo, within the prior 12. Seasonally local on purpose: a raw 12-week base reaches into holiday volume and dilutes real lift.${baseWks.length < 4 ? ' <span style="color:#8a6d1f;">Fewer than 4 weeks \u2014 weak comparison.</span>' : ''}<br>
-          ${skipWks.length ? '<b>SKIP</b> \u2014 ' + skipWks.length + ' week' + (skipWks.length === 1 ? '' : 's') + ' inside another promo window, excluded so a promoted week never inflates the baseline.<br>' : ''}
+          ${skipWks.length ? '<b>SKIP</b> \u2014 ' + skipWks.length + ' week' + (skipWks.length === 1 ? '' : 's') + ' that fell inside ANOTHER promo\'s window (named beside each). A promoted week is not a normal week, so counting it as baseline would raise the bar this promo is measured against and understate its lift. The picker keeps reaching further back until it has 6 clean weeks.<br>' : ''}
           <b>PROMO</b> \u2014 the ${winWks.length} week${winWks.length === 1 ? '' : 's'} of this event's governing window.<br>
           Measured in ${useU ? 'UNITS' : 'DOLLARS (this source carries no units \u2014 a deep discount lifts units while cutting dollars, so this reads low)'} from ${esc(rec.tag || 'Keel sales')}.${rec.overlaps ? ' <span style="color:#8a6d1f;">\u26a0 ' + rec.overlaps + ' other promo(s) on this product ran in the same weeks \u2014 this lift is their combined effect.</span>' : ''}
         </div>
@@ -27806,9 +27833,6 @@ render();
     const btSum = bt.reduce((s, [, c]) => s + c.u, 0);
     const btRate = bt.length ? btSum / bt.length : null;
     const promoWks = (rec.win && rec.win.weeks) ? rec.win.weeks : null;
-    const baseRows = bt.map(([wk, c]) => '<tr style="border-top:1px solid var(--rule-soft);">'
-      + '<td style="padding:3px 0;font-family:var(--mono);font-size:10.5px;">' + wk + '</td>'
-      + '<td style="padding:3px 0;text-align:right;font-family:var(--mono);font-size:10.5px;">' + n0(c.u) + '</td></tr>').join('');
 
     const ov = document.createElement('div');
     ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.42);z-index:200;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;';
@@ -27843,20 +27867,10 @@ render();
           ${Math.round((1 - v.incU / v.actU) * 100)}% of the volume would have sold without the promo, so ${Math.round(paidBase / v.spend * 100)}% of the spend discounted units you already had. It pays back only if gross margin per unit clears <b>${m2(v.costPer)}</b>.
         </div>
         ${bt.length ? `
-        <div style="margin-top:16px;padding:12px 14px;background:rgba(0,0,0,0.035);border-radius:7px;">
-          <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;color:var(--ink-3);margin-bottom:7px;">WHERE THE BASELINE COMES FROM \u2014 ${bt.length} off-promo weeks BEFORE the promo</div>
-          <table style="width:100%;border-collapse:collapse;">
-            ${baseRows}
-            <tr style="border-top:2px solid var(--ink);"><td style="padding:5px 0;font-family:var(--mono);font-size:11px;"><b>Total \u00f7 ${bt.length} wks</b></td><td style="padding:5px 0;text-align:right;font-family:var(--mono);font-size:11px;"><b>${n0(btSum)} \u00f7 ${bt.length} = ${n0(btRate)}/wk</b></td></tr>
-          </table>
-          <div style="margin-top:9px;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);line-height:1.8;">
-            ${n0(btRate)}/wk \u00d7 ${promoWks || '?'} promo wks = <b>${n0(v.baseU)}</b> units the promo did NOT create
-          </div>
-          <div style="margin-top:8px;font-family:var(--serif);font-style:italic;font-size:11.5px;color:var(--ink-3);line-height:1.55;">
-            Different calendar weeks from the promo \u2014 the nearest clean weeks just before it. ${n0(v.baseU)} is that rate projected into the promo window, not sales anyone observed. The two periods are different lengths on purpose: the comparison is rate vs rate, so ${bt.length} weeks against ${promoWks || '?'} is not a mismatch.
-          </div>
+        <div style="margin-top:12px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.7;">
+          Baseline = ${n0(btRate)}/wk from ${bt.length} off-promo weeks \u00d7 ${promoWks || '?'} promo wks = ${n0(v.baseU)}. Week-by-week working is in the lift pop-up.
         </div>` : ''}
-        <div style="margin-top:10px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);line-height:1.7;">
+        <div style="margin-top:8px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);line-height:1.7;">
           Graded against SHELF PRICE, not margin \u2014 Keel has no net wholesale or COGS yet, so an absolute payback figure would be invented. Add margin per unit and this becomes a real profit answer rather than a ratio.${rec.overlaps ? ' \u26a0 ' + rec.overlaps + ' overlapping promo(s) on this product inflate the measured lift, which flatters this grade.' : ''}
         </div>` : `
         <div style="margin-top:16px;font-family:var(--serif);font-style:italic;font-size:13px;color:var(--ink-2);line-height:1.6;">${esc(v.why || '')}</div>`}
