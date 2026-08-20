@@ -27298,6 +27298,7 @@ render();
   const _taCache = {};
   const _taLinesCache = {};
   let _taRecIndex = new Map();   // (promotion_key¦line_key) -> the measured line record
+  let _taEvtIndex = new Map();   // (promotion_key¦family) -> the whole event, legs summed
   let _taGroupBy = (function () { try { return localStorage.getItem('keel_ta_group') || 'retailer'; } catch (e) { return 'retailer'; } })();
   let _taOpenMs = null;
   // The panels are absolutely positioned OVER the table, so the only way to close one used to
@@ -27663,9 +27664,13 @@ render();
   function _taVerdict(rec) {
     if (!rec || rec.fee) return null;
     if (rec.alwaysOn) return { key: 'na', label: 'n/a', color: 'var(--ink-3)', bg: 'transparent', why: 'Always-on program — no off-program baseline exists, so incrementality cannot be measured.' };
-    const lift = rec.lift, actU = rec.win && rec.hasU ? rec.win.u : null;
-    const spend = (rec.l.actual_spend || 0) > 0 ? rec.l.actual_spend : (rec.l.expected_spend || 0);
-    const price = rec.pPromo;
+    // Read the EVENT, not this leg — see _taEvtIndex above.
+    const e = rec.evt || null;
+    const lift = (e && e.lift != null) ? e.lift : rec.lift;
+    const actU = (e && e.actU) ? e.actU : (rec.win && rec.hasU ? rec.win.u : null);
+    const spend = e ? (e.act > 0 ? e.act : e.exp) : ((rec.l.actual_spend || 0) > 0 ? rec.l.actual_spend : (rec.l.expected_spend || 0));
+    const price = (e && e.price != null) ? e.price : rec.pPromo;
+    const legs = e ? e.legs : 1;
     if (lift == null || !actU || !spend || !price) return null;
     if (lift <= 0) {
       return Object.assign({}, _TA_GRADES[4], {
@@ -27677,7 +27682,7 @@ render();
     const costPer = spend / incU;
     const ratio = costPer / price;
     const g = _TA_GRADES.find(x => ratio <= x.max);
-    return Object.assign({}, g, { incU, costPer, ratio, spend, actU, price, lift, baseU: actU - incU });
+    return Object.assign({}, g, { incU, costPer, ratio, spend, actU, price, lift, legs, baseU: actU - incU });
   }
 
   // ─── Lift working ─────────────────────────────────────────────────────────────
@@ -27814,6 +27819,91 @@ render();
   }
 
   // ─── Verdict working ──────────────────────────────────────────────────────────
+  // ─── Price working ────────────────────────────────────────────────────────────
+  // The promo price alone answers "did the discount reach the shelf". The week-by-week ladder
+  // answers the harder question: did it arrive on time, hold for the whole window, and snap
+  // back after. A price that drifts down before the window or stays down after is a retailer
+  // running its own pricing, and the lift attributed to this promo is not all ours.
+  function _taShowPrice(pk, lk, lines) {
+    const rec = (_taRecIndex && _taRecIndex.get(pk + '\u00a6' + lk)) || null;
+    if (!rec || !rec.lineMap || !rec.w) return;
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const n0 = (x) => (x == null || !isFinite(x)) ? '\u2014' : Math.round(x).toLocaleString();
+    const money = (x) => (x == null || !isFinite(x)) ? '\u2014' : '$' + Math.round(x).toLocaleString();
+    const p2 = (x) => (x == null || !isFinite(x)) ? '\u2014' : '$' + x.toFixed(2);
+
+    const blockers = [];
+    for (const l2 of (lines || [])) {
+      if ((l2.customer || '') !== (rec.l.customer || '')) continue;
+      if (/edlp|merch|slotting|fee|admin|freight/i.test(String(l2.promo_type || ''))) continue;
+      if (l2.promotion_key && rec.l.promotion_key && l2.promotion_key === rec.l.promotion_key) continue;
+      const w2 = _taWindow(l2); if (!w2) continue;
+      blockers.push({ w: w2, name: l2.promo_name || l2.line_key || 'promo' });
+    }
+    const blockerFor = (wk) => { const b = blockers.find(x => wk >= x.w[0] && wk <= x.w[1]); return b ? b.name : null; };
+
+    // The 6 CALENDAR weeks immediately before the window, whether or not they were usable as
+    // baseline — a week excluded for being promoted still belongs on a price ladder.
+    const all = [...rec.lineMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const prior = all.filter(([wk]) => wk < rec.w[0]).slice(-6);
+    const during = all.filter(([wk]) => wk >= rec.w[0] && wk <= rec.w[1]);
+    const after = all.filter(([wk]) => wk > rec.w[1]).slice(0, 2);
+    const pr = (c) => (c.u > 0 && c.d > 0) ? c.d / c.u : null;
+    const avg = (rows) => { const u = rows.reduce((s, [, c]) => s + c.u, 0), d = rows.reduce((s, [, c]) => s + c.d, 0); return (u > 0 && d > 0) ? d / u : null; };
+    const cleanPrior = prior.filter(([wk]) => !blockerFor(wk));
+    const bAvg = avg(cleanPrior.length ? cleanPrior : prior), pAvg = avg(during);
+
+    const band = (rows, kind) => rows.map(([wk, c]) => {
+      const p = pr(c), blk = kind === 'prior' ? blockerFor(wk) : null;
+      const col = kind === 'during' ? '#534AB7' : blk ? '#8a6d1f' : 'var(--ink-3)';
+      const lab = kind === 'during' ? 'PROMO' : kind === 'after' ? 'AFTER' : (blk ? 'PRIOR \u00b7 promoted' : 'PRIOR');
+      const bar = (p != null && bAvg) ? Math.max(2, Math.round(100 * p / (bAvg * 1.15))) : 0;
+      return '<tr style="border-top:1px solid var(--rule-soft);">'
+        + '<td style="padding:4px 10px;font-family:var(--mono);font-size:10.5px;">' + wk + '</td>'
+        + '<td style="padding:4px 10px;font-family:var(--mono);font-size:9px;color:' + col + ';">' + lab + (blk ? '<div style="font-size:8px;color:var(--ink-3);">' + esc(blk) + '</div>' : '') + '</td>'
+        + '<td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + n0(c.u) + '</td>'
+        + '<td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + money(c.d) + '</td>'
+        + '<td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;font-weight:' + (kind === 'during' ? '700' : '400') + ';color:' + (kind === 'during' ? '#534AB7' : 'var(--ink)') + ';">' + p2(p) + '</td>'
+        + '<td style="padding:4px 10px;width:38%;"><div style="height:9px;border-radius:2px;background:' + (kind === 'during' ? '#534AB7' : blk ? '#c9b17a' : 'var(--rule-soft)') + ';width:' + bar + '%;"></div></td></tr>';
+    }).join('');
+
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.42);z-index:200;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;';
+    ov.innerHTML = `
+      <div style="background:var(--paper,#f4efe6);border-radius:10px;max-width:680px;width:100%;padding:24px 26px;box-shadow:0 24px 70px rgba(0,0,0,0.3);">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:19px;">Shelf price, week by week</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">${esc(_taProdShort(rec.l))} \u00b7 ${esc(rec.l.customer || '')} \u00b7 window ${rec.w[0]} \u2192 ${rec.w[1]}</div>
+          </div>
+          <span id="hl-ta-price-x" style="cursor:pointer;font-size:20px;line-height:1;color:var(--ink-3);">&times;</span>
+        </div>
+        <div style="margin-top:16px;padding:12px 15px;background:rgba(83,74,183,0.07);border-radius:7px;font-family:var(--mono);font-size:12.5px;line-height:1.9;">
+          prior 6 wks avg &nbsp;= <b>${p2(bAvg)}</b><br>
+          promo window avg = <b style="color:#534AB7;">${p2(pAvg)}</b>
+          ${(bAvg && pAvg) ? ' &nbsp;<span style="color:' + (pAvg < bAvg ? '#3f6f4a' : '#a8381f') + ';">(' + (pAvg < bAvg ? '' : '+') + Math.round((pAvg - bAvg) / bAvg * 100) + '%)</span>' : ''}
+        </div>
+        <div style="margin-top:14px;overflow-x:auto;max-height:330px;overflow-y:auto;">
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr style="background:#efe9dd;">
+              <th style="padding:6px 10px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Week</th>
+              <th style="padding:6px 10px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Period</th>
+              <th style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Units</th>
+              <th style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Sales $</th>
+              <th style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Price</th>
+              <th style="padding:6px 10px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);"></th>
+            </tr></thead>
+            <tbody>${band(prior, 'prior')}${band(during, 'during')}${band(after, 'after')}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:12px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);line-height:1.75;">
+          Price = net sales \u00f7 units for that week, from ${esc(rec.tag || 'Keel sales')}. Weeks marked <b>promoted</b> sat inside another promo's window and are excluded from the prior-6 average, but shown \u2014 a promoted week is still a real price. Watch three things: the drop landing on the first promo week, holding flat across the window, and snapping back after.
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    ov.addEventListener('click', (e) => { if (e.target === ov || e.target.id === 'hl-ta-price-x') ov.remove(); });
+  }
+
   function _taShowVerdict(pk, lk) {
     const rec = (_taRecIndex && _taRecIndex.get(pk + '\u00a6' + lk)) || null;
     if (!rec) return;
@@ -27825,7 +27915,10 @@ render();
     const money = (x) => (x == null || !isFinite(x)) ? '\u2014' : '$' + Math.round(x).toLocaleString();
     const paidBase = v.baseU != null ? v.baseU * (v.spend / v.actU) : null;
     const paidInc = v.incU != null ? v.incU * (v.spend / v.actU) : null;
-    const spendSrc = (rec.l.actual_spend || 0) > 0 ? 'deducted' : 'planned (nothing deducted yet)';
+    const ev = rec.evt || null;
+    const spendSrc = ev
+      ? ((ev.act > 0 ? 'deducted' : 'planned, nothing deducted yet') + (ev.legs > 1 ? ' · ' + ev.legs + ' rate legs summed' : ''))
+      : ((rec.l.actual_spend || 0) > 0 ? 'deducted' : 'planned (nothing deducted yet)');
     // The baseline units are a PROJECTION of the off-promo weekly rate into the promo window,
     // not a sum of anything observed in those weeks. Show the weeks it was built from and the
     // multiplication, or the figure reads as data it isn't.
@@ -27841,7 +27934,7 @@ render();
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
           <div>
             <div style="font-family:var(--serif);font-size:19px;">Was it a good promo?</div>
-            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">${esc(_taProdShort(rec.l))} \u00b7 ${esc(rec.l.customer || '')} \u00b7 ${rec.w ? rec.w[0] + ' \u2192 ' + rec.w[1] : ''}</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">${esc(_taProdShort(rec.l))} \u00b7 ${esc(rec.l.customer || '')} \u00b7 ${rec.w ? rec.w[0] + ' \u2192 ' + rec.w[1] : ''}${(v.legs > 1) ? ' \u00b7 whole event, ' + v.legs + ' rate legs' : ''}</div>
           </div>
           <span id="hl-ta-verd-x" style="cursor:pointer;font-size:20px;line-height:1;color:var(--ink-3);">&times;</span>
         </div>
@@ -28115,6 +28208,7 @@ render();
     let mExp = 0, mAct = 0;
     const byCust = new Map();
     _taRecIndex = new Map();   // rebuilt per render — never carry records across a year or filter change
+    _taEvtIndex = new Map();
     for (const l of lines) {
       mExp += l.expected_spend || 0; mAct += l.actual_spend || 0;
       const mi = (l.month >= 1 && l.month <= 12) ? l.month - 1 : (l.start_date ? Number(l.start_date.slice(5, 7)) - 1 : null);
@@ -28197,8 +28291,14 @@ render();
         }
       }
       if (isFee9 && !tag) { const s9 = _taSeriesFor(l, src); if (s9) tag = s9.tag; }
+      const ev9 = _taEvtIndex.get(evKey9) || { act: 0, exp: 0, legs: 0, actU: null, lift: null, price: null };
+      ev9.act += l.actual_spend || 0; ev9.exp += l.expected_spend || 0; ev9.legs++;
+      if (win && hasU && win.u > 0) ev9.actU = win.u;      // identical across legs, not additive
+      if (lift9 != null) ev9.lift = lift9;
+      if (pPromo9 != null) ev9.price = pPromo9;
+      _taEvtIndex.set(evKey9, ev9);
       const rec9 = { l, w, win, base, tag, hasU, lift: lift9, fee: isFee9, scoped, alwaysOn, overlaps, baseWks: baseWks9, basis: liftBasis9, pBase: pBase9, pPromo: pPromo9, baseTake: base && base.take ? base.take : null, baseCand: base && base.cand ? base.cand : null, baseSkip: base && base.skipped ? base.skipped : null, bannerMap: bannerSeries ? bannerSeries.map : null, btag: bannerSeries ? bannerSeries.tag : tag,
-        famKey: famKey9, evKey: evKey9, expU: Number(l.expected_units) || 0, lineMap: series ? series.map : null };
+        famKey: famKey9, evKey: evKey9, expU: Number(l.expected_units) || 0, lineMap: series ? series.map : null, evt: ev9 };
       b.lines.push(rec9);
       _taRecIndex.set((l.promotion_key || '') + '\u00a6' + (l.line_key || ''), rec9);
     }
@@ -28261,6 +28361,7 @@ render();
           + '<td style="padding:5px 10px 5px 40px;" title="' + esc(l.promo_name || l.line_key) + '"><div style="font-family:var(--mono);font-size:11.5px;">' + (w ? w[0].slice(5) + ' → ' + w[1].slice(5) : '(no dates)') + '</div>' + (!tag
              ? '<div style="font-family:var(--mono);font-size:9px;color:#8a6d1f;">no sales match</div>'
              : '<div style="font-family:var(--mono);font-size:9px;color:' + (scoped ? 'var(--ink-3)' : '#8a6d1f') + ';" title="' + (scoped ? 'Measured against this product\'s own weekly item series.' : 'No per-item detail for this source or product — measured against the whole banner, so the number is diluted by every other item.') + '">' + esc(tag) + (scoped ? '' : ' · banner-wide') + '</div>')
+           + ((rec9.evt && rec9.evt.legs > 1) ? '<div style="font-family:var(--mono);font-size:8.5px;color:var(--ink-3);" title="Vividly splits one scan event into stacked rate legs. Each leg arrives as its own row with its own spend, but they share one window, one product, one set of units and one lift — so the verdict grades the WHOLE event, not this row.">1 of ' + rec9.evt.legs + ' rate legs</div>' : '')
            + '</td>'
           + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10.5px;">' + esc(_taProdShort(l)) + '</td>'
           + '<td style="padding:5px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(_taMonName(l)) + '</td>'
@@ -28284,9 +28385,10 @@ render();
                      + (overlaps ? '<div style="font-size:8px;font-weight:400;color:#8a6d1f;" title="' + overlaps + ' other promo(s) on this product ran in the same weeks — this lift is their combined effect.">\u26a0 ' + overlaps + ' overlap</div>' : ''))
              + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">'
-             + ((pBase && pPromo) ? '$' + pBase.toFixed(2) + ' → $' + pPromo.toFixed(2)
-                  + '<div style="font-size:8px;font-weight:400;color:' + (pPromo < pBase ? '#3f6f4a' : '#a8381f') + ';">' + (pPromo < pBase ? '' : '+') + Math.round((pPromo - pBase) / pBase * 100) + '%</div>'
-                : '<span style="color:var(--ink-3);">—</span>')
+             + (pPromo
+                 ? '<span class="hl-ta-pricebtn" data-pk="' + esc(l.promotion_key) + '" data-lk="' + esc(l.line_key) + '" title="Week-by-week shelf price across the promo and the 6 weeks before it" style="border-bottom:1px dotted var(--ink-3);cursor:pointer;">$' + pPromo.toFixed(2) + '</span>'
+                    + ((pBase && pPromo < pBase) ? '<div style="font-size:8px;font-weight:400;color:#3f6f4a;">' + Math.round((pPromo - pBase) / pBase * 100) + '% vs base</div>' : (pBase ? '<div style="font-size:8px;font-weight:400;color:#a8381f;">+' + Math.round((pPromo - pBase) / pBase * 100) + '% vs base</div>' : ''))
+                 : '<span style="color:var(--ink-3);">—</span>')
              + '</td>'
           + '<td style="padding:5px 10px;text-align:center;">'
              + (verd
@@ -28406,7 +28508,7 @@ render();
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="RETAIL dollars that rang at the register for the promoted product during the promo window, from Keel's weekly sales. Not your revenue and not spend — it is the size of what the promo was riding on. Customer and total rows are banner-wide.">Sales $ in window<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Vividly's forecast units for the event — already a PROMOTED number: its assumed baseline x (1 + its lift assumption). Counted once per event and product family, because Vividly repeats the same figure on every rate leg.">Forecast u<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#8c7a55;font-weight:700;margin-top:2px;">VIVIDLY</div></th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Units actually sold in the promo window, from Keel's weekly sales for the promoted product. The % beneath compares it to the forecast — that is ESTIMATE ACCURACY, not lift. A promo can beat its forecast and still have moved no extra volume.">Actual u<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;font-weight:700;margin-top:2px;"><span style="color:#534AB7;">KEEL</span><span style="color:var(--ink-3);"> vs </span><span style="color:#8c7a55;">VIVIDLY</span></div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="THE REAL PERFORMANCE NUMBER. The window's weekly unit rate against the same product's rate over the nearest 6 OFF-promo weeks. This is incremental volume; the % under Actual u is only forecast accuracy. Line rows use the promoted product's own series; customer rows are the sales-weighted mean of their lines.">Lift vs base<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
-          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="The shelf price the shopper actually paid, computed from Keel's weekly data as net sales / units — base weeks on the left, promo window on the right. This is the independent proof the retailer PASSED THE DISCOUNT THROUGH. A scan with no price move means we funded a discount nobody saw, and lift with no price move is not the promo's doing.">Price base→promo<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="The shelf price the shopper actually paid, computed from Keel's weekly data as net sales / units — base weeks on the left, promo window on the right. This is the independent proof the retailer PASSED THE DISCOUNT THROUGH. A scan with no price move means we funded a discount nobody saw, and lift with no price move is not the promo's doing.">Promo price<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
           <th style="padding:8px 10px;text-align:center;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Spend per INCREMENTAL unit as a share of the promo shelf price — the one measure that combines how much it cost with how much extra it actually sold. Click a grade for the arithmetic. Graded against shelf price, not margin, because Keel has no COGS yet.">Verdict<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:var(--ink-3);font-weight:700;margin-top:2px;">CALC</div></th>
         </tr></thead><tbody>${_taGroupBy === 'month' ? monRowsHtml : rowsHtml}</tbody>
         <tfoot>${(() => {
@@ -28430,10 +28532,10 @@ render();
           </tr>`;
         })()}</tfoot></table></div>`;
     summaryEl.onclick = (ev) => {
-      const ab = ev.target.closest('.hl-ta-auditbtn');
-      if (ab && summaryEl.contains(ab)) { _taShowAudit(ab.dataset.pk, ab.dataset.lk, lines, src); return; }
       const lb = ev.target.closest('.hl-ta-liftbtn');
       if (lb && summaryEl.contains(lb)) { _taShowLift(lb.dataset.pk, lb.dataset.lk, lines, src); return; }
+      const pb = ev.target.closest('.hl-ta-pricebtn');
+      if (pb && summaryEl.contains(pb)) { _taShowPrice(pb.dataset.pk, pb.dataset.lk, lines); return; }
       const vb = ev.target.closest('.hl-ta-verdbtn');
       if (vb && summaryEl.contains(vb)) { _taShowVerdict(vb.dataset.pk, vb.dataset.lk); return; }
       const tr = ev.target.closest('.hl-ta-cr');
@@ -28461,6 +28563,7 @@ render();
   const _VP_MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   let _vpView = (function () { try { return localStorage.getItem('keel_vp_view') || 'customer'; } catch (e) { return 'customer'; } })();
   let _vpCalIndex = new Map();   // "ci|mi" -> the promo lines in that calendar cell
+  let _vpMonBy = (function () { try { return localStorage.getItem('keel_vp_monby') || 'retailer'; } catch (e) { return 'retailer'; } })();
 
   // Which months a promo TOUCHES. The calendar spans the real date window, so an event running
   // 02-09 → 03-01 appears in February AND March — that is what makes it a schedule rather than
@@ -28535,7 +28638,17 @@ render();
         <span style="display:inline-flex;border:1.5px solid var(--ink-3);border-radius:6px;overflow:hidden;">
           ${[['customer', 'Customer'], ['month', 'Month'], ['calendar', 'Calendar']].map(([g, lb]) => `<button class="vp-view" data-v="${g}" style="font-family:var(--mono);font-size:12px;font-weight:${_vpView === g ? '700' : '500'};padding:8px 15px;border:0;background:${_vpView === g ? 'var(--ink)' : 'transparent'};color:${_vpView === g ? 'var(--paper)' : 'var(--ink-2)'};cursor:pointer;">${lb}</button>`).join('')}
         </span>
+        ${_vpView === 'month' ? `
+        <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-left:6px;">Drill into</span>
+        <span style="display:inline-flex;border:1.5px solid var(--ink-3);border-radius:6px;overflow:hidden;">
+          ${[['retailer', 'Retailer'], ['type', 'Promo type']].map(([g, lb]) => `<button class="vp-monby" data-b="${g}" style="font-family:var(--mono);font-size:12px;font-weight:${_vpMonBy === g ? '700' : '500'};padding:8px 15px;border:0;background:${_vpMonBy === g ? 'var(--ink)' : 'transparent'};color:${_vpMonBy === g ? 'var(--paper)' : 'var(--ink-2)'};cursor:pointer;">${lb}</button>`).join('')}
+        </span>` : ''}
       </div>`;
+    filtersEl.querySelectorAll('.vp-monby').forEach(bn => bn.addEventListener('click', () => {
+      _vpMonBy = bn.dataset.b;
+      try { localStorage.setItem('keel_vp_monby', _vpMonBy); } catch (e) {}
+      renderVividlyPlan(summaryEl, filtersEl, year);
+    }));
     filtersEl.querySelectorAll('.vp-view').forEach(bn => bn.addEventListener('click', () => {
       _vpView = bn.dataset.v;
       try { localStorage.setItem('keel_vp_view', _vpView); } catch (e) {}
@@ -28568,20 +28681,25 @@ render();
     for (const l of lines) {
       const mi = (l.month >= 1 && l.month <= 12) ? l.month - 1 : (l.start_date ? Number(l.start_date.slice(5, 7)) - 1 : NaN);
       const mk = (mi >= 0 && mi < 12) ? mi : 12;
-      if (!byMon.has(mk)) byMon.set(mk, { n: 0, units: 0, exp: 0, act: 0, cust: new Map() });
+      if (!byMon.has(mk)) byMon.set(mk, { n: 0, units: 0, exp: 0, act: 0, cust: new Map(), type: new Map() });
       const m = byMon.get(mk);
       m.n++; m.units += l.expected_units || 0; m.exp += l.expected_spend || 0; m.act += l.actual_spend || 0;
       const c = l.customer || '(no customer)';
-      if (!m.cust.has(c)) m.cust.set(c, { n: 0, units: 0, exp: 0, act: 0 });
-      const mc = m.cust.get(c);
-      mc.n++; mc.units += l.expected_units || 0; mc.exp += l.expected_spend || 0; mc.act += l.actual_spend || 0;
+      // Both breakdowns are accumulated every render; the toggle only picks which to display,
+      // so switching is instant and the two can never disagree about the month they sit in.
+      const t9 = l.promo_type || '(no type)';
+      for (const [mp, kk] of [[m.cust, c], [m.type, t9]]) {
+        if (!mp.has(kk)) mp.set(kk, { n: 0, units: 0, exp: 0, act: 0 });
+        const e9 = mp.get(kk);
+        e9.n++; e9.units += l.expected_units || 0; e9.exp += l.expected_spend || 0; e9.act += l.actual_spend || 0;
+      }
     }
     const monRowsHtml = [...byMon.entries()].sort((a, b) => a[0] - b[0]).map(([mk, m], mi2) => {
       const dl = m.act - m.exp;
-      const subs = [...m.cust.entries()].sort((a, b) => b[1].exp - a[1].exp).map(([c, mc]) => {
+      const subs = [...(_vpMonBy === 'type' ? m.type : m.cust).entries()].sort((a, b) => b[1].exp - a[1].exp).map(([c, mc]) => {
         const cd = mc.act - mc.exp;
         return '<tr class="hl-vp-mr hl-vp-mr' + mi2 + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
-          + '<td style="padding:5px 10px 5px 40px;font-family:var(--serif);font-size:12.5px;">' + esc(c) + '</td>'
+          + '<td style="padding:5px 10px 5px 40px;font-family:' + (_vpMonBy === 'type' ? 'var(--mono);font-size:11px;color:var(--ink-2)' : 'var(--serif);font-size:12.5px') + ';">' + esc(c) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + mc.n + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.units ? num(mc.units) : '\u2014') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(mc.exp) + '</td>'
@@ -28589,7 +28707,7 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (cd > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (mc.act ? money(cd) : '\u2014') + '</td></tr>';
       }).join('');
       return '<tr class="hl-vp-morow" data-mi="' + mi2 + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
-        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-vp-mcar' + mi2 + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">\u25b6</span>' + (mk === 12 ? 'No month' : _VP_MON[mk] + ' ' + year) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + m.cust.size + ' retailers</span></td>'
+        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-vp-mcar' + mi2 + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">\u25b6</span>' + (mk === 12 ? 'No month' : _VP_MON[mk] + ' ' + year) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + m.cust.size + ' retailers · ' + m.type.size + ' promo types</span></td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + m.n + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(m.units) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(m.exp) + '</td>'
@@ -28682,11 +28800,11 @@ render();
 
     summaryEl.innerHTML = `
       <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:4px;">${year} Vividly plan · ${lines.length.toLocaleString()} lines · expected ${money(tExp)} · actual ${money(tAct)}${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year — not reconciled</span>' : ''}</div>
-      <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-bottom:10px;">THE WHOLE BOOK — every promo line at every status (Completed · Approved · Running), dollars straight from Vividly, no sales measurement. Expected units are Vividly's own field and are REPEATED on each stacked rate leg of a scan event, so unique promoted units run about half this figure. The Trade analyzer measures a subset of these lines against Keel's sales.</div>
+      <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-bottom:10px;">THE WHOLE BOOK — every promo line at every status (Completed · Approved · Running), dollars straight from Vividly, no sales measurement. Expected units are Vividly's own field. A small number of scan events carry TWO rate lines that repeat the same unit figure — 34 such pairs in the whole book, worth about 7% of expected units — so this total is slightly overstated on units but correct on dollars, since both lines draw real deductions. The Trade analyzer measures a subset of these lines against Keel's sales.</div>
       ${_vpView === 'calendar' ? calHtml : `
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
-          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_vpView === 'month' ? 'Month · click for retailers' : 'Customer · click for promo types'}</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_vpView === 'month' ? ('Month · click for ' + (_vpMonBy === 'type' ? 'promo types' : 'retailers')) : 'Customer · click for promo types'}</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lines</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected units</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected spend</th>
