@@ -28443,13 +28443,90 @@ render();
     };
   }
 
+  // ─── Plan view: grouping + calendar ───────────────────────────────────────────
+  const _VP_MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  let _vpView = (function () { try { return localStorage.getItem('keel_vp_view') || 'customer'; } catch (e) { return 'customer'; } })();
+  let _vpCalIndex = new Map();   // "ci|mi" -> the promo lines in that calendar cell
+
+  // Which months a promo TOUCHES. The calendar spans the real date window, so an event running
+  // 02-09 → 03-01 appears in February AND March — that is what makes it a schedule rather than
+  // a budget table. Vividly's own `month` field is the fallback when dates are missing.
+  function _vpMonths(l) {
+    const out = new Set();
+    const s = l.start_date, e = l.end_date || l.start_date;
+    if (s && /^\d{4}-\d{2}/.test(s)) {
+      const sy = +s.slice(0, 4), sm = +s.slice(5, 7) - 1;
+      const ey = (e && /^\d{4}-\d{2}/.test(e)) ? +e.slice(0, 4) : sy;
+      const em = (e && /^\d{4}-\d{2}/.test(e)) ? +e.slice(5, 7) - 1 : sm;
+      for (let y = sy, m = sm; y < ey || (y === ey && m <= em); m++) {
+        if (m > 11) { m = -1; y++; continue; }
+        if (y === (l.year || sy)) out.add(m);
+        if (out.size > 12) break;
+      }
+    }
+    if (!out.size && l.month >= 1 && l.month <= 12) out.add(l.month - 1);
+    return [...out];
+  }
+
+  function _vpShowCell(ci, mi, year) {
+    const rows = _vpCalIndex.get(ci + '|' + mi);
+    if (!rows || !rows.length) return;
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const money = (n) => (n == null || !isFinite(n)) ? '\u2014' : '$' + Math.round(n).toLocaleString();
+    const tot = rows.reduce((s, l) => s + (l.expected_spend || 0), 0);
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.42);z-index:200;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;';
+    ov.innerHTML = `
+      <div style="background:var(--paper,#f4efe6);border-radius:10px;max-width:720px;width:100%;padding:24px 26px;box-shadow:0 24px 70px rgba(0,0,0,0.3);">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:19px;">${esc(rows[0].customer || '')} \u00b7 ${_VP_MON[mi]} ${year}</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">${rows.length} promo line${rows.length === 1 ? '' : 's'} live this month \u00b7 ${money(tot)} planned</div>
+          </div>
+          <span id="hl-vp-cell-x" style="cursor:pointer;font-size:20px;line-height:1;color:var(--ink-3);">&times;</span>
+        </div>
+        <div style="margin-top:14px;overflow-x:auto;max-height:60vh;overflow-y:auto;">
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr style="background:#efe9dd;">
+              <th style="padding:6px 9px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Promo</th>
+              <th style="padding:6px 9px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Type</th>
+              <th style="padding:6px 9px;text-align:left;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Window</th>
+              <th style="padding:6px 9px;text-align:right;font-family:var(--mono);font-size:9px;color:var(--ink-3);">Planned $</th>
+            </tr></thead>
+            <tbody>${rows.sort((a, b) => (b.expected_spend || 0) - (a.expected_spend || 0)).map(l => `
+              <tr style="border-top:1px solid var(--rule-soft);">
+                <td style="padding:5px 9px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">${esc(l.promo_name || l.line_key)}</div><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">${esc(l.product_group || (String(l.product_name || '').split('|')[0] || '').trim() || '\u2014')}</div></td>
+                <td style="padding:5px 9px;font-family:var(--mono);font-size:10px;color:var(--ink-2);">${esc(l.promo_type || '')}</td>
+                <td style="padding:5px 9px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc((l.start_date || '\u2014') + (l.end_date ? ' \u2192 ' + l.end_date : ''))}</td>
+                <td style="padding:5px 9px;text-align:right;font-family:var(--mono);font-size:11px;">${money(l.expected_spend)}</td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:11px;font-family:var(--mono);font-size:9px;color:var(--ink-3);line-height:1.7;">
+          A promo appears in EVERY month its window touches, so the same line can sit in two cells \u2014 the calendar is a schedule, not a budget split. Month totals therefore exceed the annual plan where windows straddle a month end.
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    ov.addEventListener('click', (e) => { if (e.target === ov || e.target.id === 'hl-vp-cell-x') ov.remove(); });
+  }
+
   async function renderVividlyPlan(summaryEl, filtersEl, year) {
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary.getSession().brandId;
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
     const num = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
-    filtersEl.innerHTML = '';
+    filtersEl.innerHTML = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">View</span>
+        <span style="display:inline-flex;border:1.5px solid var(--ink-3);border-radius:6px;overflow:hidden;">
+          ${[['customer', 'Customer'], ['month', 'Month'], ['calendar', 'Calendar']].map(([g, lb]) => `<button class="vp-view" data-v="${g}" style="font-family:var(--mono);font-size:12px;font-weight:${_vpView === g ? '700' : '500'};padding:8px 15px;border:0;background:${_vpView === g ? 'var(--ink)' : 'transparent'};color:${_vpView === g ? 'var(--paper)' : 'var(--ink-2)'};cursor:pointer;">${lb}</button>`).join('')}
+        </span>
+      </div>`;
+    filtersEl.querySelectorAll('.vp-view').forEach(bn => bn.addEventListener('click', () => {
+      _vpView = bn.dataset.v;
+      try { localStorage.setItem('keel_vp_view', _vpView); } catch (e) {}
+      renderVividlyPlan(summaryEl, filtersEl, year);
+    }));
     summaryEl.innerHTML = '<div class="hl-loading">Loading the ' + year + ' plan…</div>';
     const fetched = await _vvFetchLines(year);
     if (fetched.error) { summaryEl.innerHTML = '<div style="font-family:var(--mono);font-size:12px;color:#a8381f;padding:24px;">Could not load promo_plan_lines — has the migration run? (' + esc(fetched.error.message) + ')</div>'; return; }
@@ -28469,6 +28546,44 @@ render();
       tExp += l.expected_spend || 0; tAct += l.actual_spend || 0; tUnits += l.expected_units || 0;
     }
     const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
+
+    // MONTH ROLLUP. A line lands in ONE month here (Vividly's own month, or its start date) so
+    // the column totals still reconcile to the annual plan. The calendar below deliberately
+    // does the opposite — see the note there.
+    const byMon = new Map();
+    for (const l of lines) {
+      const mi = (l.month >= 1 && l.month <= 12) ? l.month - 1 : (l.start_date ? Number(l.start_date.slice(5, 7)) - 1 : NaN);
+      const mk = (mi >= 0 && mi < 12) ? mi : 12;
+      if (!byMon.has(mk)) byMon.set(mk, { n: 0, units: 0, exp: 0, act: 0, cust: new Map() });
+      const m = byMon.get(mk);
+      m.n++; m.units += l.expected_units || 0; m.exp += l.expected_spend || 0; m.act += l.actual_spend || 0;
+      const c = l.customer || '(no customer)';
+      if (!m.cust.has(c)) m.cust.set(c, { n: 0, units: 0, exp: 0, act: 0 });
+      const mc = m.cust.get(c);
+      mc.n++; mc.units += l.expected_units || 0; mc.exp += l.expected_spend || 0; mc.act += l.actual_spend || 0;
+    }
+    const monRowsHtml = [...byMon.entries()].sort((a, b) => a[0] - b[0]).map(([mk, m], mi2) => {
+      const dl = m.act - m.exp;
+      const subs = [...m.cust.entries()].sort((a, b) => b[1].exp - a[1].exp).map(([c, mc]) => {
+        const cd = mc.act - mc.exp;
+        return '<tr class="hl-vp-mr hl-vp-mr' + mi2 + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
+          + '<td style="padding:5px 10px 5px 40px;font-family:var(--serif);font-size:12.5px;">' + esc(c) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + mc.n + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.units ? num(mc.units) : '\u2014') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(mc.exp) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.act ? money(mc.act) : '\u2014') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (cd > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (mc.act ? money(cd) : '\u2014') + '</td></tr>';
+      }).join('');
+      return '<tr class="hl-vp-morow" data-mi="' + mi2 + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
+        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-vp-mcar' + mi2 + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">\u25b6</span>' + (mk === 12 ? 'No month' : _VP_MON[mk] + ' ' + year) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + m.cust.size + ' retailers</span></td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + m.n + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(m.units) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(m.exp) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(m.act) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (dl > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (m.act ? money(dl) : '\u2014') + '</td></tr>'
+        + subs;
+    }).join('');
+
     const rowsHtml = custs.map(([c, b], ci) => {
       const dl = b.act - b.exp;
       const typeRows = [...b.types.entries()].sort((x, y) => y[1].exp - x[1].exp).map(([t, tb], ti) => {
@@ -28502,19 +28617,69 @@ render();
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (dl > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b.act ? money(dl) : '—') + '</td></tr>'
         + typeRows;
     }).join('');
+    // ── CALENDAR: retailer \u00d7 month grid ────────────────────────────────────────
+    // A promo occupies EVERY month its window touches, so a Feb 9 \u2192 Mar 1 event shows in both.
+    // That makes the grid a SCHEDULE you can read at a glance ("what is live in March") rather
+    // than a budget split — which also means month totals here exceed the annual plan wherever a
+    // window crosses a month end. Said on screen so nobody tries to reconcile the two.
+    _vpCalIndex = new Map();
+    const calRows = custs.map(([c, b], ci) => ({ c, ci, exp: b.exp, cells: Array.from({ length: 12 }, () => ({ n: 0, exp: 0 })) }));
+    const calByCust = new Map(calRows.map(r => [r.c, r]));
+    for (const l of lines) {
+      const r = calByCust.get(l.customer || '(no customer)');
+      if (!r) continue;
+      for (const mi of _vpMonths(l)) {
+        r.cells[mi].n++; r.cells[mi].exp += l.expected_spend || 0;
+        const k = r.ci + '|' + mi;
+        if (!_vpCalIndex.has(k)) _vpCalIndex.set(k, []);
+        _vpCalIndex.get(k).push(l);
+      }
+    }
+    const calMax = Math.max(1, ...calRows.flatMap(r => r.cells.map(x => x.exp)));
+    const monTot = Array.from({ length: 12 }, (_, mi) => calRows.reduce((s, r) => s + r.cells[mi].exp, 0));
+    const monCnt = Array.from({ length: 12 }, (_, mi) => calRows.reduce((s, r) => s + r.cells[mi].n, 0));
+    const calHtml = `
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="background:#efe9dd;">
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);position:sticky;left:0;background:#efe9dd;">Retailer</th>
+          ${_VP_MON.map(m => '<th style="padding:8px 4px;text-align:center;font-family:var(--mono);font-size:10px;color:var(--ink-3);min-width:62px;">' + m + '</th>').join('')}
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Year</th>
+        </tr></thead>
+        <tbody>${calRows.map(r => `
+          <tr style="border-top:1px solid var(--rule-soft);">
+            <td style="padding:5px 10px;font-family:var(--serif);font-size:12.5px;white-space:nowrap;position:sticky;left:0;background:var(--paper,#f4efe6);">${esc(r.c)}</td>
+            ${r.cells.map((x, mi) => x.n
+              ? '<td class="hl-vp-cal" data-ci="' + r.ci + '" data-mi="' + mi + '" title="' + x.n + ' promo line' + (x.n === 1 ? '' : 's') + ' live \u00b7 ' + money(x.exp) + ' planned — click for the list" style="padding:3px;text-align:center;cursor:pointer;">'
+                  + '<div style="border-radius:4px;padding:4px 2px;background:rgba(83,74,183,' + (0.10 + 0.55 * Math.sqrt(x.exp / calMax)).toFixed(3) + ');">'
+                  + '<div style="font-family:var(--mono);font-size:10.5px;font-weight:700;">' + x.n + '</div>'
+                  + '<div style="font-family:var(--mono);font-size:8.5px;color:var(--ink-2);">' + (x.exp >= 1000 ? '$' + Math.round(x.exp / 1000) + 'k' : x.exp ? '$' + Math.round(x.exp) : '') + '</div></div></td>'
+              : '<td style="padding:3px;text-align:center;color:var(--rule-soft);font-family:var(--mono);font-size:10px;">\u00b7</td>').join('')}
+            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:600;">${money(r.exp)}</td>
+          </tr>`).join('')}</tbody>
+        <tfoot><tr style="border-top:2px solid var(--ink);background:#efe9dd;">
+          <td style="padding:7px 10px;font-family:var(--mono);font-size:11px;font-weight:700;position:sticky;left:0;background:#efe9dd;">Live per month</td>
+          ${monTot.map((t, mi) => '<td style="padding:5px 3px;text-align:center;font-family:var(--mono);font-size:10px;"><div style="font-weight:700;">' + (monCnt[mi] || '\u00b7') + '</div><div style="font-size:8.5px;color:var(--ink-3);">' + (t >= 1000 ? '$' + Math.round(t / 1000) + 'k' : '') + '</div></td>').join('')}
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11px;font-weight:700;">${money(tExp)}</td>
+        </tr></tfoot>
+      </table></div>
+      <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:10px;line-height:1.7;">
+        Each cell = promo lines LIVE that month for that retailer, shaded by planned spend; click one for the promos behind it. A promo spans every month its window touches, so the month totals add up to more than the ${money(tExp)} annual plan wherever a window crosses a month end — this is a schedule, not a budget split.
+      </div>`;
+
     summaryEl.innerHTML = `
       <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-bottom:4px;">${year} Vividly plan · ${lines.length.toLocaleString()} lines · expected ${money(tExp)} · actual ${money(tAct)}${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year — not reconciled</span>' : ''}</div>
       <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-bottom:10px;">THE WHOLE BOOK — every promo line at every status (Completed · Approved · Running), dollars straight from Vividly, no sales measurement. Expected units are Vividly's own field and are REPEATED on each stacked rate leg of a scan event, so unique promoted units run about half this figure. The Trade analyzer measures a subset of these lines against Keel's sales.</div>
+      ${_vpView === 'calendar' ? calHtml : `
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
-          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Customer · click for promo types</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_vpView === 'month' ? 'Month · click for retailers' : 'Customer · click for promo types'}</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lines</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected units</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected spend</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Actual spend</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Δ act − exp</th>
         </tr></thead>
-        <tbody>${rowsHtml}</tbody>
+        <tbody>${_vpView === 'month' ? monRowsHtml : rowsHtml}</tbody>
         <tfoot><tr style="border-top:2px solid var(--rule-soft);font-weight:700;">
           <td style="padding:8px 10px;font-family:var(--mono);font-size:11px;">Total</td>
           <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${lines.length.toLocaleString()}</td>
@@ -28523,8 +28688,20 @@ render();
           <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${money(tAct)}</td>
           <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${money(tAct - tExp)}</td>
         </tr></tfoot>
-      </table></div>`;
-    summaryEl.addEventListener('click', (ev) => {
+      </table></div>`}`;
+    summaryEl.onclick = (ev) => {
+      const cal = ev.target.closest('.hl-vp-cal');
+      if (cal && summaryEl.contains(cal)) { _vpShowCell(cal.dataset.ci, +cal.dataset.mi, year); return; }
+      const mo = ev.target.closest('.hl-vp-morow');
+      if (mo && summaryEl.contains(mo)) {
+        const mi3 = mo.dataset.mi;
+        const mr = summaryEl.querySelectorAll('.hl-vp-mr' + mi3);
+        if (!mr.length) return;
+        const sh = mr[0].style.display !== 'none';
+        mr.forEach(r => { r.style.display = sh ? 'none' : ''; });
+        const mc = document.getElementById('hl-vp-mcar' + mi3); if (mc) mc.textContent = sh ? '\u25b6' : '\u25bc';
+        return;
+      }
       const ty = ev.target.closest('.hl-vp-typerow');
       if (ty && summaryEl.contains(ty)) {
         const ci = ty.dataset.ci, ti = ty.dataset.ti;
@@ -28544,7 +28721,7 @@ render();
       rows9.forEach(r => { r.style.display = showing ? 'none' : ''; });
       if (showing) { summaryEl.querySelectorAll('.hl-vp-lr-' + ci).forEach(r => { r.style.display = 'none'; }); summaryEl.querySelectorAll('[id^="hl-vp-tcar' + ci + '-"]').forEach(c => { c.textContent = '▶'; }); }
       const car = document.getElementById('hl-vp-car' + ci); if (car) car.textContent = showing ? '▶' : '▼';
-    });
+    };
   }
 
   async function renderPromosPage() {
