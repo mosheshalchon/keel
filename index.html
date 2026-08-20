@@ -28636,7 +28636,7 @@ render();
     filtersEl.innerHTML = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
         <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">View</span>
         <span style="display:inline-flex;border:1.5px solid var(--ink-3);border-radius:6px;overflow:hidden;">
-          ${[['customer', 'Customer'], ['month', 'Month'], ['calendar', 'Calendar']].map(([g, lb]) => `<button class="vp-view" data-v="${g}" style="font-family:var(--mono);font-size:12px;font-weight:${_vpView === g ? '700' : '500'};padding:8px 15px;border:0;background:${_vpView === g ? 'var(--ink)' : 'transparent'};color:${_vpView === g ? 'var(--paper)' : 'var(--ink-2)'};cursor:pointer;">${lb}</button>`).join('')}
+          ${[['customer', 'Customer'], ['month', 'Month'], ['type', 'Promo type'], ['calendar', 'Calendar']].map(([g, lb]) => `<button class="vp-view" data-v="${g}" style="font-family:var(--mono);font-size:12px;font-weight:${_vpView === g ? '700' : '500'};padding:8px 15px;border:0;background:${_vpView === g ? 'var(--ink)' : 'transparent'};color:${_vpView === g ? 'var(--paper)' : 'var(--ink-2)'};cursor:pointer;">${lb}</button>`).join('')}
         </span>
         ${_vpView === 'month' ? `
         <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-left:6px;">Drill into</span>
@@ -28694,6 +28694,41 @@ render();
         e9.n++; e9.units += l.expected_units || 0; e9.exp += l.expected_spend || 0; e9.act += l.actual_spend || 0;
       }
     }
+    // PROMO TYPE rollup — type rows expanding to the retailers inside them. One bucket per
+    // line, like the month rollup, so the column totals still reconcile to the annual plan.
+    const byType = new Map();
+    for (const l of lines) {
+      const t = l.promo_type || '(no type)';
+      if (!byType.has(t)) byType.set(t, { n: 0, units: 0, exp: 0, act: 0, cust: new Map() });
+      const b9 = byType.get(t);
+      b9.n++; b9.units += l.expected_units || 0; b9.exp += l.expected_spend || 0; b9.act += l.actual_spend || 0;
+      const c9 = l.customer || '(no customer)';
+      if (!b9.cust.has(c9)) b9.cust.set(c9, { n: 0, units: 0, exp: 0, act: 0 });
+      const e9 = b9.cust.get(c9);
+      e9.n++; e9.units += l.expected_units || 0; e9.exp += l.expected_spend || 0; e9.act += l.actual_spend || 0;
+    }
+    const typeRowsHtml = [...byType.entries()].sort((a, b) => b[1].exp - a[1].exp).map(([t, b9], ti2) => {
+      const dl9 = b9.act - b9.exp;
+      const subs9 = [...b9.cust.entries()].sort((a, b) => b[1].exp - a[1].exp).map(([c9, mc]) => {
+        const cd = mc.act - mc.exp;
+        return '<tr class="hl-vp-tr hl-vp-tr' + ti2 + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
+          + '<td style="padding:5px 10px 5px 40px;font-family:var(--serif);font-size:12.5px;">' + esc(c9) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + mc.n + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.units ? num(mc.units) : '\u2014') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(mc.exp) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.act ? money(mc.act) : '\u2014') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (cd > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (mc.act ? money(cd) : '\u2014') + '</td></tr>';
+      }).join('');
+      return '<tr class="hl-vp-tyrow" data-ti2="' + ti2 + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
+        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-vp-tycar' + ti2 + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">\u25b6</span>' + esc(t) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + b9.cust.size + ' retailers</span></td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + b9.n + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(b9.units) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(b9.exp) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(b9.act) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (dl9 > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b9.act ? money(dl9) : '\u2014') + '</td></tr>'
+        + subs9;
+    }).join('');
+
     const monRowsHtml = [...byMon.entries()].sort((a, b) => a[0] - b[0]).map(([mk, m], mi2) => {
       const dl = m.act - m.exp;
       const subs = [...(_vpMonBy === 'type' ? m.type : m.cust).entries()].sort((a, b) => b[1].exp - a[1].exp).map(([c, mc]) => {
@@ -28804,14 +28839,14 @@ render();
       ${_vpView === 'calendar' ? calHtml : `
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
-          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_vpView === 'month' ? ('Month · click for ' + (_vpMonBy === 'type' ? 'promo types' : 'retailers')) : 'Customer · click for promo types'}</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_vpView === 'month' ? ('Month · click for ' + (_vpMonBy === 'type' ? 'promo types' : 'retailers')) : _vpView === 'type' ? 'Promo type · click for retailers' : 'Customer · click for promo types'}</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lines</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected units</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected spend</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Actual spend</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Δ act − exp</th>
         </tr></thead>
-        <tbody>${_vpView === 'month' ? monRowsHtml : rowsHtml}</tbody>
+        <tbody>${_vpView === 'month' ? monRowsHtml : _vpView === 'type' ? typeRowsHtml : rowsHtml}</tbody>
         <tfoot><tr style="border-top:2px solid var(--rule-soft);font-weight:700;">
           <td style="padding:8px 10px;font-family:var(--mono);font-size:11px;">Total</td>
           <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${lines.length.toLocaleString()}</td>
@@ -28824,6 +28859,16 @@ render();
     summaryEl.onclick = (ev) => {
       const cal = ev.target.closest('.hl-vp-cal');
       if (cal && summaryEl.contains(cal)) { _vpShowCell(cal.dataset.ci, +cal.dataset.mi, year); return; }
+      const ty2 = ev.target.closest('.hl-vp-tyrow');
+      if (ty2 && summaryEl.contains(ty2)) {
+        const ti2 = ty2.dataset.ti2;
+        const tr2 = summaryEl.querySelectorAll('.hl-vp-tr' + ti2);
+        if (!tr2.length) return;
+        const sh2 = tr2[0].style.display !== 'none';
+        tr2.forEach(r => { r.style.display = sh2 ? 'none' : ''; });
+        const tc2 = document.getElementById('hl-vp-tycar' + ti2); if (tc2) tc2.textContent = sh2 ? '\u25b6' : '\u25bc';
+        return;
+      }
       const mo = ev.target.closest('.hl-vp-morow');
       if (mo && summaryEl.contains(mo)) {
         const mi3 = mo.dataset.mi;
