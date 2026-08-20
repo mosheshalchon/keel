@@ -27904,7 +27904,7 @@ render();
       // (event, product family) and taken once — summing the legs doubles the plan.
       const famKey9 = l.product_group || String(l.product_name || '').split('|')[0].trim() || 'group';
       const evKey9 = (l.promotion_key || l.line_key || '?') + '\u00a6' + famKey9;
-      let lift9 = null, baseWks9 = 0, liftBasis9 = null;
+      let lift9 = null, baseWks9 = 0, liftBasis9 = null, pBase9 = null, pPromo9 = null;
       const isFee9 = _taIsFee(l.promo_type);
       if (w && series && !isFee9) {
         tag = series.tag; hasU = series.units;
@@ -27920,6 +27920,11 @@ render();
           if (br > 0 && !alwaysOn) lift9 = (wr - br) / br;
           baseWks9 = base ? base.weeks : 0;
           liftBasis9 = useU ? 'units' : 'dollars';
+          // Realized shelf price = dollars / units, per side of the window. This is the
+          // independent check that the retailer actually PASSED THE DISCOUNT THROUGH — a scan
+          // with no price move means we funded a discount the shopper never saw.
+          if (win.u > 0 && win.d > 0) pPromo9 = win.d / win.u;
+          if (base && base.u > 0 && base.d > 0) pBase9 = base.d / base.u;
           if (hasU) b.anyU = true;
           // Customer-level sell-through counts each week ONCE even when promo windows overlap:
           // union of (source, week) keys, not a sum of per-line sums. This stays on the BANNER
@@ -27950,7 +27955,7 @@ render();
         }
       }
       if (isFee9 && !tag) { const s9 = _taSeriesFor(l, src); if (s9) tag = s9.tag; }
-      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9, fee: isFee9, scoped, alwaysOn, overlaps, baseWks: baseWks9, basis: liftBasis9, bannerMap: bannerSeries ? bannerSeries.map : null, btag: bannerSeries ? bannerSeries.tag : tag,
+      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9, fee: isFee9, scoped, alwaysOn, overlaps, baseWks: baseWks9, basis: liftBasis9, pBase: pBase9, pPromo: pPromo9, bannerMap: bannerSeries ? bannerSeries.map : null, btag: bannerSeries ? bannerSeries.tag : tag,
         famKey: famKey9, evKey: evKey9, expU: Number(l.expected_units) || 0, lineMap: series ? series.map : null });
     }
     const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
@@ -27997,13 +28002,14 @@ render();
       const ua = unitAgg(b.lines);
       if (ua.p) _gUP += ua.p;
       for (const r of b.lines) { if (r.fee || !r.win || !r.hasU || !r.lineMap || !r.w) continue; for (const [wk, cc] of r.lineMap) if (wk >= r.w[0] && wk <= r.w[1]) _gUW.set(r.famKey + '|' + wk, cc); }
-      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift, fee, scoped, alwaysOn, overlaps, baseWks, basis, expU }) => {
+      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift, fee, scoped, alwaysOn, overlaps, baseWks, basis, expU, pBase, pPromo }) => {
         const ld = (l.actual_spend || 0) - (l.expected_spend || 0);
         const llift = lift;
+        // The audit modal hangs off LIFT now, not Deducted $ — the lift number is the one that
+        // needs its working shown (which weeks formed the baseline, per item), and Deducted $ is
+        // just a figure Vividly reports with nothing of ours to unpack.
         const canAudit = !!(l.promotion_key && tag && tag.indexOf('WFM') === 0);
-        const actCell = canAudit
-          ? '<span class="hl-ta-auditbtn" data-pk="' + esc(l.promotion_key) + '" data-lk="' + esc(l.line_key) + '" title="Audit this number — plan vs Keel-measured actual for this product" style="border-bottom:1px dotted var(--ink-3);cursor:pointer;">' + (l.actual_spend ? money(l.actual_spend) : '—') + '</span>'
-          : (l.actual_spend ? money(l.actual_spend) : '—');
+        const actCell = (l.actual_spend ? money(l.actual_spend) : '—');
         return '<tr class="hl-ta-lr hl-ta-lr' + ci + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
           + '<td style="padding:5px 10px 5px 40px;" title="' + esc(l.promo_name || l.line_key) + '"><div style="font-family:var(--mono);font-size:11.5px;">' + (w ? w[0].slice(5) + ' → ' + w[1].slice(5) : '(no dates)') + '</div>' + (!tag
              ? '<div style="font-family:var(--mono);font-size:9px;color:#8a6d1f;">no sales match</div>'
@@ -28025,9 +28031,15 @@ render();
                  ? '<span style="font-size:9px;color:var(--ink-3);">fixed fee</span>'
                  : alwaysOn
                    ? '<span style="font-size:9px;color:#8a6d1f;" title="EDLP runs continuously, so the surrounding weeks are also EDLP. There is no off-program baseline to measure against — a number here would be EDLP compared with itself.">always-on</span>'
-                   : pct(llift)
-                     + (llift != null ? '<div style="font-size:8px;font-weight:400;color:' + (baseWks >= 4 ? 'var(--ink-3)' : '#8a6d1f') + ';" title="Off-promo weeks used for the baseline. Fewer than 4 is a weak comparison.">base ' + (baseWks || 0) + ' wk' + (baseWks === 1 ? '' : 's') + (basis === 'dollars' ? ' · $ basis' : '') + '</div>' : '')
+                   : (canAudit && llift != null
+                       ? '<span class="hl-ta-auditbtn" data-pk="' + esc(l.promotion_key) + '" data-lk="' + esc(l.line_key) + '" title="Show the working — baseline weeks, per-item units, price ladder and what the deduction should have cost" style="border-bottom:1px dotted var(--ink-3);cursor:pointer;">' + pct(llift) + '</span>'
+                       : pct(llift))
                      + (overlaps ? '<div style="font-size:8px;font-weight:400;color:#8a6d1f;" title="' + overlaps + ' other promo(s) on this product ran in the same weeks — this lift is their combined effect.">\u26a0 ' + overlaps + ' overlap</div>' : ''))
+             + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">'
+             + ((pBase && pPromo) ? '$' + pBase.toFixed(2) + ' → $' + pPromo.toFixed(2)
+                  + '<div style="font-size:8px;font-weight:400;color:' + (pPromo < pBase ? '#3f6f4a' : '#a8381f') + ';">' + (pPromo < pBase ? '' : '+') + Math.round((pPromo - pBase) / pBase * 100) + '%</div>'
+                : '<span style="color:var(--ink-3);">—</span>')
              + '</td></tr>';
       }).join('');
       return '<tr class="hl-ta-cr" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
@@ -28041,7 +28053,8 @@ render();
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(ua.a)
            + (() => { const v = uPct(ua.p, ua.a); return v == null ? '' : '<div style="font-size:8.5px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs forecast</div>'; })()
            + '</td>'
-        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (lift != null && lift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(lift) + '</td></tr>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (lift != null && lift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(lift) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">—</td>' + '</tr>'
         + lineRows;
     }).join('');
     // ── MONTH GROUPING ────────────────────────────────────────────────────────────
@@ -28095,7 +28108,8 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + num(cua.a)
              + (() => { const v = uPct(cua.p, cua.a); return v == null ? '' : '<div style="font-size:8.5px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs forecast</div>'; })()
              + '</td>'
-          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (cl != null && cl > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(cl) + '</td></tr>';
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (cl != null && cl > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(cl) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">—</td>' + '</tr>';
       }).join('');
       return '<tr class="hl-ta-mo" data-mi="' + mi2 + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
         + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-ta-mcar' + mi2 + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">\u25b6</span>' + (mk === 12 ? 'No month' : MONN[mk] + ' ' + year) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + m.cust.size + ' retailers · ' + m.cov + '/' + m.n + ' measured</span></td>'
@@ -28108,7 +28122,8 @@ render();
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(mua.a)
            + (() => { const v = uPct(mua.p, mua.a); return v == null ? '' : '<div style="font-size:8.5px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs forecast</div>'; })()
            + '</td>'
-        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (lift != null && lift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(lift) + '</td></tr>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (lift != null && lift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(lift) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">—</td>' + '</tr>'
         + subs;
     }).join('');
 
@@ -28126,7 +28141,7 @@ render();
           <th colspan="3" style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">WHAT IT COST — trade spend</th>
           <th style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">SALES</th>
           <th colspan="2" style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">WHAT IT SOLD — units</th>
-          <th style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">DID IT WORK</th>
+          <th style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);" colspan="2">DID IT WORK</th>
         </tr>
         <tr style="background:#efe9dd;">
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_taGroupBy === 'month' ? 'Month · retailer' : 'Customer · promo dates'}<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#8c7a55;font-weight:700;margin-top:2px;">VIVIDLY</div></th>
@@ -28139,6 +28154,7 @@ render();
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="RETAIL dollars that rang at the register for the promoted product during the promo window, from Keel's weekly sales. Not your revenue and not spend — it is the size of what the promo was riding on. Customer and total rows are banner-wide.">Sales $ in window<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Vividly's forecast units for the event — already a PROMOTED number: its assumed baseline x (1 + its lift assumption). Counted once per event and product family, because Vividly repeats the same figure on every rate leg.">Forecast u<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#8c7a55;font-weight:700;margin-top:2px;">VIVIDLY</div></th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Units actually sold in the promo window, from Keel's weekly sales for the promoted product. The % beneath compares it to the forecast — that is ESTIMATE ACCURACY, not lift. A promo can beat its forecast and still have moved no extra volume.">Actual u<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;font-weight:700;margin-top:2px;"><span style="color:#534AB7;">KEEL</span><span style="color:var(--ink-3);"> vs </span><span style="color:#8c7a55;">VIVIDLY</span></div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="THE REAL PERFORMANCE NUMBER. The window's weekly unit rate against the same product's rate over the nearest 6 OFF-promo weeks. This is incremental volume; the % under Actual u is only forecast accuracy. Line rows use the promoted product's own series; customer rows are the sales-weighted mean of their lines.">Lift vs base<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="The shelf price the shopper actually paid, computed from Keel's weekly data as net sales / units — base weeks on the left, promo window on the right. This is the independent proof the retailer PASSED THE DISCOUNT THROUGH. A scan with no price move means we funded a discount nobody saw, and lift with no price move is not the promo's doing.">Price base→promo<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
         </tr></thead><tbody>${_taGroupBy === 'month' ? monRowsHtml : rowsHtml}</tbody>
         <tfoot>${(() => {
           let gd = 0, gu = 0;
@@ -28156,6 +28172,7 @@ render();
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:var(--ink-3);">${num(_gUP || null)}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${num(gUA)}${(() => { const v = uPct(_gUP, gUA); return v == null ? '' : '<div style="font-size:9px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs forecast</div>'; })()}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:${gLift != null && gLift > 0 ? '#3f6f4a' : 'var(--ink-3)'};" title="Sales-weighted mean of every measured line's lift. Fixed fees are excluded.">${pct(gLift)}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:var(--ink-3);">—</td>
           </tr>`;
         })()}</tfoot></table></div>`;
     summaryEl.onclick = (ev) => {
