@@ -27297,6 +27297,7 @@ render();
   let _taCompletedOnly = true;
   const _taCache = {};
   const _taLinesCache = {};
+  let _taGroupBy = (function () { try { return localStorage.getItem('keel_ta_group') || 'retailer'; } catch (e) { return 'retailer'; } })();
   let _taOpenMs = null;
   // The panels are absolutely positioned OVER the table, so the only way to close one used to
   // be hitting its own button again — everywhere else on the page was dead. One document-level
@@ -27537,10 +27538,14 @@ render();
       const f = fams.get(key);
       String(l.product_name || '').split('|').forEach(n => { n = n.trim(); if (n) f.names.add(n); });
       f.rate += Number(l.spend_rate) || 0; f.legs++;
+      // How many products ONE line bundles — the catch-all signal. Counting DISTINCT names
+      // across every line instead was the bug: a real family accumulates names as more promos
+      // run, tripped the >20 test, got treated as "All Products" and stopped matching items.
+      f.maxLineNames = Math.max(f.maxLineNames || 0, String(l.product_name || '').split('|').filter(x => x.trim()).length);
       f.expU = Math.max(f.expU, Number(l.expected_units) || 0);   // legs repeat the family's units — don't double count
       f.expS += Number(l.expected_spend) || 0; f.actS += Number(l.actual_spend) || 0;
     }
-    for (const f of fams.values()) f.all = /all products/i.test(f.key) || f.names.size > 20;
+    for (const f of fams.values()) f.all = /all products/i.test(f.key) || (f.maxLineNames || 0) > 20;
     return [...fams.values()];
   }
   function _taItemFamily(item, fams) {
@@ -27578,9 +27583,14 @@ render();
   // same weeks all reported the identical number, diluted toward the banner average. A real
   // +30% on one third of the volume reads as +6% once you divide by everything else.
   // wfm_sales is the only source with per-item rows today; UNFI weekly has them unparsed.
-  function _taWfmFamSeries(src, allLines) {
-    if (src._famSeries) return src._famSeries;
-    const fams = _taFamilies(allLines);
+  function _taWfmFamSeries(src, allLines, cust) {
+    if (!src._famSeries) src._famSeries = new Map();
+    const ck = cust || '*';
+    if (src._famSeries.has(ck)) return src._famSeries.get(ck);
+    // Families are built from THIS customer's lines only — the same scope the audit modal uses.
+    // Building them across every customer pooled unrelated product names into one family.
+    const mine = cust ? allLines.filter(l => (l.customer || '') === cust) : allLines;
+    const fams = _taFamilies(mine);
     const byFam = new Map();
     for (const [item, wkMap] of src.wfmItems) {
       const fk = _taItemFamily(item, fams);
@@ -27590,8 +27600,9 @@ render();
       e.items.add(item);
       for (const [wk, c] of wkMap) { const t = e.map.get(wk) || { u: 0, d: 0 }; t.u += c.u; t.d += c.d; e.map.set(wk, t); }
     }
-    src._famSeries = { fams, byFam };
-    return src._famSeries;
+    const out = { fams, byFam };
+    src._famSeries.set(ck, out);
+    return out;
   }
 
   // The series a LINE should be measured against — its own product where the source carries
@@ -27601,7 +27612,7 @@ render();
     if (!_taNorm(l.customer).includes('wholefoods')) return null;  // only WFM has item rows today
     const fk = l.product_group || String(l.product_name || '').split('|')[0].trim() || 'group';
     if (/all products/i.test(fk)) return null;                     // genuinely banner-wide
-    const { byFam } = _taWfmFamSeries(src, allLines);
+    const { byFam } = _taWfmFamSeries(src, allLines, l.customer || '');
     const e = byFam.get(fk);
     if (!e || !e.map.size) return null;
     return { map: e.map, tag: 'WFM · ' + fk, units: true, items: [...e.items] };
@@ -27809,11 +27820,20 @@ render();
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
         <label style="font-family:var(--mono);font-size:12px;color:var(--ink-2);cursor:pointer;display:flex;align-items:center;gap:7px;"><input type="checkbox" id="hl-ta-completed" ${_taCompletedOnly ? 'checked' : ''} style="cursor:pointer;"> Completed only <span style="color:var(--ink-3);">(${all.filter(l => /completed/i.test(String(l.status || ''))).length}/${all.length})</span></label>
         ${msHtml}
+        <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-left:4px;">Group by</span>
+        <span style="display:inline-flex;border:1.5px solid var(--ink-3);border-radius:6px;overflow:hidden;">
+          ${['retailer', 'month'].map(g => `<button class="ta-grp" data-g="${g}" style="font-family:var(--mono);font-size:12px;font-weight:${_taGroupBy === g ? '700' : '500'};padding:8px 15px;border:0;background:${_taGroupBy === g ? 'var(--ink)' : 'transparent'};color:${_taGroupBy === g ? 'var(--paper)' : 'var(--ink-2)'};cursor:pointer;">${g === 'retailer' ? 'Retailer' : 'Month'}</button>`).join('')}
+        </span>
         <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${lines.length.toLocaleString()} of ${lines0.length.toLocaleString()} lines</span>
       </div>${src.errors.length ? `
       <div style="font-family:var(--mono);font-size:10px;color:#a8381f;margin-top:8px;">${esc(src.errors.join(' · '))}</div>` : ''}`;
     _taWireMsDismiss();
     filtersEl.querySelectorAll('.ta-ms-close').forEach(a => a.addEventListener('click', (e) => { e.preventDefault(); _taCloseMsPanels(); }));
+    filtersEl.querySelectorAll('.ta-grp').forEach(bn => bn.addEventListener('click', () => {
+      _taGroupBy = bn.dataset.g;
+      try { localStorage.setItem('keel_ta_group', _taGroupBy); } catch (e) {}
+      renderTradeAnalyzer(summaryEl, filtersEl, year);
+    }));
     filtersEl.querySelector('#hl-ta-completed').addEventListener('change', (e) => { _taCompletedOnly = e.target.checked; renderTradeAnalyzer(summaryEl, filtersEl, year); });
     filtersEl.querySelectorAll('.ta-ms-btn').forEach(b => b.addEventListener('click', () => {
       const pn = filtersEl.querySelector('.ta-ms-panel[data-f="' + b.dataset.f + '"]');
@@ -27852,12 +27872,10 @@ render();
     }
     // Per-line measurement
     let mExp = 0, mAct = 0;
-    const monthly = Array.from({ length: 12 }, () => ({ exp: 0, act: 0 }));
     const byCust = new Map();
     for (const l of lines) {
       mExp += l.expected_spend || 0; mAct += l.actual_spend || 0;
       const mi = (l.month >= 1 && l.month <= 12) ? l.month - 1 : (l.start_date ? Number(l.start_date.slice(5, 7)) - 1 : null);
-      if (mi != null && mi >= 0 && mi < 12) { monthly[mi].exp += l.expected_spend || 0; monthly[mi].act += l.actual_spend || 0; }
       const c = l.customer || '(no customer)';
       if (!byCust.has(c)) byCust.set(c, { n: 0, exp: 0, act: 0, cov: 0, lines: [], wk: new Map(), bk: new Map(), anyU: false });
       const b = byCust.get(c);
@@ -27882,6 +27900,10 @@ render();
         beI = _taIso(new Date(ws.getTime() - 864e5));
       }
       const excl9 = custWins.get(c) || [];
+      // Vividly REPEATS expected_units on every stacked rate leg, so units are identified by
+      // (event, product family) and taken once — summing the legs doubles the plan.
+      const famKey9 = l.product_group || String(l.product_name || '').split('|')[0].trim() || 'group';
+      const evKey9 = (l.promotion_key || l.line_key || '?') + '\u00a6' + famKey9;
       let lift9 = null, baseWks9 = 0, liftBasis9 = null;
       const isFee9 = _taIsFee(l.promo_type);
       if (w && series && !isFee9) {
@@ -27928,18 +27950,37 @@ render();
         }
       }
       if (isFee9 && !tag) { const s9 = _taSeriesFor(l, src); if (s9) tag = s9.tag; }
-      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9, fee: isFee9, scoped, alwaysOn, overlaps, baseWks: baseWks9, basis: liftBasis9 });
+      b.lines.push({ l, w, win, base, tag, hasU, lift: lift9, fee: isFee9, scoped, alwaysOn, overlaps, baseWks: baseWks9, basis: liftBasis9, bannerMap: bannerSeries ? bannerSeries.map : null, btag: bannerSeries ? bannerSeries.tag : tag,
+        famKey: famKey9, evKey: evKey9, expU: Number(l.expected_units) || 0, lineMap: series ? series.map : null });
     }
     const custs = [...byCust.entries()].sort((a, b) => b[1].exp - a[1].exp);
-    // Monthly pacing strip (expected vs actual dollars)
-    const mMax = Math.max(1, ...monthly.map(m => Math.max(m.exp, m.act)));
-    const strip = monthly.map((m, i) => {
-      const he = Math.round(46 * m.exp / mMax), ha = Math.round(46 * m.act / mMax);
-      return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;"><div style="display:flex;align-items:flex-end;gap:2px;height:48px;"><div title="Expected ${money(m.exp)}" style="width:12px;height:${he}px;background:var(--rule-soft);border-radius:2px 2px 0 0;"></div><div title="Actual ${money(m.act)}" style="width:12px;height:${ha}px;background:#534AB7;border-radius:2px 2px 0 0;"></div></div><div style="font-family:var(--mono);font-size:8.5px;color:var(--ink-3);">${['J','F','M','A','M','J','J','A','S','O','N','D'][i]}</div></div>`;
-    }).join('');
+    // PLANNED vs ACTUAL UNITS over a set of line records.
+    // Planned: once per (event, family) — legs repeat the same figure.
+    // Actual: a UNION of (family, week), never a sum — two promos on the same product in the
+    // same weeks would otherwise book those units twice, exactly as with sell-through dollars.
+    const unitAgg = (recs) => {
+      const plan = new Map(), actWk = new Map();
+      let anyA = false;
+      for (const r of recs) {
+        if (r.fee) continue;                                  // fixed fees carry no units
+        if (r.expU > 0) plan.set(r.evKey, Math.max(plan.get(r.evKey) || 0, r.expU));
+        if (r.win && r.hasU && r.lineMap && r.w) {
+          for (const [wk, cc] of r.lineMap) {
+            if (wk >= r.w[0] && wk <= r.w[1]) { actWk.set(r.famKey + '|' + wk, cc); anyA = true; }
+          }
+        }
+      }
+      let p = 0, a = 0;
+      for (const v of plan.values()) p += v;
+      for (const cc of actWk.values()) a += cc.u;
+      return { p: p || null, a: anyA ? a : null };
+    };
+    const uPct = (p, a) => (p && a != null) ? (a - p) / p : null;
+
     // Totals-row accumulators, filled while the customer rows render.
     const _gWk = new Map();
-    let _gAnyU = false, _gLiftW = 0, _gLiftS = 0, _gCov = 0, _gN = 0;
+    let _gAnyU = false, _gLiftW = 0, _gLiftS = 0, _gCov = 0, _gN = 0, _gUP = 0;
+    const _gUW = new Map();   // union of (family, week) so overlapping promos can't double-count units
     const rowsHtml = custs.map(([c, b], ci) => {
       let md = 0, mu = 0;
       for (const cc of b.wk.values()) { md += cc.d; mu += cc.u; }
@@ -27953,7 +27994,10 @@ render();
       const lift = lw > 0 ? lsum / lw : null;
       _gLiftW += lw; _gLiftS += lsum;
       _gCov += b.cov; _gN += b.n;
-      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift, fee, scoped, alwaysOn, overlaps, baseWks, basis }) => {
+      const ua = unitAgg(b.lines);
+      if (ua.p) _gUP += ua.p;
+      for (const r of b.lines) { if (r.fee || !r.win || !r.hasU || !r.lineMap || !r.w) continue; for (const [wk, cc] of r.lineMap) if (wk >= r.w[0] && wk <= r.w[1]) _gUW.set(r.famKey + '|' + wk, cc); }
+      const lineRows = b.lines.sort((x, y) => (y.l.expected_spend || 0) - (x.l.expected_spend || 0)).map(({ l, w, win, base, tag, hasU, lift, fee, scoped, alwaysOn, overlaps, baseWks, basis, expU }) => {
         const ld = (l.actual_spend || 0) - (l.expected_spend || 0);
         const llift = lift;
         const canAudit = !!(l.promotion_key && tag && tag.indexOf('WFM') === 0);
@@ -27972,7 +28016,10 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + actCell + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (ld > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (l.actual_spend ? money(ld) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win ? money(win.d) : '—') + '</td>'
-          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win && hasU ? num(win.u) : '—') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + (fee ? '—' : num(expU || null)) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win && hasU ? num(win.u) : '—')
+             + (() => { const v = uPct(expU, (win && hasU) ? win.u : null); return v == null ? '' : '<div style="font-size:8px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs plan</div>'; })()
+             + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (llift != null && llift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">'
              + (fee
                  ? '<span style="font-size:9px;color:var(--ink-3);">fixed fee</span>'
@@ -27990,21 +28037,91 @@ render();
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(b.act) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (b.act - b.exp > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b.act ? money(b.act - b.exp) : '—') + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (b.cov ? money(md) : '—') + '</td>'
-        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (b.cov && b.anyU && mu ? num(mu) : '—') + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + num(ua.p) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(ua.a)
+           + (() => { const v = uPct(ua.p, ua.a); return v == null ? '' : '<div style="font-size:8.5px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs plan</div>'; })()
+           + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (lift != null && lift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(lift) + '</td></tr>'
         + lineRows;
     }).join('');
+    // ── MONTH GROUPING ────────────────────────────────────────────────────────────
+    // Same per-line records, pivoted: month rows expandable to the retailers inside them.
+    // Answers "what got deducted in March, and by whom" — the cash-flow question — where the
+    // retailer view answers "how is this account performing". A line's month is Vividly's own
+    // `month` field, falling back to the start date, so it matches how the plan was budgeted.
+    const MONN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const byMon = new Map();
+    for (const [c, b] of byCust) {
+      for (const rec of b.lines) {
+        const l = rec.l;
+        const mi = (l.month >= 1 && l.month <= 12) ? l.month - 1 : (l.start_date ? Number(l.start_date.slice(5, 7)) - 1 : null);
+        const mk = (mi != null && mi >= 0 && mi < 12) ? mi : 12;      // 12 = no month
+        if (!byMon.has(mk)) byMon.set(mk, { n: 0, exp: 0, act: 0, cov: 0, wk: new Map(), anyU: false, cust: new Map() });
+        const m = byMon.get(mk);
+        m.n++; m.exp += l.expected_spend || 0; m.act += l.actual_spend || 0;
+        if (!m.cust.has(c)) m.cust.set(c, { n: 0, exp: 0, act: 0, cov: 0, wk: new Map(), anyU: false, lines: [] });
+        const mc = m.cust.get(c);
+        mc.n++; mc.exp += l.expected_spend || 0; mc.act += l.actual_spend || 0; mc.lines.push(rec);
+        if (rec.win && rec.win.weeks > 0) {
+          m.cov++; mc.cov++;
+          if (rec.hasU) { m.anyU = true; mc.anyU = true; }
+          // Union by (series tag, week) at BOTH levels, same rule as everywhere else — two
+          // promos sharing a week must not book that week's sell-through twice.
+          for (const [wkk, cc] of (rec.bannerMap || [])) {
+            if (rec.w && wkk >= rec.w[0] && wkk <= rec.w[1]) { m.wk.set(rec.btag + '|' + wkk, cc); mc.wk.set(rec.btag + '|' + wkk, cc); }
+          }
+        }
+      }
+    }
+    const wLift = (recs) => { let w = 0, s = 0; for (const e of recs) if (e.lift != null && e.win && e.win.d > 0) { w += e.win.d; s += e.lift * e.win.d; } return w > 0 ? s / w : null; };
+    const sumWk = (mp) => { let d = 0, u = 0; for (const cc of mp.values()) { d += cc.d; u += cc.u; } return { d, u }; };
+    const monRowsHtml = [...byMon.entries()].sort((a, b2) => a[0] - b2[0]).map(([mk, m], mi2) => {
+      const t = sumWk(m.wk);
+      const allRecs = [...m.cust.values()].flatMap(x => x.lines);
+      const lift = wLift(allRecs);
+      const mua = unitAgg(allRecs);
+      const subs = [...m.cust.entries()].sort((a, b2) => b2[1].act - a[1].act || b2[1].exp - a[1].exp).map(([c, mc]) => {
+        const ct = sumWk(mc.wk);
+        const cl = wLift(mc.lines);
+        const cua = unitAgg(mc.lines);
+        return '<tr class="hl-ta-mr hl-ta-mr' + mi2 + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
+          + '<td style="padding:5px 10px 5px 40px;font-family:var(--serif);font-size:12.5px;">' + esc(c) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + mc.cov + '/' + mc.n + ' measured</span></td>'
+          + '<td></td><td></td><td></td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(mc.exp) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.act ? money(mc.act) : '\u2014') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (mc.act - mc.exp > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (mc.act ? money(mc.act - mc.exp) : '\u2014') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.cov && ct.d ? money(ct.d) : '\u2014') + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + num(cua.p) + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + num(cua.a)
+             + (() => { const v = uPct(cua.p, cua.a); return v == null ? '' : '<div style="font-size:8.5px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs plan</div>'; })()
+             + '</td>'
+          + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (cl != null && cl > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(cl) + '</td></tr>';
+      }).join('');
+      return '<tr class="hl-ta-mo" data-mi="' + mi2 + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
+        + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span id="hl-ta-mcar' + mi2 + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">\u25b6</span>' + (mk === 12 ? 'No month' : MONN[mk] + ' ' + year) + ' <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">' + m.cust.size + ' retailers · ' + m.cov + '/' + m.n + ' measured</span></td>'
+        + '<td></td><td></td><td></td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;font-weight:600;">' + money(m.exp) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(m.act) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (m.act - m.exp > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (m.act ? money(m.act - m.exp) : '\u2014') + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (m.cov && t.d ? money(t.d) : '\u2014') + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + num(mua.p) + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(mua.a)
+           + (() => { const v = uPct(mua.p, mua.a); return v == null ? '' : '<div style="font-size:8.5px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs plan</div>'; })()
+           + '</td>'
+        + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (lift != null && lift > 0 ? '#3f6f4a' : 'var(--ink-3)') + ';">' + pct(lift) + '</td></tr>'
+        + subs;
+    }).join('');
+
     summaryEl.innerHTML = `
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;">
         <div style="max-width:660px;">
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${year} trade analyzer · ${lines.length.toLocaleString()} lines · planned ${money(mExp)} · deducted ${money(mAct)} · <b style="color:${mAct - mExp > 0 ? '#a8381f' : 'var(--ink)'}">${money(mAct - mExp)}</b>${year === 2025 ? ' · <span style="color:#8a6d1f;">reference year</span>' : ''}</div>
         ${(() => { const aE = all.reduce((s, l) => s + (l.expected_spend || 0), 0); const off = aE - mExp; return off > 1 ? `<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:3px;">A SUBSET of the plan — ${money(off)} planned across ${(all.length - lines.length).toLocaleString()} lines is filtered out (not Completed, or excluded by a filter above). Plan view shows all ${all.length.toLocaleString()} lines / ${money(aE)}.</div>` : ''; })()}
         </div>
-        <div style="display:flex;gap:5px;align-items:flex-end;">${strip}<span style="font-family:var(--mono);font-size:8.5px;color:var(--ink-3);margin-left:8px;">▮ expected<br>▮ <span style="color:#534AB7;">actual</span></span></div>
       </div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
-          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Customer · promo dates</th>
+          <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_taGroupBy === 'month' ? 'Month · retailer' : 'Customer · promo dates'}</th>
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Products</th>
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Month</th>
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Type</th>
@@ -28012,21 +28129,24 @@ render();
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Deducted $ (Vividly)</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Δ spend</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through $ (windows)</th>
-          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Sell-through units</th>
+          <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Vividly's Total Expected Unit Sales — a PROMOTED forecast, i.e. baseline x (1 + its lift assumption). Counted once per event and product family because Vividly repeats it on every rate leg.">Planned u</th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Units actually sold in the promo window, from Keel's own weekly sales for the promoted product. The % beneath is the forecast variance — how good the estimate was, which is a different question from lift.">Actual u &middot; var</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Promo-window weekly rate vs the nearest 6 OFF-promo weeks in the prior 12, measured in units where the source carries them. Line rows use the promoted product's own series; customer rows are the sales-weighted mean of their lines.">Lift vs off-promo base</th>
-        </tr></thead><tbody>${rowsHtml}</tbody>
+        </tr></thead><tbody>${_taGroupBy === 'month' ? monRowsHtml : rowsHtml}</tbody>
         <tfoot>${(() => {
           let gd = 0, gu = 0;
           for (const cc of _gWk.values()) { gd += cc.d; gu += cc.u; }
+          let gUA = 0; for (const cc of _gUW.values()) gUA += cc.u;
+          if (!gUA) gUA = null;
           const gLift = _gLiftW > 0 ? _gLiftS / _gLiftW : null;
           return `<tr style="border-top:2px solid var(--ink);background:#efe9dd;font-weight:700;">
-            <td style="padding:9px 10px;font-family:var(--mono);font-size:11.5px;">TOTAL <span style="font-weight:400;color:var(--ink-3);font-size:9.5px;">${_gCov}/${_gN} measured · ${custs.length} retailers</span></td>
+            <td style="padding:9px 10px;font-family:var(--mono);font-size:11.5px;">TOTAL <span style="font-weight:400;color:var(--ink-3);font-size:9.5px;">${_gCov}/${_gN} measured · ${_taGroupBy === 'month' ? byMon.size + ' months · ' : ''}${custs.length} retailers</span></td>
             <td></td><td></td><td></td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${money(mExp)}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${money(mAct)}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:${mAct - mExp > 0 ? '#a8381f' : '#3f6f4a'};">${money(mAct - mExp)}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;" title="Union of measured weeks across every retailer — a week two retailers both measured counts once. Distributor-wide rollups can still overlap a named chain from the same distributor.">${gd ? money(gd) : '—'}</td>
-            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${_gAnyU && gu ? num(gu) : '—'}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:var(--ink-3);">${num(_gUP || null)}</td>
+            <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${num(gUA)}${(() => { const v = uPct(_gUP, gUA); return v == null ? '' : '<div style="font-size:9px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs plan</div>'; })()}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:${gLift != null && gLift > 0 ? '#3f6f4a' : 'var(--ink-3)'};" title="Sales-weighted mean of every measured line's lift. Fixed fees are excluded.">${pct(gLift)}</td>
           </tr>`;
         })()}</tfoot></table></div>`;
@@ -28034,13 +28154,23 @@ render();
       const ab = ev.target.closest('.hl-ta-auditbtn');
       if (ab && summaryEl.contains(ab)) { _taShowAudit(ab.dataset.pk, ab.dataset.lk, lines, src); return; }
       const tr = ev.target.closest('.hl-ta-cr');
-      if (!tr || !summaryEl.contains(tr)) return;
-      const ci = tr.dataset.ci;
-      const rows9 = summaryEl.querySelectorAll('.hl-ta-lr' + ci);
-      if (!rows9.length) return;
-      const showing = rows9[0].style.display !== 'none';
-      rows9.forEach(r => { r.style.display = showing ? 'none' : ''; });
-      const car = document.getElementById('hl-ta-car' + ci); if (car) car.textContent = showing ? '▶' : '▼';
+      if (tr && summaryEl.contains(tr)) {
+        const ci = tr.dataset.ci;
+        const rows9 = summaryEl.querySelectorAll('.hl-ta-lr' + ci);
+        if (!rows9.length) return;
+        const showing = rows9[0].style.display !== 'none';
+        rows9.forEach(r => { r.style.display = showing ? 'none' : ''; });
+        const car = document.getElementById('hl-ta-car' + ci); if (car) car.textContent = showing ? '▶' : '▼';
+        return;
+      }
+      const mo = ev.target.closest('.hl-ta-mo');
+      if (!mo || !summaryEl.contains(mo)) return;
+      const mi3 = mo.dataset.mi;
+      const mrows = summaryEl.querySelectorAll('.hl-ta-mr' + mi3);
+      if (!mrows.length) return;
+      const mshow = mrows[0].style.display !== 'none';
+      mrows.forEach(r => { r.style.display = mshow ? 'none' : ''; });
+      const mcar = document.getElementById('hl-ta-mcar' + mi3); if (mcar) mcar.textContent = mshow ? '▶' : '▼';
     };
   }
 
