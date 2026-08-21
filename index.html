@@ -28901,6 +28901,271 @@ render();
     };
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // DEDUCTIONS — third view on the Promos page (Plan | Trade analyzer |
+  // Deductions). Deliberately NOT a new nav tab: adding to NAV_ITEMS ships
+  // denied-by-default to every configured department, which has bitten this
+  // codebase three times.
+  //
+  // Reads what the sync-deductions function loaded: the K-solve check register
+  // (deduction_checks / deduction_lines) and, once mode=detail has run, the
+  // store-level backup (deduction_detail). The page degrades gracefully — it is
+  // useful the moment the register is loaded and fills in as detail arrives,
+  // rather than showing nothing until everything is ready.
+  // ══════════════════════════════════════════════════════════════════════════
+  let _dedView = (() => { try { return localStorage.getItem('keel_ded_view') || 'category'; } catch (e) { return 'category'; } })();
+  let _dedExpand = {};
+
+  async function renderDeductions(hostEl, filtersEl, year) {
+    const sb = window.Auth.getClient();
+    const brandId = window.BrandLibrary.getSession().brandId;
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
+    const money2 = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    filtersEl.innerHTML = '';
+    hostEl.innerHTML = '<div class="hl-loading">Loading deductions…</div>';
+
+    // Factory, not a builder — a supabase builder is single-use and parallel
+    // .range() calls on one object overwrite each other's offsets.
+    const paged = async (mk, pageSize = 1000) => {
+      const out = [];
+      for (let from = 0; ; from += pageSize) {
+        const { data, error } = await mk().range(from, from + pageSize - 1);
+        if (error) throw new Error(error.message);
+        out.push(...(data || []));
+        if (!data || data.length < pageSize) break;
+      }
+      return out;
+    };
+
+    let checks = [], lines = [], rmap = [], detAgg = [];
+    try {
+      [checks, lines, rmap] = await Promise.all([
+        paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
+        paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
+        paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
+      ]);
+    } catch (e) {
+      hostEl.innerHTML = `<div style="padding:20px;font-family:var(--mono);font-size:12px;color:var(--lost);">Could not load deductions: ${esc(String(e.message || e))}<br><br>If the tables don't exist yet, run the Phase III migration first.</div>`;
+      return;
+    }
+
+    if (!lines.length) {
+      hostEl.innerHTML = `<div style="padding:26px;font-family:var(--serif);font-size:14px;color:var(--ink-2);line-height:1.6;">
+        No deductions loaded yet. Run the <code style="font-family:var(--mono);font-size:12px;">sync-deductions</code> function in
+        <code style="font-family:var(--mono);font-size:12px;">mode=register</code> to load the K-solve check export.</div>`;
+      return;
+    }
+
+    // ── shape the data ──────────────────────────────────────────────────────
+    const yr = String(year);
+    const inYear = (d) => !d || String(d).slice(0, 4) === yr;
+    const L = lines.filter(l => inYear(l.doc_date));
+    const rmapBy = Object.fromEntries(rmap.map(r => [r.reason_code, r]));
+    const checkById = Object.fromEntries(checks.map(c => [c.id, c]));
+
+    const totalAmt = L.reduce((s, l) => s + Number(l.amount || 0), 0);
+    const totalFee = L.reduce((s, l) => s + Number(l.processing_fee || 0), 0);
+    const parsedN = L.filter(l => l.detail_parsed).length;
+    const notTied = checks.filter(c => !c.ties_out);
+
+    // Category rollup via the reason map. An UNMAPPED code is shown as its own
+    // visible row with its dollars, never folded into an "Other" bucket — the
+    // whole point is that the gap stays legible.
+    const cat = {};
+    for (const l of L) {
+      const rm = rmapBy[l.reason_code];
+      const key = rm && rm.keel_category ? rm.keel_category : (l.reason_code ? '⚠ Unmapped · ' + l.reason_code : '⚠ Unresolved');
+      cat[key] ??= { lines: 0, amount: 0, fee: 0, merch: 0, parsed: 0, trade: rm ? rm.is_trade_spend : null, codes: new Set() };
+      const c = cat[key];
+      c.lines++; c.amount += Number(l.amount || 0);
+      c.fee += Number(l.processing_fee || 0);
+      c.merch += Number(l.detail_line_total || 0);
+      if (l.detail_parsed) c.parsed++;
+      if (l.reason_code) c.codes.add(l.reason_code);
+    }
+    const catRows = Object.entries(cat).map(([k, v]) => ({ key: k, ...v })).sort((a, b) => a.amount - b.amount);
+
+    const byCode = {};
+    for (const l of L) {
+      const k = l.reason_code || '(unresolved)';
+      byCode[k] ??= { lines: 0, amount: 0, fee: 0, parsed: 0, src: l.reason_source, rm: rmapBy[k] || null };
+      byCode[k].lines++; byCode[k].amount += Number(l.amount || 0);
+      byCode[k].fee += Number(l.processing_fee || 0);
+      if (l.detail_parsed) byCode[k].parsed++;
+    }
+    const codeRows = Object.entries(byCode).map(([k, v]) => ({ code: k, ...v })).sort((a, b) => a.amount - b.amount);
+
+    const unmapped = codeRows.filter(r => !r.rm || !r.rm.keel_category);
+    const unmappedAmt = unmapped.reduce((s, r) => s + r.amount, 0);
+    const noBackup = L.filter(l => !l.detail_parsed);
+
+    // ── header ──────────────────────────────────────────────────────────────
+    const tag = (t, c) => `<span style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;padding:2px 6px;border-radius:3px;background:${c};color:var(--paper);">${t}</span>`;
+    const stat = (label, val, sub) => `
+      <div style="min-width:130px;">
+        <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;">${label}</div>
+        <div style="font-family:var(--serif);font-size:21px;color:var(--ink);margin-top:3px;">${val}</div>
+        ${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}
+      </div>`;
+
+    const views = [['category', 'By category'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
+
+    hostEl.innerHTML = `
+      <div style="display:flex;gap:34px;flex-wrap:wrap;padding:16px 2px 20px;border-bottom:1px solid var(--rule-soft);">
+        ${stat('Deducted ' + yr, money(-totalAmt), L.length.toLocaleString() + ' lines')}
+        ${stat('Checks', checks.length, checks.length - notTied.length + ' of ' + checks.length + ' tie out')}
+        ${stat('Processing fees', totalFee ? money(Math.abs(totalFee)) : '—', totalFee ? (totalFee / -totalAmt * 100).toFixed(1) + '% of deductions' : 'run mode=detail')}
+        ${stat('Backup parsed', parsedN.toLocaleString() + ' / ' + L.length.toLocaleString(), parsedN ? Math.round(parsedN / L.length * 100) + '% of lines' : 'run mode=detail')}
+        ${stat('Unmapped codes', unmapped.length, unmapped.length ? money(-unmappedAmt) + ' unclassified' : 'all mapped')}
+      </div>
+
+      <div style="margin:16px 0 4px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
+        ${views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_dedView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_dedView === v ? 'var(--ink)' : 'transparent'};color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">KeHE · K-solve register</span>
+      </div>
+      <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:6px 0 14px;max-width:900px;">
+        WHAT KEHE ACTUALLY TOOK — every deduction line from the check register, grouped to the same categories as the plan.
+        Merchandise and processing fees are held apart: KeHE bills a fee on top of most deductions and it does not appear in Vividly at all.
+        ${parsedN < L.length ? `Store-level backup is parsed for ${parsedN.toLocaleString()} of ${L.length.toLocaleString()} lines — run <code style="font-family:var(--mono);">mode=detail</code> for the rest.` : ''}
+      </p>
+      <div id="hl-ded-body"></div>
+    `;
+
+    hostEl.querySelectorAll('.hl-ded-view').forEach(b => b.onclick = () => {
+      if (b.dataset.v === _dedView) return;
+      _dedView = b.dataset.v;
+      try { localStorage.setItem('keel_ded_view', _dedView); } catch (e) {}
+      renderDeductions(hostEl, filtersEl, year);
+    });
+
+    const body = document.getElementById('hl-ded-body');
+    const th = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
+    const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
+
+    // ── by category ─────────────────────────────────────────────────────────
+    if (_dedView === 'category') {
+      body.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Category')}${th('Codes', true)}${th('Lines', true)}
+            ${th('Merchandise $', true)}${th('Fees $', true)}${th('Total deducted', true)}${th('Backup', true)}
+          </tr></thead>
+          <tbody>
+            ${catRows.map(r => {
+              const warn = r.key.startsWith('⚠');
+              const merch = r.merch ? money(Math.abs(r.merch)) : '<span style="color:var(--ink-3);">—</span>';
+              return `<tr>
+                ${td(`<span style="font-family:var(--serif);font-size:13.5px;${warn ? 'color:var(--lost);' : ''}">${esc(r.key)}</span>${r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : ''}`)}
+                ${td(r.codes.size || '—', true)}
+                ${td(r.lines.toLocaleString(), true)}
+                ${td(merch, true)}
+                ${td(r.fee ? money(r.fee) : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td(`<strong>${money(-r.amount)}</strong>`, true)}
+                ${td(r.lines ? Math.round(r.parsed / r.lines * 100) + '%' : '—', true, r.parsed === 0 ? 'color:var(--ink-3);' : '')}
+              </tr>`;
+            }).join('')}
+          </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>TOTAL</strong>')}${td('', true)}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${td('<strong>' + (catRows.reduce((s, r) => s + r.merch, 0) ? money(Math.abs(catRows.reduce((s, r) => s + r.merch, 0))) : '—') + '</strong>', true)}
+            ${td('<strong>' + (totalFee ? money(totalFee) : '—') + '</strong>', true)}
+            ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
+            ${td('<strong>' + Math.round(parsedN / L.length * 100) + '%</strong>', true)}
+          </tr></tfoot>
+        </table>`;
+      return;
+    }
+
+    // ── by reason code ──────────────────────────────────────────────────────
+    if (_dedView === 'code') {
+      body.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Reason code')}${th('KeHE description')}${th('Keel category')}${th('Resolved via')}
+            ${th('Lines', true)}${th('Amount', true)}${th('Backup', true)}
+          </tr></thead>
+          <tbody>
+            ${codeRows.map(r => {
+              const m = r.rm;
+              const mapped = m && m.keel_category;
+              return `<tr>
+                ${td(`<strong>${esc(r.code)}</strong>`)}
+                ${td(m && m.kehe_description ? esc(m.kehe_description) : '<span style="color:var(--ink-3);">—</span>')}
+                ${td(mapped ? esc(m.keel_category) : `<span style="color:var(--lost);">unmapped</span>`)}
+                ${td(`<span style="font-size:10px;color:var(--ink-3);">${esc(r.src || '—')}</span>`)}
+                ${td(r.lines.toLocaleString(), true)}
+                ${td(money(-r.amount), true)}
+                ${td(r.lines ? Math.round(r.parsed / r.lines * 100) + '%' : '—', true, r.parsed === 0 ? 'color:var(--ink-3);' : '')}
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+        <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:12px;line-height:1.55;">
+          RESOLVED VIA tells you where the code came from: <code style="font-family:var(--mono);">invoice_prefix</code> means a dot-format document number,
+          <code style="font-family:var(--mono);">remarks</code> means the Remarks column on an invoice adjustment, <code style="font-family:var(--mono);">alpha</code> means the leading letters of the invoice number.
+          Mapping a code changes which category its dollars roll into — edit <code style="font-family:var(--mono);">deduction_reason_map</code>.
+        </p>`;
+      return;
+    }
+
+    // ── checks ──────────────────────────────────────────────────────────────
+    if (_dedView === 'checks') {
+      body.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Check #')}${th('Date')}${th('Invoices $', true)}${th('Deductions $', true)}
+            ${th('Net parsed', true)}${th('Check amount', true)}${th('Ties out')}
+          </tr></thead>
+          <tbody>
+            ${checks.map(c => `<tr>
+              ${td(`<strong>${esc(c.check_no)}</strong>`)}
+              ${td(esc(String(c.check_date || '—')))}
+              ${td(money(c.invoice_total), true)}
+              ${td(money(c.deduction_total), true)}
+              ${td(money2(c.parsed_net), true)}
+              ${td(money2(c.check_amt), true)}
+              ${td(c.ties_out
+                  ? '<span style="color:var(--won);">✓</span>'
+                  : `<span style="color:var(--lost);">✕ off by ${money(Math.abs(c.tie_variance || 0))}</span>`)}
+            </tr>`).join('')}
+          </tbody>
+        </table>
+        <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:12px;line-height:1.55;">
+          A check TIES OUT when the invoices and deductions on it sum to the amount KeHE actually paid. This is the control on the whole module:
+          if a check does not tie, Keel is missing rows for it and any analysis built on it is incomplete. Checks that pay invoices dated before the
+          export window will not tie until an earlier register is loaded.
+        </p>`;
+      return;
+    }
+
+    // ── exceptions ──────────────────────────────────────────────────────────
+    const bigNoBackup = noBackup.slice().sort((a, b) => Number(a.amount) - Number(b.amount)).slice(0, 25);
+    const section = (title, note, inner) => `
+      <div style="margin-bottom:26px;">
+        <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-2);text-transform:uppercase;margin-bottom:5px;">${title}</div>
+        <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0 0 9px;line-height:1.5;max-width:820px;">${note}</p>
+        ${inner}
+      </div>`;
+
+    body.innerHTML =
+      section('Checks that do not tie', 'Keel does not have every row for these checks, so their totals are incomplete.',
+        notTied.length ? `<table style="width:100%;border-collapse:collapse;"><thead><tr>${th('Check #')}${th('Date')}${th('Parsed net', true)}${th('Check amount', true)}${th('Gap', true)}</tr></thead><tbody>
+          ${notTied.map(c => `<tr>${td(esc(c.check_no))}${td(esc(String(c.check_date || '—')))}${td(money2(c.parsed_net), true)}${td(money2(c.check_amt), true)}${td('<span style="color:var(--lost);">' + money(Math.abs(c.tie_variance || 0)) + '</span>', true)}</tr>`).join('')}
+        </tbody></table>` : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">All checks tie out.</div>')
+      +
+      section('Unmapped reason codes', 'These dollars are not classified into any category. Ranked by amount — mapping the top few covers most of the money.',
+        unmapped.length ? `<table style="width:100%;border-collapse:collapse;"><thead><tr>${th('Code')}${th('Resolved via')}${th('Lines', true)}${th('Amount', true)}${th('Note')}</tr></thead><tbody>
+          ${unmapped.slice(0, 20).map(r => `<tr>${td('<strong>' + esc(r.code) + '</strong>')}${td('<span style="font-size:10px;color:var(--ink-3);">' + esc(r.src || '—') + '</span>')}${td(r.lines, true)}${td('<span style="color:var(--lost);">' + money(-r.amount) + '</span>', true)}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + esc((r.rm && r.rm.notes) || '') + '</span>')}</tr>`).join('')}
+        </tbody></table>` : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">Every code is mapped.</div>')
+      +
+      section('Largest lines with no parsed backup', 'A deduction with no supporting document cannot be verified line by line. Some codes never generate one — shortages are backed by the BOL, not a K-solve document.',
+        bigNoBackup.length ? `<table style="width:100%;border-collapse:collapse;"><thead><tr>${th('Invoice #')}${th('Date')}${th('Code')}${th('DC')}${th('Remarks')}${th('Amount', true)}</tr></thead><tbody>
+          ${bigNoBackup.map(l => `<tr>${td(esc(l.invoice_no))}${td(esc(String(l.doc_date || '—')))}${td(esc(l.reason_code || '—'))}${td('<span style="font-size:10.5px;">' + esc(l.dc_name || '—') + '</span>')}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + esc(l.remarks || '') + '</span>')}${td(money(-l.amount), true)}</tr>`).join('')}
+        </tbody></table>` : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">Every line has backup.</div>');
+  }
+
   async function renderPromosPage() {
     const session = HL.mountPage('promos');
     if (!session) return;
@@ -28927,7 +29192,7 @@ render();
       </div>
       <div id="hl-promo-years" style="margin-top:18px;display:flex;gap:6px;align-items:center;">
         ${[2025, 2026, 2027].map(y => `<button class="hl-promo-year" data-y="${y}" style="font-family:var(--mono);font-size:11px;padding:7px 16px;border-radius:5px;border:1px solid ${y === _promoYear ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${y === _promoYear ? 'var(--ink)' : 'transparent'};color:${y === _promoYear ? 'var(--paper)' : 'var(--ink-3)'};font-weight:${y === _promoYear ? '700' : '400'};">${y}</button>`).join('')}
-        ${_promoYear < 2027 ? `<span style="margin-left:14px;display:inline-flex;gap:5px;">${[['plan', 'Plan'], ['analyzer', 'Trade analyzer']].map(([v, lbl]) => `<button class="hl-promo-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_promoView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_promoView === v ? 'var(--ink)' : 'transparent'};color:${_promoView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}</span>` : ''}
+        ${_promoYear < 2027 ? `<span style="margin-left:14px;display:inline-flex;gap:5px;">${[['plan', 'Plan'], ['analyzer', 'Trade analyzer'], ['deductions', 'Deductions']].map(([v, lbl]) => `<button class="hl-promo-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_promoView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_promoView === v ? 'var(--ink)' : 'transparent'};color:${_promoView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}</span>` : ''}
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:10px;">${_promoYear >= 2027 ? 'Keel-built promos' : 'Vividly plan' + (_promoYear === 2025 ? ' · reference only' : '')}</span>
       </div>
       <div id="hl-promo-filters" style="margin-top:16px;"></div>
@@ -28955,6 +29220,7 @@ render();
     if (_planYear) {
       const sEl = document.getElementById('hl-promo-summary'), fEl = document.getElementById('hl-promo-filters');
       if (_promoView === 'analyzer') await renderTradeAnalyzer(sEl, fEl, _promoYear);
+      else if (_promoView === 'deductions') await renderDeductions(sEl, fEl, _promoYear);
       else await renderVividlyPlan(sEl, fEl, _promoYear);
       return;
     }
