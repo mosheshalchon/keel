@@ -28921,6 +28921,39 @@ render();
   const DED_VIEWS = ['summary', 'reconcile', 'category', 'customer', 'code', 'checks', 'exceptions'];
   let _dedSumOpen = new Set();    // which summary buckets are expanded
   let _dedRecOpen = new Set();    // which plan customers are expanded on Reconcile
+
+  // 1,173 distinct KeHE banner strings against ~10 plan customers. Hand-picking
+  // that from dropdowns is not a workflow, so the mapper PROPOSES and Moshe
+  // confirms. Scored, never silent: every suggestion is labelled with why it
+  // fired, and nothing is written until Save.
+  const _DED_NOISE = /\b(THE|INC|LLC|CO|CORP|COMPANY|MARKET|MARKETS|MARKETPLACE|MKT|MRKT|SUPERMARKET|SUPERMARKETS|SUPERMRKT|GROCER|GROCERS|GROCERY|FOODS|FOOD|STORE|STORES|ORGANIC|NATURAL|WHOLESALE|DISTRIBUTING|DIST|INFRA|RTB)\b/g;
+  function _dedNorm(s) {
+    // Apostrophes are DELETED, not spaced: "Woodman's Markets" must normalise to
+    // WOODMANS to meet plan customer "Woodmans", and spacing it gives WOODMAN S.
+    return String(s || '').toUpperCase().replace(/\(.*?\)/g, ' ').replace(/['\u2019\u02BC]/g, '').replace(/[^A-Z0-9 ]/g, ' ')
+      .replace(/\b\d{2,6}\b/g, ' ').replace(_DED_NOISE, ' ').replace(/\s+/g, ' ').trim();
+  }
+  // Returns { pc, why, score } or null. Score is only used to order confidence,
+  // never to auto-commit — a wrong crosswalk row silently misattributes money.
+  function _dedSuggestPlan(raw, planCusts) {
+    const a = _dedNorm(raw);
+    if (!a) return null;
+    let best = null;
+    for (const pc of planCusts) {
+      const b = _dedNorm(pc);
+      if (!b) continue;
+      let score = 0, why = '';
+      if (a === b) { score = 100; why = 'exact'; }
+      else if (a.startsWith(b + ' ') || b.startsWith(a + ' ')) { score = 85; why = 'prefix'; }
+      else if (a.includes(b) || b.includes(a)) { score = 70; why = 'contains'; }
+      else {
+        const ta = a.split(' '), tb = b.split(' ');
+        if (ta[0] && ta[0] === tb[0] && ta[0].length >= 4) { score = 60; why = 'first word'; }
+      }
+      if (score && (!best || score > best.score)) best = { pc, why, score };
+    }
+    return best && best.score >= 60 ? best : null;
+  }
   let _dedPlan = null;            // promo_plan_lines for the selected year, cached
 
   // THE BUCKET IS DATA, NOT A HARDCODED LIST. deduction_reason_map.bucket wins
@@ -29308,24 +29341,58 @@ render();
       const planCusts = [...new Set(P.lines.filter(pl => /kehe/i.test(String(pl.first_receiver || '') + ' ' + String(pl.customer || ''))).map(pl => pl.customer).filter(Boolean))].sort();
       const openMapper = () => {
         const host = document.getElementById('hl-rec-mapper');
+        // Show enough rows to cover 95% of the unplaced money rather than a flat
+        // count — the tail is 1,000+ single-store names worth a few dollars each.
+        const unTotal = unattribList.reduce((n, u) => n + u[1], 0);
+        let run = 0, cut = 0;
+        for (; cut < unattribList.length && cut < 120; cut++) {
+          run += unattribList[cut][1];
+          if (run >= unTotal * 0.95) { cut++; break; }
+        }
+        const show = unattribList.slice(0, cut);
+        const rest = unattribList.slice(cut);
+        const sug = new Map(show.map(([raw]) => [raw, _dedSuggestPlan(raw, planCusts)]));
+        const nSug = [...sug.values()].filter(Boolean).length;
+        const sugAmt = show.filter(([raw]) => sug.get(raw)).reduce((n, u) => n + u[1], 0);
         host.innerHTML = `
           <div style="border:1px solid var(--ink);border-radius:6px;padding:14px 16px;margin-bottom:18px;">
-            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Map KeHE banners to plan customers</div>
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Map KeHE banners to plan customers</div>
+            <div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;margin-bottom:10px;max-width:860px;">
+              ${show.length} banners shown, covering ${money(show.reduce((n, u) => n + u[1], 0))} of ${money(unTotal)} unplaced.
+              <strong>${nSug}</strong> have a suggested match (${money(sugAmt)}) — pre-selected below and tagged with why they fired.
+              Review before saving: a wrong row misattributes money silently.
+              ${rest.length ? `<br><span style="color:var(--ink-3);">${rest.length} smaller banners not shown \u00b7 ${money(rest.reduce((n, u) => n + u[1], 0))} \u2014 mostly single stores.</span>` : ''}
+            </div>
+            <div style="margin-bottom:10px;">
+              <button id="hl-rec-accept" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--ink);background:transparent;color:var(--ink);cursor:pointer;">Accept all ${nSug} suggestions</button>
+              <button id="hl-rec-clear" style="margin-left:6px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear all</button>
+            </div>
+            <div style="max-height:440px;overflow:auto;border-top:1px solid var(--rule-soft);">
             <table style="width:100%;border-collapse:collapse;">
-              <thead><tr>${th('KeHE banner')}${th('Trade $', true)}${th('Plan customer')}</tr></thead>
+              <thead><tr>${th('KeHE banner')}${th('Trade $', true)}${th('Plan customer')}${th('Match')}</tr></thead>
               <tbody>
-                ${unattribList.slice(0, 40).map(([raw, amt], i) => `<tr>
+                ${show.map(([raw, amt]) => {
+                  const g = sug.get(raw);
+                  return `<tr>
                   ${td(esc(raw))}${td(money(amt), true)}
-                  ${td(`<select class="hl-rec-sel" data-raw="${esc(raw)}" style="font-family:var(--mono);font-size:11px;padding:5px 8px;border:1px solid var(--rule);border-radius:4px;background:#fff;min-width:220px;">
+                  ${td(`<select class="hl-rec-sel" data-raw="${esc(raw)}" data-sug="${esc(g ? g.pc : '')}" style="font-family:var(--mono);font-size:11px;padding:5px 8px;border:1px solid ${g ? 'var(--ink)' : 'var(--rule)'};border-radius:4px;background:#fff;min-width:210px;">
                     <option value="">— not a plan customer —</option>
-                    ${planCusts.map(pc => `<option value="${esc(pc)}">${esc(pc)}</option>`).join('')}
+                    ${planCusts.map(pc => `<option value="${esc(pc)}"${g && g.pc === pc ? ' selected' : ''}>${esc(pc)}</option>`).join('')}
                   </select>`)}
-                </tr>`).join('')}
+                  ${td(g ? `<span style="font-family:var(--mono);font-size:9px;letter-spacing:0.05em;padding:2px 6px;border-radius:3px;background:${g.score >= 85 ? 'var(--ink)' : 'var(--ink-3)'};color:var(--paper);">${esc(g.why)}</span>` : '<span style="color:var(--ink-3);font-size:10.5px;">no match</span>')}
+                </tr>`; }).join('')}
               </tbody>
             </table>
+            </div>
             <button id="hl-rec-save" style="margin-top:12px;font-family:var(--mono);font-size:11px;padding:8px 18px;border-radius:5px;border:0;background:var(--ink);color:var(--paper);cursor:pointer;">Save mapping</button>
             <span id="hl-rec-msg" style="margin-left:10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);"></span>
           </div>`;
+        document.getElementById('hl-rec-accept').onclick = () => {
+          host.querySelectorAll('.hl-rec-sel').forEach(s2 => { if (s2.dataset.sug) s2.value = s2.dataset.sug; });
+        };
+        document.getElementById('hl-rec-clear').onclick = () => {
+          host.querySelectorAll('.hl-rec-sel').forEach(s2 => { s2.value = ''; });
+        };
         document.getElementById('hl-rec-save').onclick = async () => {
           const msg = document.getElementById('hl-rec-msg');
           const picks = [...host.querySelectorAll('.hl-rec-sel')].filter(s2 => s2.value);
@@ -29334,6 +29401,7 @@ render();
           const payload = picks.map(s2 => ({ brand_id: brandId, banner_raw: s2.dataset.raw, banner: s2.value, plan_customer: s2.value }));
           const { error } = await sb.from('deduction_banner_map').upsert(payload, { onConflict: 'brand_id,banner_raw' });
           if (error) { msg.innerHTML = '<span style="color:var(--lost);">' + esc(error.message) + '</span>'; return; }
+          msg.textContent = payload.length + ' saved \u2014 reloading\u2026';
           _dedDetail = null;              // banner map changed — reload it
           renderDeductions(hostEl, filtersEl, year);
         };
