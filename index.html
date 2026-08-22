@@ -28971,6 +28971,11 @@ render();
     const totalAmt = L.reduce((s, l) => s + Number(l.amount || 0), 0);
     const totalFee = L.reduce((s, l) => s + Number(l.processing_fee || 0), 0);
     const parsedN = L.filter(l => l.detail_parsed).length;
+    // COVERAGE IS A DOLLAR QUESTION, NOT A LINE COUNT. The undocumented lines are
+    // the large ones, so a line percentage flatters the page badly: 71% of lines
+    // was 39% of dollars. Report money; keep the line count as the sub-label.
+    const parsedAmt = L.filter(l => l.detail_parsed).reduce((s2, l) => s2 + Number(l.amount || 0), 0);
+    const covPct = totalAmt ? Math.round(parsedAmt / totalAmt * 100) : 0;
     const notTied = checks.filter(c => !c.ties_out);
 
     // Category rollup via the reason map. An UNMAPPED code is shown as its own
@@ -29020,7 +29025,7 @@ render();
         ${stat('Deducted ' + yr, money(-totalAmt), L.length.toLocaleString() + ' lines')}
         ${stat('Checks', checks.length, checks.length - notTied.length + ' of ' + checks.length + ' tie out')}
         ${stat('Processing fees', totalFee ? money(Math.abs(totalFee)) : '—', totalFee ? (totalFee / -totalAmt * 100).toFixed(1) + '% of deductions' : 'run mode=detail')}
-        ${stat('Backup parsed', parsedN.toLocaleString() + ' / ' + L.length.toLocaleString(), parsedN ? Math.round(parsedN / L.length * 100) + '% of lines' : 'run mode=detail')}
+        ${stat('Documented', parsedN ? money(-parsedAmt) : '—', parsedN ? covPct + '% of dollars \u00b7 ' + parsedN.toLocaleString() + ' of ' + L.length.toLocaleString() + ' lines' : 'run mode=detail')}
         ${stat('Unmapped codes', unmapped.length, unmapped.length ? money(-unmappedAmt) + ' unclassified' : 'all mapped')}
       </div>
 
@@ -29031,7 +29036,7 @@ render();
       <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:6px 0 14px;max-width:900px;">
         WHAT KEHE ACTUALLY TOOK — every deduction line from the check register, grouped to the same categories as the plan.
         Merchandise and processing fees are held apart: KeHE bills a fee on top of most deductions and it does not appear in Vividly at all.
-        ${parsedN < L.length ? `Store-level backup is parsed for ${parsedN.toLocaleString()} of ${L.length.toLocaleString()} lines — run <code style="font-family:var(--mono);">mode=detail</code> for the rest.` : ''}
+        ${parsedN < L.length ? `Store-level backup is parsed for ${money(-parsedAmt)} of ${money(-totalAmt)} — ${covPct}% of the money, ${parsedN.toLocaleString()} of ${L.length.toLocaleString()} lines. Coverage is quoted in dollars because the undocumented lines are the large ones.` : ''}
       </p>
       <div id="hl-ded-body"></div>
     `;
