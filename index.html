@@ -28918,7 +28918,27 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['category', 'customer', 'code', 'checks', 'exceptions'];
+  const DED_VIEWS = ['summary', 'category', 'customer', 'code', 'checks', 'exceptions'];
+  let _dedSumOpen = new Set();    // which summary buckets are expanded
+
+  // THE BUCKET IS DATA, NOT A HARDCODED LIST. deduction_reason_map.bucket wins
+  // when it is set; otherwise it is derived from the two fields that already
+  // carry the meaning. A hardcoded name list is exactly how TAB_DEFS and
+  // _promoView drifted, so the taxonomy lives in the table Moshe already edits.
+  function _dedBucketOf(rm) {
+    if (rm && rm.bucket) return rm.bucket;
+    if (!rm || !rm.keel_category) return 'Unclassified';
+    if (rm.is_trade_spend) return 'Trade spend';
+    if (rm.reconcile_to === 'shipment' || rm.reconcile_to === 'contract') return 'Allowances & shortages';
+    return 'Fees & penalties';
+  }
+  const DED_BUCKET_ORDER = ['Trade spend', 'Allowances & shortages', 'Fees & penalties', 'Unclassified'];
+  const DED_BUCKET_NOTE = {
+    'Trade spend': 'Reconciles against the promo plan — this is the money a promotion was supposed to cost.',
+    'Allowances & shortages': 'Reconciles against shipments or a contract rate, never against a promo.',
+    'Fees & penalties': 'Charges on top of merchandise: freight, processing fees, late-delivery fines. Mostly absent from Vividly.',
+    'Unclassified': 'No category mapped yet. Ranked by dollars — mapping the top few moves most of this.',
+  };
   let _dedView = (() => {
     try { const v = localStorage.getItem('keel_ded_view');
           return DED_VIEWS.includes(v) ? v : 'category'; }
@@ -28926,6 +28946,9 @@ render();
   })();
   let _dedDetail = null;          // cached store-level detail for the Customer tab
   let _dedOpen = new Set();       // which customers are expanded
+  const DED_PAGE = 25;
+  let _dedCustLimit = DED_PAGE;   // banners shown before "show more"
+  let _dedGapLimit  = DED_PAGE;   // undocumented categories shown before "show more"
   let _dedCustMode = (() => {
     try { const v = localStorage.getItem('keel_ded_cust_mode');
           return (v === 'list' || v === 'months') ? v : 'list'; }
@@ -29057,7 +29080,7 @@ render();
         ${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}
       </div>`;
 
-    const views = [['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
+    const views = [['summary', 'Summary'], ['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
 
     hostEl.innerHTML = `
       <div style="display:flex;gap:34px;flex-wrap:wrap;padding:16px 2px 20px;border-bottom:1px solid var(--rule-soft);">
@@ -29105,6 +29128,93 @@ render();
     const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
 
     // ── by customer ─────────────────────────────────────────────────────────
+    // ── summary ───────────────────────────────────────────────────────────
+    // One row per bucket, expandable to the categories inside it. Built from the
+    // same L as every other view, so it foots to the register by construction
+    // rather than by agreement.
+    if (_dedView === 'summary') {
+      const buckets = new Map();
+      for (const l of L) {
+        const rm = rmapBy[l.reason_code];
+        const bk = _dedBucketOf(rm);
+        const catKey = rm && rm.keel_category ? rm.keel_category : (l.reason_code || 'Unresolved');
+        let b = buckets.get(bk);
+        if (!b) buckets.set(bk, b = { name: bk, lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, cats: new Map(), codes: new Set() });
+        b.lines++;
+        b.amount += Number(l.amount || 0);
+        b.fee    += Number(l.processing_fee || 0);
+        b.merch  += Number(l.detail_line_total || 0);
+        if (l.detail_parsed) b.docAmt += Number(l.amount || 0);
+        if (l.reason_code) b.codes.add(l.reason_code);
+        let c = b.cats.get(catKey);
+        if (!c) b.cats.set(catKey, c = { name: catKey, lines: 0, amount: 0, fee: 0, docAmt: 0, mapped: !!(rm && rm.keel_category) });
+        c.lines++; c.amount += Number(l.amount || 0); c.fee += Number(l.processing_fee || 0);
+        if (l.detail_parsed) c.docAmt += Number(l.amount || 0);
+      }
+      const bList = [...buckets.values()].sort((a, b) =>
+        (DED_BUCKET_ORDER.indexOf(a.name) + 1 || 99) - (DED_BUCKET_ORDER.indexOf(b.name) + 1 || 99) || a.amount - b.amount);
+      const pctOf = (v) => totalAmt ? (v / totalAmt * 100).toFixed(1) + '%' : '—';
+      const docPct = (b) => b.amount ? Math.round(b.docAmt / b.amount * 100) + '%' : '—';
+
+      body.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Bucket')}${th('Codes', true)}${th('Lines', true)}
+            ${th('Merchandise $', true)}${th('Fees $', true)}${th('Total deducted', true)}${th('% of book', true)}${th('Documented', true)}
+          </tr></thead>
+          <tbody>
+            ${bList.map(b => {
+              const open = _dedSumOpen.has(b.name);
+              const warn = b.name === 'Unclassified';
+              let out = `<tr class="hl-sum-row" data-b="${esc(b.name)}" style="cursor:pointer;">
+                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:14px;${warn ? 'color:var(--lost);' : ''}">${esc(b.name)}</span>`)}
+                ${td(b.codes.size || '—', true)}${td(b.lines.toLocaleString(), true)}
+                ${td(b.merch ? money(Math.abs(b.merch)) : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td(b.fee ? money(Math.abs(b.fee)) : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td('<strong>' + money(-b.amount) + '</strong>', true)}
+                ${td(pctOf(-b.amount), true, 'color:var(--ink-3);')}
+                ${td(docPct(b), true, b.docAmt === 0 ? 'color:var(--ink-3);' : '')}
+              </tr>
+              <tr><td colspan="8" style="padding:0 10px 6px;border-bottom:1px solid var(--rule-soft);">
+                <div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);padding-left:12px;">${esc(DED_BUCKET_NOTE[b.name] || '')}</div>
+              </td></tr>`;
+              if (open) {
+                out += [...b.cats.values()].sort((x, y) => x.amount - y.amount).map(c => `
+                  <tr style="background:var(--rule-softer);">
+                    ${td('<span style="padding-left:24px;color:' + (c.mapped ? 'var(--ink-2)' : 'var(--lost)') + ';">' + (c.mapped ? '' : '\u26A0 ') + esc(c.name) + '</span>')}
+                    ${td('', true)}${td(c.lines.toLocaleString(), true)}${td('', true)}
+                    ${td(c.fee ? money(Math.abs(c.fee)) : '', true)}
+                    ${td(money(-c.amount), true)}${td(pctOf(-c.amount), true, 'color:var(--ink-3);')}
+                    ${td(c.amount ? Math.round(c.docAmt / c.amount * 100) + '%' : '—', true, 'color:var(--ink-3);')}
+                  </tr>`).join('');
+              }
+              return out;
+            }).join('')}
+          </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>ALL DEDUCTIONS</strong>')}${td('', true)}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${td('<strong>' + money(Math.abs(bList.reduce((n, b) => n + b.merch, 0))) + '</strong>', true)}
+            ${td('<strong>' + money(Math.abs(totalFee)) + '</strong>', true)}
+            ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
+            ${td('<strong>100%</strong>', true, 'color:var(--ink-3);')}
+            ${td('<strong>' + covPct + '%</strong>', true)}
+          </tr></tfoot>
+        </table>
+        <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:14px 0 0;max-width:900px;">
+          A bucket is derived from the reason map, not hardcoded: <code style="font-family:var(--mono);">is_trade_spend</code> and
+          <code style="font-family:var(--mono);">reconcile_to</code> decide it, and an explicit
+          <code style="font-family:var(--mono);">bucket</code> value overrides both. So mapping a code moves its dollars here immediately.
+          <strong>Documented</strong> is the share of each bucket's dollars with store-level rows actually extracted — not merely a file located.
+        </p>`;
+
+      body.querySelectorAll('.hl-sum-row').forEach(tr => tr.onclick = () => {
+        const n = tr.dataset.b;
+        _dedSumOpen.has(n) ? _dedSumOpen.delete(n) : _dedSumOpen.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      return;
+    }
+
     // Starts from the full register, not from the detail table, so every dollar
     // KeHE took appears — including freight and anything else with no store
     // behind it. Those land in "Not attributable to a store" rather than being
@@ -29188,7 +29298,12 @@ render();
           <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
             <thead><tr>${th('Customer')}${MS.map(m => th(mLabel(m), true)).join('')}${th('Total', true)}</tr></thead>
             <tbody>
-              ${list.map(b => `<tr>${td(esc(b.name))}${MS.map(m => td(b.months.get(m) ? money(b.months.get(m)) : '<span style="color:var(--rule);">\u00b7</span>', true)).join('')}${td(money(b.amt), true, 'font-weight:600;')}</tr>`).join('')}
+              ${list.slice(0, _dedCustLimit).map(b => `<tr>${td(esc(b.name))}${MS.map(m => td(b.months.get(m) ? money(b.months.get(m)) : '<span style="color:var(--rule);">\u00b7</span>', true)).join('')}${td(money(b.amt), true, 'font-weight:600;')}</tr>`).join('')}
+              ${list.length > _dedCustLimit ? `<tr><td colspan="${MS.length + 2}" style="padding:11px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+                <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, list.length - _dedCustLimit)} more</button>
+                <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${list.length}</button>
+                <span style="margin-left:10px;">${list.length - _dedCustLimit} smaller customers hidden \u00b7 the row below still counts them</span>
+              </td></tr>` : ''}
               <tr>${td('<strong>Traced to a store</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(m => td('<strong>' + money(list.reduce((n, b) => n + (b.months.get(m) || 0), 0)) + '</strong>', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(documented) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table></div>
@@ -29200,7 +29315,7 @@ render();
           <table style="width:100%;border-collapse:collapse;">
             <thead><tr>${th('Customer')}${th('Stores', true)}${th('Lines', true)}${th('Plan customer')}${th('Deducted', true)}${th('Share', true)}</tr></thead>
             <tbody>
-              ${list.map(b => {
+              ${list.slice(0, _dedCustLimit).map(b => {
                 const open = _dedOpen.has(b.name);
                 let out = `<tr class="hl-cust-row" data-b="${esc(b.name)}" style="cursor:pointer;">
                   ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span>${esc(b.name)}`)}
@@ -29217,9 +29332,19 @@ render();
                 }
                 return out;
               }).join('')}
+              ${list.length > _dedCustLimit ? `<tr><td colspan="6" style="padding:11px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+                <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, list.length - _dedCustLimit)} more</button>
+                <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${list.length}</button>
+                <span style="margin-left:10px;">${list.length - _dedCustLimit} smaller customers hidden \u00b7 ${money(list.slice(_dedCustLimit).reduce((n, b) => n + b.amt, 0))} \u2014 the total below still counts them</span>
+              </td></tr>` : ''}
               ${unattributed ? `<tr>${td('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${td('', true)}${td('', true)}${td('')}${td(money(unattributed), true)}${td((unattributed / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>` : ''}
               ${gapList.length ? `<tr><td colspan="6" style="padding:16px 10px 6px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Not attributable to a store \u00b7 ${money(undoc)}</td></tr>` : ''}
-              ${gapList.map(g => `<tr>${td('<span style="color:' + (g.cat.charAt(0) === '\u26A0' ? 'var(--lost)' : 'var(--ink-2)') + ';">' + esc(g.cat) + '</span>')}${td('', true)}${td(g.lines, true)}${td('')}${td(money(g.amt), true)}${td((g.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>`).join('')}
+              ${gapList.slice(0, _dedGapLimit).map(g => `<tr>${td('<span style="color:' + (g.cat.charAt(0) === '\u26A0' ? 'var(--lost)' : 'var(--ink-2)') + ';">' + esc(g.cat) + '</span>')}${td('', true)}${td(g.lines, true)}${td('')}${td(money(g.amt), true)}${td((g.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>`).join('')}
+              ${gapList.length > _dedGapLimit ? `<tr><td colspan="6" style="padding:11px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+                <button class="hl-gap-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, gapList.length - _dedGapLimit)} more</button>
+                <button class="hl-gap-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${gapList.length}</button>
+                <span style="margin-left:10px;">${gapList.length - _dedGapLimit} smaller categories hidden \u00b7 ${money(gapList.slice(_dedGapLimit).reduce((n, g) => n + g.amt, 0))}</span>
+              </td></tr>` : ''}
               <tr>${td('<strong>All deductions</strong>', false, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table>`;
@@ -29229,6 +29354,18 @@ render();
         _dedCustMode = b.dataset.v;
         try { localStorage.setItem('keel_ded_cust_mode', _dedCustMode); } catch (e) {}
         renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-cust-more').forEach(b => b.onclick = () => {
+        _dedCustLimit += DED_PAGE; renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-cust-all').forEach(b => b.onclick = () => {
+        _dedCustLimit = Infinity; renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-gap-more').forEach(b => b.onclick = () => {
+        _dedGapLimit += DED_PAGE; renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-gap-all').forEach(b => b.onclick = () => {
+        _dedGapLimit = Infinity; renderDeductions(hostEl, filtersEl, year);
       });
       body.querySelectorAll('.hl-cust-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.b; _dedOpen.has(n) ? _dedOpen.delete(n) : _dedOpen.add(n);
