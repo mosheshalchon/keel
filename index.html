@@ -28918,8 +28918,10 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['summary', 'category', 'customer', 'code', 'checks', 'exceptions'];
+  const DED_VIEWS = ['summary', 'reconcile', 'category', 'customer', 'code', 'checks', 'exceptions'];
   let _dedSumOpen = new Set();    // which summary buckets are expanded
+  let _dedRecOpen = new Set();    // which plan customers are expanded on Reconcile
+  let _dedPlan = null;            // promo_plan_lines for the selected year, cached
 
   // THE BUCKET IS DATA, NOT A HARDCODED LIST. deduction_reason_map.bucket wins
   // when it is set; otherwise it is derived from the two fields that already
@@ -29080,7 +29082,7 @@ render();
         ${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}
       </div>`;
 
-    const views = [['summary', 'Summary'], ['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
+    const views = [['summary', 'Summary'], ['reconcile', 'Reconcile'], ['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
 
     hostEl.innerHTML = `
       <div style="display:flex;gap:34px;flex-wrap:wrap;padding:16px 2px 20px;border-bottom:1px solid var(--rule-soft);">
@@ -29113,7 +29115,7 @@ render();
     const body = document.getElementById('hl-ded-body');
     // Store-level detail is ~16k rows, so it loads only when the Customer tab is
     // open rather than on every visit to Deductions.
-    if (_dedView === 'customer' && !_dedDetail) {
+    if ((_dedView === 'customer' || _dedView === 'reconcile') && !_dedDetail) {
       body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
       try {
         const [det, bmap] = await Promise.all([
@@ -29128,6 +29130,225 @@ render();
     const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
 
     // ── by customer ─────────────────────────────────────────────────────────
+    if (_dedView === 'reconcile' && !_dedPlan) {
+      body.innerHTML = '<div class="hl-loading">Loading the promo plan\u2026</div>';
+      try {
+        const r = await _vvFetchLines(year);
+        _dedPlan = { lines: r.lines || [], err: r.error ? r.error.message : null };
+      } catch (e) { _dedPlan = { lines: [], err: String(e.message || e) }; }
+    }
+
+    // ── reconcile ─────────────────────────────────────────────────────────
+    // THE ORIGINAL QUESTION: did KeHE take what the promo was supposed to cost?
+    //
+    // Scope is deliberately narrow and stated on screen, because a wide scope
+    // here produces confident nonsense:
+    //   * TRADE SPEND ONLY — reason_map.is_trade_spend. A shortage or a late fee
+    //     has no promo to be measured against, and reconcile_to already says so.
+    //   * KEHE-SERVED PLAN LINES ONLY — first_receiver. A Whole Foods scan is not
+    //     on a KeHE check, so counting it as "planned but not deducted" is a lie.
+    //   * The deduction side is attributed through deduction_banner_map.plan_customer,
+    //     which is the ONLY join between a KeHE banner and a plan customer. What
+    //     it cannot place is shown as unattributed, never spread or dropped.
+    //
+    // A line's FULL register amount (merchandise + fee) is allocated across its
+    // detail rows in proportion to bill_amount, so this view foots to the same
+    // trade-spend total the Summary tab shows.
+    if (_dedView === 'reconcile') {
+      const D = _dedDetail || { det: [], bmap: [] };
+      const P = _dedPlan || { lines: [], err: null };
+      const bm = new Map(D.bmap.map(b => [b.banner_raw, b]));
+      const normCat = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+      const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
+
+      const isTrade = (l) => { const rm = rmapBy[l.reason_code]; return !!(rm && rm.is_trade_spend); };
+      const catOfLine = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || l.reason_code || 'Unresolved'; };
+
+      const TL = L.filter(isTrade);
+      const tradeTotal = TL.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
+      const detByLine = new Map();
+      for (const d of D.det) {
+        if (!detByLine.has(d.line_id)) detByLine.set(d.line_id, []);
+        detByLine.get(d.line_id).push(d);
+      }
+
+      // deduction side, attributed
+      const cells = new Map();          // customer -> {cats: cat -> {months: m -> amt}}
+      const catsSeen = new Set();
+      let unattrib = 0, undocumented = 0, placed = 0;
+      const unattribBy = new Map();     // banner_raw -> amount (what to map next)
+      for (const l of TL) {
+        const amt = Math.abs(Number(l.amount || 0));
+        const cat = catOfLine(l);
+        catsSeen.add(normCat(cat));
+        const rows = detByLine.get(l.id) || [];
+        const base = rows.reduce((s2, d) => s2 + Math.abs(Number(d.bill_amount || 0)), 0);
+        if (!rows.length || base <= 0) { undocumented += amt; continue; }
+        for (const d of rows) {
+          const share = amt * (Math.abs(Number(d.bill_amount || 0)) / base);
+          const raw = d.banner || null;
+          const m = raw ? bm.get(raw) : null;
+          const pc = (m && m.plan_customer) || null;
+          const mk2 = String(d.reference_date || d.date_from || l.doc_date || '').slice(0, 7);
+          if (!pc) {
+            unattrib += share;
+            const k = raw || d.customer_name || '(no banner)';
+            unattribBy.set(k, (unattribBy.get(k) || 0) + share);
+            continue;
+          }
+          placed += share;
+          let c = cells.get(pc);
+          if (!c) cells.set(pc, c = { name: pc, cats: new Map(), ded: 0, plan: 0 });
+          c.ded += share;
+          const ck = normCat(cat);
+          let cc = c.cats.get(ck);
+          if (!cc) c.cats.set(ck, cc = { key: ck, label: cat, ded: 0, plan: 0, months: new Map() });
+          cc.ded += share;
+          if (mk2) cc.months.set(mk2, (cc.months.get(mk2) || 0) + share);
+        }
+      }
+
+      // plan side — KeHE-served lines whose type matches a category KeHE deducted
+      let planExcludedType = 0, planExcludedRecv = 0;
+      for (const pl of P.lines) {
+        const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
+        const exp = Number(pl.expected_spend || 0);
+        if (!/kehe/i.test(recv)) { planExcludedRecv += exp; continue; }
+        const ck = normCat(pl.promo_type);
+        if (!catsSeen.has(ck)) { planExcludedType += exp; continue; }
+        const cust = pl.customer || '(no customer)';
+        let c = cells.get(cust);
+        if (!c) cells.set(cust, c = { name: cust, cats: new Map(), ded: 0, plan: 0 });
+        c.plan += exp;
+        let cc = c.cats.get(ck);
+        if (!cc) c.cats.set(ck, cc = { key: ck, label: pl.promo_type || ck, ded: 0, plan: 0, months: new Map() });
+        cc.plan += exp;
+      }
+
+      const rows = [...cells.values()].sort((a, b) => (b.ded + b.plan) - (a.ded + a.plan));
+      const totPlan = rows.reduce((s2, c) => s2 + c.plan, 0);
+      const totDed = rows.reduce((s2, c) => s2 + c.ded, 0);
+      const dPct = (d, p) => p ? ((d - p) / p * 100).toFixed(0) + '%' : '—';
+      const dCol = (d, p) => !p ? 'var(--ink-3)' : (d - p) > 0 ? 'var(--lost)' : 'var(--won)';
+
+      const unattribList = [...unattribBy.entries()].sort((a, b) => b[1] - a[1]);
+
+      body.innerHTML = `
+        <div style="display:flex;gap:30px;flex-wrap:wrap;margin:2px 0 16px;">
+          ${stat('Planned (KeHE)', money(totPlan), 'Vividly expected spend')}
+          ${stat('Deducted (trade)', money(totDed), 'attributed to a plan customer')}
+          ${stat('Variance', money(totDed - totPlan), totPlan ? dPct(totDed, totPlan) + ' vs plan' : 'no plan matched')}
+          ${stat('Not yet placed', money(unattrib + undocumented), tradeTotal ? Math.round((unattrib + undocumented) / tradeTotal * 100) + '% of trade spend' : '')}
+        </div>
+        <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
+          TRADE SPEND ONLY — ${money(tradeTotal)} of the ${money(-totalAmt)} register, being the codes the reason map marks
+          <code style="font-family:var(--mono);">is_trade_spend</code>. Plan side is Vividly lines whose First Receiver is KeHE and whose
+          promo type matches a category KeHE actually deducted; ${money(planExcludedRecv)} of plan on other distributors and
+          ${money(planExcludedType)} in types absent from this register are excluded rather than counted as unspent.
+          Deductions reach a customer through <code style="font-family:var(--mono);">deduction_banner_map.plan_customer</code> — nothing else joins them.
+        </p>
+        ${(unattrib + undocumented) ? `<div style="border:1px solid var(--rule);border-radius:6px;padding:12px 14px;margin-bottom:16px;background:rgba(0,0,0,.015);">
+          <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Not yet placed \u00b7 ${money(unattrib + undocumented)}</div>
+          <div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;">
+            ${money(undocumented)} has no store-level detail, so there is no banner to place it by.
+            ${money(unattrib)} has a banner with no <strong>plan customer</strong> mapped${unattribList.length ? ' \u2014 ' + esc(unattribList.slice(0, 5).map(u => u[0]).join(', ')) + (unattribList.length > 5 ? ' and ' + (unattribList.length - 5) + ' more' : '') : ''}.
+            ${unattribList.length ? `<button id="hl-rec-mapbtn" style="margin-left:6px;font-family:var(--mono);font-size:10px;padding:4px 11px;border-radius:5px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Map customers</button>` : ''}
+          </div>
+        </div>` : ''}
+        <div id="hl-rec-mapper"></div>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Plan customer')}${th('Planned $', true)}${th('Deducted $', true)}${th('Variance', true)}${th('vs plan', true)}${th('Status')}
+          </tr></thead>
+          <tbody>
+            ${rows.map(c => {
+              const open = _dedRecOpen.has(c.name);
+              const status = !c.plan ? '<span style="color:var(--lost);">deducted, not planned</span>'
+                : !c.ded ? '<span style="color:var(--ink-3);">planned, nothing deducted yet</span>'
+                : Math.abs(c.ded - c.plan) / c.plan < 0.1 ? '<span style="color:var(--won);">within 10%</span>'
+                : (c.ded > c.plan ? '<span style="color:var(--lost);">over plan</span>' : '<span style="color:var(--ink-2);">under plan</span>');
+              let out = `<tr class="hl-rec-row" data-c="${esc(c.name)}" style="cursor:pointer;">
+                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:13.5px;">${esc(c.name)}</span>`)}
+                ${td(c.plan ? money(c.plan) : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td(c.ded ? money(c.ded) : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td(c.plan && c.ded ? '<strong style="color:' + dCol(c.ded, c.plan) + ';">' + money(c.ded - c.plan) + '</strong>' : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td(c.plan && c.ded ? '<span style="color:' + dCol(c.ded, c.plan) + ';">' + dPct(c.ded, c.plan) + '</span>' : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td('<span style="font-size:10.5px;">' + status + '</span>')}
+              </tr>`;
+              if (open) {
+                out += [...c.cats.values()].sort((x, y) => (y.ded + y.plan) - (x.ded + x.plan)).map(cc => {
+                  let inner = `<tr style="background:var(--rule-softer);">
+                    ${td('<span style="padding-left:24px;color:var(--ink-2);">' + esc(cc.label) + '</span>')}
+                    ${td(cc.plan ? money(cc.plan) : '', true)}${td(cc.ded ? money(cc.ded) : '', true)}
+                    ${td(cc.plan && cc.ded ? '<span style="color:' + dCol(cc.ded, cc.plan) + ';">' + money(cc.ded - cc.plan) + '</span>' : '', true)}
+                    ${td(cc.plan && cc.ded ? dPct(cc.ded, cc.plan) : '', true, 'color:var(--ink-3);')}${td('')}
+                  </tr>`;
+                  inner += [...cc.months.entries()].sort().map(([m, v]) => `<tr style="background:var(--rule-softer);">
+                    ${td('<span style="padding-left:44px;color:var(--ink-3);font-size:10.5px;">' + mLabel(m) + '</span>')}
+                    ${td('', true)}${td('<span style="font-size:10.5px;">' + money(v) + '</span>', true)}${td('', true)}${td('', true)}${td('')}
+                  </tr>`).join('');
+                  return inner;
+                }).join('');
+              }
+              return out;
+            }).join('')}
+          </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>TOTAL</strong>')}${td('<strong>' + money(totPlan) + '</strong>', true)}
+            ${td('<strong>' + money(totDed) + '</strong>', true)}
+            ${td('<strong style="color:' + dCol(totDed, totPlan) + ';">' + money(totDed - totPlan) + '</strong>', true)}
+            ${td('<strong style="color:' + dCol(totDed, totPlan) + ';">' + dPct(totDed, totPlan) + '</strong>', true)}${td('')}
+          </tr></tfoot>
+        </table>
+        ${P.err ? `<div style="margin-top:12px;font-family:var(--mono);font-size:11px;color:var(--lost);">Plan could not be loaded: ${esc(P.err)}</div>` : ''}`;
+
+      // ── in-app crosswalk editor. plan_customer must equal promo_plan_lines.customer
+      // exactly, so the control is a picker over the real values rather than a text box.
+      const planCusts = [...new Set(P.lines.filter(pl => /kehe/i.test(String(pl.first_receiver || '') + ' ' + String(pl.customer || ''))).map(pl => pl.customer).filter(Boolean))].sort();
+      const openMapper = () => {
+        const host = document.getElementById('hl-rec-mapper');
+        host.innerHTML = `
+          <div style="border:1px solid var(--ink);border-radius:6px;padding:14px 16px;margin-bottom:18px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Map KeHE banners to plan customers</div>
+            <table style="width:100%;border-collapse:collapse;">
+              <thead><tr>${th('KeHE banner')}${th('Trade $', true)}${th('Plan customer')}</tr></thead>
+              <tbody>
+                ${unattribList.slice(0, 40).map(([raw, amt], i) => `<tr>
+                  ${td(esc(raw))}${td(money(amt), true)}
+                  ${td(`<select class="hl-rec-sel" data-raw="${esc(raw)}" style="font-family:var(--mono);font-size:11px;padding:5px 8px;border:1px solid var(--rule);border-radius:4px;background:#fff;min-width:220px;">
+                    <option value="">— not a plan customer —</option>
+                    ${planCusts.map(pc => `<option value="${esc(pc)}">${esc(pc)}</option>`).join('')}
+                  </select>`)}
+                </tr>`).join('')}
+              </tbody>
+            </table>
+            <button id="hl-rec-save" style="margin-top:12px;font-family:var(--mono);font-size:11px;padding:8px 18px;border-radius:5px;border:0;background:var(--ink);color:var(--paper);cursor:pointer;">Save mapping</button>
+            <span id="hl-rec-msg" style="margin-left:10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);"></span>
+          </div>`;
+        document.getElementById('hl-rec-save').onclick = async () => {
+          const msg = document.getElementById('hl-rec-msg');
+          const picks = [...host.querySelectorAll('.hl-rec-sel')].filter(s2 => s2.value);
+          if (!picks.length) { msg.textContent = 'Nothing selected.'; return; }
+          msg.textContent = 'Saving\u2026';
+          const payload = picks.map(s2 => ({ brand_id: brandId, banner_raw: s2.dataset.raw, banner: s2.value, plan_customer: s2.value }));
+          const { error } = await sb.from('deduction_banner_map').upsert(payload, { onConflict: 'brand_id,banner_raw' });
+          if (error) { msg.innerHTML = '<span style="color:var(--lost);">' + esc(error.message) + '</span>'; return; }
+          _dedDetail = null;              // banner map changed — reload it
+          renderDeductions(hostEl, filtersEl, year);
+        };
+      };
+      const mb = document.getElementById('hl-rec-mapbtn');
+      if (mb) mb.onclick = openMapper;
+
+      body.querySelectorAll('.hl-rec-row').forEach(tr => tr.onclick = () => {
+        const n = tr.dataset.c;
+        _dedRecOpen.has(n) ? _dedRecOpen.delete(n) : _dedRecOpen.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      return;
+    }
+
     // ── summary ───────────────────────────────────────────────────────────
     // One row per bucket, expandable to the categories inside it. Built from the
     // same L as every other view, so it foots to the register by construction
