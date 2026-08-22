@@ -27293,7 +27293,12 @@ render();
   // Dollars come from Vividly (expected + actual spend); measured sell-through comes from
   // UNFI weekly (cases + $), KeHE weekly ($ only), wfm_sales (units + $) and kroger_sales
   // (units + $, ≈ fiscal-week mapping). SPINS deliberately deferred to v2.
-  let _promoView = localStorage.getItem('keel_promo_view') === 'analyzer' ? 'analyzer' : 'plan';
+  const PROMO_VIEWS = [['plan', 'Plan'], ['analyzer', 'Trade analyzer'], ['deductions', 'Deductions']];
+  let _promoView = (() => {
+    try { const v = localStorage.getItem('keel_promo_view');
+          return PROMO_VIEWS.some(([id]) => id === v) ? v : 'plan'; }
+    catch (e) { return 'plan'; }
+  })();
   let _taCompletedOnly = true;
   const _taCache = {};
   const _taLinesCache = {};
@@ -28913,10 +28918,19 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  let _dedView = (() => { try { return localStorage.getItem('keel_ded_view') || 'category'; } catch (e) { return 'category'; } })();
+  const DED_VIEWS = ['category', 'customer', 'code', 'checks', 'exceptions'];
+  let _dedView = (() => {
+    try { const v = localStorage.getItem('keel_ded_view');
+          return DED_VIEWS.includes(v) ? v : 'category'; }
+    catch (e) { return 'category'; }
+  })();
   let _dedDetail = null;          // cached store-level detail for the Customer tab
   let _dedOpen = new Set();       // which customers are expanded
-  let _dedCustMode = 'list';      // 'list' | 'months'
+  let _dedCustMode = (() => {
+    try { const v = localStorage.getItem('keel_ded_cust_mode');
+          return (v === 'list' || v === 'months') ? v : 'list'; }
+    catch (e) { return 'list'; }
+  })();                           // 'list' | 'months'
   let _dedExpand = {};
 
   async function renderDeductions(hostEl, filtersEl, year) {
@@ -28938,6 +28952,31 @@ render();
         if (error) throw new Error(error.message);
         out.push(...(data || []));
         if (!data || data.length < pageSize) break;
+      }
+      return out;
+    };
+
+    const pagedFast = async (mk, pageSize = 1000) => {
+      const first = await mk().range(0, pageSize - 1);
+      if (first.error) throw new Error(first.error.message);
+      const out = [...(first.data || [])];
+      const total = first.count;
+      if (total == null) {                       // no count header — sequential fallback
+        for (let from = pageSize; ; from += pageSize) {
+          const { data, error } = await mk().range(from, from + pageSize - 1);
+          if (error) throw new Error(error.message);
+          out.push(...(data || []));
+          if (!data || data.length < pageSize) break;
+        }
+        return out;
+      }
+      if (total <= pageSize) return out;
+      const starts = [];
+      for (let from = pageSize; from < total; from += pageSize) starts.push(from);
+      const pages = await Promise.all(starts.map(f => mk().range(f, f + pageSize - 1)));
+      for (const pg of pages) {
+        if (pg.error) throw new Error(pg.error.message);
+        out.push(...(pg.data || []));
       }
       return out;
     };
@@ -29052,9 +29091,10 @@ render();
     // Store-level detail is ~16k rows, so it loads only when the Customer tab is
     // open rather than on every visit to Deductions.
     if (_dedView === 'customer' && !_dedDetail) {
+      body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
       try {
         const [det, bmap] = await Promise.all([
-          paged(() => sb.from('deduction_detail').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from').eq('brand_id', brandId).order('id', { ascending: true })),
+          pagedFast(() => sb.from('deduction_detail').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from', { count: 'exact' }).eq('brand_id', brandId).order('id', { ascending: true })),
           paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true })),
         ]);
         _dedDetail = { det, bmap };
@@ -29138,6 +29178,11 @@ render();
 
       if (D.err) {
         body.innerHTML = `<div style="padding:18px;font-family:var(--mono);font-size:12px;color:var(--lost);">Could not load store detail: ${esc(D.err)}</div>`;
+      } else if (!D.det.length) {
+        body.innerHTML = `<div style="padding:22px;font-family:var(--serif);font-size:13.5px;color:var(--ink-2);line-height:1.6;max-width:760px;">
+          No store-level detail is loaded yet, so nothing can be attributed to a customer.
+          The register still holds ${money(-totalAmt)} across ${L.length.toLocaleString()} lines — see <strong>By category</strong>.
+          Run the detail backfill to populate <code style="font-family:var(--mono);font-size:12px;">deduction_detail</code>.</div>`;
       } else if (_dedCustMode === 'months') {
         body.innerHTML = bar + `
           <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
@@ -29180,7 +29225,11 @@ render();
           </table>`;
       }
 
-      body.querySelectorAll('.hl-cust-mode').forEach(b => b.onclick = () => { _dedCustMode = b.dataset.v; renderDeductions(hostEl, filtersEl, year); });
+      body.querySelectorAll('.hl-cust-mode').forEach(b => b.onclick = () => {
+        _dedCustMode = b.dataset.v;
+        try { localStorage.setItem('keel_ded_cust_mode', _dedCustMode); } catch (e) {}
+        renderDeductions(hostEl, filtersEl, year);
+      });
       body.querySelectorAll('.hl-cust-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.b; _dedOpen.has(n) ? _dedOpen.delete(n) : _dedOpen.add(n);
         renderDeductions(hostEl, filtersEl, year);
@@ -29336,7 +29385,7 @@ render();
       </div>
       <div id="hl-promo-years" style="margin-top:18px;display:flex;gap:6px;align-items:center;">
         ${[2025, 2026, 2027].map(y => `<button class="hl-promo-year" data-y="${y}" style="font-family:var(--mono);font-size:11px;padding:7px 16px;border-radius:5px;border:1px solid ${y === _promoYear ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${y === _promoYear ? 'var(--ink)' : 'transparent'};color:${y === _promoYear ? 'var(--paper)' : 'var(--ink-3)'};font-weight:${y === _promoYear ? '700' : '400'};">${y}</button>`).join('')}
-        ${_promoYear < 2027 ? `<span style="margin-left:14px;display:inline-flex;gap:5px;">${[['plan', 'Plan'], ['analyzer', 'Trade analyzer'], ['deductions', 'Deductions']].map(([v, lbl]) => `<button class="hl-promo-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_promoView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_promoView === v ? 'var(--ink)' : 'transparent'};color:${_promoView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}</span>` : ''}
+        ${_promoYear < 2027 ? `<span style="margin-left:14px;display:inline-flex;gap:5px;">${PROMO_VIEWS.map(([v, lbl]) => `<button class="hl-promo-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_promoView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_promoView === v ? 'var(--ink)' : 'transparent'};color:${_promoView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}</span>` : ''}
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:10px;">${_promoYear >= 2027 ? 'Keel-built promos' : 'Vividly plan' + (_promoYear === 2025 ? ' · reference only' : '')}</span>
       </div>
       <div id="hl-promo-filters" style="margin-top:16px;"></div>
