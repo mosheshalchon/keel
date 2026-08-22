@@ -28955,6 +28955,10 @@ render();
     return best && best.score >= 60 ? best : null;
   }
   let _dedPlan = null;            // promo_plan_lines for the selected year, cached
+  let _dedRecCompleted = true;    // Reconcile: measure closed promos only
+  let _dedRecPartial = false;     // Reconcile: include the register's partial last month
+  const _dedMon = (mk) => { const q = String(mk || '').split('-');
+    return (['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][Number(q[1]) - 1] || '?') + " '" + String(q[0]).slice(2); };
 
   // THE BUCKET IS DATA, NOT A HARDCODED LIST. deduction_reason_map.bucket wins
   // when it is set; otherwise it is derived from the two fields that already
@@ -29198,6 +29202,37 @@ render();
       const isTrade = (l) => { const rm = rmapBy[l.reason_code]; return !!(rm && rm.is_trade_spend); };
       const catOfLine = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || l.reason_code || 'Unresolved'; };
 
+      // ── THE WINDOW. The register is a YTD pull; the plan is a full year.
+      // Comparing them whole is apples to oranges and produces a variance that is
+      // mostly calendar. So the window is derived FROM THE REGISTER and the plan
+      // is clipped to it — nothing outside is differenced, it is reported apart.
+      //
+      // The register's newest month is normally PARTIAL (the pull happens mid-
+      // month). Detected by line count against the median of the earlier months
+      // rather than by date arithmetic, because what matters is whether the month
+      // looks finished, not whether the calendar says it is.
+      const monthLines = new Map();
+      for (const l of L) {
+        const mk2 = String(l.doc_date || '').slice(0, 7);
+        if (mk2) monthLines.set(mk2, (monthLines.get(mk2) || 0) + 1);
+      }
+      const monthsSorted = [...monthLines.keys()].sort();
+      const winStart = monthsSorted[0] || null;
+      const winLast = monthsSorted[monthsSorted.length - 1] || null;
+      let partialMonth = null;
+      if (monthsSorted.length >= 3) {
+        const prior = monthsSorted.slice(0, -1).map(m => monthLines.get(m)).sort((a, b) => a - b);
+        const med = prior[Math.floor(prior.length / 2)];
+        if (med && monthLines.get(winLast) < med * 0.6) partialMonth = winLast;
+      }
+      const winEnd = (partialMonth && !_dedRecPartial) ? monthsSorted[monthsSorted.length - 2] : winLast;
+      const inWindow = (mk2) => !!mk2 && !!winStart && !!winEnd && mk2 >= winStart && mk2 <= winEnd;
+      const planMonthOf = (pl) => {
+        if (pl.start_date) return String(pl.start_date).slice(0, 7);
+        const m = Number(pl.month);
+        return (m >= 1 && m <= 12) ? String(year) + '-' + String(m).padStart(2, '0') : '';
+      };
+
       const TL = L.filter(isTrade);
       const tradeTotal = TL.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
       const detByLine = new Map();
@@ -29212,6 +29247,7 @@ render();
       let unattrib = 0, undocumented = 0, placed = 0;
       const unattribBy = new Map();     // banner_raw -> amount (what to map next)
       for (const l of TL) {
+        if (winStart && !inWindow(String(l.doc_date || '').slice(0, 7))) continue;
         const amt = Math.abs(Number(l.amount || 0));
         const cat = catOfLine(l);
         catsSeen.add(normCat(cat));
@@ -29243,13 +29279,18 @@ render();
       }
 
       // plan side — KeHE-served lines whose type matches a category KeHE deducted
-      let planExcludedType = 0, planExcludedRecv = 0;
+      let planExcludedType = 0, planExcludedRecv = 0, planOutOfWindow = 0, planNotClosed = 0;
       for (const pl of P.lines) {
         const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
         const exp = Number(pl.expected_spend || 0);
         if (!/kehe/i.test(recv)) { planExcludedRecv += exp; continue; }
         const ck = normCat(pl.promo_type);
         if (!catsSeen.has(ck)) { planExcludedType += exp; continue; }
+        if (!inWindow(planMonthOf(pl))) { planOutOfWindow += exp; continue; }
+        // An Approved or Running promo has no deduction yet because it has not
+        // closed — counting it as under-deducted is the same calendar error as
+        // an unbounded window, one level down.
+        if (_dedRecCompleted && !/completed/i.test(String(pl.status || ''))) { planNotClosed += exp; continue; }
         const cust = pl.customer || '(no customer)';
         let c = cells.get(cust);
         if (!c) cells.set(cust, c = { name: cust, cats: new Map(), ded: 0, plan: 0 });
@@ -29269,16 +29310,27 @@ render();
 
       body.innerHTML = `
         <div style="display:flex;gap:30px;flex-wrap:wrap;margin:2px 0 16px;">
-          ${stat('Planned (KeHE)', money(totPlan), 'Vividly expected spend')}
-          ${stat('Deducted (trade)', money(totDed), 'attributed to a plan customer')}
+          ${stat('Planned (KeHE)', money(totPlan), winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'Vividly expected spend')}
+          ${stat('Deducted (trade)', money(totDed), 'same months, attributed to a customer')}
           ${stat('Variance', money(totDed - totPlan), totPlan ? dPct(totDed, totPlan) + ' vs plan' : 'no plan matched')}
           ${stat('Not yet placed', money(unattrib + undocumented), tradeTotal ? Math.round((unattrib + undocumented) / tradeTotal * 100) + '% of trade spend' : '')}
         </div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 12px;">
+          <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);">Window</span>
+          <span style="font-family:var(--mono);font-size:11px;color:var(--ink);padding:4px 10px;border:1px solid var(--rule);border-radius:5px;">${winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'no dated lines'}</span>
+          <button id="hl-rec-comp" style="margin-left:8px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;cursor:pointer;border:1px solid ${_dedRecCompleted ? 'var(--ink)' : 'var(--rule-soft)'};background:${_dedRecCompleted ? 'var(--ink)' : 'transparent'};color:${_dedRecCompleted ? 'var(--paper)' : 'var(--ink-3)'};">Completed promos only</button>
+          ${partialMonth ? `<button id="hl-rec-part" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;cursor:pointer;border:1px solid ${_dedRecPartial ? 'var(--ink)' : 'var(--rule-soft)'};background:${_dedRecPartial ? 'var(--ink)' : 'transparent'};color:${_dedRecPartial ? 'var(--paper)' : 'var(--ink-3)'};">Include ${_dedMon(partialMonth)} (partial)</button>` : ''}
+        </div>
+        ${partialMonth && !_dedRecPartial ? `<div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);margin:0 0 12px;max-width:900px;">
+          ${_dedMon(partialMonth)} holds only ${monthLines.get(partialMonth)} deduction lines against a typical month's ${[...monthLines.entries()].filter(([mm]) => mm !== partialMonth).map(([, n]) => n).sort((a, b) => a - b)[Math.floor((monthLines.size - 1) / 2)] || '\u2014'}, so the register pull looks mid-month. It is held out of the comparison rather than read as a shortfall.
+        </div>` : ''}
         <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
           TRADE SPEND ONLY — ${money(tradeTotal)} of the ${money(-totalAmt)} register, being the codes the reason map marks
           <code style="font-family:var(--mono);">is_trade_spend</code>. Plan side is Vividly lines whose First Receiver is KeHE and whose
-          promo type matches a category KeHE actually deducted; ${money(planExcludedRecv)} of plan on other distributors and
-          ${money(planExcludedType)} in types absent from this register are excluded rather than counted as unspent.
+          promo type matches a category KeHE actually deducted, <strong>clipped to the register's own months</strong> — the register is a
+          year-to-date pull and the plan is a full year, so an unbounded comparison reports calendar as variance. Held out rather than
+          counted as unspent: ${money(planExcludedRecv)} on other distributors, ${money(planExcludedType)} in types absent from this register,
+          ${money(planOutOfWindow)} planned outside ${winStart ? _dedMon(winStart) + '\u2013' + _dedMon(winEnd) : 'the window'}${planNotClosed ? ', and ' + money(planNotClosed) + ' in promos not yet Completed' : ''}.
           Deductions reach a customer through <code style="font-family:var(--mono);">deduction_banner_map.plan_customer</code> — nothing else joins them.
         </p>
         ${(unattrib + undocumented) ? `<div style="border:1px solid var(--rule);border-radius:6px;padding:12px 14px;margin-bottom:16px;background:rgba(0,0,0,.015);">
@@ -29408,6 +29460,10 @@ render();
       };
       const mb = document.getElementById('hl-rec-mapbtn');
       if (mb) mb.onclick = openMapper;
+      const cbtn = document.getElementById('hl-rec-comp');
+      if (cbtn) cbtn.onclick = () => { _dedRecCompleted = !_dedRecCompleted; renderDeductions(hostEl, filtersEl, year); };
+      const pbtn = document.getElementById('hl-rec-part');
+      if (pbtn) pbtn.onclick = () => { _dedRecPartial = !_dedRecPartial; renderDeductions(hostEl, filtersEl, year); };
 
       body.querySelectorAll('.hl-rec-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.c;
