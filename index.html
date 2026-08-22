@@ -28914,6 +28914,9 @@ render();
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
   let _dedView = (() => { try { return localStorage.getItem('keel_ded_view') || 'category'; } catch (e) { return 'category'; } })();
+  let _dedDetail = null;          // cached store-level detail for the Customer tab
+  let _dedOpen = new Set();       // which customers are expanded
+  let _dedCustMode = 'list';      // 'list' | 'months'
   let _dedExpand = {};
 
   async function renderDeductions(hostEl, filtersEl, year) {
@@ -29010,7 +29013,7 @@ render();
         ${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}
       </div>`;
 
-    const views = [['category', 'By category'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
+    const views = [['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
 
     hostEl.innerHTML = `
       <div style="display:flex;gap:34px;flex-wrap:wrap;padding:16px 2px 20px;border-bottom:1px solid var(--rule-soft);">
@@ -29041,8 +29044,144 @@ render();
     });
 
     const body = document.getElementById('hl-ded-body');
+    // Store-level detail is ~16k rows, so it loads only when the Customer tab is
+    // open rather than on every visit to Deductions.
+    if (_dedView === 'customer' && !_dedDetail) {
+      try {
+        const [det, bmap] = await Promise.all([
+          paged(() => sb.from('deduction_detail').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from').eq('brand_id', brandId).order('id', { ascending: true })),
+          paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true })),
+        ]);
+        _dedDetail = { det, bmap };
+      } catch (e) { _dedDetail = { det: [], bmap: [], err: String(e.message || e) }; }
+    }
+
     const th = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
     const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
+
+    // ── by customer ─────────────────────────────────────────────────────────
+    // Starts from the full register, not from the detail table, so every dollar
+    // KeHE took appears — including freight and anything else with no store
+    // behind it. Those land in "Not attributable to a store" rather than being
+    // dropped, which is why this total ties to the register above.
+    if (_dedView === 'customer') {
+      const D = _dedDetail || { det: [], bmap: [] };
+      const bm = new Map(D.bmap.map(b => [b.banner_raw, b]));
+      const lineById = new Map(L.map(l => [l.id, l]));
+      const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const mLabel = k => { const p = String(k).split('-'); return MN[Number(p[1]) - 1] + " '" + String(p[0]).slice(2); };
+      const catOf = (l) => { const rm = rmapBy[l.reason_code]; return rm && rm.keel_category ? rm.keel_category : '\u26A0 ' + (l.reason_code || 'Unresolved'); };
+
+      const banners = new Map();
+      const months = new Set();
+      const detByLine = new Map();
+      let documented = 0, unattributed = 0;
+
+      for (const d of D.det) {
+        const l = lineById.get(d.line_id);
+        if (!l) continue;                       // outside the selected year
+        const amt = Math.abs(Number(d.bill_amount || 0));
+        const raw = d.banner || null;
+        const m = raw ? bm.get(raw) : null;
+        if (m && m.banner === null) continue;   // mapped to null = not a customer
+        detByLine.set(d.line_id, (detByLine.get(d.line_id) || 0) + amt);
+        documented += amt;
+        const name = (m && m.banner) || raw || d.customer_name || null;
+        if (!name) { unattributed += amt; continue; }
+        let b = banners.get(name);
+        if (!b) banners.set(name, b = { name, amt: 0, rows: 0, plan: (m && m.plan_customer) || null, stores: new Map(), cats: new Map(), months: new Map() });
+        b.amt += amt; b.rows++;
+        const store = d.customer_name || '(unnamed store)';
+        let st = b.stores.get(store);
+        if (!st) b.stores.set(store, st = { name: store, state: d.customer_state, amt: 0, rows: 0 });
+        st.amt += amt; st.rows++;
+        b.cats.set(catOf(l), (b.cats.get(catOf(l)) || 0) + amt);
+        const rawDate = d.reference_date || d.date_from || l.doc_date || null;
+        if (rawDate) { const mk = String(rawDate).slice(0, 7); months.add(mk); b.months.set(mk, (b.months.get(mk) || 0) + amt); }
+      }
+
+      // everything the register holds that no store detail explains
+      const gaps = new Map();
+      let undoc = 0;
+      for (const l of L) {
+        const g = Math.abs(Number(l.amount || 0)) - (detByLine.get(l.id) || 0);
+        if (g <= 0.005) continue;
+        const k = catOf(l);
+        const e = gaps.get(k) || { cat: k, amt: 0, lines: 0 };
+        e.amt += g; e.lines++; gaps.set(k, e);
+        undoc += g;
+      }
+
+      const list = [...banners.values()].sort((a, b) => b.amt - a.amt);
+      for (const b of list) {
+        b.storeList = [...b.stores.values()].sort((x, y) => y.amt - x.amt);
+        b.catList = [...b.cats.entries()].sort((x, y) => y[1] - x[1]);
+      }
+      const gapList = [...gaps.values()].sort((a, b) => b.amt - a.amt);
+      const MS = [...months].sort();
+      const grand = documented + unattributed + undoc;
+      const maxAmt = Math.max(1, ...list.map(b => b.amt));
+      const withPlan = list.filter(b => b.plan).reduce((n, b) => n + b.amt, 0);
+
+      const bar = `
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
+          ${[['list', 'Customers'], ['months', 'By month']].map(([v, lbl]) => `<button class="hl-cust-mode" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;cursor:pointer;border:1px solid ${_dedCustMode === v ? 'var(--ink)' : 'var(--rule-soft)'};background:${_dedCustMode === v ? 'var(--ink)' : 'transparent'};color:${_dedCustMode === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
+          <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">
+            ${money(documented)} of ${money(grand)} traced to a store · ${grand ? Math.round(documented / grand * 100) : 0}%${withPlan ? ' · ' + money(withPlan) + ' linked to plan' : ''}
+          </span>
+        </div>`;
+
+      if (D.err) {
+        body.innerHTML = `<div style="padding:18px;font-family:var(--mono);font-size:12px;color:var(--lost);">Could not load store detail: ${esc(D.err)}</div>`;
+      } else if (_dedCustMode === 'months') {
+        body.innerHTML = bar + `
+          <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Customer')}${MS.map(m => th(mLabel(m), true)).join('')}${th('Total', true)}</tr></thead>
+            <tbody>
+              ${list.map(b => `<tr>${td(esc(b.name))}${MS.map(m => td(b.months.get(m) ? money(b.months.get(m)) : '<span style="color:var(--rule);">\u00b7</span>', true)).join('')}${td(money(b.amt), true, 'font-weight:600;')}</tr>`).join('')}
+              <tr>${td('<strong>Traced to a store</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(m => td('<strong>' + money(list.reduce((n, b) => n + (b.months.get(m) || 0), 0)) + '</strong>', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(documented) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
+            </tbody>
+          </table></div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;">
+            Excludes ${money(undoc + unattributed)} with no store-level backup. See the Customers tab for the breakdown.
+          </div>`;
+      } else {
+        body.innerHTML = bar + `
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Customer')}${th('Stores', true)}${th('Lines', true)}${th('Plan customer')}${th('Deducted', true)}${th('Share', true)}</tr></thead>
+            <tbody>
+              ${list.map(b => {
+                const open = _dedOpen.has(b.name);
+                let out = `<tr class="hl-cust-row" data-b="${esc(b.name)}" style="cursor:pointer;">
+                  ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span>${esc(b.name)}`)}
+                  ${td(b.stores.size, true)}${td(b.rows.toLocaleString(), true)}
+                  ${td(b.plan ? esc(b.plan) : '<span style="color:var(--ink-3);">unlinked</span>')}
+                  ${td(money(b.amt), true, 'font-weight:600;')}
+                  ${td((b.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}
+                </tr>
+                <tr><td colspan="6" style="padding:0 10px 7px;border-bottom:1px solid var(--rule-soft);"><div style="height:2px;background:var(--ink);opacity:.8;width:${(b.amt / maxAmt * 100).toFixed(2)}%;"></div></td></tr>`;
+                if (open) {
+                  out += b.catList.map(([c, v]) => `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:22px;color:' + (c.charAt(0) === '\u26A0' ? 'var(--lost)' : 'var(--ink-3)') + ';">' + esc(c) + '</span>', false)}${td('', true)}${td('', true)}${td('')}${td(money(v), true)}${td('', true)}</tr>`).join('');
+                  out += MS.filter(m => b.months.get(m)).map(m => `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:22px;color:var(--ink-3);">' + mLabel(m) + '</span>')}${td('', true)}${td('', true)}${td('')}${td(money(b.months.get(m)), true)}${td('', true)}</tr>`).join('');
+                  out += b.storeList.map(st => `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:22px;">' + esc(st.name) + (st.state ? ' <span style="color:var(--ink-3);">' + esc(st.state) + '</span>' : '') + '</span>')}${td('', true)}${td(st.rows, true)}${td('')}${td(money(st.amt), true)}${td('', true)}</tr>`).join('');
+                }
+                return out;
+              }).join('')}
+              ${unattributed ? `<tr>${td('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${td('', true)}${td('', true)}${td('')}${td(money(unattributed), true)}${td((unattributed / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${gapList.length ? `<tr><td colspan="6" style="padding:16px 10px 6px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Not attributable to a store \u00b7 ${money(undoc)}</td></tr>` : ''}
+              ${gapList.map(g => `<tr>${td('<span style="color:' + (g.cat.charAt(0) === '\u26A0' ? 'var(--lost)' : 'var(--ink-2)') + ';">' + esc(g.cat) + '</span>')}${td('', true)}${td(g.lines, true)}${td('')}${td(money(g.amt), true)}${td((g.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>`).join('')}
+              <tr>${td('<strong>All deductions</strong>', false, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}</tr>
+            </tbody>
+          </table>`;
+      }
+
+      body.querySelectorAll('.hl-cust-mode').forEach(b => b.onclick = () => { _dedCustMode = b.dataset.v; renderDeductions(hostEl, filtersEl, year); });
+      body.querySelectorAll('.hl-cust-row').forEach(tr => tr.onclick = () => {
+        const n = tr.dataset.b; _dedOpen.has(n) ? _dedOpen.delete(n) : _dedOpen.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      return;
+    }
 
     // ── by category ─────────────────────────────────────────────────────────
     if (_dedView === 'category') {
