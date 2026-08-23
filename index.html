@@ -28918,7 +28918,9 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['summary', 'reconcile', 'category', 'customer', 'code', 'checks', 'exceptions'];
+  const DED_VIEWS = ['summary', 'reconcile', 'other', 'category', 'customer', 'code', 'checks', 'exceptions'];
+  let _dedOthCat = new Set();     // Other charges: expanded categories
+  let _dedOthCode = new Set();    // Other charges: expanded reason codes
   let _dedSumOpen = new Set();    // which summary buckets are expanded
   let _dedRecOpen = new Set();    // which plan customers are expanded on Reconcile
 
@@ -29119,7 +29121,7 @@ render();
         ${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}
       </div>`;
 
-    const views = [['summary', 'Summary'], ['reconcile', 'Reconcile'], ['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
+    const views = [['summary', 'Summary'], ['reconcile', 'Trade reconciliation'], ['other', 'Other charges'], ['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
 
     hostEl.innerHTML = `
       <div style="display:flex;gap:34px;flex-wrap:wrap;padding:16px 2px 20px;border-bottom:1px solid var(--rule-soft);">
@@ -29272,7 +29274,7 @@ render();
           c.ded += share;
           const ck = normCat(cat);
           let cc = c.cats.get(ck);
-          if (!cc) c.cats.set(ck, cc = { key: ck, label: cat, ded: 0, plan: 0, months: new Map() });
+          if (!cc) c.cats.set(ck, cc = { key: ck, label: cat, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
           cc.ded += share;
           if (mk2) cc.months.set(mk2, (cc.months.get(mk2) || 0) + share);
         }
@@ -29296,8 +29298,10 @@ render();
         if (!c) cells.set(cust, c = { name: cust, cats: new Map(), ded: 0, plan: 0 });
         c.plan += exp;
         let cc = c.cats.get(ck);
-        if (!cc) c.cats.set(ck, cc = { key: ck, label: pl.promo_type || ck, ded: 0, plan: 0, months: new Map() });
+        if (!cc) c.cats.set(ck, cc = { key: ck, label: pl.promo_type || ck, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
         cc.plan += exp;
+        const pmk = planMonthOf(pl);
+        if (pmk) cc.pmonths.set(pmk, (cc.pmonths.get(pmk) || 0) + exp);
       }
 
       const rows = [...cells.values()].sort((a, b) => (b.ded + b.plan) - (a.ded + a.plan));
@@ -29369,10 +29373,19 @@ render();
                     ${td(cc.plan && cc.ded ? '<span style="color:' + dCol(cc.ded, cc.plan) + ';">' + money(cc.ded - cc.plan) + '</span>' : '', true)}
                     ${td(cc.plan && cc.ded ? dPct(cc.ded, cc.plan) : '', true, 'color:var(--ink-3);')}${td('')}
                   </tr>`;
-                  inner += [...cc.months.entries()].sort().map(([m, v]) => `<tr style="background:var(--rule-softer);">
-                    ${td('<span style="padding-left:44px;color:var(--ink-3);font-size:10.5px;">' + mLabel(m) + '</span>')}
-                    ${td('', true)}${td('<span style="font-size:10.5px;">' + money(v) + '</span>', true)}${td('', true)}${td('', true)}${td('')}
-                  </tr>`).join('');
+                  const allM = [...new Set([...cc.months.keys(), ...(cc.pmonths ? cc.pmonths.keys() : [])])].sort();
+                  inner += allM.map(m => {
+                    const pv = (cc.pmonths && cc.pmonths.get(m)) || 0;
+                    const dv = cc.months.get(m) || 0;
+                    const both = pv > 0 && dv > 0;
+                    return `<tr style="background:var(--rule-softer);">
+                    ${td('<span style="padding-left:44px;color:var(--ink-3);font-size:10.5px;">' + mLabel(m) + (both ? '' : '<span style="margin-left:6px;color:var(--rule);">one side only</span>') + '</span>')}
+                    ${td(pv ? '<span style="font-size:10.5px;">' + money(pv) + '</span>' : '<span style="color:var(--rule);">\u00b7</span>', true)}
+                    ${td(dv ? '<span style="font-size:10.5px;">' + money(dv) + '</span>' : '<span style="color:var(--rule);">\u00b7</span>', true)}
+                    ${td(both ? '<span style="font-size:10.5px;color:' + dCol(dv, pv) + ';">' + money(dv - pv) + '</span>' : '', true)}
+                    ${td(both ? '<span style="font-size:10.5px;color:' + dCol(dv, pv) + ';">' + dPct(dv, pv) + '</span>' : '', true)}
+                    ${td('')}
+                  </tr>`; }).join('');
                   return inner;
                 }).join('');
               }
@@ -29468,6 +29481,111 @@ render();
       body.querySelectorAll('.hl-rec-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.c;
         _dedRecOpen.has(n) ? _dedRecOpen.delete(n) : _dedRecOpen.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      return;
+    }
+
+    // ── other charges ─────────────────────────────────────────────────────
+    // The mirror of Reconcile: everything the reason map does NOT mark as trade
+    // spend — allowances, shortages, late fees, freight, returns, credits. These
+    // have no promo to be measured against, which is exactly why they need their
+    // own view: on Reconcile they would be noise, and on Summary they collapse
+    // into a bucket total with no way to see the charge itself.
+    // Category -> reason code -> month, with the retailer KeHE named in the
+    // document and how much of each has backup behind it.
+    if (_dedView === 'other') {
+      const cats = new Map();
+      let grand = 0, grandFee = 0, grandDoc = 0, nLines = 0;
+      for (const l of L) {
+        const rm = rmapBy[l.reason_code];
+        if (rm && rm.is_trade_spend) continue;            // Reconcile's territory
+        const amt = Number(l.amount || 0), fee = Number(l.processing_fee || 0);
+        const catKey = (rm && rm.keel_category) || '\u26A0 Unclassified';
+        const code = l.reason_code || '(none)';
+        grand += amt; grandFee += fee; nLines++;
+        if (l.detail_parsed) grandDoc += amt;
+        let c = cats.get(catKey);
+        if (!c) cats.set(catKey, c = { name: catKey, lines: 0, amt: 0, fee: 0, doc: 0, codes: new Map() });
+        c.lines++; c.amt += amt; c.fee += fee; if (l.detail_parsed) c.doc += amt;
+        let cd = c.codes.get(code);
+        if (!cd) c.codes.set(code, cd = { code, desc: (rm && rm.kehe_description) || null,
+          retailer: (rm && rm.retailer) || null, rsrc: (rm && rm.retailer_source) || null,
+          reconcile: (rm && rm.reconcile_to) || null,
+          lines: 0, amt: 0, fee: 0, doc: 0, months: new Map() });
+        cd.lines++; cd.amt += amt; cd.fee += fee; if (l.detail_parsed) cd.doc += amt;
+        const mk2 = String(l.doc_date || '').slice(0, 7);
+        if (mk2) {
+          const mm = cd.months.get(mk2) || { amt: 0, lines: 0 };
+          mm.amt += amt; mm.lines++; cd.months.set(mk2, mm);
+        }
+      }
+      const cl = [...cats.values()].sort((a, b) => a.amt - b.amt);
+      const pc2 = (v) => grand ? (v / grand * 100).toFixed(1) + '%' : '\u2014';
+      const dp = (o) => o.amt ? Math.round(o.doc / o.amt * 100) + '%' : '\u2014';
+
+      body.innerHTML = `
+        <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
+          EVERYTHING THAT IS NOT TRADE SPEND \u2014 ${money(-grand)} across ${nLines.toLocaleString()} lines.
+          Allowances, shortages, late-delivery fines, freight, returns and credits: charges with no promotion behind them,
+          so they are never measured against the plan. Expand a category for its reason codes, and a code for its months.
+          <strong>Retailer</strong> is the name KeHE wrote in the document itself, not a decoded abbreviation.
+        </p>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Category / code')}${th('Retailer')}${th('Lines', true)}${th('Fees $', true)}${th('Total', true)}${th('% of book', true)}${th('Backup', true)}
+          </tr></thead>
+          <tbody>
+            ${cl.map(c => {
+              const open = _dedOthCat.has(c.name);
+              const warn = c.name.charAt(0) === '\u26A0';
+              let out = `<tr class="hl-oth-cat" data-c="${esc(c.name)}" style="cursor:pointer;">
+                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:13.5px;${warn ? 'color:var(--lost);' : ''}">${esc(c.name)}</span>`)}
+                ${td('')}${td(c.lines.toLocaleString(), true)}
+                ${td(c.fee ? money(-c.fee) : '<span style="color:var(--ink-3);">\u2014</span>', true)}
+                ${td('<strong>' + money(-c.amt) + '</strong>', true)}
+                ${td(pc2(c.amt), true, 'color:var(--ink-3);')}${td(dp(c), true, c.doc ? '' : 'color:var(--ink-3);')}
+              </tr>`;
+              if (open) {
+                out += [...c.codes.values()].sort((x, y) => x.amt - y.amt).map(cd => {
+                  const co = _dedOthCode.has(c.name + '|' + cd.code);
+                  let inner = `<tr class="hl-oth-code" data-k="${esc(c.name + '|' + cd.code)}" style="cursor:pointer;background:var(--rule-softer);">
+                    ${td('<span style="padding-left:24px;"><span style="display:inline-block;width:11px;color:var(--ink-3);">' + (co ? '\u2212' : '+') + '</span><strong style="font-family:var(--mono);font-size:11px;">' + esc(cd.code) + '</strong>' + (cd.desc ? '<span style="color:var(--ink-3);margin-left:8px;font-size:11.5px;">' + esc(cd.desc) + '</span>' : '') + '</span>')}
+                    ${td(cd.retailer ? '<span style="font-size:11px;">' + esc(cd.retailer) + '</span>' : '<span style="color:var(--rule);">\u00b7</span>')}
+                    ${td(cd.lines.toLocaleString(), true)}
+                    ${td(cd.fee ? money(-cd.fee) : '', true)}
+                    ${td(money(-cd.amt), true)}${td(pc2(cd.amt), true, 'color:var(--ink-3);')}${td(dp(cd), true, 'color:var(--ink-3);')}
+                  </tr>`;
+                  if (co) {
+                    inner += [...cd.months.entries()].sort().map(([m, v]) => `<tr style="background:var(--rule-softer);">
+                      ${td('<span style="padding-left:52px;color:var(--ink-3);font-size:10.5px;">' + _dedMon(m) + '</span>')}
+                      ${td('')}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + v.lines + '</span>', true)}${td('', true)}
+                      ${td('<span style="font-size:10.5px;">' + money(-v.amt) + '</span>', true)}${td('', true)}${td('', true)}
+                    </tr>`).join('');
+                  }
+                  return inner;
+                }).join('');
+              }
+              return out;
+            }).join('')}
+          </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>ALL NON-TRADE CHARGES</strong>')}${td('')}${td('<strong>' + nLines.toLocaleString() + '</strong>', true)}
+            ${td('<strong>' + money(-grandFee) + '</strong>', true)}${td('<strong>' + money(-grand) + '</strong>', true)}
+            ${td('<strong>100%</strong>', true, 'color:var(--ink-3);')}
+            ${td('<strong>' + (grand ? Math.round(grandDoc / grand * 100) + '%' : '\u2014') + '</strong>', true)}
+          </tr></tfoot>
+        </table>`;
+
+      body.querySelectorAll('.hl-oth-cat').forEach(tr => tr.onclick = () => {
+        const n = tr.dataset.c;
+        _dedOthCat.has(n) ? _dedOthCat.delete(n) : _dedOthCat.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-oth-code').forEach(tr => tr.onclick = (ev) => {
+        ev.stopPropagation();
+        const k = tr.dataset.k;
+        _dedOthCode.has(k) ? _dedOthCode.delete(k) : _dedOthCode.add(k);
         renderDeductions(hostEl, filtersEl, year);
       });
       return;
