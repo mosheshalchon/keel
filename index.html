@@ -28958,6 +28958,13 @@ render();
     return best && best.score >= 60 ? best : null;
   }
   let _dedPlan = null;            // promo_plan_lines for the selected year, cached
+  // EVERY expand re-enters renderDeductions. Without this, toggling a row
+  // refetched checks + lines + the reason map -- thousands of rows over several
+  // round trips -- to redraw a '+' as a '-'. The register is immutable between
+  // syncs, so it is fetched once per brand+year and every toggle is then pure
+  // rendering with no network at all. _dedBust() drops it after a write.
+  let _dedRaw = null;             // { key, checks, lines, rmap }
+  const _dedBust = () => { _dedRaw = null; _dedDetail = null; _dedPlan = null; };
   let _dedRecCompleted = true;    // Reconcile: measure closed promos only
   let _dedRecPartial = false;     // Reconcile: include the register's partial last month
   const _dedMon = (mk) => { const q = String(mk || '').split('-');
@@ -29047,12 +29054,18 @@ render();
     };
 
     let checks = [], lines = [], rmap = [], detAgg = [];
+    const rawKey = brandId + '|' + year;
     try {
-      [checks, lines, rmap] = await Promise.all([
-        paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
-        paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
-        paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
-      ]);
+      if (_dedRaw && _dedRaw.key === rawKey) {
+        ({ checks, lines, rmap } = _dedRaw);
+      } else {
+        [checks, lines, rmap] = await Promise.all([
+          paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
+          paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
+          paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
+        ]);
+        _dedRaw = { key: rawKey, checks, lines, rmap };
+      }
     } catch (e) {
       hostEl.innerHTML = `<div style="padding:20px;font-family:var(--mono);font-size:12px;color:var(--lost);">Could not load deductions: ${esc(String(e.message || e))}<br><br>If the tables don't exist yet, run the Phase III migration first.</div>`;
       return;
@@ -29136,6 +29149,8 @@ render();
       <div style="margin:16px 0 4px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
         ${views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_dedView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_dedView === v ? 'var(--ink)' : 'transparent'};color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">KeHE · K-solve register</span>
+        <button id="hl-ded-refresh" title="Re-read from Supabase — use after running SQL or the detail parser"
+          style="margin-left:10px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">↻ Refresh</button>
       </div>
       <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:6px 0 14px;max-width:900px;">
         WHAT KEHE ACTUALLY TOOK — every deduction line from the check register, grouped to the same categories as the plan.
@@ -29153,6 +29168,8 @@ render();
     });
 
     const body = document.getElementById('hl-ded-body');
+    const rfsh = document.getElementById('hl-ded-refresh');
+    if (rfsh) rfsh.onclick = () => { _dedBust(); renderDeductions(hostEl, filtersEl, year); };
     // Store-level detail is ~16k rows, so it loads only when the Customer tab is
     // open rather than on every visit to Deductions.
     if ((_dedView === 'customer' || _dedView === 'reconcile') && !_dedDetail) {
@@ -29468,7 +29485,7 @@ render();
           const { error } = await sb.from('deduction_banner_map').upsert(payload, { onConflict: 'brand_id,banner_raw' });
           if (error) { msg.innerHTML = '<span style="color:var(--lost);">' + esc(error.message) + '</span>'; return; }
           msg.textContent = payload.length + ' saved \u2014 reloading\u2026';
-          _dedDetail = null;              // banner map changed — reload it
+          _dedBust();                     // banner map changed — drop the cache
           renderDeductions(hostEl, filtersEl, year);
         };
       };
