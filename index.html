@@ -28921,6 +28921,7 @@ render();
   const DED_VIEWS = ['summary', 'reconcile', 'other', 'category', 'customer', 'code', 'checks', 'exceptions'];
   let _dedOthCat = new Set();     // Other charges: expanded categories
   let _dedOthCode = new Set();    // Other charges: expanded reason codes
+  let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
   let _dedSumOpen = new Set();    // which summary buckets are expanded
   let _dedRecOpen = new Set();    // which plan customers are expanded on Reconcile
 
@@ -29495,6 +29496,7 @@ render();
     // Category -> reason code -> month, with the retailer KeHE named in the
     // document and how much of each has backup behind it.
     if (_dedView === 'other') {
+      const _chkNo = new Map(checks.map(ch => [ch.id, ch.check_no]));
       const cats = new Map();
       let grand = 0, grandFee = 0, grandDoc = 0, nLines = 0;
       for (const l of L) {
@@ -29516,8 +29518,8 @@ render();
         cd.lines++; cd.amt += amt; cd.fee += fee; if (l.detail_parsed) cd.doc += amt;
         const mk2 = String(l.doc_date || '').slice(0, 7);
         if (mk2) {
-          const mm = cd.months.get(mk2) || { amt: 0, lines: 0 };
-          mm.amt += amt; mm.lines++; cd.months.set(mk2, mm);
+          const mm = cd.months.get(mk2) || { amt: 0, lines: 0, rows: [] };
+          mm.amt += amt; mm.lines++; mm.rows.push(l); cd.months.set(mk2, mm);
         }
       }
       const cl = [...cats.values()].sort((a, b) => a.amt - b.amt);
@@ -29542,7 +29544,7 @@ render();
               let out = `<tr class="hl-oth-cat" data-c="${esc(c.name)}" style="cursor:pointer;">
                 ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:13.5px;${warn ? 'color:var(--lost);' : ''}">${esc(c.name)}</span>`)}
                 ${td('')}${td(c.lines.toLocaleString(), true)}
-                ${td(c.fee ? money(-c.fee) : '<span style="color:var(--ink-3);">\u2014</span>', true)}
+                ${td(c.fee ? money(Math.abs(c.fee)) : '<span style="color:var(--ink-3);">\u2014</span>', true)}
                 ${td('<strong>' + money(-c.amt) + '</strong>', true)}
                 ${td(pc2(c.amt), true, 'color:var(--ink-3);')}${td(dp(c), true, c.doc ? '' : 'color:var(--ink-3);')}
               </tr>`;
@@ -29553,15 +29555,44 @@ render();
                     ${td('<span style="padding-left:24px;"><span style="display:inline-block;width:11px;color:var(--ink-3);">' + (co ? '\u2212' : '+') + '</span><strong style="font-family:var(--mono);font-size:11px;">' + esc(cd.code) + '</strong>' + (cd.desc ? '<span style="color:var(--ink-3);margin-left:8px;font-size:11.5px;">' + esc(cd.desc) + '</span>' : '') + '</span>')}
                     ${td(cd.retailer ? '<span style="font-size:11px;">' + esc(cd.retailer) + '</span>' : '<span style="color:var(--rule);">\u00b7</span>')}
                     ${td(cd.lines.toLocaleString(), true)}
-                    ${td(cd.fee ? money(-cd.fee) : '', true)}
+                    ${td(cd.fee ? money(Math.abs(cd.fee)) : '', true)}
                     ${td(money(-cd.amt), true)}${td(pc2(cd.amt), true, 'color:var(--ink-3);')}${td(dp(cd), true, 'color:var(--ink-3);')}
                   </tr>`;
                   if (co) {
-                    inner += [...cd.months.entries()].sort().map(([m, v]) => `<tr style="background:var(--rule-softer);">
-                      ${td('<span style="padding-left:52px;color:var(--ink-3);font-size:10.5px;">' + _dedMon(m) + '</span>')}
+                    inner += [...cd.months.entries()].sort().map(([m, v]) => {
+                      const mkey = c.name + '|' + cd.code + '|' + m;
+                      const mo = _dedOthMon.has(mkey);
+                      let mrow = `<tr class="hl-oth-mon" data-m="${esc(mkey)}" style="cursor:pointer;background:var(--rule-softer);">
+                      ${td('<span style="padding-left:52px;color:var(--ink-3);font-size:10.5px;"><span style="display:inline-block;width:11px;">' + (mo ? '\u2212' : '+') + '</span>' + _dedMon(m) + '</span>')}
                       ${td('')}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + v.lines + '</span>', true)}${td('', true)}
                       ${td('<span style="font-size:10.5px;">' + money(-v.amt) + '</span>', true)}${td('', true)}${td('', true)}
-                    </tr>`).join('');
+                      </tr>`;
+                      if (mo) {
+                        // The charges themselves. invoice_no is KeHE's document id and
+                        // the exact key to the backup file, so it is the thing to quote
+                        // back to them on a dispute.
+                        mrow += `<tr><td colspan="7" style="padding:0 0 8px 62px;background:var(--rule-softer);">
+                          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10.5px;">
+                            <thead><tr>
+                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Document / invoice no.</th>
+                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Date</th>
+                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Check</th>
+                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">PO / remarks</th>
+                              <th style="text-align:right;padding:4px 8px;color:var(--ink-3);font-weight:400;">Amount</th>
+                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Backup</th>
+                            </tr></thead>
+                            <tbody>${v.rows.slice().sort((a, b) => a.amount - b.amount).map(r => `<tr>
+                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);">${esc(r.invoice_no || '')}</td>
+                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(String(r.doc_date || '').slice(0, 10))}</td>
+                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(_chkNo.get(r.check_id) || '')}</td>
+                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(r.po_no || r.remarks || '')}</td>
+                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);text-align:right;">${money(-Number(r.amount || 0))}</td>
+                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:${r.detail_parsed ? 'var(--won)' : 'var(--ink-3)'};">${r.detail_parsed ? 'parsed' : 'not parsed'}</td>
+                            </tr>`).join('')}</tbody>
+                          </table></td></tr>`;
+                      }
+                      return mrow;
+                    }).join('');
                   }
                   return inner;
                 }).join('');
@@ -29571,7 +29602,7 @@ render();
           </tbody>
           <tfoot><tr style="border-top:2px solid var(--ink);">
             ${td('<strong>ALL NON-TRADE CHARGES</strong>')}${td('')}${td('<strong>' + nLines.toLocaleString() + '</strong>', true)}
-            ${td('<strong>' + money(-grandFee) + '</strong>', true)}${td('<strong>' + money(-grand) + '</strong>', true)}
+            ${td('<strong>' + money(Math.abs(grandFee)) + '</strong>', true)}${td('<strong>' + money(-grand) + '</strong>', true)}
             ${td('<strong>100%</strong>', true, 'color:var(--ink-3);')}
             ${td('<strong>' + (grand ? Math.round(grandDoc / grand * 100) + '%' : '\u2014') + '</strong>', true)}
           </tr></tfoot>
@@ -29580,6 +29611,12 @@ render();
       body.querySelectorAll('.hl-oth-cat').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.c;
         _dedOthCat.has(n) ? _dedOthCat.delete(n) : _dedOthCat.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-oth-mon').forEach(tr => tr.onclick = (ev) => {
+        ev.stopPropagation();
+        const k = tr.dataset.m;
+        _dedOthMon.has(k) ? _dedOthMon.delete(k) : _dedOthMon.add(k);
         renderDeductions(hostEl, filtersEl, year);
       });
       body.querySelectorAll('.hl-oth-code').forEach(tr => tr.onclick = (ev) => {
