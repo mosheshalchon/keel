@@ -29271,6 +29271,38 @@ render();
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
 
+      // THE RETAILER JOIN. deduction_banner_map only covers banners someone has
+      // crosswalked by hand — which is none of UNFI's, whose detail names stores
+      // ("WEGMANS #58 FROZEN") and chain codes ("WGE"). So a plan line for
+      // Wegmans and the Wegmans deductions sat either side of a gap.
+      //
+      // Vividly's Customer Name IS the retailer, so it can be matched directly.
+      // Same normaliser as the crosswalk mapper: strip store numbers, suffixes
+      // and noise words, then require an exact or prefix hit. Anything looser
+      // would silently merge retailers, which is worse than not matching.
+      const _planCusts = [...new Set(P.lines.map(pl => pl.customer).filter(Boolean))];
+      const _planIdx = new Map();
+      for (const pc of _planCusts) { const k = _dedNorm(pc); if (k && !_planIdx.has(k)) _planIdx.set(k, pc); }
+      const _autoMatch = (raw) => {
+        const k = _dedNorm(raw);
+        if (!k) return null;
+        if (_planIdx.has(k)) return _planIdx.get(k);
+        for (const [pk, pc] of _planIdx) {
+          if (pk.length >= 4 && (k.startsWith(pk + ' ') || k === pk)) return pc;
+        }
+        return null;
+      };
+
+      // Catch-all plan lines name a distributor or nothing at all. They can
+      // never match a retailer, so they are labelled rather than left looking
+      // like retailers that failed to reconcile.
+      const _tierOf = (name) => {
+        const n = String(name || '').toLowerCase();
+        if (n === 'all customers' || n === '(no customer)') return 'unattributable';
+        if (/^(unfi|kehe)( all other)?$/.test(n) || /all other/.test(n)) return 'catch-all';
+        return 'retailer';
+      };
+
       const isTrade = (l) => { const rm = rmapBy[l.reason_code]; return !!(rm && rm.is_trade_spend); };
       const catOfLine = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || l.reason_code || 'Unresolved'; };
 
@@ -29316,7 +29348,7 @@ render();
       // deduction side, attributed
       const cells = new Map();          // customer -> {cats: cat -> {months: m -> amt}}
       const catsSeen = new Set();
-      let unattrib = 0, undocumented = 0, placed = 0;
+      let unattrib = 0, undocumented = 0, placed = 0, autoMatched = 0;
       const unattribBy = new Map();     // banner_raw -> amount (what to map next)
       for (const l of TL) {
         if (winStart && !inWindow(String(l.doc_date || '').slice(0, 7))) continue;
@@ -29330,7 +29362,13 @@ render();
           const share = amt * (Math.abs(Number(d.bill_amount || 0)) / base);
           const raw = d.banner || null;
           const m = raw ? bm.get(raw) : null;
-          const pc = (m && m.plan_customer) || null;
+          // Crosswalk first — a hand-made mapping always beats a guess. Auto
+          // match only fills the gap where no crosswalk row exists.
+          const pc = (m && m.plan_customer)
+                  || _autoMatch(d.customer_name)
+                  || _autoMatch(raw)
+                  || null;
+          if (pc && !(m && m.plan_customer)) autoMatched += Math.abs(Number(d.bill_amount || 0));
           const mk2 = String(d.reference_date || d.date_from || l.doc_date || '').slice(0, 7);
           if (!pc) {
             unattrib += share;
@@ -29340,7 +29378,7 @@ render();
           }
           placed += share;
           let c = cells.get(pc);
-          if (!c) cells.set(pc, c = { name: pc, cats: new Map(), ded: 0, plan: 0 });
+          if (!c) cells.set(pc, c = { name: pc, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(pc) });
           c.ded += share;
           const ck = normCat(cat);
           let cc = c.cats.get(ck);
@@ -29371,7 +29409,7 @@ render();
         if (_dedRecCompleted && !/completed/i.test(String(pl.status || ''))) { planNotClosed += exp; continue; }
         const cust = pl.customer || '(no customer)';
         let c = cells.get(cust);
-        if (!c) cells.set(cust, c = { name: cust, cats: new Map(), ded: 0, plan: 0 });
+        if (!c) cells.set(cust, c = { name: cust, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(cust) });
         c.plan += exp;
         let cc = c.cats.get(ck);
         if (!cc) c.cats.set(ck, cc = { key: ck, label: pl.promo_type || ck, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
@@ -29394,6 +29432,7 @@ render();
           ${stat('Deducted (trade)', money(totDed), 'same months, attributed to a customer')}
           ${stat('Variance', money(totDed - totPlan), totPlan ? dPct(totDed, totPlan) + ' vs plan' : 'no plan matched')}
           ${stat('Not yet placed', money(unattrib + undocumented), tradeTotal ? Math.round((unattrib + undocumented) / tradeTotal * 100) + '% of trade spend' : '')}
+          ${autoMatched ? stat('Auto-matched', money(autoMatched), 'by retailer name, not crosswalked') : ''}
         </div>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 12px;">
           <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);">Window</span>
@@ -29411,7 +29450,10 @@ render();
           year-to-date pull and the plan is a full year, so an unbounded comparison reports calendar as variance. Held out rather than
           counted as unspent: ${money(planExcludedRecv)} on other distributors, ${money(planExcludedType)} in types absent from this register,
           ${money(planOutOfWindow)} planned outside ${winStart ? _dedMon(winStart) + '\u2013' + _dedMon(winEnd) : 'the window'}${planNotClosed ? ', and ' + money(planNotClosed) + ' in promos not yet Completed' : ''}.
-          Deductions reach a customer through <code style="font-family:var(--mono);">deduction_banner_map.plan_customer</code> — nothing else joins them.
+          Deductions reach a customer through <code style="font-family:var(--mono);">deduction_banner_map.plan_customer</code> first, then by
+          matching the store or chain name against Vividly's own Customer Name. Rows tagged CATCH-ALL name a distributor rather than a
+          retailer and UNATTRIBUTABLE name nothing at all — neither can ever match a deduction, so they are labelled rather than left
+          looking like retailers that failed to reconcile.
         </p>
         ${(unattrib + undocumented) ? `<div style="border:1px solid var(--rule);border-radius:6px;padding:12px 14px;margin-bottom:16px;background:rgba(0,0,0,.015);">
           <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Not yet placed \u00b7 ${money(unattrib + undocumented)}</div>
@@ -29429,12 +29471,15 @@ render();
           <tbody>
             ${rows.map(c => {
               const open = _dedRecOpen.has(c.name);
-              const status = !c.plan ? '<span style="color:var(--lost);">deducted, not planned</span>'
+              const tierTag = c.tier === 'retailer' ? ''
+                : `<span style="font-family:var(--mono);font-size:8.5px;letter-spacing:0.05em;padding:2px 6px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);margin-left:8px;">${c.tier === 'catch-all' ? 'CATCH-ALL' : 'UNATTRIBUTABLE'}</span>`;
+              const status = c.tier !== 'retailer' ? '<span style="color:var(--ink-3);">no retailer named — cannot match</span>'
+                : !c.plan ? '<span style="color:var(--lost);">deducted, not planned</span>'
                 : !c.ded ? '<span style="color:var(--ink-3);">planned, nothing deducted yet</span>'
                 : Math.abs(c.ded - c.plan) / c.plan < 0.1 ? '<span style="color:var(--won);">within 10%</span>'
                 : (c.ded > c.plan ? '<span style="color:var(--lost);">over plan</span>' : '<span style="color:var(--ink-2);">under plan</span>');
               let out = `<tr class="hl-rec-row" data-c="${esc(c.name)}" style="cursor:pointer;">
-                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:13.5px;">${esc(c.name)}</span>`)}
+                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:13.5px;">${esc(c.name)}</span>${tierTag}`)}
                 ${td(c.plan ? money(c.plan) : '<span style="color:var(--ink-3);">—</span>', true)}
                 ${td(c.ded ? money(c.ded) : '<span style="color:var(--ink-3);">—</span>', true)}
                 ${td(c.plan && c.ded ? '<strong style="color:' + dCol(c.ded, c.plan) + ';">' + money(c.ded - c.plan) + '</strong>' : '<span style="color:var(--ink-3);">—</span>', true)}
