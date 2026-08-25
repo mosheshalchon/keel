@@ -30913,11 +30913,52 @@ render();
       };
       const prevLabel = btn ? btn.textContent : null;
       if (btn) { btn.disabled = true; btn.textContent = busyLabel || 'Saving…'; }
-      let err;
-      if (promoId) ({ error: err } = await sb.from('promos').update(row).eq('id', promoId));
-      else ({ error: err } = await sb.from('promos').insert(row));
-      if (err) { alert('Save failed: ' + err.message); if (btn) { btn.disabled = false; btn.textContent = prevLabel; } return { ok: false }; }
-      return { ok: true, inputs, itemIds };
+      try {
+        // THE STUCK "Saving…" BUG. After a few idle minutes the Supabase access
+        // token expires; the write then hangs instead of returning an error, and
+        // because the label was only restored on an explicit `err`, the button
+        // sat on "Saving…" forever and the analyst's work looked lost.
+        //
+        // Three guards, all needed:
+        //   1. refresh the session BEFORE writing, so an expired token is renewed
+        //      rather than discovered mid-request
+        //   2. race the write against a timeout, because a hung fetch never
+        //      settles and no amount of error handling downstream will fire
+        //   3. restore the button in `finally`, so it comes back whatever happens
+        try {
+          const cl = window.Auth && window.Auth.getClient && window.Auth.getClient();
+          if (cl && cl.auth) {
+            const { data: { session: cur } } = await cl.auth.getSession();
+            const secsLeft = cur && cur.expires_at ? (cur.expires_at * 1000 - Date.now()) / 1000 : 0;
+            if (!cur || secsLeft < 120) await cl.auth.refreshSession();
+          }
+        } catch (se) { console.warn('[PROMO] session refresh failed, attempting save anyway:', se); }
+
+        const write = promoId
+          ? sb.from('promos').update(row).eq('id', promoId)
+          : sb.from('promos').insert(row);
+        const TIMEOUT_MS = 20000;
+        let timer;
+        const res = await Promise.race([
+          write,
+          new Promise((_, rj) => { timer = setTimeout(
+            () => rj(new Error('the save did not respond within 20 seconds')), TIMEOUT_MS); }),
+        ]);
+        clearTimeout(timer);
+        const err = res && res.error;
+        if (err) {
+          alert('Save failed: ' + err.message + '\n\nYour entries are still on screen — fix the problem and press Save again.');
+          return { ok: false };
+        }
+        return { ok: true, inputs, itemIds };
+      } catch (e) {
+        console.error('[PROMO] save error:', e);
+        alert('Save could not complete: ' + ((e && e.message) || e) +
+              '\n\nYour entries are still on screen. Press Save again — if it keeps failing, reload the page and sign in again.');
+        return { ok: false };
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = prevLabel; }
+      }
     };
 
     // A duplicate seed = current form values as a brand-new (unsaved) draft.
