@@ -29225,8 +29225,8 @@ render();
           style="margin-left:10px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">↻ Refresh</button>
       </div>
       <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:6px 0 14px;max-width:900px;">
-        WHAT KEHE ACTUALLY TOOK — every deduction line from the check register, grouped to the same categories as the plan.
-        Merchandise and processing fees are held apart: KeHE bills a fee on top of most deductions and it does not appear in Vividly at all.
+        WHAT ${_dedDist === 'all' ? 'THEY' : DSHORT.toUpperCase()} ACTUALLY TOOK — every deduction line from the check register, grouped to the same categories as the plan.
+        Merchandise and processing fees are held apart: ${_dedDist === 'all' ? 'distributors bill fees' : DSHORT + ' bills a fee'} on top of most deductions and it does not appear in Vividly at all.
         ${parsedN < L.length ? `Store-level backup is parsed for ${money(-parsedAmt)} of ${money(-totalAmt)} — ${covPct}% of the money, ${parsedN.toLocaleString()} of ${L.length.toLocaleString()} lines. Coverage is quoted in dollars because the undocumented lines are the large ones.` : ''}
       </p>
       <div id="hl-ded-body"></div>
@@ -29268,6 +29268,30 @@ render();
         _dedDetail = { det, bmap };
       } catch (e) { _dedDetail = { det: [], bmap: [], err: String(e.message || e) }; }
     }
+
+    // The screen said "KeHE" everywhere because KeHE was once the only
+    // distributor. Under All or UNFI those labels are simply false, so the name
+    // now comes from the scope in one place rather than a dozen literal strings.
+    const DNAME = _dedDist === 'all' ? 'the distributors' : _dedDist;
+    const DSHORT = _dedDist === 'all' ? 'Distributor' : _dedDist;
+    // EVERY TAB MUST FOOT TO THE SAME REGISTER. A tab that totals more than
+    // "Deducted 2026" is not a display quirk — it means dollars are being
+    // double-counted or dropped somewhere, and the whole screen stops being
+    // trustworthy. Rather than assert it in a comment, each tab states its own
+    // total against the register and says so out loud when they disagree.
+    // Tolerance is a cent, for float noise only.
+    const _dedTieNote = (tabTotal, registerTotal) => {
+      const diff = Math.round((tabTotal - registerTotal) * 100) / 100;
+      if (Math.abs(diff) < 0.01) {
+        return `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;">
+          \u2713 ties to the ${money(registerTotal)} register</p>`;
+      }
+      return `<p style="font-family:var(--mono);font-size:10.5px;color:var(--lost);margin-top:10px;
+        border-left:2px solid var(--lost);padding-left:9px;line-height:1.5;">
+        <strong>OUT BY ${money(Math.abs(diff))}</strong> \u2014 this tab totals ${money(tabTotal)} against a
+        ${money(registerTotal)} register. ${diff > 0 ? 'Something is counted twice.' : 'Something is missing.'}
+        Do not quote either figure until this reads zero.</p>`;
+    };
 
     const th = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
     const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
@@ -29466,7 +29490,7 @@ render();
 
       body.innerHTML = `
         <div style="display:flex;gap:30px;flex-wrap:wrap;margin:2px 0 16px;">
-          ${stat('Planned (KeHE)', money(totPlan), winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'Vividly expected spend')}
+          ${stat('Planned (' + DSHORT + ')', money(totPlan), winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'Vividly expected spend')}
           ${stat('Deducted (trade)', money(totDed), 'same months, attributed to a customer')}
           ${stat('Variance', money(totDed - totPlan), totPlan ? dPct(totDed, totPlan) + ' vs plan' : 'no plan matched')}
           ${stat('Not yet placed', money(unattrib + undocumented), tradeTotal ? Math.round((unattrib + undocumented) / tradeTotal * 100) + '% of trade spend' : '')}
@@ -29484,7 +29508,7 @@ render();
         <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
           TRADE SPEND ONLY — ${money(tradeTotal)} of the ${money(-totalAmt)} register, being the codes the reason map marks
           <code style="font-family:var(--mono);">is_trade_spend</code>. Plan side is Vividly lines whose First Receiver is ${_dedDist === 'all' ? 'KeHE or UNFI' : _dedDist} and whose
-          promo type matches a category KeHE actually deducted, <strong>clipped to the register's own months</strong> — the register is a
+          promo type matches a category ${_dedDist === 'all' ? 'a distributor' : DSHORT} actually deducted, <strong>clipped to the register's own months</strong> — the register is a
           year-to-date pull and the plan is a full year, so an unbounded comparison reports calendar as variance. Held out rather than
           counted as unspent: ${money(planExcludedRecv)} on other distributors, ${money(planExcludedType)} in types absent from this register,
           ${money(planOutOfWindow)} planned outside ${winStart ? _dedMon(winStart) + '\u2013' + _dedMon(winEnd) : 'the window'}${planNotClosed ? ', and ' + money(planNotClosed) + ' in promos not yet Completed' : ''}.
@@ -29580,7 +29604,7 @@ render();
         const sugAmt = show.filter(([raw]) => sug.get(raw)).reduce((n, u) => n + u[1], 0);
         host.innerHTML = `
           <div style="border:1px solid var(--ink);border-radius:6px;padding:14px 16px;margin-bottom:18px;">
-            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Map KeHE banners to plan customers</div>
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Map ${_dedDist === 'all' ? '' : DSHORT + ' '}banners to plan customers</div>
             <div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;margin-bottom:10px;max-width:860px;">
               ${show.length} banners shown, covering ${money(show.reduce((n, u) => n + u[1], 0))} of ${money(unTotal)} unplaced.
               <strong>${nSug}</strong> have a suggested match (${money(sugAmt)}) — pre-selected below and tagged with why they fired.
@@ -29593,7 +29617,7 @@ render();
             </div>
             <div style="max-height:440px;overflow:auto;border-top:1px solid var(--rule-soft);">
             <table style="width:100%;border-collapse:collapse;">
-              <thead><tr>${th('KeHE banner')}${th('Trade $', true)}${th('Plan customer')}${th('Match')}</tr></thead>
+              <thead><tr>${th(_dedDist === 'all' ? 'Banner' : DSHORT + ' banner')}${th('Trade $', true)}${th('Plan customer')}${th('Match')}</tr></thead>
               <tbody>
                 ${show.map(([raw, amt]) => {
                   const g = sug.get(raw);
@@ -30066,7 +30090,8 @@ render();
             ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
             ${td('<strong>' + Math.round(parsedN / L.length * 100) + '%</strong>', true)}
           </tr></tfoot>
-        </table>`;
+        </table>
+        ${_dedTieNote(catRows.reduce((n, r) => n + Math.abs(r.total || 0), 0), -totalAmt)}`;
       return;
     }
 
@@ -30093,7 +30118,14 @@ render();
               </tr>`;
             }).join('')}
           </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>TOTAL</strong>')}${td('')}${td('')}${td('')}
+            ${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
+            ${td('<strong>' + covPct + '%</strong>', true)}
+          </tr></tfoot>
         </table>
+        ${_dedTieNote(codeRows.reduce((n, r) => n + (-r.amount), 0), -totalAmt)}
         <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:12px;line-height:1.55;">
           RESOLVED VIA tells you where the code came from: <code style="font-family:var(--mono);">invoice_prefix</code> means a dot-format document number,
           <code style="font-family:var(--mono);">remarks</code> means the Remarks column on an invoice adjustment, <code style="font-family:var(--mono);">alpha</code> means the leading letters of the invoice number.
