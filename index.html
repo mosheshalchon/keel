@@ -28669,8 +28669,12 @@ render();
     let tExp = 0, tAct = 0, tUnits = 0;
     for (const l of lines) {
       const c = l.customer || '(no customer)';
-      if (!byCust.has(c)) byCust.set(c, { n: 0, units: 0, exp: 0, act: 0, types: new Map() });
+      if (!byCust.has(c)) byCust.set(c, { n: 0, units: 0, exp: 0, act: 0, types: new Map(), recvs: new Set() });
       const b = byCust.get(c);
+      // First Receiver is the DISTRIBUTOR, Customer is the retailer — a Publix
+      // promo can ship through KeHE, UNFI or both. One customer can therefore
+      // carry several receivers, so they are collected rather than overwritten.
+      if (l.first_receiver) b.recvs.add(String(l.first_receiver).trim());
       b.n++; b.units += l.expected_units || 0; b.exp += l.expected_spend || 0; b.act += l.actual_spend || 0;
       const t = l.promo_type || '(no type)';
       if (!b.types.has(t)) b.types.set(t, { n: 0, units: 0, exp: 0, act: 0, lines: [] });
@@ -28764,6 +28768,7 @@ render();
           const ld = (l.actual_spend || 0) - (l.expected_spend || 0);
           const dates = (l.start_date || '') + (l.end_date ? ' → ' + l.end_date : '');
           return '<tr class="hl-vp-linerow hl-vp-lr-' + ci + ' hl-vp-lrt-' + ci + '-' + ti + '" style="display:none;background:rgba(83,74,183,0.04);border-top:1px solid var(--rule-soft);">'
+            + '<td></td>'
             + '<td style="padding:5px 10px 5px 58px;"><div style="font-family:var(--sans,sans-serif);font-size:11.5px;">' + esc(l.promo_name || l.line_key) + '</div><div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(l.product_group || '(no group)') + (dates ? ' · ' + dates : '') + ((l.expected_lift || l.actual_lift) ? ' · lift ' + (l.expected_lift ? Math.round(l.expected_lift * 100) + '%' : '—') + ' → ' + (l.actual_lift ? Math.round(l.actual_lift * 100) + '%' : '—') : '') + '</div></td>'
             + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + esc(l.status || '') + '</td>'
             + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (l.expected_units ? num(l.expected_units) : '—') + '</td>'
@@ -28772,6 +28777,7 @@ render();
             + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (ld > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (l.actual_spend ? money(ld) : '—') + '</td></tr>';
         }).join('');
         return '<tr class="hl-vp-typerow hl-vp-t' + ci + '" data-ci="' + ci + '" data-ti="' + ti + '" style="display:none;background:var(--bone-2);border-top:1px solid var(--rule-soft);cursor:pointer;">'
+          + '<td></td>'
           + '<td style="padding:5px 10px 5px 34px;font-family:var(--mono);font-size:11px;color:var(--ink-2);"><span class="hl-vp-tcar" id="hl-vp-tcar' + ci + '-' + ti + '" style="font-size:9px;color:var(--ink-3);margin-right:6px;">▶</span>' + esc(t) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + tb.n + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (tb.units ? num(tb.units) : '—') + '</td>'
@@ -28780,7 +28786,9 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (td > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (tb.act ? money(td) : '—') + '</td></tr>'
           + lineRows;
       }).join('');
+      const recvTxt = [...(b.recvs || [])].sort().join(' · ') || '\u2014';
       return '<tr class="hl-vp-custrow" data-ci="' + ci + '" style="border-top:1px solid var(--rule-soft);cursor:pointer;">'
+        + '<td style="padding:7px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-3);white-space:nowrap;">' + esc(recvTxt) + '</td>'
         + '<td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;"><span class="hl-vp-car" id="hl-vp-car' + ci + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-right:8px;">▶</span>' + esc(c) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + b.n + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(b.units) + '</td>'
@@ -28844,6 +28852,7 @@ render();
       ${_vpView === 'calendar' ? calHtml : `
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#efe9dd;">
+          ${_vpView === 'customer' ? '<th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">First receiver</th>' : ''}
           <th style="padding:8px 10px;text-align:left;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${_vpView === 'month' ? ('Month · click for ' + (_vpMonBy === 'type' ? 'promo types' : 'retailers')) : _vpView === 'type' ? 'Promo type · click for retailers' : 'Customer · click for promo types'}</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Lines</th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">Expected units</th>
@@ -28853,6 +28862,7 @@ render();
         </tr></thead>
         <tbody>${_vpView === 'month' ? monRowsHtml : _vpView === 'type' ? typeRowsHtml : rowsHtml}</tbody>
         <tfoot><tr style="border-top:2px solid var(--rule-soft);font-weight:700;">
+          ${_vpView === 'customer' ? '<td></td>' : ''}
           <td style="padding:8px 10px;font-family:var(--mono);font-size:11px;">Total</td>
           <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${lines.length.toLocaleString()}</td>
           <td style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:12px;">${num(tUnits)}</td>
@@ -29055,11 +29065,25 @@ render();
       if (total <= pageSize) return out;
       const starts = [];
       for (let from = pageSize; from < total; from += pageSize) starts.push(from);
-      const pages = await Promise.all(starts.map(f => mk().range(f, f + pageSize - 1)));
-      for (const pg of pages) {
-        if (pg.error) throw new Error(pg.error.message);
-        out.push(...(pg.data || []));
-      }
+
+      // BOUNDED, not all-at-once. deduction_detail was ~16k rows when this was
+      // written; UNFI took it to ~150k, so Promise.all fired ~150 simultaneous
+      // requests. That saturates the browser's connection pool — the tab hung on
+      // "Loading store-level detail…" AND every other page queued behind it, so
+      // the Plan tab appeared broken too. A pool of 6 keeps it fast without
+      // starving the rest of the app.
+      const POOL = 6;
+      let next = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = next++;
+          if (i >= starts.length) return;
+          const pg = await mk().range(starts[i], starts[i] + pageSize - 1);
+          if (pg.error) throw new Error(pg.error.message);
+          out.push(...(pg.data || []));
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(POOL, starts.length) }, worker));
       return out;
     };
 
