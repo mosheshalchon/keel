@@ -29111,7 +29111,15 @@ render();
       const _ckDist = new Map(checks.map(c => [c.id, c.distributor || 'KeHE']));
       const _lineDist = (l) => (l.check_id && _ckDist.get(l.check_id))
         || (String(l.reason_code || '').startsWith('UNFI-') ? 'UNFI' : 'KeHE');
-      for (const l of lines) _dedDistCounts[_lineDist(l)] = (_dedDistCounts[_lineDist(l)] || 0) + 1;
+      // Dollars, not lines. KeHE books one line per deduction (1,792 of them);
+      // UNFI books one line per FILE with thousands of store rows beneath (68).
+      // Counting lines therefore made UNFI look like a rounding error next to
+      // KeHE when it is in fact the larger book. Dollars are the same unit for
+      // both, and the only honest comparator on that control.
+      for (const l of lines) {
+        const d = _lineDist(l);
+        _dedDistCounts[d] = (_dedDistCounts[d] || 0) + Math.abs(Number(l.amount) || 0);
+      }
       if (_dedDist !== 'all') {
         lines = lines.filter(l => _lineDist(l) === _dedDist);
         checks = checks.filter(c => (c.distributor || 'KeHE') === _dedDist);
@@ -29201,11 +29209,12 @@ render();
         <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:4px;">Distributor</span>
         ${[['all', 'All'], ['KeHE', 'KeHE'], ['UNFI', 'UNFI']].map(([d, lbl]) => {
           const n = d === 'all' ? (_dedDistCounts.KeHE + _dedDistCounts.UNFI) : (_dedDistCounts[d] || 0);
+          const nLbl = n >= 1000 ? '$' + Math.round(n / 1000).toLocaleString() + 'k' : (n ? '$' + Math.round(n) : '');
           return `<button class="hl-ded-dist" data-d="${d}" ${n ? '' : 'disabled'}
             style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;cursor:${n ? 'pointer' : 'default'};
                    border:1px solid ${_dedDist === d ? 'var(--ink)' : 'var(--rule-soft)'};
                    background:${_dedDist === d ? 'var(--ink)' : 'transparent'};
-                   color:${_dedDist === d ? 'var(--paper)' : (n ? 'var(--ink-3)' : 'var(--rule)')};">${lbl}${n ? ' <span style="opacity:.6;">' + n.toLocaleString() + '</span>' : ''}</button>`;
+                   color:${_dedDist === d ? 'var(--paper)' : (n ? 'var(--ink-3)' : 'var(--rule)')};">${lbl}${nLbl ? ' <span style="opacity:.6;">' + nLbl + '</span>' : ''}</button>`;
         }).join('')}
       </div>
 
@@ -29248,7 +29257,12 @@ render();
       body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
       try {
         const [det, bmap] = await Promise.all([
-          pagedFast(() => sb.from('deduction_detail').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from', { count: 'exact' }).eq('brand_id', brandId).order('id', { ascending: true })),
+          // AGGREGATE IN POSTGRES, NOT THE BROWSER. deduction_detail is ~150k
+          // rows once UNFI is loaded; fetching all of them to sum them in JS
+          // took tens of seconds and ~25MB over the wire. deduction_detail_rollup
+          // groups to line x banner x month — roughly 15k rows, same numbers,
+          // and it exposes the SAME column names so nothing downstream changes.
+          pagedFast(() => sb.from('deduction_detail_rollup').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from,stores', { count: 'exact' }).eq('brand_id', brandId).order('line_id', { ascending: true })),
           paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true })),
         ]);
         _dedDetail = { det, bmap };
