@@ -28963,6 +28963,16 @@ render();
   // round trips -- to redraw a '+' as a '-'. The register is immutable between
   // syncs, so it is fetched once per brand+year and every toggle is then pure
   // rendering with no network at all. _dedBust() drops it after a write.
+  // DISTRIBUTOR IS A SCOPE, NOT A VIEW. It decides WHICH data you are looking
+  // at; the tabs decide HOW. Sat below the tabs it would read as a property of
+  // the current tab. It also replaces the old static "KeHE · K-solve register"
+  // label, which stopped being true the moment UNFI loaded — the page was
+  // silently totalling two distributors while naming one.
+  let _dedDist = (() => {
+    try { const v = localStorage.getItem('keel_ded_dist');
+          return (v === 'KeHE' || v === 'UNFI' || v === 'all') ? v : 'all'; }
+    catch (e) { return 'all'; }
+  })();
   let _dedRaw = null;             // { key, checks, lines, rmap }
   const _dedBust = () => { _dedRaw = null; _dedDetail = null; _dedPlan = null; };
   let _dedRecCompleted = true;    // Reconcile: measure closed promos only
@@ -29054,6 +29064,8 @@ render();
     };
 
     let checks = [], lines = [], rmap = [], detAgg = [];
+    let _dedDistCounts = { KeHE: 0, UNFI: 0 };
+    let _scopedLineIds = new Set();
     const rawKey = brandId + '|' + year;
     try {
       if (_dedRaw && _dedRaw.key === rawKey) {
@@ -29066,6 +29078,21 @@ render();
         ]);
         _dedRaw = { key: rawKey, checks, lines, rmap };
       }
+      // Scope applied AFTER caching, so switching distributor is instant and
+      // never refetches. A UNFI line can have a null check (their unfiled
+      // files), so distributor is resolved from the check when there is one and
+      // from the UNFI- reason-code prefix when there is not — otherwise every
+      // unattached UNFI line would vanish from a UNFI-scoped view.
+      _dedDistCounts = { KeHE: 0, UNFI: 0 };
+      const _ckDist = new Map(checks.map(c => [c.id, c.distributor || 'KeHE']));
+      const _lineDist = (l) => (l.check_id && _ckDist.get(l.check_id))
+        || (String(l.reason_code || '').startsWith('UNFI-') ? 'UNFI' : 'KeHE');
+      for (const l of lines) _dedDistCounts[_lineDist(l)] = (_dedDistCounts[_lineDist(l)] || 0) + 1;
+      if (_dedDist !== 'all') {
+        lines = lines.filter(l => _lineDist(l) === _dedDist);
+        checks = checks.filter(c => (c.distributor || 'KeHE') === _dedDist);
+      }
+      _scopedLineIds = new Set(lines.map(l => l.id));
     } catch (e) {
       hostEl.innerHTML = `<div style="padding:20px;font-family:var(--mono);font-size:12px;color:var(--lost);">Could not load deductions: ${esc(String(e.message || e))}<br><br>If the tables don't exist yet, run the Phase III migration first.</div>`;
       return;
@@ -29146,9 +29173,21 @@ render();
         ${stat('Unmapped codes', unmapped.length, unmapped.length ? money(-unmappedAmt) + ' unclassified' : 'all mapped')}
       </div>
 
-      <div style="margin:16px 0 4px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
+      <div style="margin:14px 0 2px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
+        <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:4px;">Distributor</span>
+        ${[['all', 'All'], ['KeHE', 'KeHE'], ['UNFI', 'UNFI']].map(([d, lbl]) => {
+          const n = d === 'all' ? (_dedDistCounts.KeHE + _dedDistCounts.UNFI) : (_dedDistCounts[d] || 0);
+          return `<button class="hl-ded-dist" data-d="${d}" ${n ? '' : 'disabled'}
+            style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;cursor:${n ? 'pointer' : 'default'};
+                   border:1px solid ${_dedDist === d ? 'var(--ink)' : 'var(--rule-soft)'};
+                   background:${_dedDist === d ? 'var(--ink)' : 'transparent'};
+                   color:${_dedDist === d ? 'var(--paper)' : (n ? 'var(--ink-3)' : 'var(--rule)')};">${lbl}${n ? ' <span style="opacity:.6;">' + n.toLocaleString() + '</span>' : ''}</button>`;
+        }).join('')}
+      </div>
+
+      <div style="margin:10px 0 4px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
         ${views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_dedView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_dedView === v ? 'var(--ink)' : 'transparent'};color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">KeHE · K-solve register</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">${_dedDist === 'all' ? 'all distributors' : _dedDist}</span>
         <button id="hl-ded-refresh" title="Re-read from Supabase — use after running SQL or the detail parser"
           style="margin-left:10px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">↻ Refresh</button>
       </div>
@@ -29170,6 +29209,15 @@ render();
     const body = document.getElementById('hl-ded-body');
     const rfsh = document.getElementById('hl-ded-refresh');
     if (rfsh) rfsh.onclick = () => { _dedBust(); renderDeductions(hostEl, filtersEl, year); };
+    hostEl.querySelectorAll('.hl-ded-dist').forEach(b => b.onclick = () => {
+      _dedDist = b.dataset.d;
+      try { localStorage.setItem('keel_ded_dist', _dedDist); } catch (e) {}
+      // _dedDetail holds store rows for whichever scope was last loaded, so it
+      // has to be dropped; the register cache does not, since the filter runs
+      // over it in memory.
+      _dedDetail = null;
+      renderDeductions(hostEl, filtersEl, year);
+    });
     // Store-level detail is ~16k rows, so it loads only when the Customer tab is
     // open rather than on every visit to Deductions.
     if ((_dedView === 'customer' || _dedView === 'reconcile') && !_dedDetail) {
@@ -29213,6 +29261,10 @@ render();
     // trade-spend total the Summary tab shows.
     if (_dedView === 'reconcile') {
       const D = _dedDetail || { det: [], bmap: [] };
+      // deduction_detail has no distributor column, so it is fetched whole and
+      // narrowed here to the lines in scope — otherwise By customer and the
+      // reconciliation would total every distributor's stores under one label.
+      D.det = D.det.filter(d => _scopedLineIds.has(d.line_id));
       const P = _dedPlan || { lines: [], err: null };
       const bm = new Map(D.bmap.map(b => [b.banner_raw, b]));
       const normCat = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
@@ -29303,7 +29355,13 @@ render();
       for (const pl of P.lines) {
         const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
         const exp = Number(pl.expected_spend || 0);
-        if (!/kehe/i.test(recv)) { planExcludedRecv += exp; continue; }
+        // The plan side follows the distributor scope. Without this, scoping to
+        // UNFI compares UNFI's deductions against KeHE's plan — a variance made
+        // entirely of the mismatch.
+        const recvOk = _dedDist === 'all' ? /kehe|unfi/i.test(recv)
+                     : _dedDist === 'UNFI' ? /unfi/i.test(recv)
+                     : /kehe/i.test(recv);
+        if (!recvOk) { planExcludedRecv += exp; continue; }
         const ck = normCat(pl.promo_type);
         if (!catsSeen.has(ck)) { planExcludedType += exp; continue; }
         if (!inWindow(planMonthOf(pl))) { planOutOfWindow += exp; continue; }
@@ -29348,7 +29406,7 @@ render();
         </div>` : ''}
         <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
           TRADE SPEND ONLY — ${money(tradeTotal)} of the ${money(-totalAmt)} register, being the codes the reason map marks
-          <code style="font-family:var(--mono);">is_trade_spend</code>. Plan side is Vividly lines whose First Receiver is KeHE and whose
+          <code style="font-family:var(--mono);">is_trade_spend</code>. Plan side is Vividly lines whose First Receiver is ${_dedDist === 'all' ? 'KeHE or UNFI' : _dedDist} and whose
           promo type matches a category KeHE actually deducted, <strong>clipped to the register's own months</strong> — the register is a
           year-to-date pull and the plan is a full year, so an unbounded comparison reports calendar as variance. Held out rather than
           counted as unspent: ${money(planExcludedRecv)} on other distributors, ${money(planExcludedType)} in types absent from this register,
@@ -29738,6 +29796,10 @@ render();
     // dropped, which is why this total ties to the register above.
     if (_dedView === 'customer') {
       const D = _dedDetail || { det: [], bmap: [] };
+      // deduction_detail has no distributor column, so it is fetched whole and
+      // narrowed here to the lines in scope — otherwise By customer and the
+      // reconciliation would total every distributor's stores under one label.
+      D.det = D.det.filter(d => _scopedLineIds.has(d.line_id));
       const bm = new Map(D.bmap.map(b => [b.banner_raw, b]));
       const lineById = new Map(L.map(l => [l.id, l]));
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
