@@ -240,6 +240,13 @@ body::before {
 /* Sub-tabs under the ACTIVE nav item (Promos -> Plan / Trade analyzer /
    Deductions). Rendered only while that page is open, so the sidebar does not
    grow permanently; the rail on the left is what ties them to their parent. */
+/* Deductions overview: two columns, with the short panel and the wide table
+   spanning the full width. auto-fit was giving FOUR columns on a 2560px display,
+   which squeezed every table into a third of the width it needed to breathe. */
+.ded-exec { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; margin-top: 4px; }
+.ded-exec > .ded-wide { grid-column: 1 / -1; }
+@media (max-width: 1240px) { .ded-exec { grid-template-columns: 1fr; } }
+
 .nav-subs { display: flex; flex-direction: column; margin: 2px 0 6px 4px; }
 .nav-sub {
   display: block;
@@ -29292,44 +29299,6 @@ render();
       return out;
     };
 
-    const pagedFast = async (mk, pageSize = 1000) => {
-      const first = await mk().range(0, pageSize - 1);
-      if (first.error) throw new Error(first.error.message);
-      const out = [...(first.data || [])];
-      const total = first.count;
-      if (total == null) {                       // no count header — sequential fallback
-        for (let from = pageSize; ; from += pageSize) {
-          const { data, error } = await mk().range(from, from + pageSize - 1);
-          if (error) throw new Error(error.message);
-          out.push(...(data || []));
-          if (!data || data.length < pageSize) break;
-        }
-        return out;
-      }
-      if (total <= pageSize) return out;
-      const starts = [];
-      for (let from = pageSize; from < total; from += pageSize) starts.push(from);
-
-      // BOUNDED, not all-at-once. deduction_detail was ~16k rows when this was
-      // written; UNFI took it to ~150k, so Promise.all fired ~150 simultaneous
-      // requests. That saturates the browser's connection pool — the tab hung on
-      // "Loading store-level detail…" AND every other page queued behind it, so
-      // the Plan tab appeared broken too. A pool of 6 keeps it fast without
-      // starving the rest of the app.
-      const POOL = 6;
-      let next = 0;
-      const worker = async () => {
-        for (;;) {
-          const i = next++;
-          if (i >= starts.length) return;
-          const pg = await mk().range(starts[i], starts[i] + pageSize - 1);
-          if (pg.error) throw new Error(pg.error.message);
-          out.push(...(pg.data || []));
-        }
-      };
-      await Promise.all(Array.from({ length: Math.min(POOL, starts.length) }, worker));
-      return out;
-    };
 
     let checks = [], lines = [], rmap = [], detAgg = [];
     let _dedDistCounts = { KeHE: 0, UNFI: 0 };
@@ -29580,20 +29549,64 @@ render();
     });
     // Store-level detail is ~16k rows, so it loads only when the Customer tab is
     // open rather than on every visit to Deductions.
-    if ((_dedView === 'customer' || _dedView === 'reconcile') && !_dedDetail) {
+    // ── STORE DETAIL, FETCHED BY LINE INSTEAD OF BY OFFSET ──────────────────
+    // AGGREGATE IN POSTGRES, NOT THE BROWSER: deduction_detail is ~367k rows, so
+    // the rollup groups it to line x banner x month — ~16.5k rows, same numbers,
+    // same column names.
+    //
+    // But the rollup is a VIEW, so every page of an offset pager re-runs the
+    // whole GROUP BY over all 367k rows and then throws away everything before
+    // the offset — and `count: 'exact'` adds one more full aggregation on top.
+    // Seventeen of those in a row is what produced "canceling statement due to
+    // statement timeout": each query was legal, the seventeenth just ran out of
+    // the eight seconds Supabase allows a statement.
+    //
+    // line_id is a GROUPING column, so a predicate on it pushes down into the
+    // aggregate and hits deduction_detail_rollup_idx directly. Asking for a
+    // hundred lines at a time therefore aggregates a hundred lines' worth of
+    // rows, not all of them. Same data, ~20 cheap queries instead of 17
+    // expensive ones, and no count pass at all.
+    const _dedLoadDetail = async () => {
+      const ids = L.map(l => l.id);
+      const CH = 100, POOL = 6;
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += CH) chunks.push(ids.slice(i, i + CH));
+      const det = [];
+      let next = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = next++;
+          if (i >= chunks.length) return;
+          // (line_id, banner, month) is the rollup's group key, so ordering on
+          // those three is a TOTAL order — safe to page within a chunk without
+          // a row landing on two pages or none.
+          for (let from = 0; ; from += 1000) {
+            const { data, error } = await sb.from('deduction_detail_rollup')
+              .select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from,stores')
+              .eq('brand_id', brandId).in('line_id', chunks[i])
+              .order('line_id', { ascending: true })
+              .order('banner', { ascending: true })
+              .order('reference_date', { ascending: true })
+              .range(from, from + 999);
+            if (error) throw new Error(error.message);
+            det.push(...(data || []));
+            if (!data || data.length < 1000) break;
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(POOL, chunks.length) }, worker));
+      const bmap = await paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true }));
+      return { det, bmap };
+    };
+    // The fetch is now scoped to the lines in view, so the cache has to be keyed
+    // by that scope. Previously it pulled every line's detail and filtered in
+    // memory, which was year-proof by accident; keyed explicitly, it stays so.
+    const _detKey = brandId + '|' + year + '|' + _dedDist;
+    const _detStale = () => !_dedDetail || _dedDetail.key !== _detKey;
+    if ((_dedView === 'customer' || _dedView === 'reconcile') && _detStale()) {
       body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
-      try {
-        const [det, bmap] = await Promise.all([
-          // AGGREGATE IN POSTGRES, NOT THE BROWSER. deduction_detail is ~150k
-          // rows once UNFI is loaded; fetching all of them to sum them in JS
-          // took tens of seconds and ~25MB over the wire. deduction_detail_rollup
-          // groups to line x banner x month — roughly 15k rows, same numbers,
-          // and it exposes the SAME column names so nothing downstream changes.
-          pagedFast(() => sb.from('deduction_detail_rollup').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from,stores', { count: 'exact' }).eq('brand_id', brandId).order('line_id', { ascending: true })),
-          paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true })),
-        ]);
-        _dedDetail = { det, bmap };
-      } catch (e) { _dedDetail = { det: [], bmap: [], err: String(e.message || e) }; }
+      try { _dedDetail = Object.assign({ key: _detKey }, await _dedLoadDetail()); }
+      catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
     }
 
     // EVERY TAB MUST FOOT TO THE SAME REGISTER. A tab that totals more than
@@ -29634,18 +29647,27 @@ render();
       const grandDed = -totalAmt;
       const shr = (n) => grandDed ? (n / grandDed * 100).toFixed(1) + '%' : '—';
       const goto_ = (v, lbl) => `<a href="#" class="hl-ded-goto" data-v="${v}"
-        style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.05em;color:var(--ink-3);border-bottom:1px solid var(--rule);">${lbl} \u2192</a>`;
-      const panel = (title, sub, link, inner) => `
-        <section style="border:1px solid var(--rule-soft);border-radius:8px;padding:15px 17px 13px;background:var(--paper);min-width:0;">
-          <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;">
-            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;text-transform:uppercase;color:var(--ink-3);">${title}</div>
+        style="font-family:var(--mono);font-size:11px;letter-spacing:0.05em;color:var(--ink-3);border-bottom:1px solid var(--rule);white-space:nowrap;">${lbl} \u2192</a>`;
+      // Panel-local table helpers. The shared th/td are sized for a full-width
+      // table; at panel width they read as fine print, which is a large part of
+      // why this screen looked like it was withholding something.
+      const pth = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:9px 12px 8px;font-family:var(--mono);font-size:10.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
+      const ptd = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:11px 12px;font-family:var(--mono);font-size:13px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
+      const pname = (t, warn) => `<span style="font-family:var(--serif);font-size:15.5px;${warn ? 'color:var(--lost);' : ''}">${t}</span>`;
+      const panel = (title, sub, link, inner, wide) => `
+        <section class="${wide ? 'ded-wide' : ''}" style="border:1px solid var(--rule-soft);border-radius:8px;padding:17px 20px 15px;background:var(--paper);min-width:0;">
+          <div style="display:flex;align-items:baseline;justify-content:space-between;gap:14px;">
+            <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.09em;text-transform:uppercase;color:var(--ink-2);font-weight:600;">${title}</div>
             ${link || ''}
           </div>
-          ${sub ? `<div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:4px;line-height:1.5;">${sub}</div>` : ''}
-          <div style="margin-top:11px;">${inner}</div>
+          ${sub ? `<div style="font-family:var(--serif);font-size:13.5px;color:var(--ink-3);margin-top:5px;line-height:1.55;max-width:82ch;">${sub}</div>` : ''}
+          <div style="margin-top:12px;">${inner}</div>
         </section>`;
       const bar = (n, max) => `<div style="height:2px;background:var(--ink);opacity:.75;width:${max ? (n / max * 100).toFixed(2) : 0}%;"></div>`;
-      const wait = (t) => `<div class="hl-loading" style="padding:14px 0;">${t}</div>`;
+      const wait = (t) => `<div class="hl-loading" style="padding:16px 0;font-size:13px;">${t}</div>`;
+      const problem = (t) => `<div style="font-family:var(--mono);font-size:12.5px;color:var(--lost);line-height:1.6;padding:8px 0;">${t}</div>`;
+      const prose = (t) => `<div style="font-family:var(--serif);font-size:14px;color:var(--ink-2);line-height:1.65;padding:6px 0;max-width:82ch;">${t}</div>`;
+
 
       // ── 1 · who took it. Grouped on the check's own distributor column, not a
       // hardcoded pair, so a direct customer that starts remitting shows up on
@@ -29660,86 +29682,84 @@ render();
       }
       const distRows = [...distMap.values()].sort((a, b) => b.amt - a.amt);
       const distMax = Math.max(1, ...distRows.map(r => r.amt));
+      // Full width and laid out horizontally: it is two or three rows, so as a
+      // column it was a tall box mostly made of nothing.
       const panelDist = panel('Who deducted', _dedDist === 'all'
           ? 'Every source on the register. Lines are not comparable across sources \u2014 KeHE books one line per deduction, UNFI one per file \u2014 so the money is the comparator.'
-          : 'Scoped to ' + esc(_dedDist) + '. Clear the distributor filter above to compare sources.',
+          : 'Scoped to ' + esc(_dedDist) + '. Choose All above to compare sources.',
         goto_('checks', 'Checks'), `
-        <table style="width:100%;border-collapse:collapse;">
-          <thead><tr>${th('Source')}${th('Lines', true)}${th('Fees $', true)}${th('Deducted', true)}${th('Share', true)}</tr></thead>
-          <tbody>
-            ${distRows.map(r => `<tr>
-              ${td('<span style="font-family:var(--serif);font-size:13.5px;">' + esc(r.name) + '</span><div style="margin-top:5px;">' + bar(r.amt, distMax) + '</div>')}
-              ${td(r.lines.toLocaleString(), true)}
-              ${td(r.fee ? money(Math.abs(r.fee)) : '<span style="color:var(--ink-3);">\u2014</span>', true)}
-              ${td('<strong>' + money(r.amt) + '</strong>', true)}
-              ${td(shr(r.amt), true, 'color:var(--ink-3);')}
-            </tr>`).join('')}
-          </tbody>
-          <tfoot><tr style="border-top:2px solid var(--ink);">
-            ${td('<strong>TOTAL</strong>')}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
-            ${td('<strong>' + (totalFee ? money(Math.abs(totalFee)) : '\u2014') + '</strong>', true)}
-            ${td('<strong>' + money(grandDed) + '</strong>', true)}${td('', true)}
-          </tr></tfoot>
-        </table>`);
+        <div style="display:flex;gap:14px;flex-wrap:wrap;">
+          ${distRows.map(r => `
+            <div style="flex:1 1 220px;min-width:220px;border:1px solid var(--rule-soft);border-radius:6px;padding:13px 15px;">
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;">
+                <span style="font-family:var(--serif);font-size:17px;">${esc(r.name)}</span>
+                <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${shr(r.amt)}</span>
+              </div>
+              <div style="font-family:var(--serif);font-size:25px;margin-top:4px;">${money(r.amt)}</div>
+              <div style="margin:8px 0 7px;">${bar(r.amt, distMax)}</div>
+              <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">
+                ${r.lines.toLocaleString()} lines \u00b7 ${r.checks.size || 0} checks${r.fee ? ' \u00b7 ' + money(Math.abs(r.fee)) + ' fees' : ''}
+              </div>
+            </div>`).join('')}
+          <div style="flex:1 1 220px;min-width:220px;border:1px solid var(--ink);border-radius:6px;padding:13px 15px;">
+            <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Total</div>
+            <div style="font-family:var(--serif);font-size:25px;margin-top:4px;">${money(grandDed)}</div>
+            <div style="margin:8px 0 7px;height:2px;background:var(--ink);"></div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">
+              ${L.length.toLocaleString()} lines \u00b7 ${checks.length} checks${totalFee ? ' \u00b7 ' + money(Math.abs(totalFee)) + ' fees' : ''}
+            </div>
+          </div>
+        </div>`, true);
 
       // ── 3 · what it was for. catRows is already sorted largest-first.
       const catTop = catRows.slice(0, TOPN);
       const catRest = catRows.slice(TOPN);
       const catRestAmt = catRest.reduce((n, r) => n + -r.amount, 0);
+      const catRestLines = catRest.reduce((n, r) => n + r.lines, 0);
       const catMax = Math.max(1, ...catTop.map(r => -r.amount));
       const panelCat = panel('Top ' + TOPN + ' categories', 'What the money was taken for, from the reason code on each line.',
         goto_('category', 'By category'), `
         <table style="width:100%;border-collapse:collapse;">
-          <thead><tr>${th('Category')}${th('Lines', true)}${th('Deducted', true)}${th('Share', true)}</tr></thead>
+          <thead><tr>${pth('Category')}${pth('Lines', true)}${pth('Deducted', true)}${pth('Share', true)}</tr></thead>
           <tbody>
-            ${catTop.map(r => {
-              const warn = r.key.startsWith('\u26A0');
-              return `<tr>
-                ${td('<span style="font-family:var(--serif);font-size:13.5px;' + (warn ? 'color:var(--lost);' : '') + '">' + esc(r.key) + '</span>'
-                    + (r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : '')
-                    + '<div style="margin-top:5px;">' + bar(-r.amount, catMax) + '</div>')}
-                ${td(r.lines.toLocaleString(), true)}
-                ${td('<strong>' + money(-r.amount) + '</strong>', true)}
-                ${td(shr(-r.amount), true, 'color:var(--ink-3);')}
-              </tr>`;
-            }).join('')}
-            ${catRest.length ? `<tr>${td('<span style="color:var(--ink-3);">Other \u00b7 ' + catRest.length + ' ' + (catRest.length === 1 ? 'category' : 'categories') + '</span>')}${td(catRest.reduce((n, r) => n + r.lines, 0).toLocaleString(), true, 'color:var(--ink-3);')}${td(money(catRestAmt), true, 'color:var(--ink-3);')}${td(shr(catRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
+            ${catTop.map(r => `<tr>
+              ${ptd(pname(esc(r.key), r.key.startsWith('\u26A0')) + (r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : '')
+                  + '<div style="margin-top:6px;">' + bar(-r.amount, catMax) + '</div>')}
+              ${ptd(r.lines.toLocaleString(), true)}
+              ${ptd('<strong>' + money(-r.amount) + '</strong>', true)}
+              ${ptd(shr(-r.amount), true, 'color:var(--ink-3);')}
+            </tr>`).join('')}
+            ${catRest.length ? `<tr>${ptd('<span style="color:var(--ink-3);">Other \u00b7 ' + catRest.length + ' categories</span>')}${ptd(catRestLines.toLocaleString(), true, 'color:var(--ink-3);')}${ptd(money(catRestAmt), true, 'color:var(--ink-3);')}${ptd(shr(catRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
           </tbody>
           <tfoot><tr style="border-top:2px solid var(--ink);">
-            ${td('<strong>TOTAL</strong>')}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
-            ${td('<strong>' + money(grandDed) + '</strong>', true)}${td('', true)}
+            ${ptd('<strong>TOTAL</strong>')}${ptd('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${ptd('<strong>' + money(grandDed) + '</strong>', true)}${ptd('', true)}
           </tr></tfoot>
         </table>`);
 
       const shell = (custHtml, recHtml) => {
-        body.innerHTML = `
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:16px;align-items:start;">
-            ${panelDist}${custHtml}${panelCat}${recHtml}
-          </div>`;
+        body.innerHTML = `<div class="ded-exec">${panelDist}${custHtml}${panelCat}${recHtml}</div>`;
         body.querySelectorAll('.hl-ded-goto').forEach(a => a.onclick = (e) => {
           e.preventDefault();
           _dedView = a.dataset.v;
           try { localStorage.setItem('keel_ded_view', _dedView); } catch (e2) {}
           renderDeductions(hostEl, filtersEl, year);
         });
+        const rt = body.querySelector('#hl-ded-exec-retry');
+        if (rt) rt.onclick = () => { _dedDetail = null; _dedPlan = null; renderDeductions(hostEl, filtersEl, year); };
       };
 
       shell(panel('Top ' + TOPN + ' customers', '', '', wait('Loading store-level detail\u2026')),
-            panel('Reconciliation vs plan \u00b7 top ' + TOPN, '', '', wait('Loading the promo plan\u2026')));
+            panel('Reconciliation vs plan \u00b7 top ' + TOPN, '', '', wait('Loading the promo plan\u2026'), true));
 
       // Both remaining panels need the rollup; the reconciliation also needs the
       // plan. Fetched together so the second panel does not wait on the first.
       try {
         await Promise.all([
           (async () => {
-            if (_dedDetail) return;
-            try {
-              const [det, bmap] = await Promise.all([
-                pagedFast(() => sb.from('deduction_detail_rollup').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from,stores', { count: 'exact' }).eq('brand_id', brandId).order('line_id', { ascending: true })),
-                paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true })),
-              ]);
-              _dedDetail = { det, bmap };
-            } catch (e) { _dedDetail = { det: [], bmap: [], err: String(e.message || e) }; }
+            if (!_detStale()) return;
+            try { _dedDetail = Object.assign({ key: _detKey }, await _dedLoadDetail()); }
+            catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
           })(),
           (async () => {
             if (_dedPlan) return;
@@ -29796,36 +29816,43 @@ render();
       const custMax = Math.max(1, ...custTop.map(c => c.amt));
       const custFoot = custAll.reduce((n, c) => n + c.amt, 0) + noName2 + undoc2;
 
+      // The detail either loaded or it did not. When it did not, say so and
+      // offer the retry — the failure is usually a timeout, which is transient.
+      const detailFailed = !!D2.err || !det2.length;
+      const retryBtn = `<button id="hl-ded-exec-retry" style="margin-top:10px;font-family:var(--mono);font-size:11.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--ink);background:transparent;color:var(--ink);cursor:pointer;">Retry</button>`;
+
       const panelCust = D2.err
         ? panel('Top ' + TOPN + ' customers', '', goto_('customer', 'By customer'),
-            `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);padding:10px 0;">Could not load store detail: ${esc(D2.err)}</div>`)
+            problem('Could not load store detail \u2014 ' + esc(D2.err))
+            + prose('Nothing on this panel or the reconciliation below can be computed without it. The rest of the page is unaffected: the register itself is loaded, so the totals above and the categories are correct.')
+            + retryBtn)
         : !det2.length
         ? panel('Top ' + TOPN + ' customers', '', goto_('customer', 'By customer'),
-            `<div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;padding:6px 0;">No store-level detail is loaded for this scope, so none of the ${money(grandDed)} can be attributed to a customer yet.</div>`)
+            prose('No store-level detail is loaded for this scope, so none of the ' + money(grandDed) + ' can be attributed to a customer yet.'))
         : panel('Top ' + TOPN + ' customers', 'The downstream retailer named on the store detail, not the distributor that sent the check.',
             goto_('customer', 'By customer'), `
           <table style="width:100%;border-collapse:collapse;">
-            <thead><tr>${th('Customer')}${th('Stores', true)}${th('Deducted', true)}${th('Share', true)}</tr></thead>
+            <thead><tr>${pth('Customer')}${pth('Stores', true)}${pth('Deducted', true)}${pth('Share', true)}</tr></thead>
             <tbody>
               ${custTop.map(c => `<tr>
-                ${td('<span style="font-family:var(--serif);font-size:13.5px;">' + esc(c.name) + '</span>'
-                    + (c.plan ? '' : ' <span style="font-family:var(--mono);font-size:8.5px;letter-spacing:0.05em;padding:2px 5px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);">UNLINKED</span>')
-                    + '<div style="margin-top:5px;">' + bar(c.amt, custMax) + '</div>')}
-                ${td(c.stores.size || '\u2014', true)}
-                ${td('<strong>' + money(c.amt) + '</strong>', true)}
-                ${td(shr(c.amt), true, 'color:var(--ink-3);')}
+                ${ptd(pname(esc(c.name))
+                    + (c.plan ? '' : ' <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.05em;padding:2px 6px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);">UNLINKED</span>')
+                    + '<div style="margin-top:6px;">' + bar(c.amt, custMax) + '</div>')}
+                ${ptd(c.stores.size || '\u2014', true)}
+                ${ptd('<strong>' + money(c.amt) + '</strong>', true)}
+                ${ptd(shr(c.amt), true, 'color:var(--ink-3);')}
               </tr>`).join('')}
-              ${custRest.length ? `<tr>${td('<span style="color:var(--ink-3);">Other \u00b7 ' + custRest.length.toLocaleString() + ' customers</span>')}${td('', true)}${td(money(custRestAmt), true, 'color:var(--ink-3);')}${td(shr(custRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
-              ${noName2 ? `<tr>${td('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${td('', true)}${td(money(noName2), true, 'color:var(--ink-3);')}${td(shr(noName2), true, 'color:var(--ink-3);')}</tr>` : ''}
-              ${undoc2 ? `<tr>${td('<span style="color:var(--ink-3);">Not traced to a store \u2014 no detail behind the line</span>')}${td('', true)}${td(money(undoc2), true, 'color:var(--ink-3);')}${td(shr(undoc2), true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${custRest.length ? `<tr>${ptd('<span style="color:var(--ink-3);">Other \u00b7 ' + custRest.length.toLocaleString() + ' customers</span>')}${ptd('', true)}${ptd(money(custRestAmt), true, 'color:var(--ink-3);')}${ptd(shr(custRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${noName2 ? `<tr>${ptd('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${ptd('', true)}${ptd(money(noName2), true, 'color:var(--ink-3);')}${ptd(shr(noName2), true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${undoc2 ? `<tr>${ptd('<span style="color:var(--ink-3);">Not traced to a store \u2014 no detail behind the line</span>')}${ptd('', true)}${ptd(money(undoc2), true, 'color:var(--ink-3);')}${ptd(shr(undoc2), true, 'color:var(--ink-3);')}</tr>` : ''}
             </tbody>
             <tfoot><tr style="border-top:2px solid var(--ink);">
-              ${td('<strong>TOTAL</strong>')}${td('', true)}
-              ${td('<strong>' + money(custFoot) + '</strong>', true)}${td('', true)}
+              ${ptd('<strong>TOTAL</strong>')}${ptd('', true)}
+              ${ptd('<strong>' + money(custFoot) + '</strong>', true)}${ptd('', true)}
             </tr></tfoot>
           </table>
           ${_dedTieNote(custFoot, absTotal)}
-          ${credits > 0.005 ? `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;line-height:1.5;">
+          ${credits > 0.005 ? `<p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:6px;line-height:1.5;">
             Gross of ${money(credits)} credited back to us, which the ${money(grandDed)} headline nets off.</p>` : ''}`);
 
       // ── 4 · versus plan. Same function the Reconcile tab calls, same inputs,
@@ -29842,38 +29869,49 @@ render();
         .sort((a, b) => Math.abs(b.v) - Math.abs(a.v))
         .slice(0, TOPN);
       const rCol = (v) => v > 0 ? 'var(--lost)' : 'var(--won)';
-      const panelRec = P2.err
-        ? panel('Reconciliation vs plan \u00b7 top ' + TOPN, '', goto_('reconcile', 'Vs plan'),
-            `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);padding:10px 0;">Plan could not be loaded: ${esc(P2.err)}</div>`)
-        : panel('Reconciliation vs plan \u00b7 top ' + TOPN,
+      const recTitle = 'Reconciliation vs plan \u00b7 top ' + TOPN;
+      // WITHOUT THE STORE DETAIL THERE IS NO DEDUCTION SIDE. Saying "nothing is
+      // more than $1,000 from plan" in that state is not a reassuring result, it
+      // is a false one — every retailer reads as zero deducted because nothing
+      // could be attributed. State the missing input instead.
+      const panelRec = detailFailed
+        ? panel(recTitle, '', goto_('reconcile', 'Vs plan'),
+            problem('Cannot be computed \u2014 the store-level detail above did not load.')
+            + prose('The plan side is fine; it is the deduction side that is missing. Without a banner on each detail row there is nothing to match a plan customer against, so every retailer would read as planned-but-never-deducted.'), true)
+        : P2.err
+        ? panel(recTitle, '', goto_('reconcile', 'Vs plan'), problem('Plan could not be loaded \u2014 ' + esc(P2.err)), true)
+        : panel(recTitle,
             'Trade spend only, ' + (R2.winStart ? _dedMon(R2.winStart) + ' \u2013 ' + _dedMon(R2.winEnd) : 'no dated lines')
               + '. Furthest from plan in either direction, retailers that can actually match, variances over $1,000.',
             goto_('reconcile', 'Vs plan'),
             !recTop.length
-              ? `<div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;padding:6px 0;">Nothing is more than $1,000 away from plan on a matchable retailer.${(R2.unattrib + R2.undocumented) ? ' ' + money(R2.unattrib + R2.undocumented) + ' of trade spend is not yet placed against a customer \u2014 that is the number to move first.' : ''}</div>`
+              ? prose('Nothing is more than $1,000 away from plan on a matchable retailer.'
+                  + ((R2.unattrib + R2.undocumented) ? ' ' + money(R2.unattrib + R2.undocumented) + ' of trade spend is not yet placed against a customer \u2014 that is the number to move first.' : ''))
               : `
           <table style="width:100%;border-collapse:collapse;">
-            <thead><tr>${th('Customer')}${th('Planned', true)}${th('Deducted', true)}${th('Variance', true)}${th('vs plan', true)}</tr></thead>
+            <thead><tr>${pth('Customer')}${pth('Planned', true)}${pth('Deducted', true)}${pth('Variance', true)}${pth('vs plan', true)}${pth('')}</tr></thead>
             <tbody>
               ${recTop.map(c => `<tr>
-                ${td('<span style="font-family:var(--serif);font-size:13.5px;">' + esc(c.name) + '</span>')}
-                ${td(money(c.plan), true)}
-                ${td(money(c.ded), true)}
-                ${td('<strong style="color:' + rCol(c.v) + ';">' + (c.v > 0 ? '+' : '') + money(c.v) + '</strong>', true)}
-                ${td('<span style="color:' + rCol(c.v) + ';">' + (c.v > 0 ? '+' : '') + Math.round(c.v / c.plan * 100) + '%</span>', true)}
+                ${ptd(pname(esc(c.name)))}
+                ${ptd(money(c.plan), true)}
+                ${ptd(money(c.ded), true)}
+                ${ptd('<strong style="color:' + rCol(c.v) + ';">' + (c.v > 0 ? '+' : '') + money(c.v) + '</strong>', true)}
+                ${ptd('<span style="color:' + rCol(c.v) + ';">' + (c.v > 0 ? '+' : '') + Math.round(c.v / c.plan * 100) + '%</span>', true)}
+                ${ptd('<span style="font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">' + (c.v > 0 ? 'took more than planned' : 'took less than planned') + '</span>')}
               </tr>`).join('')}
             </tbody>
             <tfoot><tr style="border-top:2px solid var(--ink);">
-              ${td('<strong>ALL CUSTOMERS</strong>')}
-              ${td('<strong>' + money(R2.totPlan) + '</strong>', true)}
-              ${td('<strong>' + money(R2.totDed) + '</strong>', true)}
-              ${td('<strong style="color:' + rCol(R2.totDed - R2.totPlan) + ';">' + money(R2.totDed - R2.totPlan) + '</strong>', true)}
-              ${td('<strong style="color:' + rCol(R2.totDed - R2.totPlan) + ';">' + (R2.totPlan ? Math.round((R2.totDed - R2.totPlan) / R2.totPlan * 100) + '%' : '\u2014') + '</strong>', true)}
+              ${ptd('<strong>ALL CUSTOMERS</strong>')}
+              ${ptd('<strong>' + money(R2.totPlan) + '</strong>', true)}
+              ${ptd('<strong>' + money(R2.totDed) + '</strong>', true)}
+              ${ptd('<strong style="color:' + rCol(R2.totDed - R2.totPlan) + ';">' + money(R2.totDed - R2.totPlan) + '</strong>', true)}
+              ${ptd('<strong style="color:' + rCol(R2.totDed - R2.totPlan) + ';">' + (R2.totPlan ? Math.round((R2.totDed - R2.totPlan) / R2.totPlan * 100) + '%' : '\u2014') + '</strong>', true)}
+              ${ptd('')}
             </tr></tfoot>
           </table>
-          ${(R2.unattrib + R2.undocumented) ? `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;line-height:1.5;">
+          ${(R2.unattrib + R2.undocumented) ? `<p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:10px;line-height:1.55;">
             ${money(R2.unattrib + R2.undocumented)} of trade spend sits outside this comparison because it is not yet placed against a customer.
-            This panel is a variance ranking, not a control total \u2014 it does not foot to the register, and is not meant to.</p>` : ''}`);
+            This panel is a variance ranking, not a control total \u2014 it does not foot to the register, and is not meant to.</p>` : ''}`, true);
 
       shell(panelCust, panelRec);
       return;
