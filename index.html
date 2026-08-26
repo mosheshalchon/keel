@@ -27296,6 +27296,10 @@ render();
       }
       alert('Vividly plan loaded: ' + finalRows.length.toLocaleString() + ' lines (' + Object.entries(yearCounts).map(([y, n]) => y + ': ' + n.toLocaleString()).join(' · ') + '), replaced ' + ((delRows || []).length).toLocaleString() + ' prior lines.');
       Object.keys(_taLinesCache).forEach(k => { delete _taLinesCache[k]; });
+      // The plan the Deductions reconciliation reads has just been replaced. Its
+      // cache key is fingerprinted on the REGISTER, which has not changed, so it
+      // would otherwise keep serving the plan that was deleted a second ago.
+      _dedBust();
       renderPromosPage();
     } catch (err) { console.error('[VIVIDLY]', err); alert('Upload failed: ' + (err && err.message || err)); }
   }
@@ -29054,7 +29058,50 @@ render();
     catch (e) { return 'all'; }
   })();
   let _dedRaw = null;             // { key, checks, lines, rmap }
-  const _dedBust = () => { _dedRaw = null; _dedDetail = null; _dedPlan = null; };
+  // ── THE TWO SLOW DATASETS, KEPT LOCALLY ─────────────────────────────────
+  // The register arrives with the page, which is why the headline, Who deducted
+  // and By category paint instantly. The store detail (~16.5k rollup rows) and
+  // the promo plan do not — together that is ~20 round trips, and it was a
+  // spinner on the landing page on EVERY visit for data that only changes when a
+  // sync runs.
+  //
+  // So both are held in IndexedDB, keyed by a FINGERPRINT OF THE REGISTER: the
+  // line count and the summed amounts. Any sync that adds, removes or re-parses
+  // a line moves the fingerprint, and the cache misses on its own. Deliberately
+  // NO time-based expiry — a TTL either serves numbers that are quietly wrong or
+  // throws away numbers that are perfectly good, and neither is worth the
+  // spinner it saves. ↻ Refresh is the manual override.
+  const _dedIdb = (() => {
+    const DB = 'keel_ded_v1', ST = 'cache';
+    let dbp = null;
+    const open = () => dbp || (dbp = new Promise((res, rej) => {
+      const r = indexedDB.open(DB, 1);
+      r.onupgradeneeded = (e) => { const db = e.target.result; if (!db.objectStoreNames.contains(ST)) db.createObjectStore(ST, { keyPath: 'key' }); };
+      r.onsuccess = (e) => res(e.target.result);
+      r.onerror = (e) => rej(e.target.error);
+    }));
+    const run = async (mode, fn) => {
+      const db = await open();
+      return new Promise((res, rej) => {
+        const t = db.transaction(ST, mode);
+        const req = fn(t.objectStore(ST));
+        t.oncomplete = () => res(req && 'result' in req ? req.result : true);
+        t.onerror = (e) => rej(e.target.error);
+        t.onabort = (e) => rej(e.target.error);
+      });
+    };
+    // A cache is an optimisation, never a dependency: every path swallows its
+    // own error and falls through to the network.
+    return {
+      get: (key) => run('readonly', st => st.get(key)).then(r => (r && r.value) || null).catch(() => null),
+      put: (key, value) => run('readwrite', st => st.put({ key, value, at: Date.now() })).catch(() => false),
+    };
+  })();
+  // Set by ↻ Refresh and by any write that invalidates the cache. Consumed ONCE,
+  // at the top of the next render, so a forced refresh refetches and rewrites
+  // rather than permanently disabling the cache.
+  let _dedSkipCache = false;
+  const _dedBust = () => { _dedRaw = null; _dedDetail = null; _dedPlan = null; _dedSkipCache = true; };
   let _dedRecCompleted = true;    // Reconcile: measure closed promos only
   let _dedRecPartial = false;     // Reconcile: include the register's partial last month
   const _dedMon = (mk) => { const q = String(mk || '').split('-');
@@ -29303,6 +29350,7 @@ render();
     let checks = [], lines = [], rmap = [], detAgg = [];
     let _dedDistCounts = { KeHE: 0, UNFI: 0 };
     let _scopedLineIds = new Set();
+    let _dedFp = '';
     // Declared out here rather than inside the try, because the Overview groups
     // the register by distributor and needs the same resolver the scope filter
     // uses. Built from the UNFILTERED check list, so it keeps answering after
@@ -29341,6 +29389,12 @@ render();
         const d = _lineDist(l);
         _dedDistCounts[d] = (_dedDistCounts[d] || 0) + Math.abs(Number(l.amount) || 0);
       }
+      // Computed BEFORE the distributor filter, so the fingerprint describes the
+      // register itself rather than the current scope (the scope is in the key).
+      // Count catches added or removed lines; the summed amounts catch a line
+      // that was re-parsed in place, which a count alone would miss.
+      _dedFp = lines.length + ':' + lines.reduce((n, l) =>
+        n + (Number(l.amount) || 0) + (Number(l.detail_line_total) || 0), 0).toFixed(2);
       if (_dedDist !== 'all') {
         lines = lines.filter(l => _lineDist(l) === _dedDist);
         checks = checks.filter(c => (c.distributor || 'KeHE') === _dedDist);
@@ -29566,7 +29620,7 @@ render();
     // hundred lines at a time therefore aggregates a hundred lines' worth of
     // rows, not all of them. Same data, ~20 cheap queries instead of 17
     // expensive ones, and no count pass at all.
-    const _dedLoadDetail = async () => {
+    const _dedFetchRollup = async () => {
       const ids = L.map(l => l.id);
       const CH = 100, POOL = 6;
       const chunks = [];
@@ -29595,18 +29649,75 @@ render();
         }
       };
       await Promise.all(Array.from({ length: Math.min(POOL, chunks.length) }, worker));
-      const bmap = await paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true }));
+      return det;
+    };
+
+    // The fetch is scoped to the lines in view, so the cache key carries that
+    // scope AND the register fingerprint. Previously this pulled every line's
+    // detail and filtered in memory, which was year-proof by accident.
+    const _detKey  = brandId + '|' + year + '|' + _dedDist + '|' + _dedFp;
+    const _planKey = brandId + '|' + year + '|' + _dedFp;
+    const _detStale  = () => !_dedDetail || _dedDetail.key !== _detKey;
+    // _dedPlan was previously kept with no key at all, so switching year reused
+    // the previous year's plan lines until something happened to bust it.
+    const _planStale = () => !_dedPlan || _dedPlan.key !== _planKey;
+
+    // Read ONCE per render and reset, so ↻ Refresh forces exactly one network
+    // pass and then the cache is live again.
+    const _skipCache = _dedSkipCache;
+    _dedSkipCache = false;
+
+    // cacheOnly: probe local storage and return null on a miss, without touching
+    // the network. Lets a caller find out whether it can paint everything at
+    // once before it commits to showing a loading state.
+    const _dedGetDetail = async ({ cacheOnly = false } = {}) => {
+      const bKey = 'bmap|' + brandId;
+      let det = null, bmap = null;
+      if (!_skipCache) {
+        const [a, b] = await Promise.all([_dedIdb.get('det|' + _detKey), _dedIdb.get(bKey)]);
+        det = a; bmap = b;
+      }
+      if (det && bmap) return { det, bmap };
+      if (cacheOnly) return null;
+      // The banner map is small and it is what the crosswalk editor rewrites, so
+      // it is fetched alongside rather than trusted from cache after a save.
+      if (!bmap) {
+        bmap = await paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true }));
+        _dedIdb.put(bKey, bmap);
+      }
+      if (!det) { det = await _dedFetchRollup(); _dedIdb.put('det|' + _detKey, det); }
       return { det, bmap };
     };
-    // The fetch is now scoped to the lines in view, so the cache has to be keyed
-    // by that scope. Previously it pulled every line's detail and filtered in
-    // memory, which was year-proof by accident; keyed explicitly, it stays so.
-    const _detKey = brandId + '|' + year + '|' + _dedDist;
-    const _detStale = () => !_dedDetail || _dedDetail.key !== _detKey;
-    if ((_dedView === 'customer' || _dedView === 'reconcile') && _detStale()) {
-      body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
-      try { _dedDetail = Object.assign({ key: _detKey }, await _dedLoadDetail()); }
-      catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
+
+    const _dedGetPlan = async ({ cacheOnly = false } = {}) => {
+      if (!_skipCache) {
+        const hit = await _dedIdb.get('plan|' + _planKey);
+        if (hit) return { lines: hit, err: null };
+      }
+      if (cacheOnly) return null;
+      const r = await _vvFetchLines(year);
+      if (r.error) return { lines: [], err: r.error.message };
+      _dedIdb.put('plan|' + _planKey, r.lines);
+      return { lines: r.lines, err: null };
+    };
+
+    // Warm the caller from cache before it decides to paint a spinner.
+    const _dedWarm = async () => {
+      const [d, p] = await Promise.all([
+        _detStale()  ? _dedGetDetail({ cacheOnly: true }).catch(() => null) : null,
+        _planStale() ? _dedGetPlan({ cacheOnly: true }).catch(() => null)   : null,
+      ]);
+      if (d) _dedDetail = Object.assign({ key: _detKey }, d);
+      if (p) _dedPlan   = Object.assign({ key: _planKey }, p);
+    };
+
+    if (_dedView === 'customer' || _dedView === 'reconcile') {
+      await _dedWarm();
+      if (_detStale()) {
+        body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
+        try { _dedDetail = Object.assign({ key: _detKey }, await _dedGetDetail()); }
+        catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
+      }
     }
 
     // EVERY TAB MUST FOOT TO THE SAME REGISTER. A tab that totals more than
@@ -29746,11 +29857,19 @@ render();
           renderDeductions(hostEl, filtersEl, year);
         });
         const rt = body.querySelector('#hl-ded-exec-retry');
-        if (rt) rt.onclick = () => { _dedDetail = null; _dedPlan = null; renderDeductions(hostEl, filtersEl, year); };
+        if (rt) rt.onclick = () => { _dedBust(); renderDeductions(hostEl, filtersEl, year); };
       };
 
-      shell(panel('Top ' + TOPN + ' customers', '', '', wait('Loading store-level detail\u2026')),
-            panel('Reconciliation vs plan \u00b7 top ' + TOPN, '', '', wait('Loading the promo plan\u2026'), true));
+      // WARM FIRST, PAINT ONCE. A local cache hit resolves in a few milliseconds,
+      // so on any visit after the first the whole overview appears in one frame
+      // with no loading state at all. The skeleton is painted ONLY when the probe
+      // actually misses — which is a cold cache or a register that has changed.
+      await _dedWarm();
+      const _cold = _detStale() || _planStale();
+      if (_cold) {
+        shell(panel('Top ' + TOPN + ' customers', '', '', wait('Loading store-level detail\u2026')),
+              panel('Reconciliation vs plan \u00b7 top ' + TOPN, '', '', wait('Loading the promo plan\u2026'), true));
+      }
 
       // Both remaining panels need the rollup; the reconciliation also needs the
       // plan. Fetched together so the second panel does not wait on the first.
@@ -29758,13 +29877,13 @@ render();
         await Promise.all([
           (async () => {
             if (!_detStale()) return;
-            try { _dedDetail = Object.assign({ key: _detKey }, await _dedLoadDetail()); }
+            try { _dedDetail = Object.assign({ key: _detKey }, await _dedGetDetail()); }
             catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
           })(),
           (async () => {
-            if (_dedPlan) return;
-            try { const r = await _vvFetchLines(year); _dedPlan = { lines: r.lines || [], err: r.error ? r.error.message : null }; }
-            catch (e) { _dedPlan = { lines: [], err: String(e.message || e) }; }
+            if (!_planStale()) return;
+            try { _dedPlan = Object.assign({ key: _planKey }, await _dedGetPlan()); }
+            catch (e) { _dedPlan = { key: _planKey, lines: [], err: String(e.message || e) }; }
           })(),
         ]);
       } catch (e) { /* each branch already records its own error */ }
@@ -29918,12 +30037,10 @@ render();
     }
 
     // ── by customer ─────────────────────────────────────────────────────────
-    if (_dedView === 'reconcile' && !_dedPlan) {
+    if (_dedView === 'reconcile' && _planStale()) {
       body.innerHTML = '<div class="hl-loading">Loading the promo plan\u2026</div>';
-      try {
-        const r = await _vvFetchLines(year);
-        _dedPlan = { lines: r.lines || [], err: r.error ? r.error.message : null };
-      } catch (e) { _dedPlan = { lines: [], err: String(e.message || e) }; }
+      try { _dedPlan = Object.assign({ key: _planKey }, await _dedGetPlan()); }
+      catch (e) { _dedPlan = { key: _planKey, lines: [], err: String(e.message || e) }; }
     }
 
     // ── reconcile ─────────────────────────────────────────────────────────
