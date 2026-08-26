@@ -29205,6 +29205,17 @@ render();
     ];
     const views = VIEW_GROUPS.flatMap(g => g.views);
 
+    // DECLARED HERE, ABOVE FIRST USE. These were further down the function while
+    // the headline markup above referenced them — const is hoisted but not
+    // initialised, so the page died with "Cannot access 'DSHORT' before
+    // initialization" and sat on "Loading deductions..." forever.
+    // The screen said "KeHE" everywhere because KeHE was once the only
+    // distributor. Under All or UNFI those labels are simply false, so the name
+    // now comes from the scope in one place rather than a dozen literal strings.
+    const DNAME = _dedDist === 'all' ? 'the distributors' : _dedDist;
+    const DSHORT = _dedDist === 'all' ? 'Distributor' : _dedDist;
+
+
     // Trade-spend dollars with no store detail, or whose banner reaches no plan
     // customer. Computed here so the headline can state it before any tab loads;
     // null when the detail has not been fetched yet, and the clause is dropped
@@ -29312,11 +29323,6 @@ render();
       } catch (e) { _dedDetail = { det: [], bmap: [], err: String(e.message || e) }; }
     }
 
-    // The screen said "KeHE" everywhere because KeHE was once the only
-    // distributor. Under All or UNFI those labels are simply false, so the name
-    // now comes from the scope in one place rather than a dozen literal strings.
-    const DNAME = _dedDist === 'all' ? 'the distributors' : _dedDist;
-    const DSHORT = _dedDist === 'all' ? 'Distributor' : _dedDist;
     // EVERY TAB MUST FOOT TO THE SAME REGISTER. A tab that totals more than
     // "Deducted 2026" is not a display quirk — it means dollars are being
     // double-counted or dropped somewhere, and the whole screen stops being
