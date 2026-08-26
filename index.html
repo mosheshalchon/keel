@@ -30098,12 +30098,16 @@ ${(() => {
                 <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${list.length}</button>
                 <span style="margin-left:10px;">${list.length - _dedCustLimit} smaller customers hidden \u00b7 the row below still counts them</span>
               </td></tr>` : ''}
+              <!-- FOOT TO THE REGISTER. This tab used to end at "Traced to a store"
+                   and push the remainder into a footnote, so it read $411,569
+                   against a $637,257 register and looked like money had gone
+                   missing. The undocumented remainder is a ROW now: same total as
+                   every other tab, with the gap named rather than excused. -->
+              <tr>${td('Other \u2014 no store-level detail', false, 'color:var(--ink-3);border-top:1px solid var(--rule-soft);')}${MS.map(() => td('\u00b7', true, 'color:var(--rule);')).join('')}${td(money(undoc + unattributed), true, 'color:var(--ink-3);')}</tr>
               <tr>${td('<strong>Traced to a store</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(m => td('<strong>' + money(list.reduce((n, b) => n + (b.months.get(m) || 0), 0)) + '</strong>', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(documented) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table></div>
-          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;">
-            Excludes ${money(undoc + unattributed)} with no store-level backup. See the Customers tab for the breakdown.
-          </div>`;
+          `;
       } else {
         body.innerHTML = bar + `
           <table style="width:100%;border-collapse:collapse;">
@@ -30199,7 +30203,10 @@ ${(() => {
             ${td('<strong>' + Math.round(parsedN / L.length * 100) + '%</strong>', true)}
           </tr></tfoot>
         </table>
-        ${_dedTieNote(catRows.reduce((n, r) => n + Math.abs(r.total || 0), 0), -totalAmt)}`;
+        ${/* catRows carries `amount`, not `total` — reading the wrong field summed
+             to zero and the tab accused itself of losing the entire register.
+             The check was right to shout; it was measuring the wrong thing. */
+          _dedTieNote(catRows.reduce((n, r) => n + (-r.amount || 0), 0), -totalAmt)}`;
       return;
     }
 
@@ -45037,6 +45044,8 @@ ${(() => {
       const msg = document.getElementById('hl-sp-syncmsg');
       const prev = syncBtn.textContent;
       syncBtn.disabled = true; syncBtn.textContent = 'Syncing\u2026';
+      const esc = (v) => String(v == null ? '' : v)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
       const note = (html, colour) => { if (msg) msg.innerHTML =
         `<div style="font-family:var(--mono);font-size:11px;color:${colour};border-left:2px solid ${colour};padding:7px 0 7px 10px;line-height:1.55;">${html}</div>`; };
       note('Fetching the NetSuite export from Dropbox and rebuilding every month. This takes a minute or two \u2014 leave the page open.', 'var(--ink-3)');
