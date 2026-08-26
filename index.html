@@ -237,6 +237,24 @@ body::before {
 .nav-item.nav-child .bullet { width: 5px; height: 5px; }
 .nav-item.nav-child.active .bullet { width: 6px; height: 6px; }
 
+/* Sub-tabs under the ACTIVE nav item (Promos -> Plan / Trade analyzer /
+   Deductions). Rendered only while that page is open, so the sidebar does not
+   grow permanently; the rail on the left is what ties them to their parent. */
+.nav-subs { display: flex; flex-direction: column; margin: 2px 0 6px 4px; }
+.nav-sub {
+  display: block;
+  padding: 5px 0 5px 22px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  border-left: 1px solid var(--rule-soft);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.nav-sub:hover { color: var(--ink); }
+.nav-sub.active { color: var(--ink); font-weight: 600; border-left: 1px solid var(--ink); }
+
 .user-block {
   margin-top: auto;
   padding-top: 20px;
@@ -5209,6 +5227,16 @@ HL.NAV_GROUPS = [
   { type: 'item',  id: 'settings' },
 ];
 
+// Sub-tabs shown beneath a nav item while that page is the active one.
+// These are deliberately NOT NAV_ITEMS. A new nav item ships denied-by-default
+// to every configured department (the tab matrix has bitten this codebase three
+// times), and these are three VIEWS of one page, not three pages — routing is a
+// ?view= query param on the same hash, so the permission key stays 'promos'.
+// Populated by the page that owns them, so the labels have exactly one source.
+HL.NAV_SUBTABS = {};
+// Which sub-tab is live, set by the page renderer before it mounts.
+HL.SUBTAB_ACTIVE = {};
+
 HL.initials = function(name) {
   return (name || '').split(/\s+/).filter(Boolean).slice(0, 2).map(p => p[0]).join('').toUpperCase();
 };
@@ -5230,12 +5258,17 @@ HL.renderSidebar = function(activeId) {
     if (!item) return '';
     const isActive = item.id === activeId;
     const cnt = counts[item.id];
+    const subs = isActive ? ((HL.NAV_SUBTABS || {})[item.id] || null) : null;
+    const curSub = subs ? (HL.SUBTAB_ACTIVE || {})[item.id] : null;
     return `
       <a href="${item.href}" class="nav-item ${isActive ? 'active' : ''} ${opts.child ? 'nav-child' : ''}">
         <span class="bullet"></span>
         <span>${item.label}</span>
         ${cnt ? `<span class="badge">${String(cnt).padStart(2, '0')}</span>` : ''}
       </a>
+      ${subs && subs.length ? `<div class="nav-subs">${subs.map(sv =>
+        `<a href="#${item.id}?view=${sv.v}" class="nav-sub ${sv.v === curSub ? 'active' : ''}">${sv.label}</a>`
+      ).join('')}</div>` : ''}
     `;
   };
 
@@ -27294,11 +27327,37 @@ render();
   // UNFI weekly (cases + $), KeHE weekly ($ only), wfm_sales (units + $) and kroger_sales
   // (units + $, ≈ fiscal-week mapping). SPINS deliberately deferred to v2.
   const PROMO_VIEWS = [['plan', 'Plan'], ['analyzer', 'Trade analyzer'], ['deductions', 'Deductions']];
+  // The sidebar renders these beneath Promos while the page is open. Fed from
+  // PROMO_VIEWS rather than restated there, so a fourth view can never appear in
+  // one list and not the other — which is precisely how TAB_DEFS drifted.
+  if (window.HL) HL.NAV_SUBTABS = Object.assign(HL.NAV_SUBTABS || {}, {
+    promos: PROMO_VIEWS.map(([v, label]) => ({ v, label })),
+  });
   let _promoView = (() => {
     try { const v = localStorage.getItem('keel_promo_view');
           return PROMO_VIEWS.some(([id]) => id === v) ? v : 'plan'; }
     catch (e) { return 'plan'; }
   })();
+  // THE HASH IS THE TRUTH, localStorage is only the fallback. The sidebar links
+  // to #promos?view=deductions, so the view has to be resolved from the URL
+  // before the sidebar is mounted — otherwise the highlight lags one click
+  // behind the page. Called at the top of renderPromosPage, before mountPage.
+  function _promoResolveView() {
+    try {
+      const q = (location.hash.split('?')[1] || '');
+      const v = new URLSearchParams(q).get('view');
+      if (v && PROMO_VIEWS.some(([id]) => id === v)) {
+        _promoView = v;
+        try { localStorage.setItem('keel_promo_view', v); } catch (e) {}
+      }
+    } catch (e) {}
+    if (window.HL) (HL.SUBTAB_ACTIVE = HL.SUBTAB_ACTIVE || {}).promos = _promoView;
+    return _promoView;
+  }
+  // 2027 is Keel-built promos, which the analyzer has no Vividly lines to
+  // measure. Rather than hide the year pill's meaning, each view declares the
+  // years it can answer for and an out-of-range year is clamped visibly.
+  const PROMO_YEARS_FOR = (v) => v === 'analyzer' ? [2025, 2026] : [2025, 2026, 2027];
   let _taCompletedOnly = true;
   const _taCache = {};
   const _taLinesCache = {};
@@ -28928,7 +28987,11 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['summary', 'reconcile', 'other', 'category', 'customer', 'code', 'checks', 'exceptions'];
+  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'other', 'category', 'customer', 'code', 'checks', 'exceptions'];
+  // The detail tabs are collapsed on the Overview and open automatically on any
+  // other view. Session state, not persisted — this is where you are looking
+  // right now, not a preference.
+  let _dedDetailBar = false;
   let _dedOthCat = new Set();     // Other charges: expanded categories
   let _dedOthCode = new Set();    // Other charges: expanded reason codes
   let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
@@ -29010,8 +29073,8 @@ render();
   };
   let _dedView = (() => {
     try { const v = localStorage.getItem('keel_ded_view');
-          return DED_VIEWS.includes(v) ? v : 'category'; }
-    catch (e) { return 'category'; }
+          return DED_VIEWS.includes(v) ? v : 'exec'; }
+    catch (e) { return 'exec'; }
   })();
   let _dedDetail = null;          // cached store-level detail for the Customer tab
   let _dedOpen = new Set();       // which customers are expanded
@@ -29024,6 +29087,187 @@ render();
     catch (e) { return 'list'; }
   })();                           // 'list' | 'months'
   let _dedExpand = {};
+
+  // Trade or not, from the reason map. Defined at module level and bound to a
+  // map, because it is needed in two places that never run in the same branch:
+  // the reconciliation and the All buckets tab. It used to be a const inside the
+  // reconcile branch alone, so All buckets referenced a name that did not exist
+  // there and threw the moment it was opened.
+  const _dedIsTradeFor = (rmapBy) => (l) => { const rm = rmapBy[l.reason_code]; return !!(rm && rm.is_trade_spend); };
+
+  // ── THE RECONCILIATION, COMPUTED ONCE ───────────────────────────────────
+  // Lifted out of the Reconcile tab so the Overview can show the same numbers
+  // without a second, subtly different implementation. Pure: it reads nothing
+  // from module state and writes nothing back, so both callers are guaranteed
+  // the same answer for the same inputs. Nothing about the arithmetic changed
+  // when it moved here — only where it lives.
+  function _dedComputeRecon({ L, rmapBy, D, P, scopedIds, dist, completedOnly, includePartial, year }) {
+      // deduction_detail has no distributor column, so it is fetched whole and
+      // narrowed here to the lines in scope — otherwise By customer and the
+      // reconciliation would total every distributor's stores under one label.
+      // Filtered into a LOCAL, never written back onto the cache: the overview
+      // and the Reconcile tab both call this, and mutating the shared array in
+      // one would silently narrow it for the other.
+      const det = (D.det || []).filter(d => scopedIds.has(d.line_id));
+      const bm = new Map((D.bmap || []).map(b => [b.banner_raw, b]));
+      const normCat = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+
+      // THE RETAILER JOIN. deduction_banner_map only covers banners someone has
+      // crosswalked by hand — which is none of UNFI's, whose detail names stores
+      // ("WEGMANS #58 FROZEN") and chain codes ("WGE"). So a plan line for
+      // Wegmans and the Wegmans deductions sat either side of a gap.
+      //
+      // Vividly's Customer Name IS the retailer, so it can be matched directly.
+      // Same normaliser as the crosswalk mapper: strip store numbers, suffixes
+      // and noise words, then require an exact or prefix hit. Anything looser
+      // would silently merge retailers, which is worse than not matching.
+      const _planCusts = [...new Set(P.lines.map(pl => pl.customer).filter(Boolean))];
+      const _planIdx = new Map();
+      for (const pc of _planCusts) { const k = _dedNorm(pc); if (k && !_planIdx.has(k)) _planIdx.set(k, pc); }
+      const _autoMatch = (raw) => {
+        const k = _dedNorm(raw);
+        if (!k) return null;
+        if (_planIdx.has(k)) return _planIdx.get(k);
+        for (const [pk, pc] of _planIdx) {
+          if (pk.length >= 4 && (k.startsWith(pk + ' ') || k === pk)) return pc;
+        }
+        return null;
+      };
+
+      // Catch-all plan lines name a distributor or nothing at all. They can
+      // never match a retailer, so they are labelled rather than left looking
+      // like retailers that failed to reconcile.
+      const _tierOf = (name) => {
+        const n = String(name || '').toLowerCase();
+        if (n === 'all customers' || n === '(no customer)') return 'unattributable';
+        if (/^(unfi|kehe)( all other)?$/.test(n) || /all other/.test(n)) return 'catch-all';
+        return 'retailer';
+      };
+
+      const isTrade = _dedIsTradeFor(rmapBy);
+      const catOfLine = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || l.reason_code || 'Unresolved'; };
+
+      // ── THE WINDOW. The register is a YTD pull; the plan is a full year.
+      // Comparing them whole is apples to oranges and produces a variance that is
+      // mostly calendar. So the window is derived FROM THE REGISTER and the plan
+      // is clipped to it — nothing outside is differenced, it is reported apart.
+      //
+      // The register's newest month is normally PARTIAL (the pull happens mid-
+      // month). Detected by line count against the median of the earlier months
+      // rather than by date arithmetic, because what matters is whether the month
+      // looks finished, not whether the calendar says it is.
+      const monthLines = new Map();
+      for (const l of L) {
+        const mk2 = String(l.doc_date || '').slice(0, 7);
+        if (mk2) monthLines.set(mk2, (monthLines.get(mk2) || 0) + 1);
+      }
+      const monthsSorted = [...monthLines.keys()].sort();
+      const winStart = monthsSorted[0] || null;
+      const winLast = monthsSorted[monthsSorted.length - 1] || null;
+      let partialMonth = null;
+      if (monthsSorted.length >= 3) {
+        const prior = monthsSorted.slice(0, -1).map(m => monthLines.get(m)).sort((a, b) => a - b);
+        const med = prior[Math.floor(prior.length / 2)];
+        if (med && monthLines.get(winLast) < med * 0.6) partialMonth = winLast;
+      }
+      const winEnd = (partialMonth && !includePartial) ? monthsSorted[monthsSorted.length - 2] : winLast;
+      const inWindow = (mk2) => !!mk2 && !!winStart && !!winEnd && mk2 >= winStart && mk2 <= winEnd;
+      const planMonthOf = (pl) => {
+        if (pl.start_date) return String(pl.start_date).slice(0, 7);
+        const m = Number(pl.month);
+        return (m >= 1 && m <= 12) ? String(year) + '-' + String(m).padStart(2, '0') : '';
+      };
+
+      const TL = L.filter(isTrade);
+      const tradeTotal = TL.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
+      const detByLine = new Map();
+      for (const d of det) {
+        if (!detByLine.has(d.line_id)) detByLine.set(d.line_id, []);
+        detByLine.get(d.line_id).push(d);
+      }
+
+      // deduction side, attributed
+      const cells = new Map();          // customer -> {cats: cat -> {months: m -> amt}}
+      const catsSeen = new Set();
+      let unattrib = 0, undocumented = 0, placed = 0, autoMatched = 0;
+      const unattribBy = new Map();     // banner_raw -> amount (what to map next)
+      for (const l of TL) {
+        if (winStart && !inWindow(String(l.doc_date || '').slice(0, 7))) continue;
+        const amt = Math.abs(Number(l.amount || 0));
+        const cat = catOfLine(l);
+        catsSeen.add(normCat(cat));
+        const rows = detByLine.get(l.id) || [];
+        const base = rows.reduce((s2, d) => s2 + Math.abs(Number(d.bill_amount || 0)), 0);
+        if (!rows.length || base <= 0) { undocumented += amt; continue; }
+        for (const d of rows) {
+          const share = amt * (Math.abs(Number(d.bill_amount || 0)) / base);
+          const raw = d.banner || null;
+          const m = raw ? bm.get(raw) : null;
+          // Crosswalk first — a hand-made mapping always beats a guess. Auto
+          // match only fills the gap where no crosswalk row exists.
+          const pc = (m && m.plan_customer)
+                  || _autoMatch(d.customer_name)
+                  || _autoMatch(raw)
+                  || null;
+          if (pc && !(m && m.plan_customer)) autoMatched += Math.abs(Number(d.bill_amount || 0));
+          const mk2 = String(d.reference_date || d.date_from || l.doc_date || '').slice(0, 7);
+          if (!pc) {
+            unattrib += share;
+            const k = raw || d.customer_name || '(no banner)';
+            unattribBy.set(k, (unattribBy.get(k) || 0) + share);
+            continue;
+          }
+          placed += share;
+          let c = cells.get(pc);
+          if (!c) cells.set(pc, c = { name: pc, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(pc) });
+          c.ded += share;
+          const ck = normCat(cat);
+          let cc = c.cats.get(ck);
+          if (!cc) c.cats.set(ck, cc = { key: ck, label: cat, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
+          cc.ded += share;
+          if (mk2) cc.months.set(mk2, (cc.months.get(mk2) || 0) + share);
+        }
+      }
+
+      // plan side — KeHE-served lines whose type matches a category KeHE deducted
+      let planExcludedType = 0, planExcludedRecv = 0, planOutOfWindow = 0, planNotClosed = 0;
+      for (const pl of P.lines) {
+        const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
+        const exp = Number(pl.expected_spend || 0);
+        // The plan side follows the distributor scope. Without this, scoping to
+        // UNFI compares UNFI's deductions against KeHE's plan — a variance made
+        // entirely of the mismatch.
+        const recvOk = dist === 'all' ? /kehe|unfi/i.test(recv)
+                     : dist === 'UNFI' ? /unfi/i.test(recv)
+                     : /kehe/i.test(recv);
+        if (!recvOk) { planExcludedRecv += exp; continue; }
+        const ck = normCat(pl.promo_type);
+        if (!catsSeen.has(ck)) { planExcludedType += exp; continue; }
+        if (!inWindow(planMonthOf(pl))) { planOutOfWindow += exp; continue; }
+        // An Approved or Running promo has no deduction yet because it has not
+        // closed — counting it as under-deducted is the same calendar error as
+        // an unbounded window, one level down.
+        if (completedOnly && !/completed/i.test(String(pl.status || ''))) { planNotClosed += exp; continue; }
+        const cust = pl.customer || '(no customer)';
+        let c = cells.get(cust);
+        if (!c) cells.set(cust, c = { name: cust, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(cust) });
+        c.plan += exp;
+        let cc = c.cats.get(ck);
+        if (!cc) c.cats.set(ck, cc = { key: ck, label: pl.promo_type || ck, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
+        cc.plan += exp;
+        const pmk = planMonthOf(pl);
+        if (pmk) cc.pmonths.set(pmk, (cc.pmonths.get(pmk) || 0) + exp);
+      }
+
+      const rows = [...cells.values()].sort((a, b) => (b.ded + b.plan) - (a.ded + a.plan));
+      const totPlan = rows.reduce((s2, c) => s2 + c.plan, 0);
+      const totDed = rows.reduce((s2, c) => s2 + c.ded, 0);
+      const unattribList = [...unattribBy.entries()].sort((a, b) => b[1] - a[1]);
+    return { cells, rows, totPlan, totDed, unattrib, undocumented, placed, autoMatched,
+             unattribBy, unattribList, tradeTotal, catsSeen,
+             winStart, winEnd, partialMonth, monthLines, monthsSorted,
+             planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed };
+  }
 
   async function renderDeductions(hostEl, filtersEl, year) {
     const sb = window.Auth.getClient();
@@ -29090,6 +29334,11 @@ render();
     let checks = [], lines = [], rmap = [], detAgg = [];
     let _dedDistCounts = { KeHE: 0, UNFI: 0 };
     let _scopedLineIds = new Set();
+    // Declared out here rather than inside the try, because the Overview groups
+    // the register by distributor and needs the same resolver the scope filter
+    // uses. Built from the UNFILTERED check list, so it keeps answering after
+    // `checks` is narrowed to one distributor.
+    let _lineDist = () => 'KeHE';
     const rawKey = brandId + '|' + year;
     try {
       if (_dedRaw && _dedRaw.key === rawKey) {
@@ -29109,7 +29358,10 @@ render();
       // unattached UNFI line would vanish from a UNFI-scoped view.
       _dedDistCounts = { KeHE: 0, UNFI: 0 };
       const _ckDist = new Map(checks.map(c => [c.id, c.distributor || 'KeHE']));
-      const _lineDist = (l) => (l.check_id && _ckDist.get(l.check_id))
+      // Whatever the check's `distributor` column says — so a third source (C&S,
+      // a direct customer) appears on the Overview the day its first check lands,
+      // with no code change here.
+      _lineDist = (l) => (l.check_id && _ckDist.get(l.check_id))
         || (String(l.reason_code || '').startsWith('UNFI-') ? 'UNFI' : 'KeHE');
       // Dollars, not lines. KeHE books one line per deduction (1,792 of them);
       // UNFI books one line per FILE with thousands of store rows beneath (68).
@@ -29142,6 +29394,7 @@ render();
     const inYear = (d) => !d || String(d).slice(0, 4) === yr;
     const L = lines.filter(l => inYear(l.doc_date));
     const rmapBy = Object.fromEntries(rmap.map(r => [r.reason_code, r]));
+    const isTrade = _dedIsTradeFor(rmapBy);
     const checkById = Object.fromEntries(checks.map(c => [c.id, c]));
 
     const totalAmt = L.reduce((s, l) => s + Number(l.amount || 0), 0);
@@ -29270,7 +29523,15 @@ render();
       </div>
 
       <div style="margin:10px 0 4px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
-        ${VIEW_GROUPS.map(g => `
+        <button class="hl-ded-view" data-v="exec"
+          style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;cursor:pointer;margin-right:10px;
+                 border:1px solid ${_dedView === 'exec' ? 'var(--ink)' : 'var(--rule-soft)'};
+                 background:${_dedView === 'exec' ? 'var(--ink)' : 'transparent'};
+                 color:${_dedView === 'exec' ? 'var(--paper)' : 'var(--ink-3)'};">Overview</button>
+        <button id="hl-ded-detailbar"
+          style="font-family:var(--mono);font-size:10px;padding:6px 12px;border-radius:5px;cursor:pointer;margin-right:10px;
+                 border:1px solid var(--rule-soft);background:transparent;color:var(--ink-3);">Detail views ${_dedDetailBar || _dedView !== 'exec' ? '\u25B4' : '\u25BE'}</button>
+        ${!(_dedDetailBar || _dedView !== 'exec') ? '' : VIEW_GROUPS.map(g => `
           <span style="display:inline-flex;align-items:center;gap:5px;margin-right:16px;">
             <span style="font-family:var(--mono);font-size:9px;letter-spacing:0.07em;text-transform:uppercase;color:var(--rule);">${g.label}</span>
             ${g.views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}"
@@ -29288,10 +29549,22 @@ render();
 
     hostEl.querySelectorAll('.hl-ded-view').forEach(b => b.onclick = () => {
       if (b.dataset.v === _dedView) return;
+      // Returning to the Overview collapses the detail bar with it, so the
+      // landing page always lands in the same state.
+      if (b.dataset.v === 'exec') _dedDetailBar = false;
       _dedView = b.dataset.v;
       try { localStorage.setItem('keel_ded_view', _dedView); } catch (e) {}
       renderDeductions(hostEl, filtersEl, year);
     });
+
+    const _dbar = document.getElementById('hl-ded-detailbar');
+    if (_dbar) _dbar.onclick = () => {
+      // Opening the bar from the Overview reveals the tabs; closing it from a
+      // detail tab has to return somewhere, and the Overview is that somewhere.
+      if (_dedView !== 'exec') { _dedView = 'exec'; try { localStorage.setItem('keel_ded_view', 'exec'); } catch (e) {} _dedDetailBar = false; }
+      else _dedDetailBar = !_dedDetailBar;
+      renderDeductions(hostEl, filtersEl, year);
+    };
 
     const body = document.getElementById('hl-ded-body');
     const rfsh = document.getElementById('hl-ded-refresh');
@@ -29345,6 +29618,267 @@ render();
     const th = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
     const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
 
+    // ── OVERVIEW ────────────────────────────────────────────────────────────
+    // ONE SCREEN THAT ANSWERS "where did the money go". Four cuts of the same
+    // register, each footing to the same total: who took it, from which of our
+    // customers, for what, and how that compares to the plan.
+    //
+    // The first two panels need only the register, so they paint immediately.
+    // The customer and reconciliation panels need the ~15k-row rollup and the
+    // promo plan, so they load after the page is already useful rather than
+    // holding the whole screen hostage — this view is the landing page now, and
+    // a landing page that blocks for several seconds is worse than no landing
+    // page at all.
+    if (_dedView === 'exec') {
+      const TOPN = 10;
+      const grandDed = -totalAmt;
+      const shr = (n) => grandDed ? (n / grandDed * 100).toFixed(1) + '%' : '—';
+      const goto_ = (v, lbl) => `<a href="#" class="hl-ded-goto" data-v="${v}"
+        style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.05em;color:var(--ink-3);border-bottom:1px solid var(--rule);">${lbl} \u2192</a>`;
+      const panel = (title, sub, link, inner) => `
+        <section style="border:1px solid var(--rule-soft);border-radius:8px;padding:15px 17px 13px;background:var(--paper);min-width:0;">
+          <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;text-transform:uppercase;color:var(--ink-3);">${title}</div>
+            ${link || ''}
+          </div>
+          ${sub ? `<div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:4px;line-height:1.5;">${sub}</div>` : ''}
+          <div style="margin-top:11px;">${inner}</div>
+        </section>`;
+      const bar = (n, max) => `<div style="height:2px;background:var(--ink);opacity:.75;width:${max ? (n / max * 100).toFixed(2) : 0}%;"></div>`;
+      const wait = (t) => `<div class="hl-loading" style="padding:14px 0;">${t}</div>`;
+
+      // ── 1 · who took it. Grouped on the check's own distributor column, not a
+      // hardcoded pair, so a direct customer that starts remitting shows up on
+      // its own row the day its first check loads.
+      const distMap = new Map();
+      for (const l of L) {
+        const d = _lineDist(l) || 'Unknown';
+        let e = distMap.get(d);
+        if (!e) distMap.set(d, e = { name: d, lines: 0, amt: 0, fee: 0, checks: new Set() });
+        e.lines++; e.amt += -Number(l.amount || 0); e.fee += Number(l.processing_fee || 0);
+        if (l.check_id) e.checks.add(l.check_id);
+      }
+      const distRows = [...distMap.values()].sort((a, b) => b.amt - a.amt);
+      const distMax = Math.max(1, ...distRows.map(r => r.amt));
+      const panelDist = panel('Who deducted', _dedDist === 'all'
+          ? 'Every source on the register. Lines are not comparable across sources \u2014 KeHE books one line per deduction, UNFI one per file \u2014 so the money is the comparator.'
+          : 'Scoped to ' + esc(_dedDist) + '. Clear the distributor filter above to compare sources.',
+        goto_('checks', 'Checks'), `
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>${th('Source')}${th('Lines', true)}${th('Fees $', true)}${th('Deducted', true)}${th('Share', true)}</tr></thead>
+          <tbody>
+            ${distRows.map(r => `<tr>
+              ${td('<span style="font-family:var(--serif);font-size:13.5px;">' + esc(r.name) + '</span><div style="margin-top:5px;">' + bar(r.amt, distMax) + '</div>')}
+              ${td(r.lines.toLocaleString(), true)}
+              ${td(r.fee ? money(Math.abs(r.fee)) : '<span style="color:var(--ink-3);">\u2014</span>', true)}
+              ${td('<strong>' + money(r.amt) + '</strong>', true)}
+              ${td(shr(r.amt), true, 'color:var(--ink-3);')}
+            </tr>`).join('')}
+          </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>TOTAL</strong>')}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${td('<strong>' + (totalFee ? money(Math.abs(totalFee)) : '\u2014') + '</strong>', true)}
+            ${td('<strong>' + money(grandDed) + '</strong>', true)}${td('', true)}
+          </tr></tfoot>
+        </table>`);
+
+      // ── 3 · what it was for. catRows is already sorted largest-first.
+      const catTop = catRows.slice(0, TOPN);
+      const catRest = catRows.slice(TOPN);
+      const catRestAmt = catRest.reduce((n, r) => n + -r.amount, 0);
+      const catMax = Math.max(1, ...catTop.map(r => -r.amount));
+      const panelCat = panel('Top ' + TOPN + ' categories', 'What the money was taken for, from the reason code on each line.',
+        goto_('category', 'By category'), `
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>${th('Category')}${th('Lines', true)}${th('Deducted', true)}${th('Share', true)}</tr></thead>
+          <tbody>
+            ${catTop.map(r => {
+              const warn = r.key.startsWith('\u26A0');
+              return `<tr>
+                ${td('<span style="font-family:var(--serif);font-size:13.5px;' + (warn ? 'color:var(--lost);' : '') + '">' + esc(r.key) + '</span>'
+                    + (r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : '')
+                    + '<div style="margin-top:5px;">' + bar(-r.amount, catMax) + '</div>')}
+                ${td(r.lines.toLocaleString(), true)}
+                ${td('<strong>' + money(-r.amount) + '</strong>', true)}
+                ${td(shr(-r.amount), true, 'color:var(--ink-3);')}
+              </tr>`;
+            }).join('')}
+            ${catRest.length ? `<tr>${td('<span style="color:var(--ink-3);">Other \u00b7 ' + catRest.length + ' ' + (catRest.length === 1 ? 'category' : 'categories') + '</span>')}${td(catRest.reduce((n, r) => n + r.lines, 0).toLocaleString(), true, 'color:var(--ink-3);')}${td(money(catRestAmt), true, 'color:var(--ink-3);')}${td(shr(catRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
+          </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>TOTAL</strong>')}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${td('<strong>' + money(grandDed) + '</strong>', true)}${td('', true)}
+          </tr></tfoot>
+        </table>`);
+
+      const shell = (custHtml, recHtml) => {
+        body.innerHTML = `
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:16px;align-items:start;">
+            ${panelDist}${custHtml}${panelCat}${recHtml}
+          </div>`;
+        body.querySelectorAll('.hl-ded-goto').forEach(a => a.onclick = (e) => {
+          e.preventDefault();
+          _dedView = a.dataset.v;
+          try { localStorage.setItem('keel_ded_view', _dedView); } catch (e2) {}
+          renderDeductions(hostEl, filtersEl, year);
+        });
+      };
+
+      shell(panel('Top ' + TOPN + ' customers', '', '', wait('Loading store-level detail\u2026')),
+            panel('Reconciliation vs plan \u00b7 top ' + TOPN, '', '', wait('Loading the promo plan\u2026')));
+
+      // Both remaining panels need the rollup; the reconciliation also needs the
+      // plan. Fetched together so the second panel does not wait on the first.
+      try {
+        await Promise.all([
+          (async () => {
+            if (_dedDetail) return;
+            try {
+              const [det, bmap] = await Promise.all([
+                pagedFast(() => sb.from('deduction_detail_rollup').select('line_id,banner,customer_name,customer_no,customer_state,bill_amount,reference_date,date_from,stores', { count: 'exact' }).eq('brand_id', brandId).order('line_id', { ascending: true })),
+                paged(() => sb.from('deduction_banner_map').select('banner_raw,banner,plan_customer').eq('brand_id', brandId).order('banner_raw', { ascending: true })),
+              ]);
+              _dedDetail = { det, bmap };
+            } catch (e) { _dedDetail = { det: [], bmap: [], err: String(e.message || e) }; }
+          })(),
+          (async () => {
+            if (_dedPlan) return;
+            try { const r = await _vvFetchLines(year); _dedPlan = { lines: r.lines || [], err: r.error ? r.error.message : null }; }
+            catch (e) { _dedPlan = { lines: [], err: String(e.message || e) }; }
+          })(),
+        ]);
+      } catch (e) { /* each branch already records its own error */ }
+
+      // ── 2 · which of our customers. Same rollup the By customer tab reads,
+      // reduced to a top-ten plus the two remainders that make it foot: the
+      // smaller customers, and the dollars no store detail explains at all.
+      const D2 = _dedDetail || { det: [], bmap: [] };
+      const det2 = (D2.det || []).filter(d => _scopedLineIds.has(d.line_id));
+      const bm2 = new Map((D2.bmap || []).map(b => [b.banner_raw, b]));
+      const lineById2 = new Map(L.map(l => [l.id, l]));
+      const cust2 = new Map();
+      const perLine2 = new Map();
+      let noName2 = 0;
+      for (const d of det2) {
+        const l = lineById2.get(d.line_id);
+        if (!l) continue;                          // outside the selected year
+        const amt = Math.abs(Number(d.bill_amount || 0));
+        const raw = d.banner || null;
+        const m = raw ? bm2.get(raw) : null;
+        if (m && m.banner === null) continue;      // mapped to null = not a customer
+        perLine2.set(d.line_id, (perLine2.get(d.line_id) || 0) + amt);
+        const name = (m && m.banner) || raw || d.customer_name || null;
+        if (!name) { noName2 += amt; continue; }
+        let e = cust2.get(name);
+        if (!e) cust2.set(name, e = { name, amt: 0, plan: (m && m.plan_customer) || null, stores: new Set() });
+        e.amt += amt;
+        if (d.customer_name) e.stores.add(d.customer_name);
+      }
+      // Whatever the register holds that no store row accounts for. Shown as a
+      // row rather than a footnote, so the panel totals the register exactly.
+      let undoc2 = 0;
+      for (const l of L) {
+        const g = Math.abs(Number(l.amount || 0)) - (perLine2.get(l.id) || 0);
+        if (g > 0.005) undoc2 += g;
+      }
+      // SIGN. Store detail is attributed on absolute bill_amount, matching the By
+      // customer tab, so this panel totals GROSS movement. The register total
+      // nets credits — KeHE repaying a double-billed placement is a real positive
+      // line — so the two differ by twice the credits when any exist. Tie against
+      // the gross figure and name the difference rather than shouting OUT BY at a
+      // discrepancy that is arithmetic, not error.
+      const absTotal = L.reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0);
+      const credits = Math.round((absTotal - grandDed) / 2 * 100) / 100;
+      const custAll = [...cust2.values()].sort((a, b) => b.amt - a.amt);
+      const custTop = custAll.slice(0, TOPN);
+      const custRest = custAll.slice(TOPN);
+      const custRestAmt = custRest.reduce((n, c) => n + c.amt, 0);
+      const custMax = Math.max(1, ...custTop.map(c => c.amt));
+      const custFoot = custAll.reduce((n, c) => n + c.amt, 0) + noName2 + undoc2;
+
+      const panelCust = D2.err
+        ? panel('Top ' + TOPN + ' customers', '', goto_('customer', 'By customer'),
+            `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);padding:10px 0;">Could not load store detail: ${esc(D2.err)}</div>`)
+        : !det2.length
+        ? panel('Top ' + TOPN + ' customers', '', goto_('customer', 'By customer'),
+            `<div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;padding:6px 0;">No store-level detail is loaded for this scope, so none of the ${money(grandDed)} can be attributed to a customer yet.</div>`)
+        : panel('Top ' + TOPN + ' customers', 'The downstream retailer named on the store detail, not the distributor that sent the check.',
+            goto_('customer', 'By customer'), `
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Customer')}${th('Stores', true)}${th('Deducted', true)}${th('Share', true)}</tr></thead>
+            <tbody>
+              ${custTop.map(c => `<tr>
+                ${td('<span style="font-family:var(--serif);font-size:13.5px;">' + esc(c.name) + '</span>'
+                    + (c.plan ? '' : ' <span style="font-family:var(--mono);font-size:8.5px;letter-spacing:0.05em;padding:2px 5px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);">UNLINKED</span>')
+                    + '<div style="margin-top:5px;">' + bar(c.amt, custMax) + '</div>')}
+                ${td(c.stores.size || '\u2014', true)}
+                ${td('<strong>' + money(c.amt) + '</strong>', true)}
+                ${td(shr(c.amt), true, 'color:var(--ink-3);')}
+              </tr>`).join('')}
+              ${custRest.length ? `<tr>${td('<span style="color:var(--ink-3);">Other \u00b7 ' + custRest.length.toLocaleString() + ' customers</span>')}${td('', true)}${td(money(custRestAmt), true, 'color:var(--ink-3);')}${td(shr(custRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${noName2 ? `<tr>${td('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${td('', true)}${td(money(noName2), true, 'color:var(--ink-3);')}${td(shr(noName2), true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${undoc2 ? `<tr>${td('<span style="color:var(--ink-3);">Not traced to a store \u2014 no detail behind the line</span>')}${td('', true)}${td(money(undoc2), true, 'color:var(--ink-3);')}${td(shr(undoc2), true, 'color:var(--ink-3);')}</tr>` : ''}
+            </tbody>
+            <tfoot><tr style="border-top:2px solid var(--ink);">
+              ${td('<strong>TOTAL</strong>')}${td('', true)}
+              ${td('<strong>' + money(custFoot) + '</strong>', true)}${td('', true)}
+            </tr></tfoot>
+          </table>
+          ${_dedTieNote(custFoot, absTotal)}
+          ${credits > 0.005 ? `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:6px;line-height:1.5;">
+            Gross of ${money(credits)} credited back to us, which the ${money(grandDed)} headline nets off.</p>` : ''}`);
+
+      // ── 4 · versus plan. Same function the Reconcile tab calls, same inputs,
+      // so these ten rows cannot disagree with that screen.
+      const P2 = _dedPlan || { lines: [], err: null };
+      const R2 = _dedComputeRecon({ L, rmapBy, D: D2, P: P2, scopedIds: _scopedLineIds, dist: _dedDist,
+                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
+      // Catch-all and unattributable rows are excluded: a variance there is an
+      // artefact of the plan naming no retailer, not a retailer out of line.
+      const recTop = [...R2.cells.values()]
+        .filter(c => c.tier === 'retailer' && c.plan && c.ded)
+        .map(c => ({ name: c.name, plan: c.plan, ded: c.ded, v: c.ded - c.plan }))
+        .filter(c => Math.abs(c.v) > 1000)
+        .sort((a, b) => Math.abs(b.v) - Math.abs(a.v))
+        .slice(0, TOPN);
+      const rCol = (v) => v > 0 ? 'var(--lost)' : 'var(--won)';
+      const panelRec = P2.err
+        ? panel('Reconciliation vs plan \u00b7 top ' + TOPN, '', goto_('reconcile', 'Vs plan'),
+            `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);padding:10px 0;">Plan could not be loaded: ${esc(P2.err)}</div>`)
+        : panel('Reconciliation vs plan \u00b7 top ' + TOPN,
+            'Trade spend only, ' + (R2.winStart ? _dedMon(R2.winStart) + ' \u2013 ' + _dedMon(R2.winEnd) : 'no dated lines')
+              + '. Furthest from plan in either direction, retailers that can actually match, variances over $1,000.',
+            goto_('reconcile', 'Vs plan'),
+            !recTop.length
+              ? `<div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;padding:6px 0;">Nothing is more than $1,000 away from plan on a matchable retailer.${(R2.unattrib + R2.undocumented) ? ' ' + money(R2.unattrib + R2.undocumented) + ' of trade spend is not yet placed against a customer \u2014 that is the number to move first.' : ''}</div>`
+              : `
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Customer')}${th('Planned', true)}${th('Deducted', true)}${th('Variance', true)}${th('vs plan', true)}</tr></thead>
+            <tbody>
+              ${recTop.map(c => `<tr>
+                ${td('<span style="font-family:var(--serif);font-size:13.5px;">' + esc(c.name) + '</span>')}
+                ${td(money(c.plan), true)}
+                ${td(money(c.ded), true)}
+                ${td('<strong style="color:' + rCol(c.v) + ';">' + (c.v > 0 ? '+' : '') + money(c.v) + '</strong>', true)}
+                ${td('<span style="color:' + rCol(c.v) + ';">' + (c.v > 0 ? '+' : '') + Math.round(c.v / c.plan * 100) + '%</span>', true)}
+              </tr>`).join('')}
+            </tbody>
+            <tfoot><tr style="border-top:2px solid var(--ink);">
+              ${td('<strong>ALL CUSTOMERS</strong>')}
+              ${td('<strong>' + money(R2.totPlan) + '</strong>', true)}
+              ${td('<strong>' + money(R2.totDed) + '</strong>', true)}
+              ${td('<strong style="color:' + rCol(R2.totDed - R2.totPlan) + ';">' + money(R2.totDed - R2.totPlan) + '</strong>', true)}
+              ${td('<strong style="color:' + rCol(R2.totDed - R2.totPlan) + ';">' + (R2.totPlan ? Math.round((R2.totDed - R2.totPlan) / R2.totPlan * 100) + '%' : '\u2014') + '</strong>', true)}
+            </tr></tfoot>
+          </table>
+          ${(R2.unattrib + R2.undocumented) ? `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;line-height:1.5;">
+            ${money(R2.unattrib + R2.undocumented)} of trade spend sits outside this comparison because it is not yet placed against a customer.
+            This panel is a variance ranking, not a control total \u2014 it does not foot to the register, and is not meant to.</p>` : ''}`);
+
+      shell(panelCust, panelRec);
+      return;
+    }
+
     // ── by customer ─────────────────────────────────────────────────────────
     if (_dedView === 'reconcile' && !_dedPlan) {
       body.innerHTML = '<div class="hl-loading">Loading the promo plan\u2026</div>';
@@ -29372,170 +29906,15 @@ render();
     // trade-spend total the Summary tab shows.
     if (_dedView === 'reconcile') {
       const D = _dedDetail || { det: [], bmap: [] };
-      // deduction_detail has no distributor column, so it is fetched whole and
-      // narrowed here to the lines in scope — otherwise By customer and the
-      // reconciliation would total every distributor's stores under one label.
-      D.det = D.det.filter(d => _scopedLineIds.has(d.line_id));
       const P = _dedPlan || { lines: [], err: null };
-      const bm = new Map(D.bmap.map(b => [b.banner_raw, b]));
-      const normCat = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+      const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist,
+                                   completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
+      const { cells, rows, totPlan, totDed, unattrib, undocumented, autoMatched,
+              tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList } = R;
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
-
-      // THE RETAILER JOIN. deduction_banner_map only covers banners someone has
-      // crosswalked by hand — which is none of UNFI's, whose detail names stores
-      // ("WEGMANS #58 FROZEN") and chain codes ("WGE"). So a plan line for
-      // Wegmans and the Wegmans deductions sat either side of a gap.
-      //
-      // Vividly's Customer Name IS the retailer, so it can be matched directly.
-      // Same normaliser as the crosswalk mapper: strip store numbers, suffixes
-      // and noise words, then require an exact or prefix hit. Anything looser
-      // would silently merge retailers, which is worse than not matching.
-      const _planCusts = [...new Set(P.lines.map(pl => pl.customer).filter(Boolean))];
-      const _planIdx = new Map();
-      for (const pc of _planCusts) { const k = _dedNorm(pc); if (k && !_planIdx.has(k)) _planIdx.set(k, pc); }
-      const _autoMatch = (raw) => {
-        const k = _dedNorm(raw);
-        if (!k) return null;
-        if (_planIdx.has(k)) return _planIdx.get(k);
-        for (const [pk, pc] of _planIdx) {
-          if (pk.length >= 4 && (k.startsWith(pk + ' ') || k === pk)) return pc;
-        }
-        return null;
-      };
-
-      // Catch-all plan lines name a distributor or nothing at all. They can
-      // never match a retailer, so they are labelled rather than left looking
-      // like retailers that failed to reconcile.
-      const _tierOf = (name) => {
-        const n = String(name || '').toLowerCase();
-        if (n === 'all customers' || n === '(no customer)') return 'unattributable';
-        if (/^(unfi|kehe)( all other)?$/.test(n) || /all other/.test(n)) return 'catch-all';
-        return 'retailer';
-      };
-
-      const isTrade = (l) => { const rm = rmapBy[l.reason_code]; return !!(rm && rm.is_trade_spend); };
-      const catOfLine = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || l.reason_code || 'Unresolved'; };
-
-      // ── THE WINDOW. The register is a YTD pull; the plan is a full year.
-      // Comparing them whole is apples to oranges and produces a variance that is
-      // mostly calendar. So the window is derived FROM THE REGISTER and the plan
-      // is clipped to it — nothing outside is differenced, it is reported apart.
-      //
-      // The register's newest month is normally PARTIAL (the pull happens mid-
-      // month). Detected by line count against the median of the earlier months
-      // rather than by date arithmetic, because what matters is whether the month
-      // looks finished, not whether the calendar says it is.
-      const monthLines = new Map();
-      for (const l of L) {
-        const mk2 = String(l.doc_date || '').slice(0, 7);
-        if (mk2) monthLines.set(mk2, (monthLines.get(mk2) || 0) + 1);
-      }
-      const monthsSorted = [...monthLines.keys()].sort();
-      const winStart = monthsSorted[0] || null;
-      const winLast = monthsSorted[monthsSorted.length - 1] || null;
-      let partialMonth = null;
-      if (monthsSorted.length >= 3) {
-        const prior = monthsSorted.slice(0, -1).map(m => monthLines.get(m)).sort((a, b) => a - b);
-        const med = prior[Math.floor(prior.length / 2)];
-        if (med && monthLines.get(winLast) < med * 0.6) partialMonth = winLast;
-      }
-      const winEnd = (partialMonth && !_dedRecPartial) ? monthsSorted[monthsSorted.length - 2] : winLast;
-      const inWindow = (mk2) => !!mk2 && !!winStart && !!winEnd && mk2 >= winStart && mk2 <= winEnd;
-      const planMonthOf = (pl) => {
-        if (pl.start_date) return String(pl.start_date).slice(0, 7);
-        const m = Number(pl.month);
-        return (m >= 1 && m <= 12) ? String(year) + '-' + String(m).padStart(2, '0') : '';
-      };
-
-      const TL = L.filter(isTrade);
-      const tradeTotal = TL.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
-      const detByLine = new Map();
-      for (const d of D.det) {
-        if (!detByLine.has(d.line_id)) detByLine.set(d.line_id, []);
-        detByLine.get(d.line_id).push(d);
-      }
-
-      // deduction side, attributed
-      const cells = new Map();          // customer -> {cats: cat -> {months: m -> amt}}
-      const catsSeen = new Set();
-      let unattrib = 0, undocumented = 0, placed = 0, autoMatched = 0;
-      const unattribBy = new Map();     // banner_raw -> amount (what to map next)
-      for (const l of TL) {
-        if (winStart && !inWindow(String(l.doc_date || '').slice(0, 7))) continue;
-        const amt = Math.abs(Number(l.amount || 0));
-        const cat = catOfLine(l);
-        catsSeen.add(normCat(cat));
-        const rows = detByLine.get(l.id) || [];
-        const base = rows.reduce((s2, d) => s2 + Math.abs(Number(d.bill_amount || 0)), 0);
-        if (!rows.length || base <= 0) { undocumented += amt; continue; }
-        for (const d of rows) {
-          const share = amt * (Math.abs(Number(d.bill_amount || 0)) / base);
-          const raw = d.banner || null;
-          const m = raw ? bm.get(raw) : null;
-          // Crosswalk first — a hand-made mapping always beats a guess. Auto
-          // match only fills the gap where no crosswalk row exists.
-          const pc = (m && m.plan_customer)
-                  || _autoMatch(d.customer_name)
-                  || _autoMatch(raw)
-                  || null;
-          if (pc && !(m && m.plan_customer)) autoMatched += Math.abs(Number(d.bill_amount || 0));
-          const mk2 = String(d.reference_date || d.date_from || l.doc_date || '').slice(0, 7);
-          if (!pc) {
-            unattrib += share;
-            const k = raw || d.customer_name || '(no banner)';
-            unattribBy.set(k, (unattribBy.get(k) || 0) + share);
-            continue;
-          }
-          placed += share;
-          let c = cells.get(pc);
-          if (!c) cells.set(pc, c = { name: pc, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(pc) });
-          c.ded += share;
-          const ck = normCat(cat);
-          let cc = c.cats.get(ck);
-          if (!cc) c.cats.set(ck, cc = { key: ck, label: cat, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
-          cc.ded += share;
-          if (mk2) cc.months.set(mk2, (cc.months.get(mk2) || 0) + share);
-        }
-      }
-
-      // plan side — KeHE-served lines whose type matches a category KeHE deducted
-      let planExcludedType = 0, planExcludedRecv = 0, planOutOfWindow = 0, planNotClosed = 0;
-      for (const pl of P.lines) {
-        const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
-        const exp = Number(pl.expected_spend || 0);
-        // The plan side follows the distributor scope. Without this, scoping to
-        // UNFI compares UNFI's deductions against KeHE's plan — a variance made
-        // entirely of the mismatch.
-        const recvOk = _dedDist === 'all' ? /kehe|unfi/i.test(recv)
-                     : _dedDist === 'UNFI' ? /unfi/i.test(recv)
-                     : /kehe/i.test(recv);
-        if (!recvOk) { planExcludedRecv += exp; continue; }
-        const ck = normCat(pl.promo_type);
-        if (!catsSeen.has(ck)) { planExcludedType += exp; continue; }
-        if (!inWindow(planMonthOf(pl))) { planOutOfWindow += exp; continue; }
-        // An Approved or Running promo has no deduction yet because it has not
-        // closed — counting it as under-deducted is the same calendar error as
-        // an unbounded window, one level down.
-        if (_dedRecCompleted && !/completed/i.test(String(pl.status || ''))) { planNotClosed += exp; continue; }
-        const cust = pl.customer || '(no customer)';
-        let c = cells.get(cust);
-        if (!c) cells.set(cust, c = { name: cust, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(cust) });
-        c.plan += exp;
-        let cc = c.cats.get(ck);
-        if (!cc) c.cats.set(ck, cc = { key: ck, label: pl.promo_type || ck, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
-        cc.plan += exp;
-        const pmk = planMonthOf(pl);
-        if (pmk) cc.pmonths.set(pmk, (cc.pmonths.get(pmk) || 0) + exp);
-      }
-
-      const rows = [...cells.values()].sort((a, b) => (b.ded + b.plan) - (a.ded + a.plan));
-      const totPlan = rows.reduce((s2, c) => s2 + c.plan, 0);
-      const totDed = rows.reduce((s2, c) => s2 + c.ded, 0);
-      const dPct = (d, p) => p ? ((d - p) / p * 100).toFixed(0) + '%' : '—';
+      const dPct = (d, p) => p ? ((d - p) / p * 100).toFixed(0) + '%' : '\u2014';
       const dCol = (d, p) => !p ? 'var(--ink-3)' : (d - p) > 0 ? 'var(--lost)' : 'var(--won)';
-
-      const unattribList = [...unattribBy.entries()].sort((a, b) => b[1] - a[1]);
 
       body.innerHTML = `
         <div style="display:flex;gap:30px;flex-wrap:wrap;margin:2px 0 16px;">
@@ -30306,6 +30685,18 @@ ${(() => {
   }
 
   async function renderPromosPage() {
+    _promoResolveView();
+    const _yrsFor = PROMO_YEARS_FOR(_promoView);
+    if (!_yrsFor.includes(_promoYear)) {
+      _promoYear = _yrsFor.includes(2026) ? 2026 : _yrsFor[_yrsFor.length - 1];
+      try { localStorage.setItem('keel_promo_year', String(_promoYear)); } catch (e) {}
+    }
+    const _viewLabel = (PROMO_VIEWS.find(([v]) => v === _promoView) || [, 'Plan'])[1];
+    const _viewMeta = _promoView === 'analyzer'
+      ? 'Planned versus deducted, measured against Keel\u2019s own sales.'
+      : _promoView === 'deductions'
+      ? 'What the distributors actually took, and how it compares to the plan.'
+      : 'Annual promo plan by retailer. Expand a retailer to see individual promo lines.';
     const session = HL.mountPage('promos');
     if (!session) return;
     const main = document.getElementById('main-content');
@@ -30319,19 +30710,21 @@ ${(() => {
     main.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
         <div>
-          <div class="eyebrow">— Promotional planning</div>
+          <div class="eyebrow">— Promotional planning · ${_viewLabel}</div>
           <h1 class="page-title">Promos.</h1>
-          <p class="page-meta">Annual promo plan by retailer. Expand a retailer to see individual promo lines.</p>
+          <p class="page-meta">${_viewMeta}</p>
         </div>
-        <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
+        <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;${_promoView === 'plan' ? '' : 'display:none;'}">
           <button id="hl-promo-add" style="background:var(--ink);color:var(--paper);border:none;border-radius:6px;padding:10px 20px;font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer;">+ Add promo</button>
           <button id="hl-promo-upload" style="background:transparent;color:var(--ink-2);border:1px solid var(--rule-soft);border-radius:6px;padding:7px 16px;font-family:var(--sans);font-size:12px;cursor:pointer;">↥ Upload promos (Excel)</button>
           <input type="file" id="hl-promo-upload-input" accept=".xlsx,.xls,.csv" style="display:none;" />
         </div>
       </div>
+      <!-- Year is the only control left on this row. Plan / Trade analyzer /
+           Deductions moved into the sidebar beneath Promos, where they read as
+           navigation rather than as three more buttons competing with the year. -->
       <div id="hl-promo-years" style="margin-top:18px;display:flex;gap:6px;align-items:center;">
-        ${[2025, 2026, 2027].map(y => `<button class="hl-promo-year" data-y="${y}" style="font-family:var(--mono);font-size:11px;padding:7px 16px;border-radius:5px;border:1px solid ${y === _promoYear ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${y === _promoYear ? 'var(--ink)' : 'transparent'};color:${y === _promoYear ? 'var(--paper)' : 'var(--ink-3)'};font-weight:${y === _promoYear ? '700' : '400'};">${y}</button>`).join('')}
-        ${_promoYear < 2027 ? `<span style="margin-left:14px;display:inline-flex;gap:5px;">${PROMO_VIEWS.map(([v, lbl]) => `<button class="hl-promo-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_promoView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_promoView === v ? 'var(--ink)' : 'transparent'};color:${_promoView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}</span>` : ''}
+        ${_yrsFor.map(y => `<button class="hl-promo-year" data-y="${y}" style="font-family:var(--mono);font-size:11px;padding:7px 16px;border-radius:5px;border:1px solid ${y === _promoYear ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${y === _promoYear ? 'var(--ink)' : 'transparent'};color:${y === _promoYear ? 'var(--paper)' : 'var(--ink-3)'};font-weight:${y === _promoYear ? '700' : '400'};">${y}</button>`).join('')}
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:10px;">${_promoYear >= 2027 ? 'Keel-built promos' : 'Vividly plan' + (_promoYear === 2025 ? ' · reference only' : '')}</span>
       </div>
       <div id="hl-promo-filters" style="margin-top:16px;"></div>
@@ -30353,9 +30746,6 @@ ${(() => {
       if (f) { if (_planYear) handleVividlyUpload(f); else handlePromoExcelUpload(f); }
       e.target.value = '';
     });
-    document.querySelectorAll('.hl-promo-view').forEach(b => b.addEventListener('click', () => {
-      if (b.dataset.v !== _promoView) { _promoView = b.dataset.v; try { localStorage.setItem('keel_promo_view', _promoView); } catch (e) {} renderPromosPage(); }
-    }));
     if (_planYear) {
       const sEl = document.getElementById('hl-promo-summary'), fEl = document.getElementById('hl-promo-filters');
       if (_promoView === 'analyzer') await renderTradeAnalyzer(sEl, fEl, _promoYear);
