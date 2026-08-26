@@ -29194,10 +29194,50 @@ render();
         ${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}
       </div>`;
 
-    const views = [['summary', 'Summary'], ['reconcile', 'Trade reconciliation'], ['other', 'Other charges'], ['category', 'By category'], ['customer', 'By customer'], ['code', 'By reason code'], ['checks', 'Checks'], ['exceptions', 'Exceptions']];
+    // NINE PEER TABS ASKED THE READER TO CHOOSE, and gave no basis for choosing.
+    // Four of them were the same register sliced differently. Grouped into three:
+    // the reconciliation you came for, the charges that never reconcile, and the
+    // plumbing — which is worth keeping but not worth top billing.
+    const VIEW_GROUPS = [
+      { label: 'Reconcile', views: [['reconcile', 'Vs plan'], ['customer', 'By customer'], ['category', 'By category']] },
+      { label: 'Charges',   views: [['other', 'Other charges'], ['code', 'By reason code'], ['summary', 'All buckets']] },
+      { label: 'Data',      views: [['checks', 'Checks'], ['exceptions', 'Exceptions']] },
+    ];
+    const views = VIEW_GROUPS.flatMap(g => g.views);
+
+    // Trade-spend dollars with no store detail, or whose banner reaches no plan
+    // customer. Computed here so the headline can state it before any tab loads;
+    // null when the detail has not been fetched yet, and the clause is dropped
+    // rather than showing a misleading zero.
+    let unattribHint = null;
+    if (_dedDetail && _dedDetail.det) {
+      const bmH = new Map((_dedDetail.bmap || []).map(b => [b.banner_raw, b]));
+      const tradeIds = new Set(L.filter(l => { const rm = rmapBy[l.reason_code]; return rm && rm.is_trade_spend; }).map(l => l.id));
+      let placed = 0, tradeTot = 0;
+      for (const l of L) if (tradeIds.has(l.id)) tradeTot += -Number(l.amount) || 0;
+      for (const d of _dedDetail.det) {
+        if (!tradeIds.has(d.line_id)) continue;
+        const m = d.banner ? bmH.get(d.banner) : null;
+        if (m && m.plan_customer) placed += Math.abs(Number(d.bill_amount) || 0);
+      }
+      unattribHint = Math.max(0, Math.round((tradeTot - placed) * 100) / 100);
+    }
 
     hostEl.innerHTML = `
-      <div style="display:flex;gap:34px;flex-wrap:wrap;padding:16px 2px 20px;border-bottom:1px solid var(--rule-soft);">
+      <!-- THE ANSWER FIRST. Five equal KPIs described the data; nobody arrives
+           asking how many checks there are. The sentence states what was taken and
+           what could not be attributed — the two facts that decide whether anything
+           needs doing — and the counters sit underneath as supporting detail. -->
+      <div style="padding:6px 2px 14px;">
+        <div style="font-family:var(--serif);font-size:21px;line-height:1.45;color:var(--ink);max-width:820px;">
+          ${_dedDist === 'all' ? 'KeHE and UNFI took' : DSHORT + ' took'}
+          <strong>${money(-totalAmt)}</strong> in ${yr}${unattribHint ? `, of which <strong style="color:var(--lost);">${money(unattribHint)}</strong> is not yet matched to a customer` : ''}.
+        </div>
+        ${notTied.length ? `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:8px;">
+          ${notTied.length} of ${checks.length} checks do not tie to their line detail</div>` : ''}
+      </div>
+
+      <div style="display:flex;gap:34px;flex-wrap:wrap;padding:10px 2px 18px;border-bottom:1px solid var(--rule-soft);">
         ${stat('Deducted ' + yr, money(-totalAmt), L.length.toLocaleString() + ' lines')}
         ${stat('Checks', checks.length, checks.length - notTied.length + ' of ' + checks.length + ' tie out')}
         ${stat('Processing fees', totalFee ? money(Math.abs(totalFee)) : '—', totalFee ? (totalFee / -totalAmt * 100).toFixed(1) + '% of deductions' : 'run mode=detail')}
@@ -29219,16 +29259,19 @@ render();
       </div>
 
       <div style="margin:10px 0 4px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
-        ${views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;border:1px solid ${_dedView === v ? 'var(--ink)' : 'var(--rule-soft)'};cursor:pointer;background:${_dedView === v ? 'var(--ink)' : 'transparent'};color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
+        ${VIEW_GROUPS.map(g => `
+          <span style="display:inline-flex;align-items:center;gap:5px;margin-right:16px;">
+            <span style="font-family:var(--mono);font-size:9px;letter-spacing:0.07em;text-transform:uppercase;color:var(--rule);">${g.label}</span>
+            ${g.views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}"
+              style="font-family:var(--mono);font-size:10.5px;padding:6px 12px;border-radius:5px;cursor:pointer;
+                     border:1px solid ${_dedView === v ? 'var(--ink)' : 'var(--rule-soft)'};
+                     background:${_dedView === v ? 'var(--ink)' : 'transparent'};
+                     color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
+          </span>`).join('')}
         <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">${_dedDist === 'all' ? 'all distributors' : _dedDist}</span>
         <button id="hl-ded-refresh" title="Re-read from Supabase — use after running SQL or the detail parser"
           style="margin-left:10px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">↻ Refresh</button>
       </div>
-      <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:6px 0 14px;max-width:900px;">
-        WHAT ${_dedDist === 'all' ? 'THEY' : DSHORT.toUpperCase()} ACTUALLY TOOK — every deduction line from the check register, grouped to the same categories as the plan.
-        Merchandise and processing fees are held apart: ${_dedDist === 'all' ? 'distributors bill fees' : DSHORT + ' bills a fee'} on top of most deductions and it does not appear in Vividly at all.
-        ${parsedN < L.length ? `Store-level backup is parsed for ${money(-parsedAmt)} of ${money(-totalAmt)} — ${covPct}% of the money, ${parsedN.toLocaleString()} of ${L.length.toLocaleString()} lines. Coverage is quoted in dollars because the undocumented lines are the large ones.` : ''}
-      </p>
       <div id="hl-ded-body"></div>
     `;
 
@@ -29505,18 +29548,6 @@ render();
         ${partialMonth && !_dedRecPartial ? `<div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);margin:0 0 12px;max-width:900px;">
           ${_dedMon(partialMonth)} holds only ${monthLines.get(partialMonth)} deduction lines against a typical month's ${[...monthLines.entries()].filter(([mm]) => mm !== partialMonth).map(([, n]) => n).sort((a, b) => a - b)[Math.floor((monthLines.size - 1) / 2)] || '\u2014'}, so the register pull looks mid-month. It is held out of the comparison rather than read as a shortfall.
         </div>` : ''}
-        <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
-          TRADE SPEND ONLY — ${money(tradeTotal)} of the ${money(-totalAmt)} register, being the codes the reason map marks
-          <code style="font-family:var(--mono);">is_trade_spend</code>. Plan side is Vividly lines whose First Receiver is ${_dedDist === 'all' ? 'KeHE or UNFI' : _dedDist} and whose
-          promo type matches a category ${_dedDist === 'all' ? 'a distributor' : DSHORT} actually deducted, <strong>clipped to the register's own months</strong> — the register is a
-          year-to-date pull and the plan is a full year, so an unbounded comparison reports calendar as variance. Held out rather than
-          counted as unspent: ${money(planExcludedRecv)} on other distributors, ${money(planExcludedType)} in types absent from this register,
-          ${money(planOutOfWindow)} planned outside ${winStart ? _dedMon(winStart) + '\u2013' + _dedMon(winEnd) : 'the window'}${planNotClosed ? ', and ' + money(planNotClosed) + ' in promos not yet Completed' : ''}.
-          Deductions reach a customer through <code style="font-family:var(--mono);">deduction_banner_map.plan_customer</code> first, then by
-          matching the store or chain name against Vividly's own Customer Name. Rows tagged CATCH-ALL name a distributor rather than a
-          retailer and UNATTRIBUTABLE name nothing at all — neither can ever match a deduction, so they are labelled rather than left
-          looking like retailers that failed to reconcile.
-        </p>
         ${(unattrib + undocumented) ? `<div style="border:1px solid var(--rule);border-radius:6px;padding:12px 14px;margin-bottom:16px;background:rgba(0,0,0,.015);">
           <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Not yet placed \u00b7 ${money(unattrib + undocumented)}</div>
           <div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;">
@@ -29526,7 +29557,36 @@ render();
           </div>
         </div>` : ''}
         <div id="hl-rec-mapper"></div>
-        <table style="width:100%;border-collapse:collapse;">
+        <!-- WHAT'S OUT OF LINE, BEFORE THE FULL TABLE. The reconciliation used to open
+     with every customer in dollar order, which buries the exceptions among rows
+     that are behaving. These are the five largest absolute variances on rows that
+     can actually match — catch-alls and unattributable rows are excluded, since a
+     variance there is an artefact of the plan naming no retailer. -->
+${(() => {
+  const ex = [...cells.values()]
+    .filter(c => c.tier === 'retailer' && c.plan && c.ded)
+    .map(c => ({ ...c, v: c.ded - c.plan }))
+    .filter(c => Math.abs(c.v) > 1000)
+    .sort((a, b2) => Math.abs(b2.v) - Math.abs(a.v))
+    .slice(0, 5);
+  if (!ex.length) return '';
+  return `<div style="margin:0 0 20px;">
+    <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:9px;">Furthest from plan</div>
+    <div style="display:flex;flex-direction:column;gap:1px;">
+      ${ex.map(c => {
+        const over = c.v > 0;
+        const pct = c.plan ? Math.round(c.v / c.plan * 100) : 0;
+        return `<div style="display:flex;align-items:baseline;gap:12px;padding:9px 12px;background:var(--bone-2);border-left:2px solid ${over ? 'var(--lost)' : 'var(--rule)'};">
+          <span style="font-family:var(--serif);font-size:14px;min-width:190px;">${esc(c.name)}</span>
+          <span style="font-family:var(--mono);font-size:12px;color:${over ? 'var(--lost)' : 'var(--ink-2)'};font-weight:700;">${over ? '+' : ''}${money(c.v)}</span>
+          <span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">${over ? '+' : ''}${pct}% vs plan</span>
+          <span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-left:auto;">planned ${money(c.plan)} \u00b7 deducted ${money(c.ded)}</span>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+})()}
+<table style="width:100%;border-collapse:collapse;">
           <thead><tr>
             ${th('Plan customer')}${th('Planned $', true)}${th('Deducted $', true)}${th('Variance', true)}${th('vs plan', true)}${th('Status')}
           </tr></thead>
@@ -29882,12 +29942,54 @@ render();
             ${td('<strong>' + covPct + '%</strong>', true)}
           </tr></tfoot>
         </table>
-        <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:14px 0 0;max-width:900px;">
-          A bucket is derived from the reason map, not hardcoded: <code style="font-family:var(--mono);">is_trade_spend</code> and
-          <code style="font-family:var(--mono);">reconcile_to</code> decide it, and an explicit
-          <code style="font-family:var(--mono);">bucket</code> value overrides both. So mapping a code moves its dollars here immediately.
-          <strong>Documented</strong> is the share of each bucket's dollars with store-level rows actually extracted — not merely a file located.
-        </p>`;
+
+        <!-- BY DISTRIBUTOR, under the bucket table. The pills scope the page to
+             one distributor; this shows all of them side by side without having
+             to click between them. Same register, split the other way — the two
+             tables foot to the same number by construction. -->
+        <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin:26px 0 8px;">By distributor</div>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>${th('Distributor')}${th('Lines', true)}${th('Trade spend', true)}${th('Other', true)}${th('Total deducted', true)}${th('Share', true)}</tr></thead>
+          <tbody>
+            ${(() => {
+              // Same resolution the pills use: the check names the distributor
+              // when there is one, and the UNFI- reason prefix covers the lines
+              // that have no check (UNFI's unfiled files). Anything else is KeHE.
+              const ckd = new Map((checks || []).map(c => [c.id, c.distributor || 'KeHE']));
+              const dAgg = new Map();
+              for (const l of L) {
+                const dn = (l.check_id && ckd.get(l.check_id))
+                        || (String(l.reason_code || '').startsWith('UNFI-') ? 'UNFI' : 'KeHE');
+                let a2 = dAgg.get(dn);
+                if (!a2) dAgg.set(dn, a2 = { lines: 0, trade: 0, other: 0 });
+                a2.lines++;
+                const amt = -Number(l.amount) || 0;
+                if (isTrade(l)) a2.trade += amt; else a2.other += amt;
+              }
+              const tot = -totalAmt || 1;
+              return [...dAgg.entries()].sort((x, y) => (y[1].trade + y[1].other) - (x[1].trade + x[1].other))
+                .map(([dn, a2]) => {
+                  const t = a2.trade + a2.other;
+                  return `<tr style="border-top:1px solid var(--rule-soft);">
+                    ${td('<strong>' + esc(dn) + '</strong>')}
+                    ${td(a2.lines.toLocaleString(), true)}
+                    ${td(money(a2.trade), true)}
+                    ${td(money(a2.other), true)}
+                    ${td('<strong>' + money(t) + '</strong>', true)}
+                    ${td(Math.round(t / tot * 100) + '%', true, 'color:var(--ink-3);')}
+                  </tr>`;
+                }).join('');
+            })()}
+          </tbody>
+          <tfoot><tr style="border-top:2px solid var(--ink);">
+            ${td('<strong>ALL</strong>')}
+            ${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${td('<strong>' + money(L.filter(isTrade).reduce((n, l) => n + (-Number(l.amount) || 0), 0)) + '</strong>', true)}
+            ${td('<strong>' + money(L.filter(l => !isTrade(l)).reduce((n, l) => n + (-Number(l.amount) || 0), 0)) + '</strong>', true)}
+            ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
+            ${td('<strong>100%</strong>', true, 'color:var(--ink-3);')}
+          </tr></tfoot>
+        </table>`;
 
       body.querySelectorAll('.hl-sum-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.b;
