@@ -30248,219 +30248,164 @@ ${(() => {
       return;
     }
 
-    // ── other charges ─────────────────────────────────────────────────────
-    // The mirror of Reconcile: everything the reason map does NOT mark as trade
-    // spend — allowances, shortages, late fees, freight, returns, credits. These
-    // have no promo to be measured against, which is exactly why they need their
-    // own view: on Reconcile they would be noise, and on Summary they collapse
-    // into a bucket total with no way to see the charge itself.
-    // Category -> reason code -> month, with the retailer KeHE named in the
-    // document and how much of each has backup behind it.
-    // OTHER CHARGES, folded into the Category view. It answered the same
-    // question the bucket table does — what was taken and under which code —
-    // one level further down, so as its own tab it was a second route to the
-    // same place. Returns markup; the caller appends it and then calls
-    // _dedWireOtherCharges().
-    const _dedOtherChargesHtml = () => {
-      const _chkNo = new Map(checks.map(ch => [ch.id, ch.check_no]));
-      const cats = new Map();
-      let grand = 0, grandFee = 0, grandDoc = 0, nLines = 0;
-      for (const l of L) {
-        const rm = rmapBy[l.reason_code];
-        if (rm && rm.is_trade_spend) continue;            // Reconcile's territory
-        const amt = Number(l.amount || 0), fee = Number(l.processing_fee || 0);
-        const catKey = (rm && rm.keel_category) || '\u26A0 Unclassified';
-        const code = l.reason_code || '(none)';
-        grand += amt; grandFee += fee; nLines++;
-        if (l.detail_parsed) grandDoc += amt;
-        let c = cats.get(catKey);
-        if (!c) cats.set(catKey, c = { name: catKey, lines: 0, amt: 0, fee: 0, doc: 0, codes: new Map() });
-        c.lines++; c.amt += amt; c.fee += fee; if (l.detail_parsed) c.doc += amt;
-        let cd = c.codes.get(code);
-        if (!cd) c.codes.set(code, cd = { code, desc: (rm && rm.kehe_description) || null,
-          retailer: (rm && rm.retailer) || null, rsrc: (rm && rm.retailer_source) || null,
-          reconcile: (rm && rm.reconcile_to) || null,
-          lines: 0, amt: 0, fee: 0, doc: 0, months: new Map() });
-        cd.lines++; cd.amt += amt; cd.fee += fee; if (l.detail_parsed) cd.doc += amt;
-        const mk2 = String(l.doc_date || '').slice(0, 7);
-        if (mk2) {
-          const mm = cd.months.get(mk2) || { amt: 0, lines: 0, rows: [] };
-          mm.amt += amt; mm.lines++; mm.rows.push(l); cd.months.set(mk2, mm);
-        }
-      }
-      const cl = [...cats.values()].sort((a, b) => a.amt - b.amt);
-      const pc2 = (v) => grand ? (v / grand * 100).toFixed(1) + '%' : '\u2014';
-      const dp = (o) => o.amt ? Math.round(o.doc / o.amt * 100) + '%' : '\u2014';
-
-      return `
-        <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
-          EVERYTHING THAT IS NOT TRADE SPEND \u2014 ${money(-grand)} across ${nLines.toLocaleString()} lines.
-          Allowances, shortages, late-delivery fines, freight, returns and credits: charges with no promotion behind them,
-          so they are never measured against the plan. Expand a category for its reason codes, and a code for its months.
-          <strong>Retailer</strong> is the name KeHE wrote in the document itself, not a decoded abbreviation.
-        </p>
-        <table style="width:100%;border-collapse:collapse;">
-          <thead><tr>
-            ${th('Category / code')}${th('Retailer')}${th('Lines', true)}${th('Fees $', true)}${th('Total', true)}${th('% of book', true)}${th('Backup', true)}
-          </tr></thead>
-          <tbody>
-            ${cl.map(c => {
-              const open = _dedOthCat.has(c.name);
-              const warn = c.name.charAt(0) === '\u26A0';
-              let out = `<tr class="hl-oth-cat" data-c="${esc(c.name)}" style="cursor:pointer;">
-                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:13.5px;${warn ? 'color:var(--lost);' : ''}">${esc(c.name)}</span>`)}
-                ${td('')}${td(c.lines.toLocaleString(), true)}
-                ${td(c.fee ? money(Math.abs(c.fee)) : '<span style="color:var(--ink-3);">\u2014</span>', true)}
-                ${td('<strong>' + money(-c.amt) + '</strong>', true)}
-                ${td(pc2(c.amt), true, 'color:var(--ink-3);')}${td(dp(c), true, c.doc ? '' : 'color:var(--ink-3);')}
-              </tr>`;
-              if (open) {
-                out += [...c.codes.values()].sort((x, y) => x.amt - y.amt).map(cd => {
-                  const co = _dedOthCode.has(c.name + '|' + cd.code);
-                  let inner = `<tr class="hl-oth-code" data-k="${esc(c.name + '|' + cd.code)}" style="cursor:pointer;background:var(--rule-softer);">
-                    ${td('<span style="padding-left:24px;"><span style="display:inline-block;width:11px;color:var(--ink-3);">' + (co ? '\u2212' : '+') + '</span><strong style="font-family:var(--mono);font-size:11px;">' + esc(cd.code) + '</strong>' + (cd.desc ? '<span style="color:var(--ink-3);margin-left:8px;font-size:11.5px;">' + esc(cd.desc) + '</span>' : '') + '</span>')}
-                    ${td(cd.retailer ? '<span style="font-size:11px;">' + esc(cd.retailer) + '</span>' : '<span style="color:var(--rule);">\u00b7</span>')}
-                    ${td(cd.lines.toLocaleString(), true)}
-                    ${td(cd.fee ? money(Math.abs(cd.fee)) : '', true)}
-                    ${td(money(-cd.amt), true)}${td(pc2(cd.amt), true, 'color:var(--ink-3);')}${td(dp(cd), true, 'color:var(--ink-3);')}
-                  </tr>`;
-                  if (co) {
-                    inner += [...cd.months.entries()].sort().map(([m, v]) => {
-                      const mkey = c.name + '|' + cd.code + '|' + m;
-                      const mo = _dedOthMon.has(mkey);
-                      let mrow = `<tr class="hl-oth-mon" data-m="${esc(mkey)}" style="cursor:pointer;background:var(--rule-softer);">
-                      ${td('<span style="padding-left:52px;color:var(--ink-3);font-size:10.5px;"><span style="display:inline-block;width:11px;">' + (mo ? '\u2212' : '+') + '</span>' + _dedMon(m) + '</span>')}
-                      ${td('')}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + v.lines + '</span>', true)}${td('', true)}
-                      ${td('<span style="font-size:10.5px;">' + money(-v.amt) + '</span>', true)}${td('', true)}${td('', true)}
-                      </tr>`;
-                      if (mo) {
-                        // The charges themselves. invoice_no is KeHE's document id and
-                        // the exact key to the backup file, so it is the thing to quote
-                        // back to them on a dispute.
-                        mrow += `<tr><td colspan="7" style="padding:0 0 8px 62px;background:var(--rule-softer);">
-                          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10.5px;">
-                            <thead><tr>
-                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Document / invoice no.</th>
-                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Date</th>
-                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Check</th>
-                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">PO / remarks</th>
-                              <th style="text-align:right;padding:4px 8px;color:var(--ink-3);font-weight:400;">Amount</th>
-                              <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Backup</th>
-                            </tr></thead>
-                            <tbody>${v.rows.slice().sort((a, b) => a.amount - b.amount).map(r => `<tr>
-                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);">${esc(r.invoice_no || '')}</td>
-                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(String(r.doc_date || '').slice(0, 10))}</td>
-                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(_chkNo.get(r.check_id) || '')}</td>
-                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(r.po_no || r.remarks || '')}</td>
-                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);text-align:right;">${money(-Number(r.amount || 0))}</td>
-                              <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:${r.detail_parsed ? 'var(--won)' : 'var(--ink-3)'};">${r.detail_parsed ? 'parsed' : 'not parsed'}</td>
-                            </tr>`).join('')}</tbody>
-                          </table></td></tr>`;
-                      }
-                      return mrow;
-                    }).join('');
-                  }
-                  return inner;
-                }).join('');
-              }
-              return out;
-            }).join('')}
-          </tbody>
-          <tfoot><tr style="border-top:2px solid var(--ink);">
-            ${td('<strong>ALL NON-TRADE CHARGES</strong>')}${td('')}${td('<strong>' + nLines.toLocaleString() + '</strong>', true)}
-            ${td('<strong>' + money(Math.abs(grandFee)) + '</strong>', true)}${td('<strong>' + money(-grand) + '</strong>', true)}
-            ${td('<strong>100%</strong>', true, 'color:var(--ink-3);')}
-            ${td('<strong>' + (grand ? Math.round(grandDoc / grand * 100) + '%' : '\u2014') + '</strong>', true)}
-          </tr></tfoot>
-        </table>`;
-
-    };
-
-    const _dedWireOtherCharges = () => {
-      body.querySelectorAll('.hl-oth-cat').forEach(tr => tr.onclick = () => {
-        const n = tr.dataset.c;
-        _dedOthCat.has(n) ? _dedOthCat.delete(n) : _dedOthCat.add(n);
-        renderDeductions(hostEl, filtersEl, year);
-      });
-      body.querySelectorAll('.hl-oth-mon').forEach(tr => tr.onclick = (ev) => {
-        ev.stopPropagation();
-        const k = tr.dataset.m;
-        _dedOthMon.has(k) ? _dedOthMon.delete(k) : _dedOthMon.add(k);
-        renderDeductions(hostEl, filtersEl, year);
-      });
-      body.querySelectorAll('.hl-oth-code').forEach(tr => tr.onclick = (ev) => {
-        ev.stopPropagation();
-        const k = tr.dataset.k;
-        _dedOthCode.has(k) ? _dedOthCode.delete(k) : _dedOthCode.add(k);
-        renderDeductions(hostEl, filtersEl, year);
-      });
-    };
-
-    // ── summary ───────────────────────────────────────────────────────────
-    // One row per bucket, expandable to the categories inside it. Built from the
-    // same L as every other view, so it foots to the register by construction
-    // rather than by agreement.
+    // ── category ──────────────────────────────────────────────────────────
+    // Built from the same L as every other view, so it foots to the register by
+    // construction rather than by agreement.
     if (_dedView === 'summary') {
+      // ── ONE TREE, FOUR LEVELS ───────────────────────────────────────────────
+      // Bucket → category → reason code → month → the charges themselves.
+      //
+      // This used to be two tables. The bucket table stopped at categories, and
+      // a separate "Other charges" table drilled all the way down but ONLY for
+      // non-trade lines — so Allowances, Fees and Unclassified appeared twice on
+      // one screen, at two different depths, and Trade spend could not be opened
+      // at all. Same register, same numbers, two routes. Now there is one route
+      // and every bucket goes the whole way down.
+      const _chkNo = new Map(checks.map(ch => [ch.id, ch.check_no]));
       const buckets = new Map();
       for (const l of L) {
         const rm = rmapBy[l.reason_code];
         const bk = _dedBucketOf(rm);
         const catKey = rm && rm.keel_category ? rm.keel_category : (l.reason_code || 'Unresolved');
+        const code = l.reason_code || '(none)';
+        const amt = Number(l.amount || 0);
+        const fee = Number(l.processing_fee || 0);
+        const mch = Number(l.detail_line_total || 0);
+        const doc = l.detail_parsed ? amt : 0;
+
         let b = buckets.get(bk);
         if (!b) buckets.set(bk, b = { name: bk, lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, cats: new Map(), codes: new Set() });
-        b.lines++;
-        b.amount += Number(l.amount || 0);
-        b.fee    += Number(l.processing_fee || 0);
-        b.merch  += Number(l.detail_line_total || 0);
-        if (l.detail_parsed) b.docAmt += Number(l.amount || 0);
+        b.lines++; b.amount += amt; b.fee += fee; b.merch += mch; b.docAmt += doc;
         if (l.reason_code) b.codes.add(l.reason_code);
+
         let c = b.cats.get(catKey);
-        if (!c) b.cats.set(catKey, c = { name: catKey, lines: 0, amount: 0, fee: 0, docAmt: 0, mapped: !!(rm && rm.keel_category) });
-        c.lines++; c.amount += Number(l.amount || 0); c.fee += Number(l.processing_fee || 0);
-        if (l.detail_parsed) c.docAmt += Number(l.amount || 0);
+        if (!c) b.cats.set(catKey, c = { name: catKey, mapped: !!(rm && rm.keel_category), lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, codes: new Map() });
+        c.lines++; c.amount += amt; c.fee += fee; c.merch += mch; c.docAmt += doc;
+
+        let cd = c.codes.get(code);
+        if (!cd) c.codes.set(code, cd = { code, desc: (rm && rm.kehe_description) || null,
+          retailer: (rm && rm.retailer) || null,
+          lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, months: new Map() });
+        cd.lines++; cd.amount += amt; cd.fee += fee; cd.merch += mch; cd.docAmt += doc;
+
+        const mk2 = String(l.doc_date || '').slice(0, 7);
+        if (mk2) {
+          let mm = cd.months.get(mk2);
+          if (!mm) cd.months.set(mk2, mm = { lines: 0, amount: 0, rows: [] });
+          mm.lines++; mm.amount += amt; mm.rows.push(l);
+        }
       }
       const bList = [...buckets.values()].sort((a, b) =>
         (DED_BUCKET_ORDER.indexOf(a.name) + 1 || 99) - (DED_BUCKET_ORDER.indexOf(b.name) + 1 || 99) || a.amount - b.amount);
-      const pctOf = (v) => totalAmt ? (v / totalAmt * 100).toFixed(1) + '%' : '—';
-      const docPct = (b) => b.amount ? Math.round(b.docAmt / b.amount * 100) + '%' : '—';
+      const pctOf = (v) => totalAmt ? (v / totalAmt * 100).toFixed(1) + '%' : '\u2014';
+      const dPct  = (o) => o.amount ? Math.round(o.docAmt / o.amount * 100) + '%' : '\u2014';
+      const dash  = '<span style="color:var(--ink-3);">\u2014</span>';
+      const caret = (open, w) => `<span style="display:inline-block;width:${w}px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span>`;
 
       body.innerHTML = `
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Bucket')}${th('Codes', true)}${th('Lines', true)}
+            ${th('Bucket / category / code')}${th('Retailer')}${th('Lines', true)}
             ${th('Merchandise $', true)}${th('Fees $', true)}${th('Total deducted', true)}${th('% of book', true)}${th('Documented', true)}
           </tr></thead>
           <tbody>
             ${bList.map(b => {
-              const open = _dedSumOpen.has(b.name);
+              const bOpen = _dedSumOpen.has(b.name);
               const warn = b.name === 'Unclassified';
               let out = `<tr class="hl-sum-row" data-b="${esc(b.name)}" style="cursor:pointer;">
-                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span><span style="font-family:var(--serif);font-size:14px;${warn ? 'color:var(--lost);' : ''}">${esc(b.name)}</span>`)}
-                ${td(b.codes.size || '—', true)}${td(b.lines.toLocaleString(), true)}
-                ${td(b.merch ? money(Math.abs(b.merch)) : '<span style="color:var(--ink-3);">—</span>', true)}
-                ${td(b.fee ? money(Math.abs(b.fee)) : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td(caret(bOpen, 12) + `<span style="font-family:var(--serif);font-size:14px;${warn ? 'color:var(--lost);' : ''}">${esc(b.name)}</span>`)}
+                ${td('')}${td(b.lines.toLocaleString(), true)}
+                ${td(b.merch ? money(Math.abs(b.merch)) : dash, true)}
+                ${td(b.fee ? money(Math.abs(b.fee)) : dash, true)}
                 ${td('<strong>' + money(-b.amount) + '</strong>', true)}
                 ${td(pctOf(-b.amount), true, 'color:var(--ink-3);')}
-                ${td(docPct(b), true, b.docAmt === 0 ? 'color:var(--ink-3);' : '')}
+                ${td(dPct(b), true, b.docAmt === 0 ? 'color:var(--ink-3);' : '')}
               </tr>
               <tr><td colspan="8" style="padding:0 10px 6px;border-bottom:1px solid var(--rule-soft);">
                 <div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);padding-left:12px;">${esc(DED_BUCKET_NOTE[b.name] || '')}</div>
               </td></tr>`;
-              if (open) {
-                out += [...b.cats.values()].sort((x, y) => x.amount - y.amount).map(c => `
-                  <tr style="background:var(--rule-softer);">
-                    ${td('<span style="padding-left:24px;color:' + (c.mapped ? 'var(--ink-2)' : 'var(--lost)') + ';">' + (c.mapped ? '' : '\u26A0 ') + esc(c.name) + '</span>')}
-                    ${td('', true)}${td(c.lines.toLocaleString(), true)}${td('', true)}
-                    ${td(c.fee ? money(Math.abs(c.fee)) : '', true)}
-                    ${td(money(-c.amount), true)}${td(pctOf(-c.amount), true, 'color:var(--ink-3);')}
-                    ${td(c.amount ? Math.round(c.docAmt / c.amount * 100) + '%' : '—', true, 'color:var(--ink-3);')}
-                  </tr>`).join('');
-              }
+
+              if (!bOpen) return out;
+
+              out += [...b.cats.values()].sort((x, y) => x.amount - y.amount).map(c => {
+                const cKey = b.name + '|' + c.name;
+                const cOpen = _dedOthCat.has(cKey);
+                let mid = `<tr class="hl-oth-cat" data-c="${esc(cKey)}" style="cursor:pointer;background:var(--rule-softer);">
+                  ${td('<span style="padding-left:20px;">' + caret(cOpen, 12)
+                      + '<span style="font-family:var(--serif);font-size:13.5px;color:' + (c.mapped ? 'var(--ink-2)' : 'var(--lost)') + ';">'
+                      + (c.mapped ? '' : '\u26A0 ') + esc(c.name) + '</span></span>')}
+                  ${td('')}${td(c.lines.toLocaleString(), true)}
+                  ${td(c.merch ? money(Math.abs(c.merch)) : '', true)}
+                  ${td(c.fee ? money(Math.abs(c.fee)) : '', true)}
+                  ${td(money(-c.amount), true)}
+                  ${td(pctOf(-c.amount), true, 'color:var(--ink-3);')}
+                  ${td(dPct(c), true, 'color:var(--ink-3);')}
+                </tr>`;
+
+                if (!cOpen) return mid;
+
+                mid += [...c.codes.values()].sort((x, y) => x.amount - y.amount).map(cd => {
+                  const dKey = cKey + '|' + cd.code;
+                  const dOpen = _dedOthCode.has(dKey);
+                  let inner = `<tr class="hl-oth-code" data-k="${esc(dKey)}" style="cursor:pointer;background:var(--rule-softer);">
+                    ${td('<span style="padding-left:46px;">' + caret(dOpen, 11)
+                        + '<strong style="font-family:var(--mono);font-size:11px;">' + esc(cd.code) + '</strong>'
+                        + (cd.desc ? '<span style="color:var(--ink-3);margin-left:8px;font-size:11.5px;">' + esc(cd.desc) + '</span>' : '') + '</span>')}
+                    ${td(cd.retailer ? '<span style="font-size:11px;">' + esc(cd.retailer) + '</span>' : '<span style="color:var(--rule);">\u00b7</span>')}
+                    ${td(cd.lines.toLocaleString(), true)}
+                    ${td(cd.merch ? money(Math.abs(cd.merch)) : '', true)}
+                    ${td(cd.fee ? money(Math.abs(cd.fee)) : '', true)}
+                    ${td(money(-cd.amount), true)}
+                    ${td(pctOf(-cd.amount), true, 'color:var(--ink-3);')}
+                    ${td(dPct(cd), true, 'color:var(--ink-3);')}
+                  </tr>`;
+
+                  if (!dOpen) return inner;
+
+                  inner += [...cd.months.entries()].sort().map(([m, v]) => {
+                    const mKey = dKey + '|' + m;
+                    const mOpen = _dedOthMon.has(mKey);
+                    let mrow = `<tr class="hl-oth-mon" data-m="${esc(mKey)}" style="cursor:pointer;background:var(--rule-softer);">
+                      ${td('<span style="padding-left:74px;color:var(--ink-3);font-size:10.5px;">' + caret(mOpen, 11) + _dedMon(m) + '</span>')}
+                      ${td('')}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + v.lines + '</span>', true)}
+                      ${td('', true)}${td('', true)}
+                      ${td('<span style="font-size:10.5px;">' + money(-v.amount) + '</span>', true)}
+                      ${td('', true)}${td('', true)}
+                    </tr>`;
+                    if (!mOpen) return mrow;
+                    // The charges themselves. invoice_no is the distributor's own
+                    // document id and the exact key to the backup file, so it is
+                    // the thing to quote back to them on a dispute.
+                    mrow += `<tr><td colspan="8" style="padding:0 0 8px 84px;background:var(--rule-softer);">
+                      <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10.5px;">
+                        <thead><tr>
+                          <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Document / invoice no.</th>
+                          <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Date</th>
+                          <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Check</th>
+                          <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">PO / remarks</th>
+                          <th style="text-align:right;padding:4px 8px;color:var(--ink-3);font-weight:400;">Amount</th>
+                          <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Backup</th>
+                        </tr></thead>
+                        <tbody>${v.rows.slice().sort((a, b2) => a.amount - b2.amount).map(r => `<tr>
+                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);">${esc(r.invoice_no || '')}</td>
+                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(String(r.doc_date || '').slice(0, 10))}</td>
+                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(_chkNo.get(r.check_id) || '')}</td>
+                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(r.po_no || r.remarks || '')}</td>
+                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);text-align:right;">${money(-Number(r.amount || 0))}</td>
+                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:${r.detail_parsed ? 'var(--won)' : 'var(--ink-3)'};">${r.detail_parsed ? 'parsed' : 'not parsed'}</td>
+                        </tr>`).join('')}</tbody>
+                      </table></td></tr>`;
+                    return mrow;
+                  }).join('');
+                  return inner;
+                }).join('');
+                return mid;
+              }).join('');
               return out;
             }).join('')}
           </tbody>
           <tfoot><tr style="border-top:2px solid var(--ink);">
-            ${td('<strong>ALL DEDUCTIONS</strong>')}${td('', true)}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${td('<strong>ALL DEDUCTIONS</strong>')}${td('')}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
             ${td('<strong>' + money(Math.abs(bList.reduce((n, b) => n + b.merch, 0))) + '</strong>', true)}
             ${td('<strong>' + money(Math.abs(totalFee)) + '</strong>', true)}
             ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
@@ -30517,20 +30462,31 @@ ${(() => {
           </tr></tfoot>
         </table>`;
 
-      // Other charges now lives here, beneath the distributor split, rather than
-      // as its own tab reaching the same numbers by a different route.
-      body.innerHTML += `
-        <div style="margin-top:34px;padding-top:22px;border-top:1px solid var(--rule);">
-          <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.09em;text-transform:uppercase;color:var(--ink-2);font-weight:600;margin-bottom:12px;">Other charges \u00b7 everything that is not trade spend</div>
-          ${_dedOtherChargesHtml()}
-        </div>`;
-
+      // Four levels, four toggles. Each stops propagation so opening a code does
+      // not also collapse the category it sits inside.
       body.querySelectorAll('.hl-sum-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.b;
         _dedSumOpen.has(n) ? _dedSumOpen.delete(n) : _dedSumOpen.add(n);
         renderDeductions(hostEl, filtersEl, year);
       });
-      _dedWireOtherCharges();
+      body.querySelectorAll('.hl-oth-cat').forEach(tr => tr.onclick = (ev) => {
+        ev.stopPropagation();
+        const n = tr.dataset.c;
+        _dedOthCat.has(n) ? _dedOthCat.delete(n) : _dedOthCat.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-oth-code').forEach(tr => tr.onclick = (ev) => {
+        ev.stopPropagation();
+        const k = tr.dataset.k;
+        _dedOthCode.has(k) ? _dedOthCode.delete(k) : _dedOthCode.add(k);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-oth-mon').forEach(tr => tr.onclick = (ev) => {
+        ev.stopPropagation();
+        const k = tr.dataset.m;
+        _dedOthMon.has(k) ? _dedOthMon.delete(k) : _dedOthMon.add(k);
+        renderDeductions(hostEl, filtersEl, year);
+      });
       return;
     }
 
