@@ -28998,11 +28998,10 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'other', 'category', 'customer', 'code', 'checks', 'exceptions'];
-  // The detail tabs are collapsed on the Overview and open automatically on any
-  // other view. Session state, not persisted — this is where you are looking
-  // right now, not a preference.
-  let _dedDetailBar = false;
+  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'customer', 'code', 'checks', 'exceptions'];
+  // 'category' and 'other' were retired into 'summary'. Anyone whose browser has
+  // one of them saved would otherwise land on a view that no longer renders.
+  const DED_VIEW_MOVED = { category: 'summary', other: 'summary' };
   let _dedOthCat = new Set();     // Other charges: expanded categories
   let _dedOthCode = new Set();    // Other charges: expanded reason codes
   let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
@@ -29126,7 +29125,7 @@ render();
     'Unclassified': 'No category mapped yet. Ranked by dollars — mapping the top few moves most of this.',
   };
   let _dedView = (() => {
-    try { const v = localStorage.getItem('keel_ded_view');
+    try { const v = DED_VIEW_MOVED[localStorage.getItem('keel_ded_view')] || localStorage.getItem('keel_ded_view');
           return DED_VIEWS.includes(v) ? v : 'exec'; }
     catch (e) { return 'exec'; }
   })();
@@ -29474,12 +29473,20 @@ render();
     // Four of them were the same register sliced differently. Grouped into three:
     // the reconciliation you came for, the charges that never reconcile, and the
     // plumbing — which is worth keeping but not worth top billing.
-    const VIEW_GROUPS = [
-      { label: 'Reconcile', views: [['reconcile', 'Vs plan'], ['customer', 'By customer'], ['category', 'By category']] },
-      { label: 'Charges',   views: [['other', 'Other charges'], ['code', 'By reason code'], ['summary', 'All buckets']] },
-      { label: 'Data',      views: [['checks', 'Checks'], ['exceptions', 'Exceptions']] },
+    // ONE ROW, NO GROUPS, NO DISCLOSURE. The three group labels and the
+    // "Detail views" toggle were chrome around seven buttons that fit on a line.
+    // 'By category' is gone: it and 'All buckets' answered the same question, so
+    // the bucket view survives under the name Category. 'Other charges' is gone
+    // too — it now sits inside that view, under the distributor split.
+    const views = [
+      ['exec',       'Overview'],
+      ['reconcile',  'Reconcile vs. plan'],
+      ['customer',   'By customer'],
+      ['summary',    'Category'],
+      ['code',       'By reason code'],
+      ['checks',     'Checks'],
+      ['exceptions', 'Exceptions'],
     ];
-    const views = VIEW_GROUPS.flatMap(g => g.views);
 
     // DECLARED HERE, ABOVE FIRST USE. These were further down the function while
     // the headline markup above referenced them — const is hoisted but not
@@ -29545,25 +29552,15 @@ render();
         }).join('')}
       </div>
 
-      <div style="margin:10px 0 4px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
-        <button class="hl-ded-view" data-v="exec"
-          style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;cursor:pointer;margin-right:10px;
-                 border:1px solid ${_dedView === 'exec' ? 'var(--ink)' : 'var(--rule-soft)'};
-                 background:${_dedView === 'exec' ? 'var(--ink)' : 'transparent'};
-                 color:${_dedView === 'exec' ? 'var(--paper)' : 'var(--ink-3)'};">Overview</button>
-        <button id="hl-ded-detailbar"
-          style="font-family:var(--mono);font-size:10px;padding:6px 12px;border-radius:5px;cursor:pointer;margin-right:10px;
-                 border:1px solid var(--rule-soft);background:transparent;color:var(--ink-3);">Detail views ${_dedDetailBar || _dedView !== 'exec' ? '\u25B4' : '\u25BE'}</button>
-        ${!(_dedDetailBar || _dedView !== 'exec') ? '' : VIEW_GROUPS.map(g => `
-          <span style="display:inline-flex;align-items:center;gap:5px;margin-right:16px;">
-            <span style="font-family:var(--mono);font-size:9px;letter-spacing:0.07em;text-transform:uppercase;color:var(--rule);">${g.label}</span>
-            ${g.views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}"
-              style="font-family:var(--mono);font-size:10.5px;padding:6px 12px;border-radius:5px;cursor:pointer;
-                     border:1px solid ${_dedView === v ? 'var(--ink)' : 'var(--rule-soft)'};
-                     background:${_dedView === v ? 'var(--ink)' : 'transparent'};
-                     color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
-          </span>`).join('')}
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">${_dedDist === 'all' ? 'all distributors' : _dedDist}</span>
+      <div style="margin:10px 0 4px;display:flex;gap:4px;align-items:center;flex-wrap:wrap;">
+        <span style="display:inline-flex;gap:3px;padding:3px;border:1px solid var(--rule-soft);border-radius:7px;">
+          ${views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}"
+            style="font-family:var(--mono);font-size:10.5px;padding:6px 13px;border-radius:5px;cursor:pointer;white-space:nowrap;
+                   border:1px solid ${_dedView === v ? 'var(--ink)' : 'transparent'};
+                   background:${_dedView === v ? 'var(--ink)' : 'transparent'};
+                   color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
+        </span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:10px;">${_dedDist === 'all' ? 'all distributors' : _dedDist}</span>
         <button id="hl-ded-refresh" title="Re-read from Supabase — use after running SQL or the detail parser"
           style="margin-left:10px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">↻ Refresh</button>
       </div>
@@ -29572,22 +29569,10 @@ render();
 
     hostEl.querySelectorAll('.hl-ded-view').forEach(b => b.onclick = () => {
       if (b.dataset.v === _dedView) return;
-      // Returning to the Overview collapses the detail bar with it, so the
-      // landing page always lands in the same state.
-      if (b.dataset.v === 'exec') _dedDetailBar = false;
       _dedView = b.dataset.v;
       try { localStorage.setItem('keel_ded_view', _dedView); } catch (e) {}
       renderDeductions(hostEl, filtersEl, year);
     });
-
-    const _dbar = document.getElementById('hl-ded-detailbar');
-    if (_dbar) _dbar.onclick = () => {
-      // Opening the bar from the Overview reveals the tabs; closing it from a
-      // detail tab has to return somewhere, and the Overview is that somewhere.
-      if (_dedView !== 'exec') { _dedView = 'exec'; try { localStorage.setItem('keel_ded_view', 'exec'); } catch (e) {} _dedDetailBar = false; }
-      else _dedDetailBar = !_dedDetailBar;
-      renderDeductions(hostEl, filtersEl, year);
-    };
 
     const body = document.getElementById('hl-ded-body');
     const rfsh = document.getElementById('hl-ded-refresh');
@@ -29774,7 +29759,6 @@ render();
           ${sub ? `<div style="font-family:var(--serif);font-size:13.5px;color:var(--ink-3);margin-top:5px;line-height:1.55;max-width:82ch;">${sub}</div>` : ''}
           <div style="margin-top:12px;">${inner}</div>
         </section>`;
-      const bar = (n, max) => `<div style="height:2px;background:var(--ink);opacity:.75;width:${max ? (n / max * 100).toFixed(2) : 0}%;"></div>`;
       const wait = (t) => `<div class="hl-loading" style="padding:16px 0;font-size:13px;">${t}</div>`;
       const problem = (t) => `<div style="font-family:var(--mono);font-size:12.5px;color:var(--lost);line-height:1.6;padding:8px 0;">${t}</div>`;
       const prose = (t) => `<div style="font-family:var(--serif);font-size:14px;color:var(--ink-2);line-height:1.65;padding:6px 0;max-width:82ch;">${t}</div>`;
@@ -29792,7 +29776,6 @@ render();
         if (l.check_id) e.checks.add(l.check_id);
       }
       const distRows = [...distMap.values()].sort((a, b) => b.amt - a.amt);
-      const distMax = Math.max(1, ...distRows.map(r => r.amt));
       // Full width and laid out horizontally: it is two or three rows, so as a
       // column it was a tall box mostly made of nothing.
       const panelDist = panel('Who deducted', _dedDist === 'all'
@@ -29807,7 +29790,7 @@ render();
                 <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${shr(r.amt)}</span>
               </div>
               <div style="font-family:var(--serif);font-size:25px;margin-top:4px;">${money(r.amt)}</div>
-              <div style="margin:8px 0 7px;">${bar(r.amt, distMax)}</div>
+              <div style="margin:8px 0 7px;height:1px;background:var(--rule-soft);"></div>
               <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">
                 ${r.lines.toLocaleString()} lines \u00b7 ${r.checks.size || 0} checks${r.fee ? ' \u00b7 ' + money(Math.abs(r.fee)) + ' fees' : ''}
               </div>
@@ -29815,7 +29798,7 @@ render();
           <div style="flex:1 1 220px;min-width:220px;border:1px solid var(--ink);border-radius:6px;padding:13px 15px;">
             <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Total</div>
             <div style="font-family:var(--serif);font-size:25px;margin-top:4px;">${money(grandDed)}</div>
-            <div style="margin:8px 0 7px;height:2px;background:var(--ink);"></div>
+            <div style="margin:8px 0 7px;height:1px;background:var(--rule);"></div>
             <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">
               ${L.length.toLocaleString()} lines \u00b7 ${checks.length} checks${totalFee ? ' \u00b7 ' + money(Math.abs(totalFee)) + ' fees' : ''}
             </div>
@@ -29827,15 +29810,13 @@ render();
       const catRest = catRows.slice(TOPN);
       const catRestAmt = catRest.reduce((n, r) => n + -r.amount, 0);
       const catRestLines = catRest.reduce((n, r) => n + r.lines, 0);
-      const catMax = Math.max(1, ...catTop.map(r => -r.amount));
       const panelCat = panel('Top ' + TOPN + ' categories', 'What the money was taken for, from the reason code on each line.',
-        goto_('category', 'By category'), `
+        goto_('summary', 'Category'), `
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>${pth('Category')}${pth('Lines', true)}${pth('Deducted', true)}${pth('Share', true)}</tr></thead>
           <tbody>
             ${catTop.map(r => `<tr>
-              ${ptd(pname(esc(r.key), r.key.startsWith('\u26A0')) + (r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : '')
-                  + '<div style="margin-top:6px;">' + bar(-r.amount, catMax) + '</div>')}
+              ${ptd(pname(esc(r.key), r.key.startsWith('\u26A0')) + (r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : ''))}
               ${ptd(r.lines.toLocaleString(), true)}
               ${ptd('<strong>' + money(-r.amount) + '</strong>', true)}
               ${ptd(shr(-r.amount), true, 'color:var(--ink-3);')}
@@ -29932,7 +29913,6 @@ render();
       const custTop = custAll.slice(0, TOPN);
       const custRest = custAll.slice(TOPN);
       const custRestAmt = custRest.reduce((n, c) => n + c.amt, 0);
-      const custMax = Math.max(1, ...custTop.map(c => c.amt));
       const custFoot = custAll.reduce((n, c) => n + c.amt, 0) + noName2 + undoc2;
 
       // The detail either loaded or it did not. When it did not, say so and
@@ -29955,8 +29935,7 @@ render();
             <tbody>
               ${custTop.map(c => `<tr>
                 ${ptd(pname(esc(c.name))
-                    + (c.plan ? '' : ' <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.05em;padding:2px 6px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);">UNLINKED</span>')
-                    + '<div style="margin-top:6px;">' + bar(c.amt, custMax) + '</div>')}
+                    + (c.plan ? '' : ' <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.05em;padding:2px 6px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);">UNLINKED</span>'))}
                 ${ptd(c.stores.size || '\u2014', true)}
                 ${ptd('<strong>' + money(c.amt) + '</strong>', true)}
                 ${ptd(shr(c.amt), true, 'color:var(--ink-3);')}
@@ -30277,7 +30256,12 @@ ${(() => {
     // into a bucket total with no way to see the charge itself.
     // Category -> reason code -> month, with the retailer KeHE named in the
     // document and how much of each has backup behind it.
-    if (_dedView === 'other') {
+    // OTHER CHARGES, folded into the Category view. It answered the same
+    // question the bucket table does — what was taken and under which code —
+    // one level further down, so as its own tab it was a second route to the
+    // same place. Returns markup; the caller appends it and then calls
+    // _dedWireOtherCharges().
+    const _dedOtherChargesHtml = () => {
       const _chkNo = new Map(checks.map(ch => [ch.id, ch.check_no]));
       const cats = new Map();
       let grand = 0, grandFee = 0, grandDoc = 0, nLines = 0;
@@ -30308,7 +30292,7 @@ ${(() => {
       const pc2 = (v) => grand ? (v / grand * 100).toFixed(1) + '%' : '\u2014';
       const dp = (o) => o.amt ? Math.round(o.doc / o.amt * 100) + '%' : '\u2014';
 
-      body.innerHTML = `
+      return `
         <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);line-height:1.55;margin:0 0 14px;max-width:900px;">
           EVERYTHING THAT IS NOT TRADE SPEND \u2014 ${money(-grand)} across ${nLines.toLocaleString()} lines.
           Allowances, shortages, late-delivery fines, freight, returns and credits: charges with no promotion behind them,
@@ -30390,6 +30374,9 @@ ${(() => {
           </tr></tfoot>
         </table>`;
 
+    };
+
+    const _dedWireOtherCharges = () => {
       body.querySelectorAll('.hl-oth-cat').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.c;
         _dedOthCat.has(n) ? _dedOthCat.delete(n) : _dedOthCat.add(n);
@@ -30407,8 +30394,7 @@ ${(() => {
         _dedOthCode.has(k) ? _dedOthCode.delete(k) : _dedOthCode.add(k);
         renderDeductions(hostEl, filtersEl, year);
       });
-      return;
-    }
+    };
 
     // ── summary ───────────────────────────────────────────────────────────
     // One row per bucket, expandable to the categories inside it. Built from the
@@ -30531,11 +30517,20 @@ ${(() => {
           </tr></tfoot>
         </table>`;
 
+      // Other charges now lives here, beneath the distributor split, rather than
+      // as its own tab reaching the same numbers by a different route.
+      body.innerHTML += `
+        <div style="margin-top:34px;padding-top:22px;border-top:1px solid var(--rule);">
+          <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.09em;text-transform:uppercase;color:var(--ink-2);font-weight:600;margin-bottom:12px;">Other charges \u00b7 everything that is not trade spend</div>
+          ${_dedOtherChargesHtml()}
+        </div>`;
+
       body.querySelectorAll('.hl-sum-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.b;
         _dedSumOpen.has(n) ? _dedSumOpen.delete(n) : _dedSumOpen.add(n);
         renderDeductions(hostEl, filtersEl, year);
       });
+      _dedWireOtherCharges();
       return;
     }
 
@@ -30703,44 +30698,6 @@ ${(() => {
         const n = tr.dataset.b; _dedOpen.has(n) ? _dedOpen.delete(n) : _dedOpen.add(n);
         renderDeductions(hostEl, filtersEl, year);
       });
-      return;
-    }
-
-    // ── by category ─────────────────────────────────────────────────────────
-    if (_dedView === 'category') {
-      body.innerHTML = `
-        <table style="width:100%;border-collapse:collapse;">
-          <thead><tr>
-            ${th('Category')}${th('Codes', true)}${th('Lines', true)}
-            ${th('Merchandise $', true)}${th('Fees $', true)}${th('Total deducted', true)}${th('Backup', true)}
-          </tr></thead>
-          <tbody>
-            ${catRows.map(r => {
-              const warn = r.key.startsWith('⚠');
-              const merch = r.merch ? money(Math.abs(r.merch)) : '<span style="color:var(--ink-3);">—</span>';
-              return `<tr>
-                ${td(`<span style="font-family:var(--serif);font-size:13.5px;${warn ? 'color:var(--lost);' : ''}">${esc(r.key)}</span>${r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : ''}`)}
-                ${td(r.codes.size || '—', true)}
-                ${td(r.lines.toLocaleString(), true)}
-                ${td(merch, true)}
-                ${td(r.fee ? money(r.fee) : '<span style="color:var(--ink-3);">—</span>', true)}
-                ${td(`<strong>${money(-r.amount)}</strong>`, true)}
-                ${td(r.lines ? Math.round(r.parsed / r.lines * 100) + '%' : '—', true, r.parsed === 0 ? 'color:var(--ink-3);' : '')}
-              </tr>`;
-            }).join('')}
-          </tbody>
-          <tfoot><tr style="border-top:2px solid var(--ink);">
-            ${td('<strong>TOTAL</strong>')}${td('', true)}${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
-            ${td('<strong>' + (catRows.reduce((s, r) => s + r.merch, 0) ? money(Math.abs(catRows.reduce((s, r) => s + r.merch, 0))) : '—') + '</strong>', true)}
-            ${td('<strong>' + (totalFee ? money(totalFee) : '—') + '</strong>', true)}
-            ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
-            ${td('<strong>' + Math.round(parsedN / L.length * 100) + '%</strong>', true)}
-          </tr></tfoot>
-        </table>
-        ${/* catRows carries `amount`, not `total` — reading the wrong field summed
-             to zero and the tab accused itself of losing the entire register.
-             The check was right to shout; it was measuring the wrong thing. */
-          _dedTieNote(catRows.reduce((n, r) => n + (-r.amount || 0), 0), -totalAmt)}`;
       return;
     }
 
