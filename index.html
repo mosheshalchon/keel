@@ -29539,6 +29539,11 @@ render();
         ${stat('Unmapped codes', unmapped.length, unmapped.length ? money(-unmappedAmt) + ' unclassified' : 'all mapped')}
       </div>
 
+      <!-- Filled asynchronously by _dedRenderCrawl(). Empty until it resolves, and
+           empty forever if the table isn't there — an absent catalogue table is a
+           brand that doesn't crawl, not a fault worth shouting about. -->
+      <div id="hl-ded-crawl"></div>
+
       <div style="margin:14px 0 2px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
         <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:4px;">Distributor</span>
         ${[['all', 'All'], ['KeHE', 'KeHE'], ['UNFI', 'UNFI']].map(([d, lbl]) => {
@@ -29566,6 +29571,100 @@ render();
       </div>
       <div id="hl-ded-body"></div>
     `;
+
+    // ── CATALOGUE STATE ─────────────────────────────────────────────────────
+    // THE FAILURE THIS EXISTS TO MAKE VISIBLE. `sync-deduction-files` walks
+    // Dropbox and writes one row per file — a card catalogue. It opens nothing.
+    // Nothing downstream in Keel can touch a file that is not on that list.
+    //
+    // It is built to stop after ~2.5 minutes and save a bookmark so a large
+    // folder can be crawled across several runs, which is correct. What is not
+    // correct is that a truncated run and a finished run are indistinguishable
+    // afterwards: both stamp last_run_at, both return HTTP 200, and `truncated`
+    // was reported only in the response body, which is not stored anywhere. So a
+    // two-thirds-finished catalogue looked exactly like a complete one — and
+    // every line beneath the stopping point read "no file", which is true and
+    // useless. It presents as a parser fault. It cost a day: 2,551 files in
+    // `Kehe - ksolve`, including all the SN backup, were never indexed, and the
+    // re-run that found them took 12 seconds.
+    //
+    // `cursor` is the completeness signal, and it is ALREADY PERSISTED: the
+    // crawler saves a bookmark when it stops early and clears it on reaching the
+    // end. It is a PROXY, not a verdict — a run that dies mid-walk leaves a
+    // stale bookmark that looks the same as a clean truncation — so this strip
+    // reports what it read and names the proxy rather than asserting health.
+    //
+    // THE REMAINING GAP, deliberately not papered over: last_run_at is one
+    // timestamp doing two jobs. A truncated run stamps it exactly as a complete
+    // one does, so "the catalogue is incomplete right now" is answerable and
+    // "it was last whole on the 24th" is not. That needs a `last_completed_at`
+    // column and a stamp in the Edge Function. Until it exists, this strip does
+    // not pretend to know it.
+    async function _dedRenderCrawl() {
+      const el = document.getElementById('hl-ded-crawl');
+      if (!el) return;
+      let row;
+      try {
+        const { data, error } = await sb.from('deduction_crawl_state')
+          .select('cursor,last_run_at,last_result').eq('brand_id', brandId).limit(1);
+        if (error) return;                       // absent or unreadable — stay silent
+        row = (data || [])[0];
+      } catch (e) { return; }
+
+      const box = (border, bg, inner) => `<div style="margin:12px 0 0;padding:9px 12px;border:1px solid ${border};border-left-width:3px;border-radius:4px;background:${bg};font-family:var(--mono);font-size:10.5px;line-height:1.55;color:var(--ink-2);">${inner}</div>`;
+
+      if (!row) {
+        el.innerHTML = box('var(--lost)', 'rgba(168,56,31,0.06)',
+          `<strong style="color:var(--lost);">Catalogue never built.</strong> No file has been indexed, so every line on this page will report no backup regardless of what sits in Dropbox. Run <code>sync-deduction-files</code>.`);
+        return;
+      }
+
+      // jsonb arrives as an object through PostgREST, but a text column holding
+      // JSON arrives as a string. Accept either rather than assuming.
+      let res = row.last_result;
+      if (typeof res === 'string') { try { res = JSON.parse(res); } catch (e) { res = null; } }
+
+      const files = res && Number(res.files);
+      const folders = res && res.byFolder && typeof res.byFolder === 'object'
+        ? Object.keys(res.byFolder).length : null;
+      const gone = res && res.notSeenThisCrawl != null ? Number(res.notSeenThisCrawl) : null;
+
+      // A saved bookmark means it stopped with more to walk. Postgres NULL comes
+      // through as null, but a cursor written as the four-character string 'null'
+      // has happened, so both are treated as "no bookmark".
+      const cur = row.cursor;
+      const partial = cur != null && String(cur).trim() !== '' && String(cur).trim().toLowerCase() !== 'null';
+
+      const when = row.last_run_at ? new Date(row.last_run_at) : null;
+      const whenTxt = when && !isNaN(when) ? when.toLocaleString(undefined,
+        { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'unknown';
+      const ageDays = when && !isNaN(when) ? Math.floor((Date.now() - when.getTime()) / 86400000) : null;
+
+      const counted = [
+        files ? files.toLocaleString() + ' files' : null,
+        folders ? 'across ' + folders.toLocaleString() + ' folders' : null,
+      ].filter(Boolean).join(' ');
+
+      if (partial) {
+        el.innerHTML = box('var(--lost)', 'rgba(168,56,31,0.06)',
+          `<strong style="color:var(--lost);">Catalogue incomplete.</strong> The last crawl (${esc(whenTxt)}) stopped early and saved a bookmark, so part of the folder was never indexed.
+           Anything past the stopping point is invisible to Keel: those lines will read <em>no backup</em> whether or not the document exists.
+           <span style="color:var(--ink-3);">Re-run <code>sync-deduction-files</code> to continue from the bookmark — do not read the Exceptions tab as a document problem until it comes back clean.</span>
+           ${counted ? `<br><span style="color:var(--ink-3);">Indexed so far: ${counted}.</span>` : ''}`);
+        return;
+      }
+
+      // Stale is a different question from incomplete, and worth its own line: a
+      // catalogue can be complete as of a crawl that ran three weeks ago and
+      // still be missing everything filed since.
+      const stale = ageDays != null && ageDays >= 7;
+      el.innerHTML = box(stale ? 'var(--rule)' : 'var(--rule-soft)', 'transparent',
+        `<strong style="color:var(--ink);">Catalogue</strong> · ${counted || 'no count recorded'} · walked to the end of the folder on ${esc(whenTxt)}
+         ${gone != null && gone > 0 ? `· <span style="color:var(--ink-3);">${gone.toLocaleString()} previously-indexed file(s) not seen this crawl</span>` : ''}
+         ${stale ? `<br><span style="color:var(--ink-3);">Last crawled ${ageDays} days ago — complete as of then, so anything filed since is not indexed.</span>` : ''}
+         <br><span style="color:var(--ink-3);font-size:10px;">Completeness is read from the saved bookmark, not from a recorded completion — a run that died mid-walk would also leave no bookmark to find.</span>`);
+    }
+    _dedRenderCrawl().catch(e => console.error('[deductions] catalogue strip failed:', e));
 
     hostEl.querySelectorAll('.hl-ded-view').forEach(b => b.onclick = () => {
       if (b.dataset.v === _dedView) return;
@@ -30746,7 +30845,7 @@ ${(() => {
           ${unmapped.slice(0, 20).map(r => `<tr>${td('<strong>' + esc(r.code) + '</strong>')}${td('<span style="font-size:10px;color:var(--ink-3);">' + esc(r.src || '—') + '</span>')}${td(r.lines, true)}${td('<span style="color:var(--lost);">' + money(-r.amount) + '</span>', true)}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + esc((r.rm && r.rm.notes) || '') + '</span>')}</tr>`).join('')}
         </tbody></table>` : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">Every code is mapped.</div>')
       +
-      section('Largest lines with no parsed backup', 'A deduction with no supporting document cannot be verified line by line. Some codes never generate one — shortages are backed by the BOL, not a K-solve document.',
+      section('Largest lines with no parsed backup', 'A deduction with no supporting document cannot be verified line by line. Some are genuinely unfiled — KeHE never sent the document. Some are backed by ATG\'s own records rather than a K-solve one: INVATG is ATG\'s own invoice prefix returning as a deduction. Before reading any line here as a missing document, check the catalogue strip at the top of this page — a file that was never indexed reads exactly like a file that does not exist.',
         bigNoBackup.length ? `<table style="width:100%;border-collapse:collapse;"><thead><tr>${th('Invoice #')}${th('Date')}${th('Code')}${th('DC')}${th('Remarks')}${th('Amount', true)}</tr></thead><tbody>
           ${bigNoBackup.map(l => `<tr>${td(esc(l.invoice_no))}${td(esc(String(l.doc_date || '—')))}${td(esc(l.reason_code || '—'))}${td('<span style="font-size:10.5px;">' + esc(l.dc_name || '—') + '</span>')}${td('<span style="font-size:10.5px;color:var(--ink-3);">' + esc(l.remarks || '') + '</span>')}${td(money(-l.amount), true)}</tr>`).join('')}
         </tbody></table>` : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">Every line has backup.</div>');
@@ -49136,6 +49235,65 @@ ${(() => {
         };
       },
     },
+    {
+      id: 'sync-completeness',
+      title: 'Background crawls finished what they started',
+      why: 'A process that can stop halfway and a process that finished look identical afterwards: both stamp a run time, both return HTTP 200 (these functions return ok:false in the BODY by design, so a status code cannot tell them apart), and the truncation flag lives only in a response nobody keeps. The document catalogue stopped two-thirds of the way through and said so in a field that was never stored — 2,551 files, including every SN document, stayed invisible for a day while the symptom read as a parser bug. The Sales Pacing outage was the same shape: twelve days of silence indistinguishable from twelve days of success.',
+      async run(ctx) {
+        // One entry per state table. A second background process becomes one
+        // more line here — that is the point of the shape.
+        const SOURCES = [
+          { table: 'deduction_crawl_state', label: 'Document catalogue (sync-deduction-files)', staleDays: 7 },
+        ];
+        const rows = [];
+        let worst = 'ok';
+        const bump = (s) => { if (s === 'fail') worst = 'fail'; else if (s === 'warn' && worst !== 'fail') worst = 'warn'; };
+
+        for (const src of SOURCES) {
+          const { data, error } = await ctx.sb.from(src.table)
+            .select('cursor,last_run_at,last_result').eq('brand_id', ctx.brandId).limit(1);
+          if (_auditMissingTable(error)) continue;                  // not this brand's concern
+          if (error) { rows.push([src.label, 'unreadable', error.message]); bump('warn'); continue; }
+
+          const r = (data || [])[0];
+          if (!r) { rows.push([src.label, 'NEVER RUN', 'Nothing indexed — everything downstream will report missing.']); bump('fail'); continue; }
+
+          const cur = r.cursor;
+          const partial = cur != null && String(cur).trim() !== '' && String(cur).trim().toLowerCase() !== 'null';
+          const when = r.last_run_at ? new Date(r.last_run_at) : null;
+          const ok = when && !isNaN(when);
+          const ageDays = ok ? Math.floor((Date.now() - when.getTime()) / 86400000) : null;
+          const whenTxt = ok ? when.toISOString().slice(0, 16).replace('T', ' ') : 'unknown';
+
+          let res = r.last_result;
+          if (typeof res === 'string') { try { res = JSON.parse(res); } catch (e) { res = null; } }
+          const n = res && res.files ? Number(res.files).toLocaleString() + ' files' : 'no count';
+
+          if (partial) {
+            rows.push([src.label, 'INCOMPLETE', 'Stopped early at ' + whenTxt + ' with a saved bookmark · ' + n + ' indexed so far — re-run to continue.']);
+            bump('fail');
+          } else if (ageDays != null && ageDays >= src.staleDays) {
+            rows.push([src.label, 'STALE', 'Complete, but last walked ' + ageDays + ' days ago (' + whenTxt + ') · ' + n + ' — nothing filed since is indexed.']);
+            bump('warn');
+          } else {
+            rows.push([src.label, 'complete', 'Walked to the end at ' + whenTxt + ' · ' + n + '.']);
+          }
+        }
+
+        if (!rows.length) return { status: 'skip', summary: 'No background crawl state tables on this brand.' };
+        if (worst === 'ok') return { status: 'ok', summary: rows.length + ' background crawl(s) finished their last run.', cols: ['process', 'state', 'detail'], rows };
+        return {
+          status: worst,
+          summary: rows.filter(r => r[1] !== 'complete').length + ' of ' + rows.length + ' background crawl(s) did not finish, or finished too long ago to trust.',
+          cols: ['process', 'state', 'detail'],
+          rows,
+          // Deliberately not SQL. Nothing here is fixed by a statement — the
+          // remedy is re-running the function, and the durable fix is a stored
+          // completion time so this stops relying on the bookmark as a proxy.
+          note: 'Completeness is inferred from the saved cursor: a bookmark means it stopped early, none means it reached the end. A run that crashed mid-walk would also leave no bookmark, so this reads clean in that one case. Closing it needs a last_completed_at column on the state table, stamped by the Edge Function only on a full pass.',
+        };
+      },
+    },
   ];
 
   async function renderSettingsAudit() {
@@ -49202,6 +49360,12 @@ ${(() => {
           + res.rows.map(r => '<tr>' + r.map(c => '<td style="padding:4px 9px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">' + escapeHtml(String(c)) + '</td>').join('') + '</tr>').join('')
           + '</tbody></table></div>'
         : '';
+      // Optional. Some checks have no SQL fix and a real limitation worth
+      // stating on screen — a check that knows its own blind spot and reports it
+      // nowhere is the same failure this panel exists to catch.
+      const note = res.note
+        ? '<div style="margin-top:10px;padding:8px 11px;border-left:2px solid var(--rule);background:rgba(0,0,0,0.03);font-family:var(--mono);font-size:10px;line-height:1.55;color:var(--ink-3);">' + escapeHtml(res.note) + '</div>'
+        : '';
       const sql = res.sql
         ? '<div style="margin-top:10px;"><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-bottom:4px;">SUGGESTED FIX — read it before you run it</div>'
           + '<pre style="margin:0;padding:9px 11px;background:rgba(0,0,0,0.05);border-radius:5px;font-family:var(--mono);font-size:10px;white-space:pre-wrap;overflow-x:auto;">' + escapeHtml(res.sql) + '</pre></div>'
@@ -49214,7 +49378,7 @@ ${(() => {
         + '<span class="hl-audit-car" id="hl-audit-car' + i + '" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (open ? '▼' : '▶') + '</span></div>'
         + '<div class="hl-audit-detail" id="hl-audit-d' + i + '" style="display:' + (open ? 'block' : 'none') + ';margin-top:10px;padding-top:10px;border-top:1px solid var(--rule-soft);">'
         + '<div style="font-family:var(--serif,serif);font-style:italic;font-size:12.5px;color:var(--ink-2);line-height:1.5;">' + escapeHtml(chk.why) + '</div>'
-        + table + sql + '</div></div>';
+        + table + note + sql + '</div></div>';
     }).join('');
 
     host.innerHTML = '<div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">'
