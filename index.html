@@ -30133,13 +30133,7 @@ render();
           ${notTied.length} of ${checks.length} checks do not tie to their line detail</div>` : ''}
       </div>
 
-      <div style="display:flex;gap:34px;flex-wrap:wrap;padding:10px 2px 18px;border-bottom:1px solid var(--rule-soft);">
-        ${stat('Deducted ' + yr, money(-totalAmt), L.length.toLocaleString() + ' lines')}
-        ${stat('Checks', checks.length, checks.length - notTied.length + ' of ' + checks.length + ' tie out')}
-        ${stat('Processing fees', totalFee ? money(Math.abs(totalFee)) : '—', totalFee ? (totalFee / -totalAmt * 100).toFixed(1) + '% of deductions' : 'run mode=detail')}
-        ${stat('Documented', parsedN ? money(-parsedAmt) : '—', parsedN ? covPct + '% of dollars \u00b7 ' + parsedN.toLocaleString() + ' of ' + L.length.toLocaleString() + ' lines' : 'run mode=detail')}
-        ${stat('Unmapped codes', unmapped.length, unmapped.length ? money(-unmappedAmt) + ' unclassified' : 'all mapped')}
-      </div>
+      <div style="padding:2px 2px 14px;border-bottom:1px solid var(--rule-soft);"></div>
 
       <!-- Filled asynchronously by _dedRenderCrawl(). Empty until it resolves, and
            empty forever if the table isn't there — an absent catalogue table is a
@@ -30162,13 +30156,13 @@ render();
       <div style="margin:10px 0 4px;display:flex;gap:4px;align-items:center;flex-wrap:wrap;">
         <span style="display:inline-flex;gap:3px;padding:3px;border:1px solid var(--rule-soft);border-radius:7px;">
           ${views.map(([v, lbl]) => `<button class="hl-ded-view" data-v="${v}"
-            style="font-family:var(--mono);font-size:10.5px;padding:6px 13px;border-radius:5px;cursor:pointer;white-space:nowrap;
+            style="font-family:var(--mono);font-size:12.5px;padding:9px 18px;border-radius:6px;cursor:pointer;white-space:nowrap;
                    border:1px solid ${_dedView === v ? 'var(--ink)' : 'transparent'};
                    background:${_dedView === v ? 'var(--ink)' : 'transparent'};
                    color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
         </span>
         <button id="hl-ded-refresh" title="Re-read from Supabase — use after running SQL or the detail parser"
-          style="margin-left:auto;font-family:var(--mono);font-size:10px;padding:6px 14px;border-radius:5px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">↻ Refresh</button>
+          style="margin-left:auto;font-family:var(--mono);font-size:12px;padding:9px 18px;border-radius:6px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">↻ Refresh</button>
       </div>
       <div id="hl-ded-body"></div>
     `;
@@ -30497,7 +30491,7 @@ render();
                 <span style="font-family:var(--serif);font-size:17px;">${esc(r.name)}</span>
                 <span style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${shr(r.amt)}</span>
               </div>
-              <div style="font-family:var(--serif);font-size:25px;margin-top:4px;">${money(r.amt)}</div>
+              <div style="font-family:var(--serif);font-size:19px;margin-top:4px;">${money(r.amt)}</div>
               <div style="margin:8px 0 7px;height:1px;background:var(--rule-soft);"></div>
               <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">
                 ${r.lines.toLocaleString()} lines \u00b7 ${r.checks.size || 0} checks${r.fee ? ' \u00b7 ' + money(Math.abs(r.fee)) + ' fees' : ''}
@@ -30505,12 +30499,25 @@ render();
             </div>`).join('')}
           <div style="flex:1 1 220px;min-width:220px;border:1px solid var(--ink);border-radius:6px;padding:13px 15px;">
             <div style="font-family:var(--mono);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);">Total</div>
-            <div style="font-family:var(--serif);font-size:25px;margin-top:4px;">${money(grandDed)}</div>
+            <div style="font-family:var(--serif);font-size:19px;margin-top:4px;">${money(grandDed)}</div>
             <div style="margin:8px 0 7px;height:1px;background:var(--rule);"></div>
             <div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">
               ${L.length.toLocaleString()} lines \u00b7 ${checks.length} checks${totalFee ? ' \u00b7 ' + money(Math.abs(totalFee)) + ' fees' : ''}
             </div>
           </div>
+        </div>
+
+        <!-- THE SUMMARY STRIP, MOVED HERE FROM THE PAGE HEADER. It was five
+             numbers about the register floating above a tab bar that changes
+             what the register means, so on every tab but this one it described
+             something the reader was not looking at. Same numbers, same order,
+             now sitting under the source breakdown they belong to. -->
+        <div style="display:flex;gap:30px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--rule-soft);">
+          ${stat('Deducted ' + yr, money(-totalAmt), L.length.toLocaleString() + ' lines')}
+          ${stat('Checks', checks.length, checks.length - notTied.length + ' of ' + checks.length + ' tie out')}
+          ${stat('Processing fees', totalFee ? money(Math.abs(totalFee)) : '\u2014', totalFee ? (totalFee / -totalAmt * 100).toFixed(1) + '% of deductions' : 'run mode=detail')}
+          ${stat('Documented', parsedN ? money(-parsedAmt) : '\u2014', parsedN ? covPct + '% of dollars \u00b7 ' + parsedN.toLocaleString() + ' of ' + L.length.toLocaleString() + ' lines' : 'run mode=detail')}
+          ${stat('Unmapped codes', unmapped.length, unmapped.length ? money(-unmappedAmt) + ' unclassified' : 'all mapped')}
         </div>`, true);
 
       // ── 3 · what it was for. catRows is already sorted largest-first.
@@ -30521,18 +30528,17 @@ render();
       const panelCat = panel('Top ' + TOPN + ' categories', 'What the money was taken for, from the reason code on each line.',
         goto_('summary', 'Category'), `
         <table style="width:100%;border-collapse:collapse;">
-          <thead><tr>${pth('Category')}${pth('Lines', true)}${pth('Deducted', true)}${pth('Share', true)}</tr></thead>
+          <thead><tr>${pth('Category')}${pth('Deducted', true)}${pth('Share', true)}</tr></thead>
           <tbody>
             ${catTop.map(r => `<tr>
-              ${ptd(pname(esc(r.key), r.key.startsWith('\u26A0')) + (r.trade === true ? ' ' + tag('TRADE', 'var(--ink-3)') : ''))}
-              ${ptd(r.lines.toLocaleString(), true)}
+              ${ptd(pname(esc(r.key), r.key.startsWith('\u26A0')))}
               ${ptd('<strong>' + money(-r.amount) + '</strong>', true)}
               ${ptd(shr(-r.amount), true, 'color:var(--ink-3);')}
             </tr>`).join('')}
-            ${catRest.length ? `<tr>${ptd('<span style="color:var(--ink-3);">Other \u00b7 ' + catRest.length + ' categories</span>')}${ptd(catRestLines.toLocaleString(), true, 'color:var(--ink-3);')}${ptd(money(catRestAmt), true, 'color:var(--ink-3);')}${ptd(shr(catRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
+            ${catRest.length ? `<tr>${ptd('<span style="color:var(--ink-3);">Other \u00b7 ' + catRest.length + ' categories</span>')}${ptd(money(catRestAmt), true, 'color:var(--ink-3);')}${ptd(shr(catRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
           </tbody>
           <tfoot><tr style="border-top:2px solid var(--ink);">
-            ${ptd('<strong>TOTAL</strong>')}${ptd('<strong>' + L.length.toLocaleString() + '</strong>', true)}
+            ${ptd('<strong>TOTAL</strong>')}
             ${ptd('<strong>' + money(grandDed) + '</strong>', true)}${ptd('', true)}
           </tr></tfoot>
         </table>`);
@@ -30639,21 +30645,25 @@ render();
         : panel('Top ' + TOPN + ' customers', 'The downstream retailer named on the store detail, not the distributor that sent the check.',
             goto_('customer', 'By customer'), `
           <table style="width:100%;border-collapse:collapse;">
-            <thead><tr>${pth('Customer')}${pth('Stores', true)}${pth('Deducted', true)}${pth('Share', true)}</tr></thead>
+            <thead><tr>${pth('Customer')}${pth('Deducted', true)}${pth('Share', true)}</tr></thead>
             <tbody>
               ${custTop.map(c => `<tr>
-                ${ptd(pname(esc(c.name))
-                    + (c.plan ? '' : ' <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.05em;padding:2px 6px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);">UNLINKED</span>'))}
-                ${ptd(c.stores.size || '\u2014', true)}
+                ${ptd(pname(esc(c.name)))}
                 ${ptd('<strong>' + money(c.amt) + '</strong>', true)}
                 ${ptd(shr(c.amt), true, 'color:var(--ink-3);')}
               </tr>`).join('')}
-              ${custRest.length ? `<tr>${ptd('<span style="color:var(--ink-3);">Other \u00b7 ' + custRest.length.toLocaleString() + ' customers</span>')}${ptd('', true)}${ptd(money(custRestAmt), true, 'color:var(--ink-3);')}${ptd(shr(custRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
-              ${noName2 ? `<tr>${ptd('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${ptd('', true)}${ptd(money(noName2), true, 'color:var(--ink-3);')}${ptd(shr(noName2), true, 'color:var(--ink-3);')}</tr>` : ''}
-              ${undoc2 ? `<tr>${ptd('<span style="color:var(--ink-3);">Not traced to a store \u2014 no detail behind the line</span>')}${ptd('', true)}${ptd(money(undoc2), true, 'color:var(--ink-3);')}${ptd(shr(undoc2), true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${custRest.length ? `<tr>${ptd('<span style="color:var(--ink-3);">Other \u00b7 ' + custRest.length.toLocaleString() + ' customers</span>')}${ptd(money(custRestAmt), true, 'color:var(--ink-3);')}${ptd(shr(custRestAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
+              <!-- ONE BUCKET, NOT TWO. 'Store detail with no customer name' and
+                   'Not traced to a store' were a $219 row sitting next to a
+                   $168,488 row, and the distinction between them — detail exists
+                   but names nobody, versus no detail at all — is a parser
+                   distinction, not one a reader of this table can act on. They
+                   are the same answer to the same question: this money reached
+                   no customer. Split back out if the small one ever grows. -->
+              ${(noName2 + undoc2) ? `<tr>${ptd('<span style="color:var(--ink-3);">Not traced to a customer</span>')}${ptd(money(noName2 + undoc2), true, 'color:var(--ink-3);')}${ptd(shr(noName2 + undoc2), true, 'color:var(--ink-3);')}</tr>` : ''}
             </tbody>
             <tfoot><tr style="border-top:2px solid var(--ink);">
-              ${ptd('<strong>TOTAL</strong>')}${ptd('', true)}
+              ${ptd('<strong>TOTAL</strong>')}
               ${ptd('<strong>' + money(custFoot) + '</strong>', true)}${ptd('', true)}
             </tr></tfoot>
           </table>
