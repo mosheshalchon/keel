@@ -28998,7 +28998,7 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'customer', 'checks', 'exceptions', 'upload'];
+  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'customer', 'checks', 'exceptions', 'upload', 'lines'];
   // 'category' and 'other' were retired into 'summary'. Anyone whose browser has
   // one of them saved would otherwise land on a view that no longer renders.
   // 'code' joined them: By reason code showed the same money as Category, split
@@ -29007,6 +29007,11 @@ render();
   // remove a button is a worse trade than leaving it unreachable.
   const DED_VIEW_MOVED = { category: 'summary', other: 'summary', code: 'summary' };
   let _dedCustStore = new Set();  // By customer: expanded stores -> the item rows
+  // Deductions tab: the register at line grain.
+  let _dedLinesLimit = 25;        // rows shown; grows by DED_PAGE
+  let _dedLinesQ = '';            // free-text search over invoice / code / remarks
+  let _dedLinesMonths = new Set(); // empty = every month, matching the app's other multi-selects
+  let _dedLinesOpen = new Set();  // which lines are expanded to their store detail
   let _dedOthCat = new Set();     // Other charges: expanded categories
   let _dedOthCode = new Set();    // Other charges: expanded reason codes
   let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
@@ -30161,6 +30166,7 @@ render();
       ['customer',   'By customer'],
       ['summary',    'Category'],
       ['checks',     'Checks'],
+      ['lines',      'Deductions'],
       ['exceptions', 'Exceptions'],
       ['reconcile',  'Reconcile vs. plan'],
       ['upload',     'Upload backup'],
@@ -30470,6 +30476,219 @@ render();
     // fetch, which is ~16.5k rows this view never reads.
     if (_dedView === 'upload') {
       await _dedRenderUpload(body, sb, brandId, esc, money, () => renderDeductions(hostEl, filtersEl, year));
+      return;
+    }
+
+    // ── DEDUCTIONS · THE REGISTER AT LINE GRAIN ───────────────────────────────
+    // Every other tab is an aggregate. This one is the rows themselves — one per
+    // deduction, largest first — because when a category or a customer looks
+    // wrong the next question is always "which lines is that?", and until now
+    // the only way to answer it was SQL.
+    //
+    // IT FOOTS TO THE SUMMARY. The total below is the same `L` the headline sums,
+    // so this tab and the Deductions summary cannot disagree. Filters change what
+    // is LISTED and are shown as their own subtotal — the register total stays on
+    // screen next to it, so a filter can never look like money going missing.
+    if (_dedView === 'lines') {
+      const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const mLbl = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
+      const catOf = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || null; };
+
+      // Detail is optional here: the tab is useful without it and must not wait
+      // on a 16.5k-row fetch to paint. If the cache happens to hold it, each row
+      // can expand to its store lines.
+      const DL = _dedDetail && !_dedDetail.err ? _dedDetail : null;
+      const detBy = new Map();
+      if (DL) for (const d of (DL.det || [])) {
+        if (!detBy.has(d.line_id)) detBy.set(d.line_id, []);
+        detBy.get(d.line_id).push(d);
+      }
+
+      const monthOf = (l) => String(l.doc_date || '').slice(0, 7);
+      const allMonths = [...new Set(L.map(monthOf).filter(Boolean))].sort();
+      const undatedN = L.filter(l => !monthOf(l)).length;
+
+      // Search covers what someone would actually have in hand: an invoice
+      // number off a check stub, a reason code, a DC name, or a phrase from the
+      // remarks. Tokenised so "WE0131 MCB" narrows rather than finding nothing.
+      const terms = _dedLinesQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const hay = (l) => [l.invoice_no, l.reason_code, l.dc_name, l.remarks, catOf(l)]
+        .filter(Boolean).join(' ').toLowerCase();
+      const matches = (l) => {
+        if (_dedLinesMonths.size) {
+          const mk = monthOf(l) || '(undated)';
+          if (!_dedLinesMonths.has(mk)) return false;
+        }
+        if (!terms.length) return true;
+        const h = hay(l);
+        return terms.every(t => h.includes(t));
+      };
+
+      const filtered = L.filter(matches).slice().sort((a, b) =>
+        Math.abs(Number(b.amount || 0)) - Math.abs(Number(a.amount || 0)));
+      const filteredAmt = filtered.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
+      const registerAmt = L.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
+      const shown = filtered.slice(0, _dedLinesLimit);
+      const isFiltered = terms.length > 0 || _dedLinesMonths.size > 0;
+
+      const monthChip = (k, lbl, n, amt) => {
+        const on = _dedLinesMonths.has(k);
+        return `<label style="display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;font-family:var(--mono);font-size:11.5px;white-space:nowrap;">
+          <input type="checkbox" class="hl-dl-mon" data-m="${esc(k)}" ${on ? 'checked' : ''} style="margin:0;cursor:pointer;">
+          <span style="flex:1;">${esc(lbl)}</span>
+          <span style="color:var(--ink-3);">${n}</span>
+        </label>`;
+      };
+      const monLabel = !_dedLinesMonths.size ? 'All months'
+        : _dedLinesMonths.size === 1 ? mLbl([..._dedLinesMonths][0])
+        : _dedLinesMonths.size + ' months';
+
+      body.innerHTML = `
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
+          <input id="hl-dl-q" type="search" placeholder="Search invoice, code, DC or remarks\u2026" value="${esc(_dedLinesQ)}"
+            style="flex:1 1 300px;min-width:220px;font-family:var(--mono);font-size:12px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
+          <div style="position:relative;">
+            <button id="hl-dl-mon-toggle" type="button"
+              style="font-family:var(--mono);font-size:12px;padding:9px 14px;border:1px solid ${_dedLinesMonths.size ? 'var(--ink)' : 'var(--rule)'};border-radius:6px;background:var(--paper);cursor:pointer;display:flex;align-items:center;gap:10px;">
+              <span style="color:var(--ink);">${esc(monLabel)}</span><span style="color:var(--ink-3);font-size:10px;">\u25be</span>
+            </button>
+            <div id="hl-dl-mon-menu" style="display:none;position:absolute;top:100%;right:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,0.10);z-index:60;min-width:220px;max-height:320px;overflow-y:auto;">
+              <div style="padding:6px 10px;border-bottom:1px solid var(--rule-softer);display:flex;gap:6px;">
+                <button id="hl-dl-mon-all" type="button" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:3px 8px;cursor:pointer;text-transform:uppercase;border-radius:3px;">Select all</button>
+                <button id="hl-dl-mon-none" type="button" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:3px 8px;cursor:pointer;text-transform:uppercase;border-radius:3px;">Clear</button>
+              </div>
+              <div style="padding:4px 0;">
+                ${allMonths.map(m => monthChip(m, mLbl(m), L.filter(l => monthOf(l) === m).length)).join('')}
+                ${undatedN ? monthChip('(undated)', 'No date', undatedN) : ''}
+              </div>
+            </div>
+          </div>
+          ${isFiltered ? `<button id="hl-dl-clear" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear filters</button>` : ''}
+        </div>
+
+        <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:0 0 10px;">
+          ${isFiltered
+            ? `${filtered.length.toLocaleString()} of ${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(filteredAmt)}</strong> of ${money(registerAmt)}`
+            : `${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(registerAmt)}</strong>`}
+        </div>
+
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Invoice')}${th('Month', true)}${th('Category')}${th('Code')}${th('Backup')}${th('Deducted', true)}${th('Share', true)}
+          </tr></thead>
+          <tbody>
+            ${shown.map(l => {
+              const amt = Math.abs(Number(l.amount || 0));
+              const cat = catOf(l);
+              const rows = detBy.get(l.id) || [];
+              const open = _dedLinesOpen.has(String(l.id));
+              const canOpen = rows.length > 0;
+              let out = `<tr class="${canOpen ? 'hl-dl-row' : ''}" data-l="${esc(String(l.id))}" style="${canOpen ? 'cursor:pointer;' : ''}">
+                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${canOpen ? (open ? '\u2212' : '+') : ''}</span><span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>`)}
+                ${td(monthOf(l) ? mLbl(monthOf(l)) : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
+                ${td(cat ? esc(cat) : '<span style="color:var(--lost);">\u26A0 unmapped</span>')}
+                ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(l.reason_code || '\u2014') + '</span>')}
+                ${td(l.detail_parsed
+                     ? '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + (rows.length ? rows.length.toLocaleString() + ' rows' : 'parsed') + '</span>'
+                     : '<span style="color:var(--lost);font-family:var(--mono);font-size:10px;">none</span>')}
+                ${td('<strong>' + money(amt) + '</strong>', true)}
+                ${td(registerAmt ? (amt / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
+              </tr>`;
+              if (open && rows.length) {
+                // Largest first, same as everywhere else: the row that matters is
+                // never the one the document happened to print first.
+                const items = rows.slice().sort((x, y) =>
+                  Math.abs(Number(y.bill_amount || 0)) - Math.abs(Number(x.bill_amount || 0)));
+                out += items.slice(0, 40).map(it => `<tr style="background:var(--rule-softer);">
+                  ${td('<span style="padding-left:26px;color:var(--ink-2);">' + esc(it.customer_name || it.banner || '(no customer)') + '</span>'
+                     + (it.item_desc ? '<div style="padding-left:26px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(it.item_desc) + '</div>' : ''))}
+                  ${td(it.reference_date ? String(it.reference_date).slice(0, 10) : '', true, 'color:var(--ink-3);font-size:10px;')}
+                  ${td(it.banner ? '<span style="color:var(--ink-3);">' + esc(it.banner) + '</span>' : '')}
+                  ${td('')}
+                  ${td(it.ship_qty != null ? '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + esc(it.ship_qty) + '</span>' : '')}
+                  ${td(money(Math.abs(Number(it.bill_amount || 0))), true, 'color:var(--ink-2);')}
+                  ${td('', true)}
+                </tr>`).join('');
+                if (items.length > 40) out += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:26px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (items.length - 40).toLocaleString() + ' smaller rows not shown \u00b7 the line total above still counts them</span>')}${td('')}${td('')}${td('')}${td('')}${td('', true)}${td('', true)}</tr>`;
+              }
+              return out;
+            }).join('')}
+            ${!shown.length ? `<tr><td colspan="7" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
+              No deduction matches ${terms.length ? '\u201c' + esc(_dedLinesQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
+            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="7" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+              <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
+              <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
+              <span style="margin-left:10px;">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
+            </td></tr>` : ''}
+          </tbody>
+          <tfoot>
+            ${isFiltered ? `<tr>
+              ${td('<strong>Matching these filters</strong>', false, 'border-top:2px solid var(--ink);')}
+              ${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
+              ${td('', false, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
+              ${td('<strong>' + money(filteredAmt) + '</strong>', true, 'border-top:2px solid var(--ink);')}
+              ${td(registerAmt ? (filteredAmt / registerAmt * 100).toFixed(1) + '%' : '', true, 'border-top:2px solid var(--ink);color:var(--ink-3);')}
+            </tr>` : ''}
+            <!-- THE REGISTER TOTAL STAYS ON SCREEN WHATEVER IS FILTERED. It sums
+                 the same line array the page headline sums, so this tab cannot
+                 disagree with the summary - and a filter can never make money
+                 look like it went missing. -->
+            <tr>
+              ${td('<strong>All deductions ' + esc(yr) + (_dedDist === 'all' ? '' : ' \u00b7 ' + esc(_dedDist)) + '</strong>', false, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
+              ${td('', true)}${td('')}${td('')}${td('')}
+              ${td('<strong>' + money(registerAmt) + '</strong>', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
+              ${td('100%', true, 'color:var(--ink-3);' + (isFiltered ? '' : 'border-top:2px solid var(--ink);'))}
+            </tr>
+          </tfoot>
+        </table>
+        ${!DL ? `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;line-height:1.55;">
+          Open <strong>By customer</strong> once to load store-level detail; rows here then expand to show it.</p>` : ''}`;
+
+      // ── handlers ──
+      const q = document.getElementById('hl-dl-q');
+      if (q) {
+        // Re-render on a pause, not per keystroke: each render rebuilds the whole
+        // table, and typing an invoice number is eight of those.
+        let t = null;
+        q.oninput = () => {
+          clearTimeout(t);
+          t = setTimeout(() => {
+            _dedLinesQ = q.value;
+            _dedLinesLimit = 25;
+            renderDeductions(hostEl, filtersEl, year);
+          }, 220);
+        };
+      }
+      const mt = document.getElementById('hl-dl-mon-toggle');
+      const mm = document.getElementById('hl-dl-mon-menu');
+      if (mt && mm) {
+        mt.onclick = (ev) => { ev.stopPropagation(); mm.style.display = mm.style.display === 'none' ? 'block' : 'none'; };
+        // Clicking inside the menu must not close it — every checkbox would
+        // otherwise shut the thing it was opened to use.
+        mm.onclick = (ev) => ev.stopPropagation();
+        document.addEventListener('click', () => { if (mm) mm.style.display = 'none'; }, { once: true });
+      }
+      body.querySelectorAll('.hl-dl-mon').forEach(cb => cb.onchange = () => {
+        const k = cb.dataset.m;
+        cb.checked ? _dedLinesMonths.add(k) : _dedLinesMonths.delete(k);
+        _dedLinesLimit = 25;
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      const mAll = document.getElementById('hl-dl-mon-all');
+      if (mAll) mAll.onclick = () => { _dedLinesMonths = new Set(allMonths.concat(undatedN ? ['(undated)'] : [])); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
+      const mNone = document.getElementById('hl-dl-mon-none');
+      if (mNone) mNone.onclick = () => { _dedLinesMonths = new Set(); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
+      const clr = document.getElementById('hl-dl-clear');
+      if (clr) clr.onclick = () => { _dedLinesQ = ''; _dedLinesMonths = new Set(); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
+      const more = document.getElementById('hl-dl-more');
+      if (more) more.onclick = () => { _dedLinesLimit += DED_PAGE; renderDeductions(hostEl, filtersEl, year); };
+      const all = document.getElementById('hl-dl-all');
+      if (all) all.onclick = () => { _dedLinesLimit = filtered.length; renderDeductions(hostEl, filtersEl, year); };
+      body.querySelectorAll('.hl-dl-row').forEach(tr => tr.onclick = () => {
+        const k = tr.dataset.l;
+        _dedLinesOpen.has(k) ? _dedLinesOpen.delete(k) : _dedLinesOpen.add(k);
+        renderDeductions(hostEl, filtersEl, year);
+      });
       return;
     }
 
@@ -30964,10 +31183,14 @@ ${(() => {
           // its month column. So a month here means "when the promo ran", not
           // "when the check cleared" — the two differ, and matching them by
           // check date would manufacture variance out of payment timing.
+          // Same folding as By customer: anything before the selected year is one
+          // row, so the table opens at January instead of at a parser artefact.
+          const _RY = String(year) + '-01';
+          const _fold = (k) => (k && k < _RY) ? '0000-00' : k;
           const mm = new Map();
           for (const c of cells.values()) for (const cc of c.cats.values()) {
-            for (const [k, v] of cc.months)  { const e = mm.get(k) || { k, ded: 0, plan: 0 }; e.ded  += v; mm.set(k, e); }
-            for (const [k, v] of cc.pmonths) { const e = mm.get(k) || { k, ded: 0, plan: 0 }; e.plan += v; mm.set(k, e); }
+            for (const [k0, v] of cc.months)  { const k = _fold(k0); const e = mm.get(k) || { k, ded: 0, plan: 0 }; e.ded  += v; mm.set(k, e); }
+            for (const [k0, v] of cc.pmonths) { const k = _fold(k0); const e = mm.get(k) || { k, ded: 0, plan: 0 }; e.plan += v; mm.set(k, e); }
           }
           const ms = [...mm.values()].sort((a, b2) => a.k.localeCompare(b2.k));
           if (!ms.length) return '<div style="padding:18px;font-family:var(--serif);font-size:13px;color:var(--ink-3);">No dated plan or deduction rows in this window.</div>';
@@ -30977,7 +31200,7 @@ ${(() => {
             <thead><tr>${th('Month')}${th('Planned $', true)}${th('Deducted $', true)}${th('Variance', true)}${th('vs plan', true)}${th('')}</tr></thead>
             <tbody>
               ${ms.map(m => `<tr>
-                ${td(_dedMon(m.k))}
+                ${td(m.k === '0000-00' ? 'Before ' + _dedMon(String(year) + '-01') : _dedMon(m.k))}
                 ${td(m.plan ? money(m.plan) : '<span style="color:var(--rule);">\u00b7</span>', true)}
                 ${td(m.ded ? money(m.ded) : '<span style="color:var(--rule);">\u00b7</span>', true)}
                 ${td((m.ded - m.plan > 0 ? '+' : '') + money(m.ded - m.plan), true, 'color:' + dCol(m.ded, m.plan) + ';font-weight:600;')}
@@ -31401,7 +31624,18 @@ ${(() => {
       const bm = new Map(D.bmap.map(b => [b.banner_raw, b]));
       const lineById = new Map(L.map(l => [l.id, l]));
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      const mLabel = k => { const p = String(k).split('-'); return MN[Number(p[1]) - 1] + " '" + String(p[0]).slice(2); };
+      // EVERYTHING BEFORE THE SELECTED YEAR IS ONE COLUMN. This view was
+      // showing JAN '01 and JAN '06 — the malformed reference dates where a
+      // parser wrote a bad year instead of failing — sitting alongside real
+      // Oct/Nov/Dec '25 promo months, so the reader got five columns of
+      // not-this-year before reaching January. Folded rather than dropped: the
+      // money is real and the row totals have to keep tying.
+      const DED_PRIOR = '0000-00';
+      const _yStart = String(year) + '-01';
+      const mLabel = k => {
+        if (k === DED_PRIOR) return 'Pre-' + MN[0] + " '" + String(year).slice(2);
+        const p = String(k).split('-'); return MN[Number(p[1]) - 1] + " '" + String(p[0]).slice(2);
+      };
       const catOf = (l) => { const rm = rmapBy[l.reason_code]; return rm && rm.keel_category ? rm.keel_category : '\u26A0 ' + (l.reason_code || 'Unresolved'); };
 
       const banners = new Map();
@@ -31431,8 +31665,15 @@ ${(() => {
         // qty, rate. Held by reference, not copied.
         st.items.push(d);
         b.cats.set(catOf(l), (b.cats.get(catOf(l)) || 0) + amt);
+        // A date before 2000 is a parser artefact, not an old promo; it lands in
+        // the prior bucket with everything else pre-year rather than inventing a
+        // year-1 column.
         const rawDate = d.reference_date || d.date_from || l.doc_date || null;
-        if (rawDate) { const mk = String(rawDate).slice(0, 7); months.add(mk); b.months.set(mk, (b.months.get(mk) || 0) + amt); }
+        if (rawDate) {
+          const raw7 = String(rawDate).slice(0, 7);
+          const mk = raw7 < _yStart ? DED_PRIOR : raw7;
+          months.add(mk); b.months.set(mk, (b.months.get(mk) || 0) + amt);
+        }
       }
 
       // everything the register holds that no store detail explains
@@ -31453,7 +31694,7 @@ ${(() => {
         b.catList = [...b.cats.entries()].sort((x, y) => y[1] - x[1]);
       }
       const gapList = [...gaps.values()].sort((a, b) => b.amt - a.amt);
-      const MS = [...months].sort();
+      const MS = [...months].sort();   // DED_PRIOR ('0000-00') sorts to the front
       const grand = documented + unattributed + undoc;
       const maxAmt = Math.max(1, ...list.map(b => b.amt));
       const withPlan = list.filter(b => b.plan).reduce((n, b) => n + b.amt, 0);
