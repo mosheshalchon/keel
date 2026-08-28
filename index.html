@@ -29270,15 +29270,58 @@ render();
       // reconciliation total is smaller than trade spend, and it used to leave
       // no trace at all — the loop simply continued, so the money vanished
       // between two numbers that were each individually correct.
-      let dedOutOfWindow = 0;
+      // ── WHEN THE PROMO RAN GOVERNS ──────────────────────────────────────
+      // A line carries up to two dates and they disagree by design: doc_date is
+      // when the money moved, the detail's reference_date is when the promotion
+      // ran. UNFI pays months in arrears — the WHFD* files are stamped four
+      // months after the promo month — so dating a line by the payment puts a
+      // December promo in an April bucket and invents variance out of payment
+      // timing. The promo date decides which plan a line answers to; the money
+      // stays on the register for the year it was taken.
+      //
+      // MALFORMED DATES ARE NOT OLD DATES. Nine rows carry year 0001 — a parser
+      // wrote a bad value instead of failing — and $219 sits in 2024. Anything
+      // before VALID_FROM is treated as no date at all rather than allowed to
+      // sort itself into the prior-period bucket, where it would look like a
+      // real 2025 promo.
+      const VALID_FROM = '2000-01-01';
+      const promoMonthOf = (l) => {
+        let best = null;
+        for (const d of (detByLine.get(l.id) || [])) {
+          const s = String(d.reference_date || d.date_from || '');
+          if (!s || s < VALID_FROM) continue;
+          if (!best || s < best) best = s;
+        }
+        if (best) return best.slice(0, 7);
+        const dd = String(l.doc_date || '');
+        return (dd && dd >= VALID_FROM) ? dd.slice(0, 7) : '';
+      };
+
+      let dedOutOfWindow = 0, dedUndated = 0, dedPriorPeriod = 0;
       const outOfWindowBy = new Map();  // month -> amount held out
+      const priorPeriodBy = new Map();  // month -> amount from before the window
       const unattribBy = new Map();     // banner_raw -> amount (what to map next)
       for (const l of TL) {
-        const lmk = String(l.doc_date || '').slice(0, 7);
+        const lmk = promoMonthOf(l);
+        const a0 = Math.abs(Number(l.amount || 0));
+        // UNDATED IS NOT OUT OF WINDOW. inWindow('') is false, so a line with no
+        // usable date was counted as "dated outside the window" — which reads as
+        // a calendar exclusion and is nothing of the sort. Kept as its own
+        // number so it stops hiding inside a legitimate one.
+        if (!lmk) { dedUndated += a0; continue; }
+        // BEFORE THE WINDOW AND AFTER IT ARE OPPOSITE SITUATIONS. A promo that
+        // ran last year belongs to last year's plan and will never reconcile
+        // here; a line in the current partial month is money still arriving.
+        // Lumping them together was why $103K of prior-year promos read as a
+        // calendar quirk.
+        if (winStart && lmk < winStart) {
+          dedPriorPeriod += a0;
+          priorPeriodBy.set(lmk, (priorPeriodBy.get(lmk) || 0) + a0);
+          continue;
+        }
         if (winStart && !inWindow(lmk)) {
-          const a0 = Math.abs(Number(l.amount || 0));
           dedOutOfWindow += a0;
-          outOfWindowBy.set(lmk || '(undated)', (outOfWindowBy.get(lmk || '(undated)') || 0) + a0);
+          outOfWindowBy.set(lmk, (outOfWindowBy.get(lmk) || 0) + a0);
           continue;
         }
         const amt = Math.abs(Number(l.amount || 0));
@@ -29298,7 +29341,8 @@ render();
                   || _autoMatch(raw)
                   || null;
           if (pc && !(m && m.plan_customer)) autoMatched += Math.abs(Number(d.bill_amount || 0));
-          const mk2 = String(d.reference_date || d.date_from || l.doc_date || '').slice(0, 7);
+          const _ds = String(d.reference_date || d.date_from || l.doc_date || '');
+          const mk2 = (_ds && _ds >= VALID_FROM) ? _ds.slice(0, 7) : '';
           if (!pc) {
             unattrib += share;
             const k = raw || d.customer_name || '(no banner)';
@@ -29352,7 +29396,8 @@ render();
       const totDed = rows.reduce((s2, c) => s2 + c.ded, 0);
       const unattribList = [...unattribBy.entries()].sort((a, b) => b[1] - a[1]);
     return { cells, rows, totPlan, totDed, unattrib, undocumented, placed, autoMatched,
-             dedOutOfWindow, outOfWindowBy, registerTotal, nonTradeTotal, nonTradeBy,
+             dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
+             registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
              planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed };
@@ -30113,11 +30158,11 @@ render();
     // too — it now sits inside that view, under the distributor split.
     const views = [
       ['exec',       'Overview'],
-      ['reconcile',  'Reconcile vs. plan'],
       ['customer',   'By customer'],
       ['summary',    'Category'],
       ['checks',     'Checks'],
       ['exceptions', 'Exceptions'],
+      ['reconcile',  'Reconcile vs. plan'],
       ['upload',     'Upload backup'],
     ];
 
@@ -30797,7 +30842,8 @@ render();
                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       const { cells, rows, totPlan, totDed, unattrib, undocumented, autoMatched,
               tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
-              dedOutOfWindow, outOfWindowBy, registerTotal, nonTradeTotal, nonTradeBy } = R;
+              dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
+              registerTotal, nonTradeTotal, nonTradeBy } = R;
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
       const dPct = (d, p) => p ? ((d - p) / p * 100).toFixed(0) + '%' : '\u2014';
@@ -30816,26 +30862,24 @@ render();
         ? [...m.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 3).map(([k, v]) => esc(k) + ' ' + money(v)).join(', ')
         : '';
       const bridge = [
-        ['All deductions' + (_dedDist === 'all' ? '' : ' \u00b7 ' + esc(_dedDist)), registerTotal, null,
-          'The headline on this page \u2014 every line on the register in scope.'],
-        ['Not trade spend', -nonTradeTotal, 'sub',
-          'Freight, fees, shortages and the like. These never reconcile against a promo plan \u2014 different kind of charge, not a gap.'
-          + (nonTradeBy && nonTradeBy.size ? '<br>Largest: ' + _top3(nonTradeBy) : '')],
-        ['Trade-spend deductions', tradeTotal, 'mid', 'What a promo plan can be compared against, all months.'],
-        ['Outside the window', -dedOutOfWindow, 'sub',
-          winStart ? 'Dated outside ' + _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd)
-                   + (outOfWindowBy && outOfWindowBy.size ? '<br>' + [...outOfWindowBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => (m === '(undated)' ? 'undated' : _dedMon(m)) + ' ' + money(v)).join(', ') : '')
-                   : 'No dated lines to window'],
-        ['No store-level detail', -undocumented, 'sub', 'Nothing behind the line to name a customer with.'],
-        ['Banner not mapped to a plan customer', -unattrib, 'sub',
-          unattribList.length ? 'Largest: ' + esc(unattribList.slice(0, 3).map(u => u[0]).join(', ')) : ''],
-        ['Reconciled against plan', totDed, 'tot', 'What the table below compares.'],
-      ];
+        ['All deductions' + (_dedDist === 'all' ? '' : ' \u00b7 ' + esc(_dedDist)), registerTotal, null, ''],
+        ['Not trade spend', -nonTradeTotal, 'sub', nonTradeBy && nonTradeBy.size ? _top3(nonTradeBy) : 'freight, fees, shortages'],
+        ['Trade spend', tradeTotal, 'mid', ''],
+        ['No date on the line', -dedUndated, 'sub', 'cannot be placed in a month'],
+        ['Promos that ran before ' + (winStart ? _dedMon(winStart) : 'the window'), -dedPriorPeriod, 'sub',
+          (priorPeriodBy && priorPeriodBy.size ? [...priorPeriodBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => _dedMon(m) + ' ' + money(v)).join(', ') : '')
+          + ' \u00b7 answers to the prior year\u2019s plan'],
+        ['After ' + (winEnd ? _dedMon(winEnd) : 'the window'), -dedOutOfWindow, 'sub',
+          outOfWindowBy && outOfWindowBy.size ? [...outOfWindowBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => _dedMon(m) + ' ' + money(v)).join(', ') : ''],
+        ['No store detail', -undocumented, 'sub', 'no banner to place it by'],
+        ['Banner not mapped', -unattrib, 'sub', unattribList.length ? esc(unattribList.slice(0, 3).map(u => u[0]).join(', ')) : ''],
+        ['Reconciled against plan', totDed, 'tot', ''],
+      ].filter(r => r[2] !== 'sub' || Math.abs(r[1]) > 0.005);
       const brRow = ([label, val, kind, note]) => `
         <tr>
-          <td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'padding-left:26px;color:var(--ink-2);' : ''}">
+          <td style="padding:5px 10px;font-family:var(--serif);font-size:13px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'padding-left:26px;color:var(--ink-2);' : ''}">
             ${kind === 'sub' ? '<span style="color:var(--ink-3);">\u2212 </span>' : ''}${label}
-            ${note ? `<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:2px;${kind === 'sub' ? '' : ''}">${note}</div>` : ''}
+            ${note ? `<span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;">${note}</span>` : ''}
           </td>
           <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:13px;white-space:nowrap;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'color:var(--ink-2);' : ''}">
             ${money(Math.abs(val))}
