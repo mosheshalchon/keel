@@ -30630,17 +30630,30 @@ render();
                 // never the one the document happened to print first.
                 const items = rows.slice().sort((x, y) =>
                   Math.abs(Number(y.bill_amount || 0)) - Math.abs(Number(x.bill_amount || 0)));
-                out += items.slice(0, 40).map(it => `<tr style="background:var(--rule-softer);">
-                  ${td('<span style="padding-left:26px;color:var(--ink-2);">' + esc(it.customer_name || it.banner || '(no customer)') + '</span>'
-                     + (it.item_desc ? '<div style="padding-left:26px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(it.item_desc) + '</div>' : ''))}
+                // EACH ROW IS A ROLLUP GROUP, NOT A STORE. The cache reads
+                // deduction_detail_rollup, which groups by (line_id, banner,
+                // month); customer_name on it is one representative store from
+                // the group, so printing it alone reads as "this is the store"
+                // and it is not. Banner leads, the store count says how many are
+                // behind it, and the representative name is marked as an example.
+                out += items.slice(0, 40).map(it => {
+                  const nStores = Number(it.stores || 0);
+                  const lead = it.banner || it.customer_name || '(no customer)';
+                  const sub = [
+                    nStores > 1 ? nStores.toLocaleString() + ' stores' : (nStores === 1 ? '1 store' : ''),
+                    it.customer_name && nStores > 1 ? 'e.g. ' + esc(it.customer_name) : (it.customer_name && nStores <= 1 ? esc(it.customer_name) : ''),
+                  ].filter(Boolean).join(' \u00b7 ');
+                  return `<tr style="background:var(--rule-softer);">
+                  ${td('<span style="padding-left:26px;color:var(--ink-2);">' + esc(lead) + '</span>'
+                     + (sub ? '<div style="padding-left:26px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + sub + '</div>' : ''))}
                   ${td(it.reference_date ? String(it.reference_date).slice(0, 10) : '', true, 'color:var(--ink-3);font-size:10px;')}
-                  ${td(it.banner ? '<span style="color:var(--ink-3);">' + esc(it.banner) + '</span>' : '')}
+                  ${td(it.customer_state ? '<span style="color:var(--ink-3);">' + esc(it.customer_state) + '</span>' : '')}
                   ${td('')}
-                  ${td(it.ship_qty != null ? '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + esc(it.ship_qty) + '</span>' : '')}
+                  ${td('')}
                   ${td(money(Math.abs(Number(it.bill_amount || 0))), true, 'color:var(--ink-2);')}
                   ${td('', true)}
-                </tr>`).join('');
-                if (items.length > 40) out += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:26px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (items.length - 40).toLocaleString() + ' smaller rows not shown \u00b7 the line total above still counts them</span>')}${td('')}${td('')}${td('')}${td('')}${td('', true)}${td('', true)}</tr>`;
+                </tr>`; }).join('');
+                if (items.length > 40) out += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:26px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (items.length - 40).toLocaleString() + ' smaller groups not shown \u00b7 the line total above still counts them</span>')}${td('')}${td('')}${td('')}${td('')}${td('', true)}${td('', true)}</tr>`;
               }
               return out;
             }).join('')}
@@ -31624,18 +31637,14 @@ ${(() => {
       const bm = new Map(D.bmap.map(b => [b.banner_raw, b]));
       const lineById = new Map(L.map(l => [l.id, l]));
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      // EVERYTHING BEFORE THE SELECTED YEAR IS ONE COLUMN. This view was
-      // showing JAN '01 and JAN '06 — the malformed reference dates where a
-      // parser wrote a bad year instead of failing — sitting alongside real
-      // Oct/Nov/Dec '25 promo months, so the reader got five columns of
-      // not-this-year before reaching January. Folded rather than dropped: the
-      // money is real and the row totals have to keep tying.
-      const DED_PRIOR = '0000-00';
+      // COLUMNS START AT JANUARY. This view was showing JAN '01 and JAN '06 —
+      // malformed reference dates where a parser wrote a bad year rather than
+      // failing — beside real Oct/Nov/Dec '25 months, so five columns of
+      // not-this-year came before January. Anything earlier is now excluded from
+      // the view entirely and reported as a named footer row, so the total is
+      // the selected year and the excluded money is still on screen.
       const _yStart = String(year) + '-01';
-      const mLabel = k => {
-        if (k === DED_PRIOR) return 'Pre-' + MN[0] + " '" + String(year).slice(2);
-        const p = String(k).split('-'); return MN[Number(p[1]) - 1] + " '" + String(p[0]).slice(2);
-      };
+      const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
       const catOf = (l) => { const rm = rmapBy[l.reason_code]; return rm && rm.keel_category ? rm.keel_category : '\u26A0 ' + (l.reason_code || 'Unresolved'); };
 
       const banners = new Map();
@@ -31643,6 +31652,18 @@ ${(() => {
       const detByLine = new Map();
       let documented = 0, unattributed = 0;
 
+      // ── THIS VIEW IS THE SELECTED YEAR ONLY ─────────────────────────────
+      // Promo date governs, so a detail row dated before January belongs to the
+      // prior year's plan and is excluded from the customer totals rather than
+      // folded into a leading column. It is NOT dropped silently: the amount is
+      // carried to a named footer row, because a total that quietly disagrees
+      // with the register is the failure this whole screen exists to prevent.
+      //
+      // It still counts toward detByLine. That map is what decides whether a
+      // register line has backup at all — leaving prior rows out would make
+      // those lines look undocumented and move the money into "no store detail",
+      // which is a different and wrong answer.
+      let priorExcluded = 0;
       for (const d of D.det) {
         const l = lineById.get(d.line_id);
         if (!l) continue;                       // outside the selected year
@@ -31651,6 +31672,8 @@ ${(() => {
         const m = raw ? bm.get(raw) : null;
         if (m && m.banner === null) continue;   // mapped to null = not a customer
         detByLine.set(d.line_id, (detByLine.get(d.line_id) || 0) + amt);
+        const _rd = String(d.reference_date || d.date_from || l.doc_date || '');
+        if (_rd && _rd.slice(0, 7) < _yStart) { priorExcluded += amt; continue; }
         documented += amt;
         const name = (m && m.banner) || raw || d.customer_name || null;
         if (!name) { unattributed += amt; continue; }
@@ -31668,12 +31691,7 @@ ${(() => {
         // A date before 2000 is a parser artefact, not an old promo; it lands in
         // the prior bucket with everything else pre-year rather than inventing a
         // year-1 column.
-        const rawDate = d.reference_date || d.date_from || l.doc_date || null;
-        if (rawDate) {
-          const raw7 = String(rawDate).slice(0, 7);
-          const mk = raw7 < _yStart ? DED_PRIOR : raw7;
-          months.add(mk); b.months.set(mk, (b.months.get(mk) || 0) + amt);
-        }
+        if (_rd) { const mk = _rd.slice(0, 7); months.add(mk); b.months.set(mk, (b.months.get(mk) || 0) + amt); }
       }
 
       // everything the register holds that no store detail explains
@@ -31694,7 +31712,7 @@ ${(() => {
         b.catList = [...b.cats.entries()].sort((x, y) => y[1] - x[1]);
       }
       const gapList = [...gaps.values()].sort((a, b) => b.amt - a.amt);
-      const MS = [...months].sort();   // DED_PRIOR ('0000-00') sorts to the front
+      const MS = [...months].sort();
       const grand = documented + unattributed + undoc;
       const maxAmt = Math.max(1, ...list.map(b => b.amt));
       const withPlan = list.filter(b => b.plan).reduce((n, b) => n + b.amt, 0);
@@ -31731,6 +31749,7 @@ ${(() => {
                    missing. The undocumented remainder is a ROW now: same total as
                    every other tab, with the gap named rather than excused. -->
               <tr>${td('Other \u2014 no store-level detail', false, 'color:var(--ink-3);border-top:1px solid var(--rule-soft);')}${MS.map(() => td('\u00b7', true, 'color:var(--rule);')).join('')}${td(money(undoc + unattributed), true, 'color:var(--ink-3);')}</tr>
+              ${priorExcluded ? `<tr>${td('<span style="color:var(--ink-3);">Before ' + esc(_dedMon(_yStart)) + ' \u2014 excluded</span>')}${MS.map(() => td('\u00b7', true, 'color:var(--rule);')).join('')}${td('<span style="color:var(--ink-3);">' + money(priorExcluded) + '</span>', true)}</tr>` : ''}
               <tr>${td('<strong>Traced to a store</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(m => td('<strong>' + money(list.reduce((n, b) => n + (b.months.get(m) || 0), 0)) + '</strong>', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(documented) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table></div>
@@ -31808,7 +31827,8 @@ ${(() => {
                 <button class="hl-gap-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${gapList.length}</button>
                 <span style="margin-left:10px;">${gapList.length - _dedGapLimit} smaller categories hidden \u00b7 ${money(gapList.slice(_dedGapLimit).reduce((n, g) => n + g.amt, 0))}</span>
               </td></tr>` : ''}
-              <tr>${td('<strong>All deductions</strong>', false, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}</tr>
+              ${priorExcluded ? `<tr>${td('<span style="color:var(--ink-3);">Promos that ran before ' + esc(_dedMon(_yStart)) + ' \u2014 excluded from this view</span>')}${td('', true)}${td('', true)}${td('')}${td('<span style="color:var(--ink-3);">' + money(priorExcluded) + '</span>', true)}${td('', true)}</tr>` : ''}
+              <tr>${td('<strong>All deductions ' + esc(yr) + '</strong>', false, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table>`;
       }
