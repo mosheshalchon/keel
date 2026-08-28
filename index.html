@@ -30479,6 +30479,37 @@ render();
       return;
     }
 
+    if (_dedView === 'customer' || _dedView === 'reconcile') {
+      await _dedWarm();
+      if (_detStale()) {
+        body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
+        try { _dedDetail = Object.assign({ key: _detKey }, await _dedGetDetail()); }
+        catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
+      }
+    }
+
+    // EVERY TAB MUST FOOT TO THE SAME REGISTER. A tab that totals more than
+    // "Deducted 2026" is not a display quirk — it means dollars are being
+    // double-counted or dropped somewhere, and the whole screen stops being
+    // trustworthy. Rather than assert it in a comment, each tab states its own
+    // total against the register and says so out loud when they disagree.
+    // Tolerance is a cent, for float noise only.
+    const _dedTieNote = (tabTotal, registerTotal) => {
+      const diff = Math.round((tabTotal - registerTotal) * 100) / 100;
+      if (Math.abs(diff) < 0.01) {
+        return `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;">
+          \u2713 ties to the ${money(registerTotal)} register</p>`;
+      }
+      return `<p style="font-family:var(--mono);font-size:10.5px;color:var(--lost);margin-top:10px;
+        border-left:2px solid var(--lost);padding-left:9px;line-height:1.5;">
+        <strong>OUT BY ${money(Math.abs(diff))}</strong> \u2014 this tab totals ${money(tabTotal)} against a
+        ${money(registerTotal)} register. ${diff > 0 ? 'Something is counted twice.' : 'Something is missing.'}
+        Do not quote either figure until this reads zero.</p>`;
+    };
+
+    const th = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
+    const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
+
     // ── DEDUCTIONS · THE REGISTER AT LINE GRAIN ───────────────────────────────
     // Every other tab is an aggregate. This one is the rows themselves — one per
     // deduction, largest first — because when a category or a customer looks
@@ -30691,37 +30722,6 @@ render();
       });
       return;
     }
-
-    if (_dedView === 'customer' || _dedView === 'reconcile') {
-      await _dedWarm();
-      if (_detStale()) {
-        body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
-        try { _dedDetail = Object.assign({ key: _detKey }, await _dedGetDetail()); }
-        catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
-      }
-    }
-
-    // EVERY TAB MUST FOOT TO THE SAME REGISTER. A tab that totals more than
-    // "Deducted 2026" is not a display quirk — it means dollars are being
-    // double-counted or dropped somewhere, and the whole screen stops being
-    // trustworthy. Rather than assert it in a comment, each tab states its own
-    // total against the register and says so out loud when they disagree.
-    // Tolerance is a cent, for float noise only.
-    const _dedTieNote = (tabTotal, registerTotal) => {
-      const diff = Math.round((tabTotal - registerTotal) * 100) / 100;
-      if (Math.abs(diff) < 0.01) {
-        return `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;">
-          \u2713 ties to the ${money(registerTotal)} register</p>`;
-      }
-      return `<p style="font-family:var(--mono);font-size:10.5px;color:var(--lost);margin-top:10px;
-        border-left:2px solid var(--lost);padding-left:9px;line-height:1.5;">
-        <strong>OUT BY ${money(Math.abs(diff))}</strong> \u2014 this tab totals ${money(tabTotal)} against a
-        ${money(registerTotal)} register. ${diff > 0 ? 'Something is counted twice.' : 'Something is missing.'}
-        Do not quote either figure until this reads zero.</p>`;
-    };
-
-    const th = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
-    const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
 
     // ── OVERVIEW ────────────────────────────────────────────────────────────
     // ONE SCREEN THAT ANSWERS "where did the money go". Four cuts of the same
