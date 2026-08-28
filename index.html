@@ -29012,6 +29012,10 @@ render();
   let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
   let _dedSumOpen = new Set();    // which summary buckets are expanded
   let _dedRecOpen = new Set();    // which plan customers are expanded on Reconcile
+  // Reconcile grain: 'customer' (the original) or 'month'. Same cells, summed on
+  // a different axis — a calendar question and an account question are not the
+  // same question, and the customer table could not answer the first one.
+  let _dedRecBy = (() => { try { return localStorage.getItem('keel_ded_rec_by') === 'month' ? 'month' : 'customer'; } catch (e) { return 'customer'; } })();
 
   // 1,173 distinct KeHE banner strings against ~10 plan customers. Hand-picking
   // that from dropdowns is not a workflow, so the mapper PROPOSES and Moshe
@@ -29238,6 +29242,20 @@ render();
 
       const TL = L.filter(isTrade);
       const tradeTotal = TL.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
+      // The register total in scope, and the non-trade step out of it. The
+      // bridge used to open at tradeTotal, which meant the first subtraction a
+      // reader makes — the headline on this page minus what reconciles — was
+      // the one step the bridge did not show. Non-trade categories (freight,
+      // processing fees, shortages, post-audit) never reconcile against a
+      // promo plan by design; they are a different kind of charge, not a gap.
+      const registerTotal = L.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
+      const nonTradeTotal = registerTotal - tradeTotal;
+      const nonTradeBy = new Map();
+      for (const l of L) {
+        if (isTrade(l)) continue;
+        const k = catOfLine(l);
+        nonTradeBy.set(k, (nonTradeBy.get(k) || 0) + Math.abs(Number(l.amount || 0)));
+      }
       const detByLine = new Map();
       for (const d of det) {
         if (!detByLine.has(d.line_id)) detByLine.set(d.line_id, []);
@@ -29248,9 +29266,21 @@ render();
       const cells = new Map();          // customer -> {cats: cat -> {months: m -> amt}}
       const catsSeen = new Set();
       let unattrib = 0, undocumented = 0, placed = 0, autoMatched = 0;
+      // Counted, not just skipped. This is the largest single reason the
+      // reconciliation total is smaller than trade spend, and it used to leave
+      // no trace at all — the loop simply continued, so the money vanished
+      // between two numbers that were each individually correct.
+      let dedOutOfWindow = 0;
+      const outOfWindowBy = new Map();  // month -> amount held out
       const unattribBy = new Map();     // banner_raw -> amount (what to map next)
       for (const l of TL) {
-        if (winStart && !inWindow(String(l.doc_date || '').slice(0, 7))) continue;
+        const lmk = String(l.doc_date || '').slice(0, 7);
+        if (winStart && !inWindow(lmk)) {
+          const a0 = Math.abs(Number(l.amount || 0));
+          dedOutOfWindow += a0;
+          outOfWindowBy.set(lmk || '(undated)', (outOfWindowBy.get(lmk || '(undated)') || 0) + a0);
+          continue;
+        }
         const amt = Math.abs(Number(l.amount || 0));
         const cat = catOfLine(l);
         catsSeen.add(normCat(cat));
@@ -29322,6 +29352,7 @@ render();
       const totDed = rows.reduce((s2, c) => s2 + c.ded, 0);
       const unattribList = [...unattribBy.entries()].sort((a, b) => b[1] - a[1]);
     return { cells, rows, totPlan, totDed, unattrib, undocumented, placed, autoMatched,
+             dedOutOfWindow, outOfWindowBy, registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
              planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed };
@@ -30065,7 +30096,7 @@ render();
     // ── header ──────────────────────────────────────────────────────────────
     const tag = (t, c) => `<span style="font-family:var(--mono);font-size:9px;letter-spacing:0.06em;padding:2px 6px;border-radius:3px;background:${c};color:var(--paper);">${t}</span>`;
     const stat = (label, val, sub) => `
-      <div style="min-width:130px;">
+      <div style="min-width:0;">
         <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;">${label}</div>
         <div style="font-family:var(--serif);font-size:21px;color:var(--ink);margin-top:3px;">${val}</div>
         ${sub ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">${sub}</div>` : ''}
@@ -30146,7 +30177,7 @@ render();
           const n = d === 'all' ? (_dedDistCounts.KeHE + _dedDistCounts.UNFI) : (_dedDistCounts[d] || 0);
           const nLbl = n >= 1000 ? '$' + Math.round(n / 1000).toLocaleString() + 'k' : (n ? '$' + Math.round(n) : '');
           return `<button class="hl-ded-dist" data-d="${d}" ${n ? '' : 'disabled'}
-            style="font-family:var(--mono);font-size:10px;padding:6px 13px;border-radius:5px;cursor:${n ? 'pointer' : 'default'};
+            style="font-family:var(--mono);font-size:12.5px;padding:9px 18px;border-radius:6px;cursor:${n ? 'pointer' : 'default'};
                    border:1px solid ${_dedDist === d ? 'var(--ink)' : 'var(--rule-soft)'};
                    background:${_dedDist === d ? 'var(--ink)' : 'transparent'};
                    color:${_dedDist === d ? 'var(--paper)' : (n ? 'var(--ink-3)' : 'var(--rule)')};">${lbl}${nLbl ? ' <span style="opacity:.6;">' + nLbl + '</span>' : ''}</button>`;
@@ -30254,10 +30285,9 @@ render();
       // still be missing everything filed since.
       const stale = ageDays != null && ageDays >= 7;
       el.innerHTML = box(stale ? 'var(--rule)' : 'var(--rule-soft)', 'transparent',
-        `<strong style="color:var(--ink);">Catalogue</strong> · ${counted || 'no count recorded'} · walked to the end of the folder on ${esc(whenTxt)}
+        `<strong style="color:var(--ink);">Catalogue</strong> · ${counted || 'no count recorded'} · complete as of ${esc(whenTxt)}
          ${gone != null && gone > 0 ? `· <span style="color:var(--ink-3);">${gone.toLocaleString()} previously-indexed file(s) not seen this crawl</span>` : ''}
-         ${stale ? `<br><span style="color:var(--ink-3);">Last crawled ${ageDays} days ago — complete as of then, so anything filed since is not indexed.</span>` : ''}
-         <br><span style="color:var(--ink-3);font-size:10px;">Completeness is read from the saved bookmark, not from a recorded completion — a run that died mid-walk would also leave no bookmark to find.</span>`);
+         ${stale ? `<br><span style="color:var(--ink-3);">Last crawled ${ageDays} days ago — complete as of then, so anything filed since is not indexed.</span>` : ''}`);
     }
     _dedRenderCrawl().catch(e => console.error('[deductions] catalogue strip failed:', e));
 
@@ -30480,9 +30510,13 @@ render();
       const distRows = [...distMap.values()].sort((a, b) => b.amt - a.amt);
       // Full width and laid out horizontally: it is two or three rows, so as a
       // column it was a tall box mostly made of nothing.
-      const panelDist = panel('Who deducted', _dedDist === 'all'
-          ? 'Every source on the register. Lines are not comparable across sources \u2014 KeHE books one line per deduction, UNFI one per file \u2014 so the money is the comparator.'
-          : 'Scoped to ' + esc(_dedDist) + '. Choose All above to compare sources.',
+      // The subtitle is gone. It explained that KeHE books one line per
+      // deduction and UNFI one per file, so line counts are not comparable —
+      // still true, and still the reason the money is the comparator, but the
+      // per-source cards carry their own line counts and the caveat was three
+      // lines of prose guarding a column nobody totals across.
+      const panelDist = panel('Deductions summary',
+        _dedDist === 'all' ? '' : 'Scoped to ' + esc(_dedDist) + '. Choose All above to compare sources.',
         goto_('checks', 'Checks'), `
         <div style="display:flex;gap:14px;flex-wrap:wrap;">
           ${distRows.map(r => `
@@ -30512,7 +30546,7 @@ render();
              what the register means, so on every tab but this one it described
              something the reader was not looking at. Same numbers, same order,
              now sitting under the source breakdown they belong to. -->
-        <div style="display:flex;gap:30px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--rule-soft);">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:18px;margin-top:16px;padding-top:14px;border-top:1px solid var(--rule-soft);">
           ${stat('Deducted ' + yr, money(-totalAmt), L.length.toLocaleString() + ' lines')}
           ${stat('Checks', checks.length, checks.length - notTied.length + ' of ' + checks.length + ' tie out')}
           ${stat('Processing fees', totalFee ? money(Math.abs(totalFee)) : '\u2014', totalFee ? (totalFee / -totalAmt * 100).toFixed(1) + '% of deductions' : 'run mode=detail')}
@@ -30762,18 +30796,66 @@ render();
       const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist,
                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       const { cells, rows, totPlan, totDed, unattrib, undocumented, autoMatched,
-              tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList } = R;
+              tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
+              dedOutOfWindow, outOfWindowBy, registerTotal, nonTradeTotal, nonTradeBy } = R;
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
       const dPct = (d, p) => p ? ((d - p) / p * 100).toFixed(0) + '%' : '\u2014';
       const dCol = (d, p) => !p ? 'var(--ink-3)' : (d - p) > 0 ? 'var(--lost)' : 'var(--won)';
 
+      // ── THE BRIDGE ────────────────────────────────────────────────────────
+      // This screen used to open with four figures that did not visibly relate
+      // to each other: trade spend was a headline elsewhere, the reconciliation
+      // total was about half of it, and the difference lived in a
+      // "Not yet placed" stat that only accounted for part of the drop. The
+      // rest — everything outside the comparison window — was subtracted
+      // silently. Every step is named now and the arithmetic closes, so the
+      // question "why is this only half my deductions" is answered on the
+      // screen that raises it rather than by reading the source.
+      const _top3 = (m) => m && m.size
+        ? [...m.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 3).map(([k, v]) => esc(k) + ' ' + money(v)).join(', ')
+        : '';
+      const bridge = [
+        ['All deductions' + (_dedDist === 'all' ? '' : ' \u00b7 ' + esc(_dedDist)), registerTotal, null,
+          'The headline on this page \u2014 every line on the register in scope.'],
+        ['Not trade spend', -nonTradeTotal, 'sub',
+          'Freight, fees, shortages and the like. These never reconcile against a promo plan \u2014 different kind of charge, not a gap.'
+          + (nonTradeBy && nonTradeBy.size ? '<br>Largest: ' + _top3(nonTradeBy) : '')],
+        ['Trade-spend deductions', tradeTotal, 'mid', 'What a promo plan can be compared against, all months.'],
+        ['Outside the window', -dedOutOfWindow, 'sub',
+          winStart ? 'Dated outside ' + _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd)
+                   + (outOfWindowBy && outOfWindowBy.size ? '<br>' + [...outOfWindowBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => (m === '(undated)' ? 'undated' : _dedMon(m)) + ' ' + money(v)).join(', ') : '')
+                   : 'No dated lines to window'],
+        ['No store-level detail', -undocumented, 'sub', 'Nothing behind the line to name a customer with.'],
+        ['Banner not mapped to a plan customer', -unattrib, 'sub',
+          unattribList.length ? 'Largest: ' + esc(unattribList.slice(0, 3).map(u => u[0]).join(', ')) : ''],
+        ['Reconciled against plan', totDed, 'tot', 'What the table below compares.'],
+      ];
+      const brRow = ([label, val, kind, note]) => `
+        <tr>
+          <td style="padding:7px 10px;font-family:var(--serif);font-size:13.5px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'padding-left:26px;color:var(--ink-2);' : ''}">
+            ${kind === 'sub' ? '<span style="color:var(--ink-3);">\u2212 </span>' : ''}${label}
+            ${note ? `<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:2px;${kind === 'sub' ? '' : ''}">${note}</div>` : ''}
+          </td>
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:13px;white-space:nowrap;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'color:var(--ink-2);' : ''}">
+            ${money(Math.abs(val))}
+          </td>
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);white-space:nowrap;${kind === 'tot' ? 'border-top:2px solid var(--ink);' : kind === 'mid' ? 'border-top:1px solid var(--rule);' : ''}">
+            ${registerTotal ? (Math.abs(val) / registerTotal * 100).toFixed(1) + '%' : ''}
+          </td>
+        </tr>`;
+
       body.innerHTML = `
-        <div style="display:flex;gap:30px;flex-wrap:wrap;margin:2px 0 16px;">
+        <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;margin:2px 0 16px;">
+          <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
+            From trade spend to what is reconciled
+          </div>
+          <table style="width:100%;border-collapse:collapse;">${bridge.map(brRow).join('')}</table>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:18px;margin:0 0 16px;">
           ${stat('Planned (' + DSHORT + ')', money(totPlan), winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'Vividly expected spend')}
           ${stat('Deducted (trade)', money(totDed), 'same months, attributed to a customer')}
           ${stat('Variance', money(totDed - totPlan), totPlan ? dPct(totDed, totPlan) + ' vs plan' : 'no plan matched')}
-          ${stat('Not yet placed', money(unattrib + undocumented), tradeTotal ? Math.round((unattrib + undocumented) / tradeTotal * 100) + '% of trade spend' : '')}
           ${autoMatched ? stat('Auto-matched', money(autoMatched), 'by retailer name, not crosswalked') : ''}
         </div>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 12px;">
@@ -30823,7 +30905,54 @@ ${(() => {
     </div>
   </div>`;
 })()}
-<table style="width:100%;border-collapse:collapse;">
+<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin:0 0 10px;">
+          <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:3px;">Reconcile by</span>
+          ${[['customer', 'Customer'], ['month', 'Month']].map(([v, lbl]) => `<button class="hl-rec-by" data-v="${v}"
+            style="font-family:var(--mono);font-size:11px;padding:6px 14px;border-radius:5px;cursor:pointer;
+                   border:1px solid ${_dedRecBy === v ? 'var(--ink)' : 'var(--rule-soft)'};
+                   background:${_dedRecBy === v ? 'var(--ink)' : 'transparent'};
+                   color:${_dedRecBy === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
+        </div>
+        ${_dedRecBy === 'month' ? (() => {
+          // SAME CELLS, SUMMED ON THE OTHER AXIS. Deduction months come from the
+          // store detail's own date (reference_date, falling back to the line's
+          // doc_date); plan months from the promo's start_date, falling back to
+          // its month column. So a month here means "when the promo ran", not
+          // "when the check cleared" — the two differ, and matching them by
+          // check date would manufacture variance out of payment timing.
+          const mm = new Map();
+          for (const c of cells.values()) for (const cc of c.cats.values()) {
+            for (const [k, v] of cc.months)  { const e = mm.get(k) || { k, ded: 0, plan: 0 }; e.ded  += v; mm.set(k, e); }
+            for (const [k, v] of cc.pmonths) { const e = mm.get(k) || { k, ded: 0, plan: 0 }; e.plan += v; mm.set(k, e); }
+          }
+          const ms = [...mm.values()].sort((a, b2) => a.k.localeCompare(b2.k));
+          if (!ms.length) return '<div style="padding:18px;font-family:var(--serif);font-size:13px;color:var(--ink-3);">No dated plan or deduction rows in this window.</div>';
+          const tp = ms.reduce((s2, m) => s2 + m.plan, 0), tdd = ms.reduce((s2, m) => s2 + m.ded, 0);
+          const mx = Math.max(1, ...ms.map(m => Math.max(m.plan, m.ded)));
+          return `<table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Month')}${th('Planned $', true)}${th('Deducted $', true)}${th('Variance', true)}${th('vs plan', true)}${th('')}</tr></thead>
+            <tbody>
+              ${ms.map(m => `<tr>
+                ${td(_dedMon(m.k))}
+                ${td(m.plan ? money(m.plan) : '<span style="color:var(--rule);">\u00b7</span>', true)}
+                ${td(m.ded ? money(m.ded) : '<span style="color:var(--rule);">\u00b7</span>', true)}
+                ${td((m.ded - m.plan > 0 ? '+' : '') + money(m.ded - m.plan), true, 'color:' + dCol(m.ded, m.plan) + ';font-weight:600;')}
+                ${td(m.plan ? dPct(m.ded, m.plan) : '\u2014', true, 'color:var(--ink-3);')}
+                ${td(`<span style="display:inline-flex;gap:2px;align-items:flex-end;height:15px;" title="plan vs deducted">
+                       <span style="width:26px;background:var(--rule);height:${Math.max(2, m.plan / mx * 15).toFixed(1)}px;display:inline-block;"></span>
+                       <span style="width:26px;background:var(--ink);height:${Math.max(2, m.ded / mx * 15).toFixed(1)}px;display:inline-block;"></span></span>`)}
+              </tr>`).join('')}
+            </tbody>
+            <tfoot><tr style="border-top:2px solid var(--ink);">
+              ${td('<strong>Total</strong>')}${td('<strong>' + money(tp) + '</strong>', true)}${td('<strong>' + money(tdd) + '</strong>', true)}
+              ${td('<strong>' + (tdd - tp > 0 ? '+' : '') + money(tdd - tp) + '</strong>', true, 'color:' + dCol(tdd, tp) + ';')}
+              ${td(tp ? dPct(tdd, tp) : '\u2014', true, 'color:var(--ink-3);')}${td('')}
+            </tr></tfoot>
+          </table>
+          <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.55;">
+            Grey bar is plan, black is deducted. Months come from when the promo ran \u2014 the store detail's own
+            date and the promo's start date \u2014 not from when the check cleared.</p>`;
+        })() : `<table style="width:100%;border-collapse:collapse;">
           <thead><tr>
             ${th('Plan customer')}${th('Planned $', true)}${th('Deducted $', true)}${th('Variance', true)}${th('vs plan', true)}${th('Status')}
           </tr></thead>
@@ -30878,7 +31007,7 @@ ${(() => {
             ${td('<strong style="color:' + dCol(totDed, totPlan) + ';">' + money(totDed - totPlan) + '</strong>', true)}
             ${td('<strong style="color:' + dCol(totDed, totPlan) + ';">' + dPct(totDed, totPlan) + '</strong>', true)}${td('')}
           </tr></tfoot>
-        </table>
+        </table>`}
         ${P.err ? `<div style="margin-top:12px;font-family:var(--mono);font-size:11px;color:var(--lost);">Plan could not be loaded: ${esc(P.err)}</div>` : ''}`;
 
       // ── in-app crosswalk editor. plan_customer must equal promo_plan_lines.customer
@@ -30958,6 +31087,13 @@ ${(() => {
       const pbtn = document.getElementById('hl-rec-part');
       if (pbtn) pbtn.onclick = () => { _dedRecPartial = !_dedRecPartial; renderDeductions(hostEl, filtersEl, year); };
 
+      // querySelectorAll returns an empty list in month mode, so the customer
+      // handler below is a no-op there rather than an error.
+      body.querySelectorAll('.hl-rec-by').forEach(b => b.onclick = () => {
+        _dedRecBy = b.dataset.v;
+        try { localStorage.setItem('keel_ded_rec_by', _dedRecBy); } catch (e) {}
+        renderDeductions(hostEl, filtersEl, year);
+      });
       body.querySelectorAll('.hl-rec-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.c;
         _dedRecOpen.has(n) ? _dedRecOpen.delete(n) : _dedRecOpen.add(n);
