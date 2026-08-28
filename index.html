@@ -28998,10 +28998,15 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'customer', 'code', 'checks', 'exceptions'];
+  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'customer', 'checks', 'exceptions', 'upload'];
   // 'category' and 'other' were retired into 'summary'. Anyone whose browser has
   // one of them saved would otherwise land on a view that no longer renders.
-  const DED_VIEW_MOVED = { category: 'summary', other: 'summary' };
+  // 'code' joined them: By reason code showed the same money as Category, split
+  // one level finer, and Category already expands to the code. Its render branch
+  // is left in place — nothing routes to it now, and deleting live code to
+  // remove a button is a worse trade than leaving it unreachable.
+  const DED_VIEW_MOVED = { category: 'summary', other: 'summary', code: 'summary' };
+  let _dedCustStore = new Set();  // By customer: expanded stores -> the item rows
   let _dedOthCat = new Set();     // Other charges: expanded categories
   let _dedOthCode = new Set();    // Other charges: expanded reason codes
   let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
@@ -29322,6 +29327,603 @@ render();
              planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed };
   }
 
+  // ══ IN-APP PDF BACKUP UPLOAD ══════════════════════════════════════════════
+  // WHY THIS EXISTS AT ALL. The K-Solve scanned invoices — every SN (Sprouts
+  // SCAN) document among them — are scanned pages redrawn as VECTORS: one
+  // content stream per page, ~275KB compressed inflating to ~25MB, of which
+  // about fifty bytes are text. The Supabase edge worker cannot survive that.
+  // It does not throw: WORKER_RESOURCE_LIMIT kills the process, so there is no
+  // exception to catch, nothing in the Logs, and the file is recorded as
+  // 'image-only' — a memory failure wearing a parsing failure's label. That is
+  // why `mode=pdfwhy` dies on Sprouts-sized files while `pdfindex`, which stops
+  // at the cover page, survives the same file.
+  //
+  // The browser has none of those constraints. The parsing logic below is a
+  // direct port of sync-deductions.ts (pdfText / parseCoverBlock /
+  // parseKsolvePdfText) with the Dropbox fetch replaced by a local File and the
+  // memory ceilings raised, because here they are not load-bearing.
+  //
+  // DOUBLE-COUNTING. The Edge path's only protection is the queue filter
+  // `.eq('detail_parsed', false)` — a flag. Its insert has no delete in front of
+  // it, so if that flag is ever wrong the rows go in twice, silently. This path
+  // does NOT rely on the flag: it deletes by line_id and re-inserts, so
+  // importing the same document ten times leaves the same rows as importing it
+  // once. The flag is still read, but only to TELL YOU what is already there and
+  // make you confirm — it is not what keeps the arithmetic right.
+  const _DED_MAX_STREAM   = 2_000_000;        // compressed bytes per stream
+  const _DED_MAX_INFLATE  = 96 * 1024 * 1024; // inflated bytes per stream
+  const _DED_MAX_SCAN     = 32 * 1024 * 1024; // bytes of the file to scan
+
+  // Text-showing operators, COMPARED AS BYTES. A full page read pushes ~1.4GB
+  // through this test; building a two-char string per line cost 135s on one
+  // file. Every operator contains 'T' (0x54), so one integer comparison rejects
+  // the path data that is 99.99% of these streams.
+  function _dedIsTextOp(a, b) {
+    if (a === 0x54) return b === 0x6a || b === 0x4a || b === 0x64 || b === 0x44 || b === 0x6d || b === 0x2a;
+    if (b === 0x54) return a === 0x42 || a === 0x45;
+    return false;
+  }
+
+  // Decompress and scan in ONE pass, holding one chunk plus the carry. Never
+  // materialise the 25MB a Sprouts page inflates to.
+  async function _dedStreamTextOps(raw) {
+    for (const fmt of ['deflate', 'deflate-raw']) {
+      try {
+        const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream(fmt));
+        const rd = stream.getReader();
+        const dv = new TextDecoder('latin1');
+        let out = '', total = 0;
+        let carry = new Uint8Array(0);
+        for (;;) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          total += value.length;
+          if (total > _DED_MAX_INFLATE) { try { await rd.cancel(); } catch (e) {} break; }
+          let buf;
+          if (carry.length) {
+            buf = new Uint8Array(carry.length + value.length);
+            buf.set(carry, 0); buf.set(value, carry.length);
+          } else buf = value;
+          let start = 0;
+          for (let k = 0; k < buf.length; k++) {
+            if (buf[k] !== 0x0a) continue;
+            let stop = k;
+            if (stop > start && buf[stop - 1] === 0x0d) stop--;
+            const len = stop - start;
+            if (len > 1 && len < 2000 && _dedIsTextOp(buf[stop - 2], buf[stop - 1]))
+              out += dv.decode(buf.subarray(start, stop)) + '\n';
+            start = k + 1;
+          }
+          carry = start < buf.length ? buf.slice(start) : new Uint8Array(0);
+          if (carry.length > 1000000) carry = carry.slice(carry.length - 4096);
+        }
+        if (carry.length > 2) {
+          let stop = carry.length;
+          if (carry[stop - 1] === 0x0d) stop--;
+          if (_dedIsTextOp(carry[stop - 2], carry[stop - 1])) out += dv.decode(carry.subarray(0, stop)) + '\n';
+        }
+        if (total) return out;
+      } catch (e) { /* try the next encoding */ }
+    }
+    return null;
+  }
+
+  function _dedDecLiteral(s) {
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c !== '\\') { out += c; continue; }
+      const n = s[++i];
+      if (n === 'n') out += '\n';
+      else if (n === 'r') out += '\r';
+      else if (n === 't') out += '\t';
+      else if (n === 'b' || n === 'f') out += ' ';
+      else if (n >= '0' && n <= '7') {
+        let oct = n;
+        while (oct.length < 3 && s[i + 1] >= '0' && s[i + 1] <= '7') oct += s[++i];
+        out += String.fromCharCode(parseInt(oct, 8));
+      } else out += n;
+    }
+    return out;
+  }
+
+  function _dedDecHex(h) {
+    const clean = h.replace(/[^0-9A-Fa-f]/g, '');
+    let out = '';
+    if (clean.length % 4 === 0 && /^(00|D[89AB])/i.test(clean)) {
+      for (let i = 0; i + 3 < clean.length; i += 4) out += String.fromCharCode(parseInt(clean.substr(i, 4), 16));
+    } else {
+      for (let i = 0; i + 1 < clean.length; i += 2) out += String.fromCharCode(parseInt(clean.substr(i, 2), 16));
+    }
+    return out;
+  }
+
+  function _dedTextFromContent(content) {
+    let out = '', pending = '';
+    const flush = () => { if (pending) { out += pending; pending = ''; } };
+    const RX = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|\[[^\]]*\]|(T[dDmJj*fLwsz]|BT|ET|'|")|(-?[\d.]+)/g;
+    let m;
+    while ((m = RX.exec(content))) {
+      const tok = m[0];
+      if (tok.startsWith('(')) pending += _dedDecLiteral(tok.slice(1, -1));
+      else if (tok.startsWith('<') && !tok.startsWith('<<')) pending += _dedDecHex(tok.slice(1, -1));
+      else if (tok.startsWith('[')) {
+        const IRX = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|(-?[\d.]+)/g;
+        let im;
+        while ((im = IRX.exec(tok.slice(1, -1)))) {
+          const t = im[0];
+          if (t.startsWith('(')) pending += _dedDecLiteral(t.slice(1, -1));
+          else if (t.startsWith('<')) pending += _dedDecHex(t.slice(1, -1));
+          else if (Number(t) < -120) pending += ' ';   // a big kern is a space
+        }
+      }
+      else if (tok === 'Td' || tok === 'TD' || tok === 'T*' || tok === "'" || tok === '"' || tok === 'ET') { flush(); out += '\n'; }
+    }
+    flush();
+    return out;
+  }
+
+  // Byte-level search, so the file never becomes a JS string. Strings are
+  // UTF-16: decoding a 4.5MB scan just to run indexOf over it doubles it.
+  function _dedFindBytes(hay, needle, from) {
+    const n0 = needle[0], last = hay.length - needle.length;
+    outer: for (let i = from; i <= last; i++) {
+      if (hay[i] !== n0) continue;
+      for (let j = 1; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+      return i;
+    }
+    return -1;
+  }
+  const _DED_B_STREAM = new TextEncoder().encode('stream');
+  const _DED_B_ENDSTREAM = new TextEncoder().encode('endstream');
+
+  // onProgress is called with the stream index so a 60-page file does not look
+  // frozen. Two traps, both hit while building the original: 'endstream' ENDS
+  // with 'stream', so a naive match starts the next read at the wrong offset;
+  // and the EOL around the data is not part of it, so including it makes
+  // inflate reject the whole stream.
+  async function _dedPdfText(arrayBuf, onProgress) {
+    const buf = new Uint8Array(arrayBuf);
+    const view = buf.length > _DED_MAX_SCAN ? buf.subarray(0, _DED_MAX_SCAN) : buf;
+    let out = '', pos = 0, n = 0;
+    for (;;) {
+      const i = _dedFindBytes(view, _DED_B_STREAM, pos);
+      if (i < 0) break;
+      pos = i + 6;
+      if (i >= 3 && view[i - 3] === 0x65 && view[i - 2] === 0x6e && view[i - 1] === 0x64) continue;
+      if (view[pos] !== 0x0d && view[pos] !== 0x0a) continue;
+      let start = pos;
+      while (view[start] === 0x0d || view[start] === 0x0a) start++;
+      const end = _dedFindBytes(view, _DED_B_ENDSTREAM, start);
+      if (end < 0) break;
+      pos = end + 9;
+      let stop = end;
+      while (stop > start && (view[stop - 1] === 0x0a || view[stop - 1] === 0x0d)) stop--;
+      const raw = view.subarray(start, stop);
+      if (!raw.length) continue;
+      if (raw.length > _DED_MAX_STREAM) continue;
+      const sTxt = await _dedStreamTextOps(raw);
+      if (!sTxt) continue;
+      out += _dedTextFromContent(sTxt) + '\n';
+      if (onProgress && (++n % 10 === 0)) { onProgress(n); await new Promise(r => setTimeout(r, 0)); }
+    }
+    return out.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  // ── THE OCR COVER LETTER, WHEN THE LABELS ARE NOT TEXT ────────────────────
+  // Every uuid-named PDF opens with the same K-Solve cover: Invoice #, Special
+  // Payee, PO #, DC #, Type. On SOME the labels are real text. On others — both
+  // Sprouts SCAN files checked — they are rendered as GRAPHICS and the text
+  // layer holds only the values, in order and nothing else:
+  //     SN000166756 / 35007596 / 41 / SCAN
+  // So the cover is read positionally as a fallback. TYPE is the prize: it is
+  // KeHE naming its own charge, which no amount of decoding the reason code
+  // will ever produce.
+  function _dedParseCover(t) {
+    const out = { invoice_no: null, special_payee: null, dc: null, type: null };
+    const LN = String(t || '').split('\n').map(x => x.trim()).filter(Boolean).slice(0, 60);
+    // The barcode line repeats every field joined by hyphens and would satisfy
+    // every pattern below while being wrong about all of them.
+    const rows = LN.filter(x => !/^\*.*\*$/.test(x) && !/^[-\s]*$/.test(x));
+    const isLabel = (x) => /^(Invoice\s*#|Special\s*Payee\s*#?|PO\s*#|DC\s*#|Type)\s*:?\s*$/i.test(x);
+    // A bare label takes its value from a NEIGHBOURING line — and not always the
+    // next one. These covers are drawn, not typeset.
+    const neighbour = (i) => {
+      for (const j of [i + 1, i - 1]) {
+        const v = rows[j];
+        if (v && !isLabel(v) && !/^\*/.test(v)) return v;
+      }
+      return null;
+    };
+    rows.forEach((r, i) => {
+      let m;
+      // The LABEL match is case-insensitive; the TOKEN match is NOT. A check
+      // register reading 'Invoice # Number310276' otherwise keys itself as
+      // invoice 'Number310276'.
+      if (!out.invoice_no && (m = r.match(/^Invoice\s*#\s*:?\s*(\S+)/i)) && /^[A-Z]{1,6}\d{6,}$/.test(m[1])) out.invoice_no = m[1];
+      if (!out.special_payee && (m = r.match(/^Special\s*Payee\s*#?\s*:?\s*(\d{6,10})\b/i))) out.special_payee = m[1];
+      if (!out.dc && (m = r.match(/^DC\s*#?\s*:?\s*(\d{1,3})\b/i))) out.dc = m[1];
+      if (!out.type && (m = r.match(/^Type\s*:?\s*([^\s:]\S*.*)$/i))) out.type = m[1].trim();
+      if (!isLabel(r)) return;
+      const v = neighbour(i);
+      if (!v) return;
+      if (!out.invoice_no && /^Invoice/i.test(r) && /^[A-Z]{1,6}\d{6,}$/.test(v)) out.invoice_no = v.toUpperCase();
+      else if (!out.special_payee && /^Special/i.test(r) && /^\d{6,10}$/.test(v)) out.special_payee = v;
+      else if (!out.dc && /^DC/i.test(r) && /^\d{1,3}$/.test(v)) out.dc = v;
+      else if (!out.type && /^Type/i.test(r) && /[A-Za-z]{3,}/.test(v) && v.length <= 60) out.type = v;
+    });
+    if (out.invoice_no && out.type) return out;
+    const i = rows.findIndex(x => /^[A-Z]{1,6}\d{6,}$/.test(x));
+    if (i < 0) return out;
+    if (!out.invoice_no) out.invoice_no = rows[i];
+    for (const v of rows.slice(i + 1, i + 7)) {
+      if (!out.special_payee && /^\d{6,10}$/.test(v)) { out.special_payee = v; continue; }
+      if (!out.dc && /^\d{1,3}$/.test(v)) { out.dc = v; continue; }
+      if (!out.type && /[A-Za-z]{3,}/.test(v) && v.length <= 60
+          && !isLabel(v) && !/^(K-Solve|KeHE)\b/i.test(v)) out.type = v;
+    }
+    return out;
+  }
+
+  const _DED_BANNER_NOISE = /\b(INFRA|INFR|RTB|GROC|MRKT|MKT|SUPERMARKET|SUPERMRKT|MARKET|MARKETS|INC|LLC)\b/gi;
+  function _dedBannerCandidate(s) {
+    let t = String(s == null ? '' : s).toUpperCase();
+    t = t.replace(/\(.*?\)/g, ' ').replace(/#?\b\d{2,6}\b/g, ' ').replace(_DED_BANNER_NOISE, ' ');
+    t = t.replace(/[^A-Z' -]/g, ' ').replace(/\s+/g, ' ').trim();
+    return t.split(/\s+/).slice(0, 2).join(' ').replace(/[-']$/, '').trim() || null;
+  }
+
+  // The extracted layout is ONE FIELD PER LINE, nine per row:
+  //   UPC / ITEM / BRAND / Cust Name / Date / Inv # / Qty / Inv % / Amt
+  // Anchoring on the 12-digit UPC and validating the date and percent cells
+  // keeps header rows and page furniture out without a fragile flowed regex.
+  function _dedParseKsolve(text) {
+    const t = String(text || '').replace(/\r/g, '');
+    const head = {
+      invoice_no: (t.match(/Invoice\s*#\s*:\s*([A-Z0-9]{5,})/i)
+                || t.match(/^\s*([A-Z]{2,6}\d{6,})\s*$/im)
+                || [])[1] || null,
+      special_payee: (t.match(/Special Payee\s*:\s*(\d+)/i) || [])[1] || null,
+      dc: (t.match(/DC\s*#\s*:\s*(\d+)/i) || [])[1] || null,
+      type: ((t.match(/Type\s*:\s*(.+?)(?:Customer Spoilage|KeHE|\n)/i) || [])[1]
+          || (t.match(/^\s*([A-Z][A-Za-z ]{6,44}?)\s*\n\s*KeHE Distributors/m) || [])[1]
+          || ((t.split('\n')[0] || '').trim().match(/^[A-Z][A-Za-z ]{6,44}$/) || [])[0]
+          || '').trim() || null,
+      total: Number((((t.match(/TOTAL:\s*\$\s*([\d,]*\.?\d+)/i) || [])[1]) || '0').replace(/,/g, '')) || null,
+    };
+    // Labelled hits win — they are unambiguous. The positional read only covers
+    // the files whose labels are graphics.
+    const cover = _dedParseCover(t);
+    for (const k of ['invoice_no', 'special_payee', 'dc', 'type'])
+      if (!head[k] && cover[k]) head[k] = cover[k];
+
+    const LN = t.split('\n').map(x => x.trim());
+    const rows = [];
+    for (let i = 0; i < LN.length; i++) {
+      if (!/^\d{12}$/.test(LN[i])) continue;
+      const w = LN.slice(i, i + 9);
+      if (w.length < 9) continue;
+      if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(w[4])) continue;
+      if (!/^\d+%$/.test(w[7])) continue;
+      const amt = Number(String(w[8]).replace(/[$,\s]/g, ''));
+      if (!isFinite(amt)) continue;
+      rows.push({
+        upc: w[0], item_desc: w[1], customer_name: w[3],
+        ship_date: w[4], reference_no: w[5],
+        ship_qty: Number(w[6]),
+        // The cell is '45%'. The Edge parser does Number(w[7]) here, which is
+        // NaN for every row — serialised as null, so discount_pct has been
+        // quietly empty on every K-Solve PDF it ever parsed. Strip the sign.
+        discount_pct: Number(String(w[7]).replace('%', '')),
+        bill_amount: amt,
+      });
+      i += 8;
+    }
+    const lineTotal = Math.round(rows.reduce((s, r) => s + r.bill_amount, 0) * 100) / 100;
+    return {
+      head, rows, line_total: lineTotal,
+      // A file that does not tie is a FAILED parse, not a partial one — same
+      // control as the workbook path.
+      ties: head.total != null && Math.abs(lineTotal - head.total) < 0.01,
+    };
+  }
+
+  // ── ROW SHAPE ─────────────────────────────────────────────────────────────
+  // deduction_detail has no `ship_date` column — the parser's field name is not
+  // the column name. The Edge path inserts the parser output as-is, so a
+  // K-Solve PDF going through THAT path would be rejected by PostgREST for an
+  // unknown column; here the row is mapped explicitly onto real columns, and
+  // anything the document does not carry is left null rather than invented.
+  // SIGN: bill_amount is written POSITIVE, matching every other source. The
+  // negative SN rows that had to be corrected by hand came from a one-off SQL
+  // load, not from this parser.
+  function _dedDetailRow(r, brandId, lineId, banner) {
+    return {
+      brand_id: brandId,
+      line_id: lineId,
+      upc: r.upc || null,
+      item_desc: r.item_desc || null,
+      customer_name: r.customer_name || null,
+      banner: banner || null,
+      reference_no: r.reference_no || null,
+      reference_date: _dedIsoDate(r.ship_date),
+      ship_qty: isFinite(r.ship_qty) ? r.ship_qty : null,
+      discount_pct: isFinite(r.discount_pct) ? r.discount_pct : null,
+      bill_amount: Math.abs(r.bill_amount),
+    };
+  }
+
+  function _dedIsoDate(s) {
+    const m = String(s == null ? '' : s).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (!m) return null;
+    return m[3] + '-' + String(m[1]).padStart(2, '0') + '-' + String(m[2]).padStart(2, '0');
+  }
+
+  // ── UPLOAD VIEW ───────────────────────────────────────────────────────────
+  // Staged, never one-shot. Files are parsed and RECONCILED against the
+  // register first, and nothing is written until you look at the table and
+  // press Import. A document that does not tie to its own stated TOTAL, or that
+  // matches no register line, cannot be imported at all — those are not
+  // warnings you can click past, because a backup that disagrees with itself is
+  // worse than no backup.
+  let _dedUploadState = [];   // [{file, status, head, rows, line, existing, chosen}]
+
+  async function _dedRenderUpload(body, sb, brandId, esc, money, refresh) {
+    const st = (s, c) => `<span style="font-family:var(--mono);font-size:9px;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:${c};color:var(--paper);">${s}</span>`;
+
+    body.innerHTML = `
+      <div style="margin-bottom:20px;">
+        <p style="font-family:var(--serif);font-size:13px;color:var(--ink-3);margin:0 0 14px;line-height:1.55;max-width:760px;">
+          Drop K-Solve backup PDFs here — the scanned SCAN, spoilage and fee documents. These are read
+          <strong>in this browser</strong>: they are scanned pages redrawn as vectors, ~25MB per page inflated, which is
+          what kills the server-side parser. Nothing is written until you press Import, and importing the same document
+          twice leaves the same rows as importing it once.
+        </p>
+        <div id="hl-ded-drop" style="border:1.5px dashed var(--rule);border-radius:8px;padding:26px 18px;text-align:center;cursor:pointer;background:transparent;transition:background .15s;">
+          <div style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">Drop PDFs here, or click to choose</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">Multiple files are fine. Large scans take a few seconds each.</div>
+          <input type="file" id="hl-ded-file" accept=".pdf,application/pdf" multiple style="display:none;">
+        </div>
+      </div>
+      <div id="hl-ded-up-list"></div>`;
+
+    const drop = document.getElementById('hl-ded-drop');
+    const input = document.getElementById('hl-ded-file');
+    if (!drop || !input) return;
+
+    drop.onclick = () => input.click();
+    drop.ondragover = (e) => { e.preventDefault(); drop.style.background = 'rgba(0,0,0,0.03)'; };
+    drop.ondragleave = () => { drop.style.background = 'transparent'; };
+    drop.ondrop = (e) => {
+      e.preventDefault(); drop.style.background = 'transparent';
+      handle([...(e.dataTransfer.files || [])]);
+    };
+    input.onchange = () => handle([...(input.files || [])]);
+
+    const listEl = document.getElementById('hl-ded-up-list');
+
+    async function handle(files) {
+      const pdfs = files.filter(f => /\.pdf$/i.test(f.name));
+      if (!pdfs.length) return;
+      for (const f of pdfs) {
+        const entry = { file: f, status: 'reading', note: 'reading…', head: null, rows: [],
+                        line: null, existing: null, chosen: false };
+        _dedUploadState.push(entry);
+        paint();
+        try {
+          const buf = await f.arrayBuffer();
+          const text = await _dedPdfText(buf, (n) => { entry.note = 'reading… ' + n + ' streams'; paint(); });
+          if (text.replace(/\s+/g, '').length < 40) {
+            entry.status = 'fail'; entry.note = 'no text layer — this is an image-only scan, nothing to read';
+            paint(); continue;
+          }
+          // Routed on what the document calls itself. Only the K-Solve family is
+          // handled here; the Distributor Charge and Vendor Chargeback layouts
+          // parse fine server-side and have no reason to come through the browser.
+          if (/DISTRIBUTOR CHARGE/i.test(text) || /VENDOR CHARGEBACK/i.test(text)) {
+            entry.status = 'fail';
+            entry.note = 'this is a Distributor Charge / Vendor Chargeback layout — run sync-deductions mode=detail instead';
+            paint(); continue;
+          }
+          const p = _dedParseKsolve(text);
+          entry.head = p.head; entry.rows = p.rows; entry.parsed_total = p.line_total; entry.ties = p.ties;
+          if (!p.rows.length) {
+            entry.status = 'fail';
+            entry.note = 'read the file but found no detail rows — head: ' + text.replace(/\s+/g, ' ').slice(0, 90);
+            paint(); continue;
+          }
+          if (!p.head.invoice_no) {
+            entry.status = 'fail'; entry.note = 'no invoice number on the cover — cannot attach to a register line';
+            paint(); continue;
+          }
+          if (!p.ties) {
+            entry.status = 'fail';
+            entry.note = 'rows sum to ' + money(p.line_total) + ' against a stated TOTAL of '
+                       + (p.head.total == null ? 'none found' : money(p.head.total)) + ' — not imported';
+            paint(); continue;
+          }
+          // Reconcile against the register.
+          const { data: lns, error: lErr } = await sb.from('deduction_lines')
+            .select('id,invoice_no,amount,reason_code,detail_parsed,detail_line_total')
+            .eq('brand_id', brandId).eq('invoice_no', p.head.invoice_no).limit(2);
+          if (lErr) { entry.status = 'fail'; entry.note = 'could not read the register: ' + lErr.message; paint(); continue; }
+          if (!lns || !lns.length) {
+            entry.status = 'fail';
+            entry.note = 'invoice ' + p.head.invoice_no + ' is not on the check register — load the register first';
+            paint(); continue;
+          }
+          if (lns.length > 1) {
+            entry.status = 'fail';
+            entry.note = 'invoice ' + p.head.invoice_no + ' matches more than one register line — resolve that first';
+            paint(); continue;
+          }
+          entry.line = lns[0];
+
+          // ── THE INVOICE NUMBER IS NOT SELF-VALIDATING ────────────────────
+          // When the cover labels are graphics the number is read POSITIONALLY:
+          // the first line shaped like [A-Z]{1,6}\d{6,}. A detail row's
+          // reference number ('BM432340') has that exact shape, so a document
+          // whose cover did not extract can key itself off its own body and
+          // then attach these rows to a DIFFERENT invoice's line. Unlike the
+          // Edge path, nothing here matched on filename first, so the number is
+          // the only thing selecting the line — it has to be checked against
+          // the money.
+          //
+          // The document total EXCLUDES KeHE's fee (SN000166756: $5,872.95
+          // document, $469.84 fee, $6,342.79 deducted — a flat 8%, capped at
+          // $700). So the parsed total must not exceed the deduction, and the
+          // shortfall must look like a fee rather than a coincidence.
+          const amt = Math.abs(lns[0].amount);
+          const gap = amt - p.line_total;
+          if (p.line_total > amt + 0.01) {
+            entry.status = 'fail';
+            entry.note = 'the document totals ' + money(p.line_total) + ' but the register line for '
+                       + p.head.invoice_no + ' is only ' + money(amt)
+                       + ' — the invoice number was probably read off a detail row, not the cover. Not imported.';
+            paint(); continue;
+          }
+          if (amt > 0 && gap / amt > 0.15) {
+            entry.status = 'fail';
+            entry.note = 'the document totals ' + money(p.line_total) + ' against a deduction of ' + money(amt)
+                       + ' — a gap of ' + money(gap) + ' (' + (gap / amt * 100).toFixed(1)
+                       + '%) is too large to be the processing fee. Check this is the right invoice before importing.';
+            paint(); continue;
+          }
+          entry.fee_gap = Math.round(gap * 100) / 100;
+          // What is ALREADY under this line, counted rather than assumed. The
+          // detail_parsed flag is reported next to it precisely so a
+          // disagreement between the two is visible instead of silent.
+          const { count, error: cErr } = await sb.from('deduction_detail')
+            .select('*', { count: 'exact', head: true }).eq('line_id', lns[0].id);
+          entry.existing = cErr ? null : (count || 0);
+          entry.status = entry.existing ? 'dupe' : 'ready';
+          entry.chosen = !entry.existing;
+          entry.note = '';
+          paint();
+        } catch (err) {
+          entry.status = 'fail'; entry.note = 'failed to read: ' + (err && err.message || String(err));
+          paint();
+        }
+      }
+    }
+
+    function paint() {
+      if (!listEl) return;
+      if (!_dedUploadState.length) { listEl.innerHTML = ''; return; }
+      const ready = _dedUploadState.filter(e => e.chosen && (e.status === 'ready' || e.status === 'dupe'));
+      listEl.innerHTML = `
+        <table style="width:100%;border-collapse:collapse;margin-bottom:14px;">
+          <thead><tr>
+            ${['', 'File', 'Invoice', 'Type', 'Rows', 'Parsed total', 'Line amount', 'State'].map(h =>
+              `<th style="text-align:left;padding:5px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}
+          </tr></thead>
+          <tbody>
+          ${_dedUploadState.map((e, i) => {
+            const sev = e.status === 'fail' ? 'var(--lost)' : e.status === 'dupe' ? '#8a6d1f' : e.status === 'ready' ? 'var(--won)' : 'var(--ink-3)';
+            const label = e.status === 'fail' ? 'CANNOT IMPORT' : e.status === 'dupe' ? 'ALREADY IMPORTED' : e.status === 'ready' ? 'READY' : 'READING';
+            const box = (e.status === 'ready' || e.status === 'dupe')
+              ? `<input type="checkbox" class="hl-ded-up-pick" data-i="${i}" ${e.chosen ? 'checked' : ''}>` : '';
+            return `<tr>
+              <td style="padding:5px 8px;border-bottom:1px solid var(--rule-soft);">${box}</td>
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);">${esc(e.file.name)}</td>
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.invoice_no) || '—')}</td>
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.type) || '—')}</td>
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.rows.length || '—'}</td>
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.parsed_total != null ? money(e.parsed_total) : '—'}</td>
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.line ? money(Math.abs(e.line.amount)) : '—'}</td>
+              <td style="padding:5px 8px;border-bottom:1px solid var(--rule-soft);">
+                ${st(label, sev)}
+                ${e.note ? `<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:3px;max-width:420px;line-height:1.45;">${esc(e.note)}</div>` : ''}
+                ${e.status === 'dupe' ? `<div style="font-family:var(--mono);font-size:9.5px;color:#8a6d1f;margin-top:3px;line-height:1.45;">${e.existing} detail row(s) already under this line${e.line && !e.line.detail_parsed ? ' — though the line is NOT flagged as parsed, which is itself worth knowing' : ''}. Importing REPLACES them.</div>` : ''}
+              </td></tr>`;
+          }).join('')}
+          </tbody>
+        </table>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <button id="hl-ded-up-go" ${ready.length ? '' : 'disabled'}
+            style="font-family:var(--mono);font-size:11px;padding:8px 18px;border-radius:5px;cursor:${ready.length ? 'pointer' : 'default'};
+                   border:1px solid ${ready.length ? 'var(--ink)' : 'var(--rule-soft)'};
+                   background:${ready.length ? 'var(--ink)' : 'transparent'};color:${ready.length ? 'var(--paper)' : 'var(--rule)'};">
+            Import ${ready.length || ''} document${ready.length === 1 ? '' : 's'}</button>
+          <button id="hl-ded-up-clear" style="font-family:var(--mono);font-size:11px;padding:8px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear</button>
+          <span id="hl-ded-up-msg" style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);"></span>
+        </div>`;
+
+      listEl.querySelectorAll('.hl-ded-up-pick').forEach(cb => cb.onchange = () => {
+        _dedUploadState[Number(cb.dataset.i)].chosen = cb.checked; paint();
+      });
+      const clr = document.getElementById('hl-ded-up-clear');
+      if (clr) clr.onclick = () => { _dedUploadState = []; paint(); };
+      const go = document.getElementById('hl-ded-up-go');
+      if (go) go.onclick = doImport;
+    }
+
+    async function doImport() {
+      const msg = document.getElementById('hl-ded-up-msg');
+      const go = document.getElementById('hl-ded-up-go');
+      if (go) { go.disabled = true; go.textContent = 'Importing…'; }
+
+      // Banner crosswalk is the authority; the extracted name only seeds what
+      // nobody has mapped yet — same rule as the Edge path.
+      const bmap = new Map();
+      try {
+        const { data } = await sb.from('deduction_banner_map').select('banner_raw,banner').eq('brand_id', brandId);
+        for (const b of (data || [])) if (b.banner) bmap.set(b.banner_raw, b.banner);
+      } catch (e) { /* an unmapped banner is survivable; a failed import is not */ }
+
+      let ok = 0, failed = 0;
+      for (const e of _dedUploadState) {
+        if (!e.chosen || (e.status !== 'ready' && e.status !== 'dupe')) continue;
+        try {
+          // DELETE FIRST. This is what makes the import idempotent rather than
+          // trusting detail_parsed — re-importing the same file replaces its
+          // rows instead of adding a second copy.
+          const { error: dErr } = await sb.from('deduction_detail').delete().eq('line_id', e.line.id);
+          if (dErr) throw new Error('clearing existing rows: ' + dErr.message);
+
+          const rows = e.rows.map(r => {
+            const cand = _dedBannerCandidate(r.customer_name);
+            return _dedDetailRow(r, brandId, e.line.id, (cand && bmap.get(cand)) || cand);
+          });
+          for (let k = 0; k < rows.length; k += 500) {
+            const { error } = await sb.from('deduction_detail').insert(rows.slice(k, k + 500));
+            if (error) throw new Error(error.message);
+          }
+          const { error: uErr } = await sb.from('deduction_lines').update({
+            detail_parsed: true,
+            detail_line_total: e.parsed_total,
+            detail_variance: Math.round((Math.abs(e.line.amount) - e.parsed_total) * 100) / 100,
+          }).eq('id', e.line.id);
+          if (uErr) throw new Error('updating the register line: ' + uErr.message);
+
+          e.status = 'done'; e.chosen = false;
+          e.note = 'imported ' + rows.length + ' rows';
+          ok++;
+        } catch (err) {
+          e.status = 'fail'; e.chosen = false;
+          e.note = 'import failed: ' + (err && err.message || String(err));
+          failed++;
+        }
+        paint();
+      }
+
+      if (msg) {
+        // The rollup is a MATERIALIZED view: it stores its result. Anything that
+        // changes deduction_detail outside a sync-deductions run leaves it stale,
+        // and a stale rollup shows up as the tie-out count climbing on the
+        // headline — which is the control that makes this visible rather than
+        // silent. Said plainly here so it is not discovered later.
+        msg.innerHTML = ok
+          ? `<span style="color:var(--won);">Imported ${ok} document${ok === 1 ? '' : 's'}${failed ? ', ' + failed + ' failed' : ''}.</span>
+             <span style="color:var(--ink-3);">Now run <code>refresh materialized view concurrently public.deduction_detail_rollup;</code> alone in a SQL tab — the store-detail views read a stored snapshot, not the table.</span>`
+          : `<span style="color:var(--lost);">Nothing imported.</span>`;
+      }
+      if (ok) { try { _dedBust(); } catch (e2) {} }
+    }
+
+    paint();
+  }
+
   async function renderDeductions(hostEl, filtersEl, year) {
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary.getSession().brandId;
@@ -29483,9 +30085,9 @@ render();
       ['reconcile',  'Reconcile vs. plan'],
       ['customer',   'By customer'],
       ['summary',    'Category'],
-      ['code',       'By reason code'],
       ['checks',     'Checks'],
       ['exceptions', 'Exceptions'],
+      ['upload',     'Upload backup'],
     ];
 
     // DECLARED HERE, ABOVE FIRST USE. These were further down the function while
@@ -29565,9 +30167,8 @@ render();
                    background:${_dedView === v ? 'var(--ink)' : 'transparent'};
                    color:${_dedView === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
         </span>
-        <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:10px;">${_dedDist === 'all' ? 'all distributors' : _dedDist}</span>
         <button id="hl-ded-refresh" title="Re-read from Supabase — use after running SQL or the detail parser"
-          style="margin-left:10px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">↻ Refresh</button>
+          style="margin-left:auto;font-family:var(--mono);font-size:10px;padding:6px 14px;border-radius:5px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">↻ Refresh</button>
       </div>
       <div id="hl-ded-body"></div>
     `;
@@ -29794,6 +30395,14 @@ render();
       if (d) _dedDetail = Object.assign({ key: _detKey }, d);
       if (p) _dedPlan   = Object.assign({ key: _planKey }, p);
     };
+
+    // Upload is answered before anything else and returns: it needs none of the
+    // register aggregation above, and it must not wait on the store-detail
+    // fetch, which is ~16.5k rows this view never reads.
+    if (_dedView === 'upload') {
+      await _dedRenderUpload(body, sb, brandId, esc, money, () => renderDeductions(hostEl, filtersEl, year));
+      return;
+    }
 
     if (_dedView === 'customer' || _dedView === 'reconcile') {
       await _dedWarm();
@@ -30626,8 +31235,11 @@ ${(() => {
         b.amt += amt; b.rows++;
         const store = d.customer_name || '(unnamed store)';
         let st = b.stores.get(store);
-        if (!st) b.stores.set(store, st = { name: store, state: d.customer_state, amt: 0, rows: 0 });
+        if (!st) b.stores.set(store, st = { name: store, state: d.customer_state, amt: 0, rows: 0, items: [] });
         st.amt += amt; st.rows++;
+        // The deepest level is the document's own row: item, reference, date,
+        // qty, rate. Held by reference, not copied.
+        st.items.push(d);
         b.cats.set(catOf(l), (b.cats.get(catOf(l)) || 0) + amt);
         const rawDate = d.reference_date || d.date_from || l.doc_date || null;
         if (rawDate) { const mk = String(rawDate).slice(0, 7); months.add(mk); b.months.set(mk, (b.months.get(mk) || 0) + amt); }
@@ -30707,10 +31319,48 @@ ${(() => {
                   ${td((b.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}
                 </tr>
                 <tr><td colspan="6" style="padding:0 10px 7px;border-bottom:1px solid var(--rule-soft);"><div style="height:2px;background:var(--ink);opacity:.8;width:${(b.amt / maxAmt * 100).toFixed(2)}%;"></div></td></tr>`;
+                // ── THREE LEVELS, EACH ITS OWN TOGGLE ──────────────────────
+                // This used to dump categories, months and stores as flat
+                // siblings at one indent — three different kinds of thing
+                // reading as one list, and no way to reach the document rows
+                // underneath. Now it descends: customer -> store -> the item
+                // lines themselves, which is the lowest grain Keel holds.
+                // Category and month are gone from here: Category is its own
+                // tab and By month is the toggle above, so repeating them
+                // inside the row was the same repetition that made By reason
+                // code redundant.
                 if (open) {
-                  out += b.catList.map(([c, v]) => `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:22px;color:' + (c.charAt(0) === '\u26A0' ? 'var(--lost)' : 'var(--ink-3)') + ';">' + esc(c) + '</span>', false)}${td('', true)}${td('', true)}${td('')}${td(money(v), true)}${td('', true)}</tr>`).join('');
-                  out += MS.filter(m => b.months.get(m)).map(m => `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:22px;color:var(--ink-3);">' + mLabel(m) + '</span>')}${td('', true)}${td('', true)}${td('')}${td(money(b.months.get(m)), true)}${td('', true)}</tr>`).join('');
-                  out += b.storeList.map(st => `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:22px;">' + esc(st.name) + (st.state ? ' <span style="color:var(--ink-3);">' + esc(st.state) + '</span>' : '') + '</span>')}${td('', true)}${td(st.rows, true)}${td('')}${td(money(st.amt), true)}${td('', true)}</tr>`).join('');
+                  out += b.storeList.map(st => {
+                    const sk = b.name + '\u0000' + st.name;
+                    const sOpen = _dedCustStore.has(sk);
+                    let s = `<tr class="hl-cust-store" data-s="${esc(sk)}" style="background:var(--rule-softer);cursor:pointer;">
+                      ${td('<span style="padding-left:22px;display:inline-block;width:12px;color:var(--ink-3);">' + (sOpen ? '\u2212' : '+') + '</span>' + esc(st.name) + (st.state ? ' <span style="color:var(--ink-3);">' + esc(st.state) + '</span>' : ''))}
+                      ${td('', true)}${td(st.rows, true)}${td('')}${td(money(st.amt), true)}${td('', true)}</tr>`;
+                    if (sOpen) {
+                      // Largest first — on a 60-store SCAN document the row that
+                      // matters is never the one that happens to be printed first.
+                      const items = st.items.slice().sort((x, y) =>
+                        Math.abs(Number(y.bill_amount || 0)) - Math.abs(Number(x.bill_amount || 0)));
+                      s += items.slice(0, 60).map(it => {
+                        const dt = it.reference_date || it.date_from || null;
+                        const meta = [
+                          it.reference_no ? esc(it.reference_no) : null,
+                          dt ? esc(String(dt).slice(0, 10)) : null,
+                          it.discount_pct != null ? esc(it.discount_pct) + '%' : null,
+                        ].filter(Boolean).join(' \u00b7 ');
+                        return `<tr style="background:var(--rule-softer);">
+                          ${td('<span style="padding-left:52px;color:var(--ink-2);">' + esc(it.item_desc || it.upc || '(no description)') + '</span>'
+                             + (meta ? '<div style="padding-left:52px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + meta + '</div>' : ''))}
+                          ${td('', true)}
+                          ${td(it.ship_qty != null ? esc(it.ship_qty) : '', true, 'color:var(--ink-3);')}
+                          ${td('')}
+                          ${td(money(Math.abs(Number(it.bill_amount || 0))), true, 'color:var(--ink-2);')}
+                          ${td('', true)}</tr>`;
+                      }).join('');
+                      if (items.length > 60) s += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:52px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (items.length - 60).toLocaleString() + ' smaller item rows not shown \u00b7 the store total above still counts them</span>')}${td('', true)}${td('', true)}${td('')}${td('', true)}${td('', true)}</tr>`;
+                    }
+                    return s;
+                  }).join('');
                 }
                 return out;
               }).join('')}
@@ -30751,6 +31401,13 @@ ${(() => {
       });
       body.querySelectorAll('.hl-cust-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.b; _dedOpen.has(n) ? _dedOpen.delete(n) : _dedOpen.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      // stopPropagation, or opening a store also collapses the customer it sits
+      // inside — the same rule the four Category toggles follow.
+      body.querySelectorAll('.hl-cust-store').forEach(tr => tr.onclick = (ev) => {
+        ev.stopPropagation();
+        const k = tr.dataset.s; _dedCustStore.has(k) ? _dedCustStore.delete(k) : _dedCustStore.add(k);
         renderDeductions(hostEl, filtersEl, year);
       });
       return;
