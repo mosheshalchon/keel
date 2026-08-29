@@ -29434,6 +29434,13 @@ render();
       // that do not visibly come from anywhere.
       let planBookTotal = 0;
       for (const pl of P.lines) planBookTotal += Number(pl.expected_spend || 0);
+      // Which promo types are being excluded, and for how much. 'Promo type with
+      // no matching deductions' as a single figure is not reviewable — it hid a
+      // $178,951 Whole Foods mismatch for as long as it existed. Named, the row
+      // separates the correct exclusions (OI and Early Pay come off the invoice,
+      // so no deduction will ever exist for them) from the ones that are really
+      // a vocabulary gap.
+      const planExcludedTypeBy = new Map();
       for (const pl of P.lines) {
         const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
         const exp = Number(pl.expected_spend || 0);
@@ -29445,7 +29452,12 @@ render();
                      : /kehe/i.test(recv);
         if (!recvOk) { planExcludedRecv += exp; continue; }
         const ck = normCat(pl.promo_type);
-        if (!catsSeen.has(ck)) { planExcludedType += exp; continue; }
+        if (!catsSeen.has(ck)) {
+          planExcludedType += exp;
+          const pt = String(pl.promo_type || '(no type)');
+          planExcludedTypeBy.set(pt, (planExcludedTypeBy.get(pt) || 0) + exp);
+          continue;
+        }
         if (!inWindow(planMonthOf(pl))) { planOutOfWindow += exp; continue; }
         // An Approved or Running promo has no deduction yet because it has not
         // closed — counting it as under-deducted is the same calendar error as
@@ -29471,7 +29483,8 @@ render();
              registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
-             planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal };
+             planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
+             planExcludedTypeBy };
   }
 
   // ══ PROMOTIONS BY RETAILER PROMO NUMBER ═══════════════════════════════════
@@ -31402,7 +31415,8 @@ render();
       const P = _dedPlan || { lines: [], err: null };
       const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist,
                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
-      const { planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal } = R;
+      const { planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
+              planExcludedTypeBy } = R;
       const { cells, rows, totPlan, totDed, unattrib, undocumented, autoMatched,
               tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
               dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
@@ -31461,7 +31475,17 @@ render();
       const planBridge = [
         ['Plan book ' + esc(yr), planBookTotal, null, 'Every line Vividly holds for the year.'],
         ['Not a KeHE or UNFI line', -planExcludedRecv, 'sub', 'no deductions arrive through this receiver'],
-        ['Promo type with no matching deductions', -planExcludedType, 'sub', ''],
+        ['Promo type with no matching deductions', -planExcludedType, 'sub',
+          (() => {
+            if (!planExcludedTypeBy || !planExcludedTypeBy.size) return '';
+            const es = [...planExcludedTypeBy.entries()].filter(e => e[1] > 0.5).sort((a, b2) => b2[1] - a[1]);
+            const MIN = 1000;
+            const big = es.filter(e => e[1] >= MIN).slice(0, 3);
+            const rest = es.filter(e => !big.includes(e));
+            const restAmt = rest.reduce((s2, e) => s2 + e[1], 0);
+            return big.map(([t, v]) => esc(t) + ' ' + money(v)).join(', ')
+              + (rest.length ? (big.length ? ', ' : '') + 'other ' + rest.length + ' type' + (rest.length === 1 ? '' : 's') + ' ' + money(restAmt) : '');
+          })()],
         ['Outside ' + (winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'the window'), -planOutOfWindow, 'sub', ''],
         ['Not closed yet', -planNotClosed, 'sub', 'no final spend to compare against'],
         ['Compared against deductions', totPlan, 'tot', ''],
@@ -31476,20 +31500,6 @@ render();
         </tr>`;
 
       body.innerHTML = `
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;margin:2px 0 16px;">
-          <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;">
-            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
-              From the plan book to what is compared
-            </div>
-            <table style="width:100%;border-collapse:collapse;">${planBridge.map(pbRow).join('')}</table>
-          </div>
-          <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;">
-            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
-              From trade spend to what is reconciled
-            </div>
-            <table style="width:100%;border-collapse:collapse;">${bridge.map(brRow).join('')}</table>
-          </div>
-        </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:18px;margin:0 0 16px;">
           ${stat('Planned (' + DSHORT + ')', money(totPlan), winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'Vividly expected spend')}
           ${stat('Deducted (trade)', money(totDed), 'same months, attributed to a customer')}
@@ -31650,6 +31660,20 @@ ${(() => {
             ${td('<strong style="color:' + dCol(totDed, totPlan) + ';">' + dPct(totDed, totPlan) + '</strong>', true)}${td('')}
           </tr></tfoot>
         </table>`}
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;margin:2px 0 16px;">
+          <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
+              From the plan book to what is compared
+            </div>
+            <table style="width:100%;border-collapse:collapse;">${planBridge.map(pbRow).join('')}</table>
+          </div>
+          <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
+              From trade spend to what is reconciled
+            </div>
+            <table style="width:100%;border-collapse:collapse;">${bridge.map(brRow).join('')}</table>
+          </div>
+        </div>
         ${P.err ? `<div style="margin-top:12px;font-family:var(--mono);font-size:11px;color:var(--lost);">Plan could not be loaded: ${esc(P.err)}</div>` : ''}`;
 
       // ── in-app crosswalk editor. plan_customer must equal promo_plan_lines.customer
