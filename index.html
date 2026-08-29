@@ -29012,6 +29012,12 @@ render();
   let _dedLinesQ = '';            // free-text search over invoice / code / remarks
   let _dedLinesMonths = new Set(); // empty = every month, matching the app's other multi-selects
   let _dedLinesOpen = new Set();  // which lines are expanded to their store detail
+  // Deductions tab grain: 'line' (the register) or 'promo' (the retailer's own
+  // promo number). Two ways of cutting the same money — the register answers
+  // "what did they take", the promo view answers "what did each promotion cost".
+  let _dedGrain = (() => { try { return localStorage.getItem('keel_ded_grain') === 'promo' ? 'promo' : 'line'; } catch (e) { return 'line'; } })();
+  let _dedPromos = null;          // cached deduction_promo_rollup rows
+  let _dedPromosErr = null;
   let _dedOthCat = new Set();     // Other charges: expanded categories
   let _dedOthCode = new Set();    // Other charges: expanded reason codes
   let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
@@ -29406,6 +29412,174 @@ render();
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
              planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed };
+  }
+
+  // ══ PROMOTIONS BY RETAILER PROMO NUMBER ═══════════════════════════════════
+  // Reads deduction_promo_rollup — one row per retailer promo number, with the
+  // rate, the event window, units and what was actually spent. This is the
+  // actuals half of a promo-level plan; the other half is what was agreed, and
+  // the export at the bottom is how you seed it.
+  let _dedPromoQ = '';
+  let _dedPromoLimit = 50;
+  let _dedPromoSort = 'spend';    // spend | rate | start | promo
+  let _dedPromoYearOnly = true;   // scope to the selected year by event window
+
+  async function _dedRenderPromos(body, rows, err, U) {
+    const { esc, money, th, td, yr, year, rerender } = U;
+
+    if (err) {
+      // The view is created by hand, so its absence is the expected first state
+      // rather than a fault. Say what to run instead of showing a stack trace.
+      const missing = /does not exist|42P01|could not find the table/i.test(err);
+      body.innerHTML = `
+        ${_dedGrainBar(esc)}
+        <div style="border:1px solid var(--rule);border-left-width:3px;border-radius:5px;padding:14px 16px;font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--ink-2);">
+          ${missing
+            ? `<strong>The promo view does not exist yet.</strong> It aggregates <code>deduction_detail</code> by the
+               retailer's promo number. Create it once with the SQL supplied alongside this build, then press Refresh.
+               <div style="color:var(--ink-3);margin-top:7px;">Nothing else in Keel depends on it, so creating it changes no existing number.</div>`
+            : `<strong style="color:var(--lost);">Could not read the promo view.</strong> ${esc(err)}`}
+        </div>`;
+      return;
+    }
+
+    const all = rows || [];
+    const ys = String(year) + '-01-01', ye = String(year) + '-12-31';
+    // Scoped on the EVENT WINDOW, not on when the money moved. A December promo
+    // invoiced in January is a December promo — same rule the reconciliation
+    // follows, applied to the same question one level down.
+    const inYear = (p) => {
+      const s = String(p.event_start || p.first_scan || '');
+      const e = String(p.event_end || p.last_scan || s);
+      if (!s) return true;
+      return !(e < ys || s > ye);
+    };
+    const terms = _dedPromoQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const hay = (p) => [p.promo_no, p.promo_name, p.plan_customer, p.banner, p.reason_codes, p.invoices]
+      .filter(Boolean).join(' ').toLowerCase();
+
+    let list = all.filter(p => (!_dedPromoYearOnly || inYear(p)) && (!terms.length || terms.every(t => hay(p).includes(t))));
+    const SORTS = {
+      spend: (a, b) => Number(b.actual_spend || 0) - Number(a.actual_spend || 0),
+      rate:  (a, b) => Number(b.rate_max || 0) - Number(a.rate_max || 0),
+      start: (a, b) => String(b.event_start || '').localeCompare(String(a.event_start || '')),
+      promo: (a, b) => String(a.promo_no || '').localeCompare(String(b.promo_no || '')),
+    };
+    list = list.slice().sort(SORTS[_dedPromoSort] || SORTS.spend);
+
+    const totAll   = all.reduce((s, p) => s + Number(p.actual_spend || 0), 0);
+    const totShown = list.reduce((s, p) => s + Number(p.actual_spend || 0), 0);
+    const shown = list.slice(0, _dedPromoLimit);
+    const filtered = terms.length > 0 || _dedPromoYearOnly;
+
+    const dt = (v) => v ? String(v).slice(0, 10) : '';
+    const rateCell = (p) => {
+      const lo = Number(p.rate_min), hi = Number(p.rate_max);
+      if (!isFinite(hi) || !hi) return '<span style="color:var(--rule);">·</span>';
+      // A promo with several rates is shown as a range, never as one number:
+      // the Dec Whole Foods promo billed at 1.36, 0.87 and 0.67 across items,
+      // and printing any single one of those would be a quiet lie.
+      return Number(p.rate_count) > 1
+        ? `$${lo.toFixed(2)}\u2013$${hi.toFixed(2)}<span style="color:var(--ink-3);"> ·${p.rate_count}</span>`
+        : `$${hi.toFixed(2)}`;
+    };
+
+    body.innerHTML = `
+      ${_dedGrainBar(esc)}
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px;">
+        <input id="hl-pr-q" type="search" placeholder="Search promo number, name, customer or invoice\u2026" value="${esc(_dedPromoQ)}"
+          style="flex:1 1 300px;min-width:220px;font-family:var(--mono);font-size:12px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
+        <button id="hl-pr-yr" style="font-family:var(--mono);font-size:11.5px;padding:9px 14px;border-radius:6px;cursor:pointer;
+          border:1px solid ${_dedPromoYearOnly ? 'var(--ink)' : 'var(--rule)'};background:${_dedPromoYearOnly ? 'var(--ink)' : 'transparent'};color:${_dedPromoYearOnly ? 'var(--paper)' : 'var(--ink-3)'};">${esc(yr)} only</button>
+        ${[['spend', 'Spend'], ['rate', 'Rate'], ['start', 'Newest'], ['promo', 'Number']].map(([v, l]) => `<button class="hl-pr-sort" data-v="${v}"
+          style="font-family:var(--mono);font-size:11px;padding:9px 12px;border-radius:6px;cursor:pointer;
+                 border:1px solid ${_dedPromoSort === v ? 'var(--ink)' : 'var(--rule-soft)'};
+                 background:${_dedPromoSort === v ? 'var(--ink)' : 'transparent'};color:${_dedPromoSort === v ? 'var(--paper)' : 'var(--ink-3)'};">${l}</button>`).join('')}
+        <button id="hl-pr-csv" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Export CSV</button>
+      </div>
+
+      <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:0 0 10px;">
+        ${filtered
+          ? `${list.length.toLocaleString()} of ${all.length.toLocaleString()} promotions \u00b7 <strong style="color:var(--ink);">${money(totShown)}</strong> of ${money(totAll)}`
+          : `${all.length.toLocaleString()} promotions \u00b7 <strong style="color:var(--ink);">${money(totAll)}</strong>`}
+      </div>
+
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr>
+          ${th('Promo #')}${th('Promotion')}${th('Customer')}${th('Event window')}${th('Rate', true)}${th('Items', true)}${th('Stores', true)}${th('Units', true)}${th('Spend', true)}
+        </tr></thead>
+        <tbody>
+          ${shown.map(p => `<tr>
+            ${td('<span style="font-family:var(--mono);font-size:11.5px;">' + esc(p.promo_no) + '</span>')}
+            ${td('<span style="font-size:12.5px;">' + esc(p.promo_name || '\u2014') + '</span>'
+               + (p.reason_codes ? '<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(p.reason_codes) + '</div>' : ''))}
+            ${td(p.plan_customer ? esc(p.plan_customer) : '<span style="color:var(--lost);">unmapped</span>')}
+            ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(dt(p.event_start)) + (p.event_end ? ' \u2192 ' + esc(dt(p.event_end)) : '') + '</span>')}
+            ${td(rateCell(p), true)}
+            ${td(p.items || '', true, 'color:var(--ink-3);')}
+            ${td(p.stores ? Number(p.stores).toLocaleString() : '', true, 'color:var(--ink-3);')}
+            ${td(p.units != null ? Number(p.units).toLocaleString() : '', true, 'color:var(--ink-3);')}
+            ${td('<strong>' + money(Number(p.actual_spend || 0)) + '</strong>', true)}
+          </tr>`).join('')}
+          ${!shown.length ? `<tr><td colspan="9" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">No promotion matches this filter.</td></tr>` : ''}
+          ${list.length > _dedPromoLimit ? `<tr><td colspan="9" style="padding:12px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+            <button id="hl-pr-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show 50 more</button>
+            <span style="margin-left:10px;">${(list.length - _dedPromoLimit).toLocaleString()} smaller promotions hidden \u00b7 ${money(list.slice(_dedPromoLimit).reduce((s, p) => s + Number(p.actual_spend || 0), 0))} \u2014 the total below still counts them</span>
+          </td></tr>` : ''}
+        </tbody>
+        <tfoot><tr style="border-top:2px solid var(--ink);">
+          ${td('<strong>Total</strong>')}${td('')}${td('')}${td('')}${td('', true)}${td('', true)}${td('', true)}${td('', true)}
+          ${td('<strong>' + money(totShown) + '</strong>', true)}
+        </tr></tfoot>
+      </table>
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;line-height:1.6;">
+        Rate is what the distributor <strong>charged</strong>. A plan carries what was <strong>agreed</strong> — the two
+        differing is the variance worth catching. Export gives one row per promo number to seed that plan.
+      </p>`;
+
+    const q = document.getElementById('hl-pr-q');
+    if (q) { let t = null; q.oninput = () => { clearTimeout(t); t = setTimeout(() => { _dedPromoQ = q.value; _dedPromoLimit = 50; rerender(); }, 220); }; }
+    const yb = document.getElementById('hl-pr-yr');
+    if (yb) yb.onclick = () => { _dedPromoYearOnly = !_dedPromoYearOnly; _dedPromoLimit = 50; rerender(); };
+    body.querySelectorAll('.hl-pr-sort').forEach(b => b.onclick = () => { _dedPromoSort = b.dataset.v; rerender(); });
+    const mo = document.getElementById('hl-pr-more');
+    if (mo) mo.onclick = () => { _dedPromoLimit += 50; rerender(); };
+    body.querySelectorAll('.hl-ded-grain').forEach(b => b.onclick = () => {
+      _dedGrain = b.dataset.v;
+      try { localStorage.setItem('keel_ded_grain', _dedGrain); } catch (e) {}
+      rerender();
+    });
+
+    const csv = document.getElementById('hl-pr-csv');
+    if (csv) csv.onclick = () => {
+      // Exports EVERY row the filters match, not the page. A 50-row page is a
+      // reading convenience; an export that silently stopped at 50 would seed a
+      // plan missing most of its promotions.
+      const cols = ['promo_no', 'promo_name', 'plan_customer', 'banner', 'event_start', 'event_end',
+                    'rate_min', 'rate_max', 'rate_count', 'items', 'stores', 'units',
+                    'actual_spend', 'reason_codes', 'invoices'];
+      const cell = (v) => {
+        const s = v == null ? '' : String(v);
+        return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const out = [cols.join(',')].concat(list.map(p => cols.map(c => cell(p[c])).join(','))).join('\n');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([out], { type: 'text/csv;charset=utf-8;' }));
+      a.download = 'keel-promotions-' + yr + '.csv';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    };
+  }
+
+  function _dedGrainBar(esc) {
+    return `<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
+      <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:3px;">Show</span>
+      ${[['line', 'Deduction lines'], ['promo', 'Promotions']].map(([v, l]) => `<button class="hl-ded-grain" data-v="${v}"
+        style="font-family:var(--mono);font-size:11.5px;padding:7px 15px;border-radius:5px;cursor:pointer;
+               border:1px solid ${_dedGrain === v ? 'var(--ink)' : 'var(--rule-soft)'};
+               background:${_dedGrain === v ? 'var(--ink)' : 'transparent'};
+               color:${_dedGrain === v ? 'var(--paper)' : 'var(--ink-3)'};">${l}</button>`).join('')}
+    </div>`;
   }
 
   // ══ IN-APP PDF BACKUP UPLOAD ══════════════════════════════════════════════
@@ -30479,7 +30653,7 @@ render();
       return;
     }
 
-    if (_dedView === 'customer' || _dedView === 'reconcile') {
+    if (_dedView === 'customer' || _dedView === 'reconcile' || _dedView === 'lines') {
       await _dedWarm();
       if (_detStale()) {
         body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
@@ -30521,6 +30695,27 @@ render();
     // is LISTED and are shown as their own subtotal — the register total stays on
     // screen next to it, so a filter can never look like money going missing.
     if (_dedView === 'lines') {
+      // ── PROMO GRAIN ──────────────────────────────────────────────────────
+      // Keyed on the RETAILER'S own promo number, which they issue before the
+      // promo runs. That is what makes it a plan key: it exists on both sides
+      // before any money moves, and it owes nothing to Vividly's internal ids
+      // (2411-LZNRF shares no characters with 10111957 — there is no join
+      // between them and there never was).
+      if (_dedGrain === 'promo') {
+        if (!_dedPromos && !_dedPromosErr) {
+          body.innerHTML = '<div class="hl-loading">Loading promotions\u2026</div>';
+          try {
+            _dedPromos = await paged(() => sb.from('deduction_promo_rollup')
+              .select('*').eq('brand_id', brandId).order('actual_spend', { ascending: false }));
+          } catch (e) { _dedPromosErr = String(e && e.message || e); }
+        }
+        await _dedRenderPromos(body, _dedPromos, _dedPromosErr, {
+          esc, money, th, td, yr, year,
+          rerender: () => renderDeductions(hostEl, filtersEl, year),
+        });
+        return;
+      }
+
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLbl = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
       const catOf = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || null; };
@@ -30535,7 +30730,28 @@ render();
         detBy.get(d.line_id).push(d);
       }
 
-      const monthOf = (l) => String(l.doc_date || '').slice(0, 7);
+      // PROMO DATE GOVERNS, HERE TOO. This column read doc_date alone and so
+      // said "no date" on lines whose backup is dated — WHFDSCAN0426015930 has
+      // detail dated 2025-12-01 and a null doc_date, because UNFI's loader never
+      // stamps one. Same rule as the reconciliation: earliest reference_date on
+      // the line's own detail, doc_date as the fallback, and anything before
+      // 2000 treated as no date rather than as a very old promo.
+      const _VF = '2000-01-01';
+      const monthOf = (l) => {
+        let best = null;
+        for (const d of (detBy.get(l.id) || [])) {
+          const s = String(d.reference_date || d.date_from || '');
+          if (!s || s < _VF) continue;
+          if (!best || s < best) best = s;
+        }
+        if (best) return best.slice(0, 7);
+        const dd = String(l.doc_date || '');
+        return (dd && dd >= _VF) ? dd.slice(0, 7) : '';
+      };
+      // Whether the month came from the document or from the register line —
+      // worth showing, because a derived month is a weaker claim than a stated
+      // one and the reader should be able to tell them apart.
+      const monthIsDerived = (l) => !l.doc_date && !!monthOf(l);
       const allMonths = [...new Set(L.map(monthOf).filter(Boolean))].sort();
       const undatedN = L.filter(l => !monthOf(l)).length;
 
@@ -30575,6 +30791,7 @@ render();
         : _dedLinesMonths.size + ' months';
 
       body.innerHTML = `
+        ${_dedGrainBar(esc)}
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
           <input id="hl-dl-q" type="search" placeholder="Search invoice, code, DC or remarks\u2026" value="${esc(_dedLinesQ)}"
             style="flex:1 1 300px;min-width:220px;font-family:var(--mono);font-size:12px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
@@ -30616,7 +30833,9 @@ render();
               const canOpen = rows.length > 0;
               let out = `<tr class="${canOpen ? 'hl-dl-row' : ''}" data-l="${esc(String(l.id))}" style="${canOpen ? 'cursor:pointer;' : ''}">
                 ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${canOpen ? (open ? '\u2212' : '+') : ''}</span><span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>`)}
-                ${td(monthOf(l) ? mLbl(monthOf(l)) : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
+                ${td(monthOf(l)
+                     ? mLbl(monthOf(l)) + (monthIsDerived(l) ? '<span title="from the backup\u2019s own date; the register line carries none" style="color:var(--ink-3);opacity:.65;"> \u00b7 doc</span>' : '')
+                     : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
                 ${td(cat ? esc(cat) : '<span style="color:var(--lost);">\u26A0 unmapped</span>')}
                 ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(l.reason_code || '\u2014') + '</span>')}
                 ${td(l.detail_parsed
@@ -30685,8 +30904,8 @@ render();
             </tr>
           </tfoot>
         </table>
-        ${!DL ? `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;line-height:1.55;">
-          Open <strong>By customer</strong> once to load store-level detail; rows here then expand to show it.</p>` : ''}`;
+        ${!DL ? `<p style="font-family:var(--mono);font-size:10px;color:var(--lost);margin-top:10px;line-height:1.55;">
+          Store-level detail could not be loaded, so rows cannot be expanded and months fall back to the register line's own date.</p>` : ''}`;
 
       // ── handlers ──
       const q = document.getElementById('hl-dl-q');
@@ -30728,6 +30947,11 @@ render();
       if (more) more.onclick = () => { _dedLinesLimit += DED_PAGE; renderDeductions(hostEl, filtersEl, year); };
       const all = document.getElementById('hl-dl-all');
       if (all) all.onclick = () => { _dedLinesLimit = filtered.length; renderDeductions(hostEl, filtersEl, year); };
+      body.querySelectorAll('.hl-ded-grain').forEach(b => b.onclick = () => {
+        _dedGrain = b.dataset.v;
+        try { localStorage.setItem('keel_ded_grain', _dedGrain); } catch (e) {}
+        renderDeductions(hostEl, filtersEl, year);
+      });
       body.querySelectorAll('.hl-dl-row').forEach(tr => tr.onclick = () => {
         const k = tr.dataset.l;
         _dedLinesOpen.has(k) ? _dedLinesOpen.delete(k) : _dedLinesOpen.add(k);
