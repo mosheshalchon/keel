@@ -29010,13 +29010,8 @@ render();
   // Deductions tab: the register at line grain.
   let _dedLinesLimit = 25;        // rows shown; grows by DED_PAGE
   let _dedLinesQ = '';            // free-text search over invoice / code / remarks
+  let _dedLinesOpen = new Set();  // lines expanded to their customer split
   let _dedLinesMonths = new Set(); // empty = every month, matching the app's other multi-selects
-  let _dedLinesOpen = new Set();  // which lines are expanded to their store detail
-  // Individual stores, fetched per line on expand. The cached rollup only has
-  // banner groups, so expanding a WHFD line showed regions (FL, SW, NA) where a
-  // reader expects store names. One small query per line beats loading 334k
-  // detail rows to answer a question about one of them.
-  let _dedLineStores = new Set() && new Map();   // line_id -> rows | 'loading' | 'error'
   // Deductions tab grain: 'line' (the register) or 'promo' (the retailer's own
   // promo number). Two ways of cutting the same money — the register answers
   // "what did they take", the promo view answers "what did each promotion cost".
@@ -30360,12 +30355,12 @@ render();
     const views = [
       ['exec',       'Overview'],
       ['customer',   'By customer'],
-      ['summary',    'Category'],
-      ['checks',     'Checks'],
-      ['lines',      'Deductions'],
-      ['promos',     'Promotions'],
-      ['exceptions', 'Exceptions'],
+      ['summary',    'By category'],
       ['reconcile',  'Reconcile vs. plan'],
+      ['promos',     'Promotions'],
+      ['lines',      'Deductions'],
+      ['checks',     'Checks'],
+      ['exceptions', 'Exceptions'],
       ['upload',     'Upload backup'],
     ];
 
@@ -30765,12 +30760,34 @@ render();
       // on a 16.5k-row fetch to paint. If the cache happens to hold it, each row
       // can expand to its store lines.
       const DL = _dedDetail && !_dedDetail.err ? _dedDetail : null;
-      const storesFor = (id) => _dedLineStores.get(String(id)) || null;
       const detBy = new Map();
       if (DL) for (const d of (DL.det || [])) {
         if (!detBy.has(d.line_id)) detBy.set(d.line_id, []);
         detBy.get(d.line_id).push(d);
       }
+      // ── CUSTOMER, NOT STORE OR REGION ───────────────────────────────────
+      // The rollup groups by banner, and a banner is whatever the distributor
+      // wrote: a region on the WHFD lines (FL, SW, NA), a chain code on
+      // UNFI-MCB (WGE, TFM), a store name elsewhere. None of those is what a
+      // reader wants when they open a deduction — they want to know which
+      // CUSTOMERS it hit. deduction_banner_map answers that and is cached
+      // beside the detail, so this costs no query.
+      const _bmL = new Map((DL && DL.bmap || []).map(b => [b.banner_raw, b]));
+      const custSplit = (lineId) => {
+        const out = new Map();
+        for (const d of (detBy.get(lineId) || [])) {
+          const m = d.banner ? _bmL.get(d.banner) : null;
+          // Fall back to the raw banner when nothing is mapped, and label it —
+          // an unmapped banner shown as a customer name would be a quiet lie.
+          const name = (m && m.plan_customer) || (m && m.banner) || d.banner || null;
+          const key = name || '\u0000none';
+          const e = out.get(key) || { name, amt: 0, stores: 0, mapped: !!(m && m.plan_customer) };
+          e.amt += Math.abs(Number(d.bill_amount || 0));
+          e.stores += Number(d.stores || 1);
+          out.set(key, e);
+        }
+        return [...out.values()].sort((a, b) => b.amt - a.amt);
+      };
 
       // PROMO DATE GOVERNS, HERE TOO. This column read doc_date alone and so
       // said "no date" on lines whose backup is dated — WHFDSCAN0426015930 has
@@ -30871,8 +30888,7 @@ render();
               const cat = catOf(l);
               const rows = detBy.get(l.id) || [];
               const open = _dedLinesOpen.has(String(l.id));
-              const canOpen = rows.length > 0 || l.detail_parsed;
-              const st = storesFor(l.id);
+              const canOpen = rows.length > 0;
               let out = `<tr class="${canOpen ? 'hl-dl-row' : ''}" data-l="${esc(String(l.id))}" style="${canOpen ? 'cursor:pointer;' : ''}">
                 ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${canOpen ? (open ? '\u2212' : '+') : ''}</span><span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>`)}
                 ${td(monthOf(l)
@@ -30887,22 +30903,26 @@ render();
                 ${td(registerAmt ? (amt / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
               </tr>`;
               if (open) {
-                // STORES, not rollup groups. st is fetched per line on expand,
-                // already ordered by amount from the query.
-                const items = (st && st !== 'loading' && st !== 'error') ? st : [];
-                if (st === 'loading') out += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:26px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">loading stores\u2026</span>')}${td('')}${td('')}${td('')}${td('')}${td('', true)}${td('', true)}</tr>`;
-                else if (st === 'error') out += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:26px;font-family:var(--mono);font-size:10px;color:var(--lost);">could not load store detail</span>')}${td('')}${td('')}${td('')}${td('')}${td('', true)}${td('', true)}</tr>`;
-                out += items.slice(0, 40).map(it => `<tr style="background:var(--rule-softer);">
-                  ${td('<span style="padding-left:26px;color:var(--ink-2);">' + esc(it.customer_name || '(unnamed store)') + '</span>'
-                     + (it.item_desc ? '<div style="padding-left:26px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(it.item_desc) + '</div>' : ''))}
-                  ${td(it.reference_date ? String(it.reference_date).slice(0, 10) : '', true, 'color:var(--ink-3);font-size:10px;')}
-                  ${td(it.banner ? '<span style="color:var(--ink-3);">' + esc(it.banner) + (it.customer_state ? ' \u00b7 ' + esc(it.customer_state) : '') + '</span>' : '')}
-                  ${td(it.reference_no ? '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + esc(it.reference_no) + '</span>' : '')}
-                  ${td(it.ship_qty != null ? '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + esc(it.ship_qty) + '</span>' : '')}
-                  ${td(money(Math.abs(Number(it.bill_amount || 0))), true, 'color:var(--ink-2);')}
+                const cs = custSplit(l.id);
+                out += cs.map(c => `<tr style="background:var(--rule-softer);">
+                  ${td('<span style="padding-left:26px;color:var(--ink-2);">' + esc(c.name || '(no customer on the detail)') + '</span>'
+                     + (c.name && !c.mapped ? '<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:8px;">unmapped banner</span>' : ''))}
                   ${td('', true)}
+                  ${td(c.stores ? '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + c.stores.toLocaleString() + ' store' + (c.stores === 1 ? '' : 's') + '</span>' : '')}
+                  ${td('')}${td('')}
+                  ${td(money(c.amt), true, 'color:var(--ink-2);')}
+                  ${td(amt ? (c.amt / amt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
                 </tr>`).join('');
-                if (items.length > 40) out += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:26px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (items.length - 40).toLocaleString() + ' smaller groups not shown \u00b7 the line total above still counts them</span>')}${td('')}${td('')}${td('')}${td('')}${td('', true)}${td('', true)}</tr>`;
+                // The split comes from store detail; the line amount also carries
+                // the distributor's fee and anything with no detail behind it.
+                // Naming the difference beats letting the rows look like they
+                // should add up and quietly not.
+                const csTot = cs.reduce((s2, c) => s2 + c.amt, 0);
+                if (Math.abs(amt - csTot) > 0.5) out += `<tr style="background:var(--rule-softer);">
+                  ${td('<span style="padding-left:26px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">not traced to a customer \u2014 fee, or no detail behind it</span>')}
+                  ${td('', true)}${td('')}${td('')}${td('')}
+                  ${td('<span style="color:var(--ink-3);">' + money(amt - csTot) + '</span>', true)}
+                  ${td('', true)}</tr>`;
               }
               return out;
             }).join('')}
@@ -30961,6 +30981,11 @@ render();
         mm.onclick = (ev) => ev.stopPropagation();
         document.addEventListener('click', () => { if (mm) mm.style.display = 'none'; }, { once: true });
       }
+      body.querySelectorAll('.hl-dl-row').forEach(tr => tr.onclick = () => {
+        const k = tr.dataset.l;
+        _dedLinesOpen.has(k) ? _dedLinesOpen.delete(k) : _dedLinesOpen.add(k);
+        renderDeductions(hostEl, filtersEl, year);
+      });
       body.querySelectorAll('.hl-dl-mon').forEach(cb => cb.onchange = () => {
         const k = cb.dataset.m;
         cb.checked ? _dedLinesMonths.add(k) : _dedLinesMonths.delete(k);
@@ -30977,35 +31002,6 @@ render();
       if (more) more.onclick = () => { _dedLinesLimit += DED_PAGE; renderDeductions(hostEl, filtersEl, year); };
       const all = document.getElementById('hl-dl-all');
       if (all) all.onclick = () => { _dedLinesLimit = filtered.length; renderDeductions(hostEl, filtersEl, year); };
-      body.querySelectorAll('.hl-dl-row').forEach(tr => tr.onclick = async () => {
-        const k = tr.dataset.l;
-        if (_dedLinesOpen.has(k)) { _dedLinesOpen.delete(k); renderDeductions(hostEl, filtersEl, year); return; }
-        _dedLinesOpen.add(k);
-        if (!_dedLineStores.has(k)) {
-          // Paint the open row with a loading marker first, then fetch. Doing it
-          // the other way round means a click does nothing visible for a second
-          // and reads as a dead control.
-          _dedLineStores.set(k, 'loading');
-          renderDeductions(hostEl, filtersEl, year);
-          try {
-            const { data, error } = await sb.from('deduction_detail')
-              .select('customer_name,customer_state,banner,item_desc,reference_no,reference_date,ship_qty,bill_amount')
-              .eq('line_id', Number(k))
-              .order('bill_amount', { ascending: true })   // amounts are stored positive; abs-desc is not expressible here
-              .limit(500);
-            if (error) throw new Error(error.message);
-            // Sorted client-side on absolute value: a credit memo line carries
-            // negatives, and ordering by the raw column would bury the largest
-            // items under them.
-            _dedLineStores.set(k, (data || []).slice().sort((a, b) =>
-              Math.abs(Number(b.bill_amount || 0)) - Math.abs(Number(a.bill_amount || 0))));
-          } catch (e) {
-            console.error('[deductions] store detail failed:', e);
-            _dedLineStores.set(k, 'error');
-          }
-        }
-        renderDeductions(hostEl, filtersEl, year);
-      });
       return;
     }
 
