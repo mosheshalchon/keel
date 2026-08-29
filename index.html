@@ -29540,7 +29540,7 @@ render();
     let list = all.filter(p => (!_dedPromoYearOnly || inYear(p)) && (!terms.length || terms.every(t => hay(p).includes(t))));
     const SORTS = {
       spend: (a, b) => Number(b.actual_spend || 0) - Number(a.actual_spend || 0),
-      rate:  (a, b) => Number(b.rate_max || 0) - Number(a.rate_max || 0),
+      rate:  (a, b) => Number(b.rate_max || b.rate_implied || 0) - Number(a.rate_max || a.rate_implied || 0),
       start: (a, b) => String(b.event_start || '').localeCompare(String(a.event_start || '')),
       promo: (a, b) => String(a.promo_no || '').localeCompare(String(b.promo_no || '')),
     };
@@ -29554,13 +29554,23 @@ render();
     const dt = (v) => v ? String(v).slice(0, 10) : '';
     const rateCell = (p) => {
       const lo = Number(p.rate_min), hi = Number(p.rate_max);
-      if (!isFinite(hi) || !hi) return '<span style="color:var(--rule);">·</span>';
-      // A promo with several rates is shown as a range, never as one number:
-      // the Dec Whole Foods promo billed at 1.36, 0.87 and 0.67 across items,
-      // and printing any single one of those would be a quiet lie.
-      return Number(p.rate_count) > 1
-        ? `$${lo.toFixed(2)}\u2013$${hi.toFixed(2)}<span style="color:var(--ink-3);"> ·${p.rate_count}</span>`
-        : `$${hi.toFixed(2)}`;
+      if (isFinite(hi) && hi) {
+        // A promo with several rates is shown as a range, never as one number:
+        // the Dec Whole Foods promo billed at 1.36, 0.87 and 0.67 across items,
+        // and printing any single one of those would be a quiet lie.
+        return Number(p.rate_count) > 1
+          ? `$${lo.toFixed(2)}\u2013$${hi.toFixed(2)}<span style="color:var(--ink-3);"> ·${p.rate_count}</span>`
+          : `$${hi.toFixed(2)}`;
+      }
+      // NO STATED RATE. Kroger's promo lines carry an amount and a quantity but
+      // no rate column, so the only rate available is spend / units. It is
+      // shown, because a blank column is less useful than a derived one, and it
+      // is MARKED, because the difference matters the moment someone quotes the
+      // number back to a buyer. A stated rate always wins the cell above.
+      const im = Number(p.rate_implied);
+      if (isFinite(im) && im) return `<span style="color:var(--ink-2);">~$${im.toFixed(2)}</span>`
+        + `<span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);" title="spend \u00f7 units \u2014 calculated by Keel, not a rate the retailer published"> calc</span>`;
+      return '<span style="color:var(--rule);">·</span>';
     };
 
     body.innerHTML = `
@@ -29657,7 +29667,7 @@ render();
       // reading convenience; an export that silently stopped at 50 would seed a
       // plan missing most of its promotions.
       const cols = ['promo_no', 'promo_name', 'plan_customer', 'banner', 'event_start', 'event_end',
-                    'rate_min', 'rate_max', 'rate_count', 'items', 'stores', 'units',
+                    'rate_min', 'rate_max', 'rate_count', 'rate_implied', 'items', 'stores', 'units',
                     'actual_spend', 'reason_codes', 'invoices'];
       const cell = (v) => {
         const s = v == null ? '' : String(v);
