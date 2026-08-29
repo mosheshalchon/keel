@@ -29429,7 +29429,7 @@ render();
   let _dedPromoYearOnly = true;   // scope to the selected year by event window
 
   async function _dedRenderPromos(body, rows, err, U) {
-    const { esc, money, th, td, yr, year, rerender } = U;
+    const { esc, money, th, td, yr, year, rerender, tradeTotal, promoBearingTotal } = U;
 
     if (err) {
       // The view is created by hand, so its absence is the expected first state
@@ -29507,9 +29507,36 @@ render();
         <button id="hl-pr-csv" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Export CSV</button>
       </div>
 
+      <!-- ── WHERE TRADE SPEND SITS ────────────────────────────────────────
+           Not "N promotions, $X" floating with no denominator — that was the
+           version that could not answer "how much of my trade spend is planned
+           against a promo number". Three buckets that sum to trade spend:
+           promos with an identifier, promo-bearing codes whose lines carry none,
+           and program spend that never has one (ad fees, late delivery,
+           all-DC chargebacks). -->
+      ${tradeTotal ? (() => {
+        const noRef   = Math.max(0, promoBearingTotal - totAll);
+        const program = Math.max(0, tradeTotal - promoBearingTotal);
+        const pct = (v) => tradeTotal ? (v / tradeTotal * 100).toFixed(1) + '%' : '';
+        const row = (label, val, note, bold) => `<tr>
+          <td style="padding:5px 10px;font-family:var(--serif);font-size:13px;${bold ? 'border-top:2px solid var(--ink);font-weight:600;' : 'padding-left:24px;color:var(--ink-2);'}">${label}
+            ${note ? `<span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;">${note}</span>` : ''}</td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;${bold ? 'border-top:2px solid var(--ink);font-weight:600;' : ''}">${money(val)}</td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);${bold ? 'border-top:2px solid var(--ink);' : ''}">${pct(val)}</td>
+        </tr>`;
+        return `<div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;margin:0 0 14px;">
+          <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">Trade spend ${esc(yr)}, by promotion identifier</div>
+          <table style="width:100%;border-collapse:collapse;">
+            ${row('Promotions with an identifier', totAll, all.length.toLocaleString() + ' promos')}
+            ${noRef   > 0.5 ? row('Promoted, but the line carries no identifier', noRef, '') : ''}
+            ${program > 0.5 ? row('Program spend \u2014 no promo number by nature', program, 'ad fees, late delivery, all-DC chargebacks') : ''}
+            ${row('Trade spend', tradeTotal, '', true)}
+          </table>
+        </div>` })() : ''}
+
       <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:0 0 10px;">
         ${filtered
-          ? `${list.length.toLocaleString()} of ${all.length.toLocaleString()} promotions \u00b7 <strong style="color:var(--ink);">${money(totShown)}</strong> of ${money(totAll)}`
+          ? `Listing ${list.length.toLocaleString()} of ${all.length.toLocaleString()} \u00b7 <strong style="color:var(--ink);">${money(totShown)}</strong> of ${money(totAll)}`
           : `${all.length.toLocaleString()} promotions \u00b7 <strong style="color:var(--ink);">${money(totAll)}</strong>`}
       </div>
 
@@ -29519,7 +29546,8 @@ render();
         </tr></thead>
         <tbody>
           ${shown.map(p => `<tr>
-            ${td('<span style="font-family:var(--mono);font-size:11.5px;">' + esc(p.promo_no) + '</span>')}
+            ${td('<span style="font-family:var(--mono);font-size:11.5px;">' + esc(p.promo_no) + '</span>'
+               + (p.ref_kind === 'scan invoice' ? '<div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);">scan invoice</div>' : ''))}
             ${td('<span style="font-size:12.5px;">' + esc(p.promo_name || '\u2014') + '</span>'
                + (p.reason_codes ? '<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + esc(p.reason_codes) + '</div>' : ''))}
             ${td(p.plan_customer ? esc(p.plan_customer) : '<span style="color:var(--lost);">unmapped</span>')}
@@ -30701,8 +30729,21 @@ render();
             .select('*').eq('brand_id', brandId).order('actual_spend', { ascending: false }));
         } catch (e) { _dedPromosErr = String(e && e.message || e); }
       }
+      // Trade spend for the year is the denominator this tab has to foot to.
+      // It comes from the same computation the Reconcile bridge uses, so the two
+      // screens cannot report different trade-spend totals.
+      let tradeTotal = 0, promoBearingTotal = 0;
+      try {
+        for (const l of L) {
+          const rm = rmapBy[l.reason_code];
+          if (!rm || rm.is_trade_spend !== true) continue;
+          tradeTotal += Math.abs(Number(l.amount || 0));
+          if (rm.promo_bearing === true) promoBearingTotal += Math.abs(Number(l.amount || 0));
+        }
+      } catch (e) { /* denominator is a nicety; the list still works without it */ }
+
       await _dedRenderPromos(body, _dedPromos, _dedPromosErr, {
-        esc, money, th, td, yr, year,
+        esc, money, th, td, yr, year, tradeTotal, promoBearingTotal,
         rerender: () => renderDeductions(hostEl, filtersEl, year),
       });
       return;
