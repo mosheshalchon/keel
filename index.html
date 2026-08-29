@@ -29431,14 +29431,21 @@ render();
       // The view is created by hand, so its absence is the expected first state
       // rather than a fault. Say what to run instead of showing a stack trace.
       const missing = /does not exist|42P01|could not find the table/i.test(err);
+      const timeout = /statement timeout|57014|canceling statement/i.test(err);
       body.innerHTML = `
         ${_dedGrainBar(esc)}
-        <div style="border:1px solid var(--rule);border-left-width:3px;border-radius:5px;padding:14px 16px;font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--ink-2);">
+        <div style="border:1px solid ${timeout || missing ? 'var(--rule)' : 'var(--lost)'};border-left-width:3px;border-radius:5px;padding:14px 16px;font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--ink-2);">
           ${missing
-            ? `<strong>The promo view does not exist yet.</strong> It aggregates <code>deduction_detail</code> by the
-               retailer's promo number. Create it once with the SQL supplied alongside this build, then press Refresh.
-               <div style="color:var(--ink-3);margin-top:7px;">Nothing else in Keel depends on it, so creating it changes no existing number.</div>`
-            : `<strong style="color:var(--lost);">Could not read the promo view.</strong> ${esc(err)}`}
+            ? `<strong>The promo rollup does not exist yet.</strong> It groups <code>deduction_detail</code> by the
+               retailer's own promo number. Build it once with the supplied SQL, then press Refresh.
+               <div style="color:var(--ink-3);margin-top:7px;">Nothing else in Keel reads it, so creating it changes no existing number.</div>`
+            : timeout
+            ? `<strong>The promo rollup timed out.</strong> It exists as a plain view, which recomputes ~334k detail rows
+               on every read and cannot finish inside the API's statement limit.
+               <div style="color:var(--ink-3);margin-top:7px;">Materialise it with the supplied SQL — steps run
+               <em>one at a time</em>, because the editor wraps a multi-statement script in a single transaction and the
+               concurrent refresh cannot run inside one.</div>`
+            : `<strong style="color:var(--lost);">Could not read the promo rollup.</strong> ${esc(err)}`}
         </div>`;
       return;
     }
