@@ -28230,41 +28230,6 @@ render();
     }
     if (!lines.length) { summaryEl.innerHTML = '<div style="font-family:var(--serif);font-style:italic;color:var(--ink-3);padding:32px;text-align:center;background:var(--bone-2);border-radius:8px;">No ' + year + ' plan loaded — upload the Vividly export first.</div>'; return; }
     const src = await _taLoadSales(year);
-    const KD = await _taLoadKeelDed(year);
-    // Vividly's customer names and Keel's plan_customer are the same vocabulary
-    // (both come from the plan), so this is a direct lookup — not the fuzzy
-    // chain_name matching the sales sources need.
-    const kdMon  = (cust, mk) => KD && KD.byCustMon.get(_taNorm(cust) + '|' + mk) || null;
-    const kdCust = (cust) => KD && KD.byCust.get(_taNorm(cust)) || null;
-    // A plan line's month, as Vividly states it, in the YYYY-MM the view uses.
-    const MONN3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    // Every YYYY-MM the promo window touches. kdMk() read start_date alone, so a
-    // promo running 04-20 -> 05-17 drew the APRIL bucket while the label printed
-    // Vividly's month field, May: the value and the label disagreed, and the half
-    // that ran in May was ignored.
-    //
-    // This cannot be narrowed to the promo's exact WEEKS. A scan document is
-    // itself dated monthly - WHFDSCAN detail is stamped 2025-12-01 for all of
-    // December - so the source has no finer grain. Both months of a straddling
-    // promo is the honest answer; either one alone is simply wrong.
-    const kdMonths = (l) => {
-      const s = String(l.start_date || ''), e = String(l.end_date || l.start_date || '');
-      if (!/^\d{4}-\d{2}/.test(s)) {
-        if (l.year && l.month) return [String(l.year) + '-' + String(l.month).padStart(2, '0')];
-        return [];
-      }
-      const out = [];
-      let y = Number(s.slice(0, 4)), m = Number(s.slice(5, 7));
-      const ey = /^\d{4}-\d{2}/.test(e) ? Number(e.slice(0, 4)) : y;
-      const em = /^\d{4}-\d{2}/.test(e) ? Number(e.slice(5, 7)) : m;
-      for (let guard = 0; guard < 24; guard++) {
-        out.push(y + '-' + String(m).padStart(2, '0'));
-        if (y > ey || (y === ey && m >= em)) break;
-        m++; if (m > 12) { m = 1; y++; }
-      }
-      return out;
-    };
-    const kdMonLabel = (mk) => MONN3[Number(String(mk).slice(5, 7)) - 1] + " '" + String(mk).slice(2, 4);
     const all = lines;
     if (_taCompletedOnly) lines = lines.filter(l => /completed/i.test(String(l.status || '')));
     // Filters: apply the checkbox multi-selects to the post-completed line set
@@ -28474,7 +28439,6 @@ render();
     const _gWk = new Map();
     let _gAnyU = false, _gLiftW = 0, _gLiftS = 0, _gCov = 0, _gN = 0, _gUP = 0;
     const _gUW = new Map();   // union of (family, week) so overlapping promos can't double-count units
-    const _taKdSeen = new Set();   // customer|month buckets already printed
     const rowsHtml = custs.map(([c, b], ci) => {
       let md = 0, mu = 0;
       for (const cc of b.wk.values()) { md += cc.d; mu += cc.u; }
@@ -28515,26 +28479,7 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + actCell + '</td>'
           
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (ld > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (l.actual_spend ? money(ld) : '—') + '</td>'
-        + (KD ? (() => {
-              // Claim only the months of this window nobody has claimed yet, so
-              // every customer-month is counted exactly once down the column.
-              const mine = [], cats = [];
-              let sum = 0, anyKnown = false;
-              for (const mk of kdMonths(l)) {
-                const k = kdMon(c, mk);
-                if (!k) continue;
-                anyKnown = true;
-                const bk = _taNorm(c) + '|' + mk;
-                if (_taKdSeen.has(bk)) continue;
-                _taKdSeen.add(bk); mine.push(mk); sum += k.amt;
-                if (k.cats) cats.push(k.cats);
-              }
-              if (!mine.length) return anyKnown
-                ? '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--rule);" title="Already counted on an earlier line covering the same month(s). A deduction names no product, so it cannot be split across a month\'s plan lines.">\u2191</td>'
-                : '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">\u2014</td>';
-              return '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + money(sum)
-                + '<div style="font-family:var(--mono);font-size:8px;color:var(--ink-3);" title="' + esc(cats.join(' | ')) + '">' + mine.map(kdMonLabel).join(' + ') + ', all products</div></td>';
-            })() : '')
+
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win ? money(win.d) : '—') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + (fee ? '—' : num(expU || null)) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (win && hasU ? num(win.u) : '—')
@@ -28569,16 +28514,7 @@ render();
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(b.act) + '</td>'
         
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (b.act - b.exp > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (b.act ? money(b.act - b.exp) : '—') + '</td>'
-        + (KD ? (() => {
-            const k = kdCust(c);
-            if (!k) return '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);" title="No deductions attributed to this customer — either none were taken, or its banner is not yet mapped.">—</td>';
-            // The delta against Vividly is the point of the column, so it sits
-            // under the figure rather than needing a second column.
-            const dv = k.amt - (b.act || 0);
-            return '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(k.amt)
-              + (b.act ? '<div style="font-family:var(--mono);font-size:9px;color:' + (Math.abs(dv) / Math.max(1, b.act) > 0.02 ? '#a8381f' : 'var(--ink-3)') + ';">' + (dv > 0 ? '+' : '') + money(dv) + ' vs Vividly</div>' : '')
-              + '</td>';
-          })() : '')
+
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (b.cov ? money(md) : '—') + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + num(ua.p) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(ua.a)
@@ -28635,10 +28571,7 @@ render();
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.act ? money(mc.act) : '\u2014') + '</td>'
           
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:' + (mc.act - mc.exp > 0 ? '#a8381f' : 'var(--ink-3)') + ';">' + (mc.act ? money(mc.act - mc.exp) : '\u2014') + '</td>'
-        + (KD ? (() => {
-              const kk = (mk === 12) ? null : kdMon(c, year + '-' + String(mk + 1).padStart(2, '0'));
-              return '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;' + (kk ? '' : 'color:var(--ink-3);') + '">' + (kk ? money(kk.amt) : '\u2014') + '</td>';
-            })() : '')
+
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + (mc.cov && ct.d ? money(ct.d) : '\u2014') + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">' + num(cua.p) + '</td>'
           + '<td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">' + num(cua.a)
@@ -28654,19 +28587,7 @@ render();
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + money(m.act) + '</td>'
         
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:' + (m.act - m.exp > 0 ? '#a8381f' : '#3f6f4a') + ';">' + (m.act ? money(m.act - m.exp) : '\u2014') + '</td>'
-        + (KD ? (() => {
-            if (mk === 12) return '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + '\u2014' + '</td>';
-            // Summed over the retailers actually present in this month, not
-            // over every customer in the view - a month row must not report
-            // deductions for retailers it does not list.
-            const mkey = year + '-' + String(mk + 1).padStart(2, '0');
-            let tot = 0, hit = 0;
-            for (const cn2 of m.cust) { const kk = kdMon(cn2, mkey); if (kk) { tot += kk.amt; hit++; } }
-            const dv = tot - (m.act || 0);
-            return '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;' + (hit ? '' : 'color:var(--ink-3);') + '">' + (hit ? money(tot) : '\u2014')
-              + ((hit && m.act) ? '<div style="font-family:var(--mono);font-size:9px;color:' + (Math.abs(dv) / Math.max(1, m.act) > 0.02 ? '#a8381f' : 'var(--ink-3)') + ';">' + (dv > 0 ? '+' : '') + money(dv) + ' vs Vividly</div>' : '')
-              + '</td>';
-          })() : '')
+
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + (m.cov && t.d ? money(t.d) : '\u2014') + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;color:var(--ink-3);">' + num(mua.p) + '</td>'
         + '<td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:12px;">' + num(mua.a)
@@ -28688,7 +28609,7 @@ render();
         <thead>
         <tr style="background:#efe9dd;">
           <th colspan="4"></th>
-          <th colspan="${KD ? 4 : 3}" style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">WHAT IT COST — trade spend</th>
+          <th colspan="3" style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">WHAT IT COST — trade spend</th>
           <th style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">SALES</th>
           <th colspan="2" style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">WHAT IT SOLD — units</th>
           <th style="padding:5px 10px;text-align:center;font-family:var(--mono);font-size:8.5px;letter-spacing:0.1em;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);" colspan="3">DID IT WORK</th>
@@ -28701,7 +28622,6 @@ render();
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Vividly's budget for the line.">Planned $<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#8c7a55;font-weight:700;margin-top:2px;">VIVIDLY</div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="What Vividly recorded as posted — money taken off an invoice, not sales.">Deducted $<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#8c7a55;font-weight:700;margin-top:2px;">VIVIDLY</div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Deducted minus Planned. Red = spent more than budgeted.">Δ vs budget<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:var(--ink-3);font-weight:700;margin-top:2px;">CALC</div></th>
-          ${KD ? `<th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="What the distributors' own remittance documents say was taken, from Keel's deduction register — trade-spend codes only, attributed to this customer through the banner crosswalk, and dated by WHEN THE PROMO RAN rather than when the money moved. Shown at customer and month level only: a deduction line names no product, so it cannot be split across a month's plan lines without inventing an allocation.">Deducted $<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>` : ''}
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="RETAIL dollars that rang at the register for the promoted product during the promo window, from Keel's weekly sales. Not your revenue and not spend — it is the size of what the promo was riding on. Customer and total rows are banner-wide.">Sales $ in window<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Vividly's forecast units for the event — already a PROMOTED number: its assumed baseline x (1 + its lift assumption). Counted once per event and product family, because Vividly repeats the same figure on every rate leg.">Forecast u<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#8c7a55;font-weight:700;margin-top:2px;">VIVIDLY</div></th><th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="Units actually sold in the promo window, from Keel's weekly sales for the promoted product. The % beneath compares it to the forecast — that is ESTIMATE ACCURACY, not lift. A promo can beat its forecast and still have moved no extra volume.">Actual u<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;font-weight:700;margin-top:2px;"><span style="color:#534AB7;">KEEL</span><span style="color:var(--ink-3);"> vs </span><span style="color:#8c7a55;">VIVIDLY</span></div></th>
           <th style="padding:8px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="THE REAL PERFORMANCE NUMBER. The window's weekly unit rate against the same product's rate over the nearest 6 OFF-promo weeks. This is incremental volume; the % under Actual u is only forecast accuracy. Line rows use the promoted product's own series; customer rows are the sales-weighted mean of their lines.">Lift vs base<div style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.12em;color:#534AB7;font-weight:700;margin-top:2px;">KEEL</div></th>
@@ -28720,12 +28640,6 @@ render();
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${money(mExp)}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${money(mAct)}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:${mAct - mExp > 0 ? '#a8381f' : '#3f6f4a'};">${money(mAct - mExp)}</td>
-            ${KD ? (() => {
-              // Totalled over the customers on screen, so it foots to the
-              // column above rather than to the whole register.
-              let t2 = 0; for (const [c2] of custs) { const k2 = kdCust(c2); if (k2) t2 += k2.amt; }
-              return `<td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${money(t2)}</td>`;
-            })() : ''}
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;" title="Union of measured weeks across every retailer — a week two retailers both measured counts once. Distributor-wide rollups can still overlap a named chain from the same distributor.">${gd ? money(gd) : '—'}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;color:var(--ink-3);">${num(_gUP || null)}</td>
             <td style="padding:9px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;">${num(gUA)}${(() => { const v = uPct(_gUP, gUA); return v == null ? '' : '<div style="font-size:9px;font-weight:400;color:' + (v >= 0 ? '#3f6f4a' : '#a8381f') + ';">' + (v > 0 ? '+' : '') + Math.round(v * 100) + '% vs forecast</div>'; })()}</td>
@@ -29310,7 +29224,21 @@ render();
       // one would silently narrow it for the other.
       const det = (D.det || []).filter(d => scopedIds.has(d.line_id));
       const bm = new Map((D.bmap || []).map(b => [b.banner_raw, b]));
-      const normCat = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+      const _catRaw = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+      // Shared family key. Order matters: 'adsmerchandising' must be tested for
+      // 'merch' before 'ads', or Keel's combined category and Vividly's separate
+      // 'Ad fee' and 'Merchandising' land in three different buckets.
+      const normCat = (s) => {
+        const t = String(s || '').toLowerCase();
+        if (/scan|tpr|mcb|billback|billing/.test(t)) return 'promo';        // MCB, TPR scan, scanback
+        if (/merch|\bads?\b|advert|display|coupon|edlp|feature/.test(t)) return 'ads';  // Ads / Merchandising, Ad fee, EDLP
+        if (/slot|placement/.test(t)) return 'slotting';
+        if (/freight|shipping/.test(t)) return 'freight';
+        if (/return|shortage|allowance|spoil|damage/.test(t)) return 'returns';
+        if (/fee|penalt|complian|charge/.test(t)) return 'fees';
+        if (/audit|postaudit|deduction/.test(t)) return 'audit';
+        return _catRaw(t) || 'other';
+      };
 
       // THE RETAILER JOIN. deduction_banner_map only covers banners someone has
       // crosswalked by hand — which is none of UNFI's, whose detail names stores
