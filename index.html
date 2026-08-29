@@ -29429,6 +29429,11 @@ render();
 
       // plan side — KeHE-served lines whose type matches a category KeHE deducted
       let planExcludedType = 0, planExcludedRecv = 0, planOutOfWindow = 0, planNotClosed = 0;
+      // The whole book, before any of this screen's filters. Without it the plan
+      // side has no denominator and the four exclusions below are four numbers
+      // that do not visibly come from anywhere.
+      let planBookTotal = 0;
+      for (const pl of P.lines) planBookTotal += Number(pl.expected_spend || 0);
       for (const pl of P.lines) {
         const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
         const exp = Number(pl.expected_spend || 0);
@@ -29466,7 +29471,7 @@ render();
              registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
-             planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed };
+             planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal };
   }
 
   // ══ PROMOTIONS BY RETAILER PROMO NUMBER ═══════════════════════════════════
@@ -31397,6 +31402,7 @@ render();
       const P = _dedPlan || { lines: [], err: null };
       const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist,
                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
+      const { planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal } = R;
       const { cells, rows, totPlan, totDed, unattrib, undocumented, autoMatched,
               tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
               dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
@@ -31446,12 +31452,43 @@ render();
           </td>
         </tr>`;
 
+      // ── THE PLAN SIDE'S OWN BRIDGE ────────────────────────────────────────
+      // The deduction side has explained itself since the bridge went in; the
+      // plan side never did. Its four exclusions were computed and thrown away,
+      // so "planned $1,343,055" sat next to a plan book of $3.5m with nothing to
+      // account for the difference — and one of those exclusions was silently
+      // eating $178,951 of Whole Foods on a category-name mismatch.
+      const planBridge = [
+        ['Plan book ' + esc(yr), planBookTotal, null, 'Every line Vividly holds for the year.'],
+        ['Not a KeHE or UNFI line', -planExcludedRecv, 'sub', 'no deductions arrive through this receiver'],
+        ['Promo type with no matching deductions', -planExcludedType, 'sub', ''],
+        ['Outside ' + (winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'the window'), -planOutOfWindow, 'sub', ''],
+        ['Not closed yet', -planNotClosed, 'sub', 'no final spend to compare against'],
+        ['Compared against deductions', totPlan, 'tot', ''],
+      ].filter(r => r[2] !== 'sub' || Math.abs(r[1]) > 0.005);
+      const pbRow = ([label, val, kind, note]) => `
+        <tr>
+          <td style="padding:5px 10px;font-family:var(--serif);font-size:13px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'sub' ? 'padding-left:24px;color:var(--ink-2);' : ''}">
+            ${kind === 'sub' ? '<span style="color:var(--ink-3);">\u2212 </span>' : ''}${label}
+            ${note ? `<span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;">${note}</span>` : ''}</td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'sub' ? 'color:var(--ink-2);' : ''}">${money(Math.abs(val))}</td>
+          <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);${kind === 'tot' ? 'border-top:2px solid var(--ink);' : ''}">${planBookTotal ? (Math.abs(val) / planBookTotal * 100).toFixed(1) + '%' : ''}</td>
+        </tr>`;
+
       body.innerHTML = `
-        <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;margin:2px 0 16px;">
-          <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
-            From trade spend to what is reconciled
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;margin:2px 0 16px;">
+          <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
+              From the plan book to what is compared
+            </div>
+            <table style="width:100%;border-collapse:collapse;">${planBridge.map(pbRow).join('')}</table>
           </div>
-          <table style="width:100%;border-collapse:collapse;">${bridge.map(brRow).join('')}</table>
+          <div style="border:1px solid var(--rule);border-radius:7px;padding:6px 8px 8px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:8px 10px 4px;">
+              From trade spend to what is reconciled
+            </div>
+            <table style="width:100%;border-collapse:collapse;">${bridge.map(brRow).join('')}</table>
+          </div>
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:18px;margin:0 0 16px;">
           ${stat('Planned (' + DSHORT + ')', money(totPlan), winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'Vividly expected spend')}
