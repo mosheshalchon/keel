@@ -47419,7 +47419,14 @@ ${(() => {
   // own column widths, so the numbers drifted a column out of line with the parent
   // (Aug 11: Moshe's Sep column showed customer values against the wrong month).
   // Same cell structure as a product row = guaranteed alignment, forever.
-  async function spShowProductCustomers(product, slug, windowMonths, metricKey, curMonthKey) {
+  // Works from EITHER side of the pair. The stored entity is
+  // "<product> § <customer>", so a product row matches on the prefix and
+  // lists customers, and a customer row matches on the suffix and lists
+  // products. One function, because the two views are the same join read in
+  // opposite directions -- keeping them separate would mean two places to fix
+  // the next time the closed-month rule or the $/units toggle changes.
+  async function spShowProductCustomers(entity, slug, windowMonths, metricKey, curMonthKey, dim) {
+    const byProduct = dim === 'customer';   // clicked a customer -> list its products
     const anchor = document.querySelector(`[data-sp-row="${slug}"]`);
     if (!anchor) return;
     const caret = document.querySelector(`[data-sp-caret="${slug}"]`);
@@ -47434,7 +47441,7 @@ ${(() => {
     const nCols = windowMonths.length + 4;
     const loading = document.createElement('tr');
     loading.dataset.spKid = slug;
-    loading.innerHTML = `<td colspan="${nCols}" style="padding:8px 34px;font-family:var(--mono);font-size:10px;color:var(--ink-3);background:var(--bone-2);">Loading customer detail…</td>`;
+    loading.innerHTML = `<td colspan="${nCols}" style="padding:8px 34px;font-family:var(--mono);font-size:10px;color:var(--ink-3);background:var(--bone-2);">Loading ${byProduct ? 'product' : 'customer'} detail…</td>`;
     anchor.after(loading);
 
     let all;
@@ -47445,15 +47452,20 @@ ${(() => {
       return;
     }
 
-    const prefix = product + ' \u00A7 ';
-    const mine = all.filter(r => r.entity && r.entity.startsWith(prefix));
+    // Product view matches the prefix; customer view matches the suffix.
+    const sep = ' \u00A7 ';
+    const needle = byProduct ? sep + entity : entity + sep;
+    const mine = all.filter(r => r.entity && (byProduct
+      ? r.entity.endsWith(needle) : r.entity.startsWith(needle)));
     const FINAL = new Set(['billed', 'closed']);
     const isFinal = (r) => FINAL.has(String(r.status || '').trim().toLowerCase());
     const byCust = new Map();
     for (const r of mine) {
       // Same closed-month rule as the parent row, so the parts sum to the whole.
       if (!(r.month >= curMonthKey || isFinal(r))) continue;
-      const cust = r.entity.slice(prefix.length);
+      const cust = byProduct
+        ? r.entity.slice(0, r.entity.length - needle.length)
+        : r.entity.slice(needle.length);
       let o = byCust.get(cust);
       if (!o) { o = { cust, months: {}, total: 0 }; byCust.set(cust, o); }
       const v = Number(r[metricKey] || 0);
@@ -47470,7 +47482,7 @@ ${(() => {
     if (!rows.length) {
       const none = document.createElement('tr');
       none.dataset.spKid = slug;
-      none.innerHTML = `<td colspan="${nCols}" style="padding:8px 34px;font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);background:var(--bone-2);">No customer breakdown stored for this item yet — these rows come from the sales sync.</td>`;
+      none.innerHTML = `<td colspan="${nCols}" style="padding:8px 34px;font-family:var(--serif);font-style:italic;font-size:12px;color:var(--ink-3);background:var(--bone-2);">No ${byProduct ? 'product' : 'customer'} breakdown stored for this ${byProduct ? 'customer' : 'item'} yet — these rows come from the sales sync.</td>`;
       anchor.after(none);
       return;
     }
@@ -48176,11 +48188,13 @@ ${(() => {
       const bg = w.key === curMonthKey ? 'background:var(--bone-2);' : '';
       return `<td style="text-align:right;padding:6px 8px;font-family:var(--mono);font-size:11px;color:${v ? 'var(--ink-2)' : 'var(--ink-4)'};${bg}">${v ? fmt$(v) : '·'}</td>`;
     };
-    const _drillable = _spState.dimension === 'product';
+    // Both dimensions drill now: a product lists its customers, a customer lists
+    // its products. Same customer_product rows, read from the other end.
+    const _drillable = _spState.dimension === 'product' || _spState.dimension === 'customer';
     const _slug = (t) => String(t).replace(/[^a-z0-9]+/gi, '_');
     const bodyRows = perEntity.map(pe => `
       <tr data-sp-row="${_slug(pe.ent)}" style="border-bottom:1px solid var(--rule-softer);">
-        <td ${_drillable ? `data-sp-drill="${escapeHtml(pe.ent)}" title="Show which customers drive this item"` : ''} style="position:sticky;left:0;background:var(--paper);text-align:left;padding:6px 10px;font-family:var(--sans);font-size:12px;color:var(--ink);z-index:1;${_drillable ? 'cursor:pointer;' : ''}">${_drillable ? `<span data-sp-caret="${_slug(pe.ent)}" style="display:inline-block;width:12px;color:var(--ink-3);font-size:9px;transition:transform 0.12s;">▶</span> ` : ''}${escapeHtml(pe.ent)}</td>
+        <td ${_drillable ? `data-sp-drill="${escapeHtml(pe.ent)}" title="${_spState.dimension === 'customer' ? 'Show which products this customer ordered' : 'Show which customers drive this item'}"` : ''} style="position:sticky;left:0;background:var(--paper);text-align:left;padding:6px 10px;font-family:var(--sans);font-size:12px;color:var(--ink);z-index:1;${_drillable ? 'cursor:pointer;' : ''}">${_drillable ? `<span data-sp-caret="${_slug(pe.ent)}" style="display:inline-block;width:12px;color:var(--ink-3);font-size:9px;transition:transform 0.12s;">▶</span> ` : ''}${escapeHtml(pe.ent)}</td>
         ${windowMonths.map(w => monthTd(pe.months[w.key] || 0, w)).join('')}
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink);border-left:1px solid var(--rule-soft);">${fmt$(pe.l12)}</td>
         <td style="text-align:right;padding:6px 10px;font-family:var(--mono);font-size:11px;font-weight:600;color:${varColor(pe.varAbs)};border-left:1px solid var(--rule-soft);">${fmtSigned$(pe.varAbs)}</td>
@@ -48289,7 +48303,7 @@ ${(() => {
 
     body.querySelectorAll('[data-sp-drill]').forEach(td => td.addEventListener('click', () => {
       const name = td.dataset.spDrill;
-      spShowProductCustomers(name, String(name).replace(/[^a-z0-9]+/gi, '_'), _spState._lastWindow || [], _spState.metric === 'units' ? 'units' : 'amount', _spState.curMonthKey);
+      spShowProductCustomers(name, String(name).replace(/[^a-z0-9]+/gi, '_'), _spState._lastWindow || [], _spState.metric === 'units' ? 'units' : 'amount', _spState.curMonthKey, _spState.dimension);
     }));
 
     body.querySelectorAll('[data-sp-preset]').forEach(btn => btn.addEventListener('click', () => {
