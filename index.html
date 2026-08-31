@@ -29040,7 +29040,7 @@ render();
   // useful the moment the register is loaded and fills in as detail arrives,
   // rather than showing nothing until everything is ready.
   // ══════════════════════════════════════════════════════════════════════════
-  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'customer', 'checks', 'exceptions', 'upload', 'lines', 'promos'];
+  const DED_VIEWS = ['exec', 'summary', 'reconcile', 'customer', 'checks', 'exceptions', 'upload', 'lines', 'promos', 'catalogue'];
   // 'category' and 'other' were retired into 'summary'. Anyone whose browser has
   // one of them saved would otherwise land on a view that no longer renders.
   // 'code' joined them: By reason code showed the same money as Category, split
@@ -29113,10 +29113,23 @@ render();
   // label, which stopped being true the moment UNFI loaded — the page was
   // silently totalling two distributors while naming one.
   let _dedDist = (() => {
+    // Any stored name is accepted. The old whitelist silently reset a Kroger or
+    // Harris Teeter selection back to 'all' on every reload; an unknown name is
+    // harmless because the scope filter simply matches nothing and the pill for
+    // it is not rendered.
     try { const v = localStorage.getItem('keel_ded_dist');
-          return (v === 'KeHE' || v === 'UNFI' || v === 'all') ? v : 'all'; }
+          return (typeof v === 'string' && v.trim()) ? v : 'all'; }
     catch (e) { return 'all'; }
   })();
+  // "KeHE and UNFI" / "KeHE, UNFI and Kroger" / "KeHE, UNFI, Kroger and Harris
+  // Teeter" -- reads as a sentence however many sources are loaded.
+  function _dedDistNames() {
+    const names = Object.keys(_dedDistCounts || {}).filter(d => _dedDistCounts[d]);
+    if (!names.length) return 'Deductions';
+    names.sort((a, b) => (_dedDistCounts[b] || 0) - (_dedDistCounts[a] || 0));
+    if (names.length === 1) return names[0];
+    return names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+  }
   let _dedRaw = null;             // { key, checks, lines, rmap }
   // ── THE TWO SLOW DATASETS, KEPT LOCALLY ─────────────────────────────────
   // The register arrives with the page, which is why the headline, Who deducted
@@ -30024,6 +30037,106 @@ render();
   // worse than no backup.
   let _dedUploadState = [];   // [{file, status, head, rows, line, existing, chosen}]
 
+  // ── Deductions → Catalogue ──────────────────────────────────────────────
+  // What documents exist, where they live, and how many have actually been
+  // read. This tab exists because "the number looks low" and "the files are
+  // not loaded" are indistinguishable from every other screen -- Thrive read
+  // $21,642 against an expected $70K for hours before anyone could see that
+  // 2,027 KeHE documents were sitting unopened.
+  //
+  // Reads the deduction_file_coverage VIEW, which aggregates server-side. The
+  // alternative is fetching ~10,000 rows to count them in the browser.
+  async function _dedRenderCatalogue(body, sb, brandId, esc) {
+    body.innerHTML = '<div class="hl-loading">Reading the catalogue\u2026</div>';
+    let rows = [];
+    try {
+      const { data, error } = await sb.from('deduction_file_coverage')
+        .select('*').eq('brand_id', brandId);
+      if (error) throw new Error(error.message);
+      rows = data || [];
+    } catch (e) {
+      // The view is a separate migration. Say so plainly rather than rendering
+      // an empty table that looks like "no files".
+      body.innerHTML = `<div style="font-family:var(--serif);font-size:13px;color:var(--ink-2);line-height:1.6;">
+        <p><strong>The catalogue view isn't installed yet.</strong></p>
+        <p style="color:var(--ink-3);">Run <code style="font-family:var(--mono);font-size:11px;">deduction-file-coverage.sql</code>
+        in the SQL editor to create <code style="font-family:var(--mono);font-size:11px;">deduction_file_coverage</code>, then reload.</p>
+        <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(String(e.message || e))}</p>
+      </div>`;
+      return;
+    }
+    if (!rows.length) { body.innerHTML = '<div class="hl-empty">No files catalogued yet. Run the Dropbox crawl.</div>'; return; }
+
+    const n = (v) => Number(v || 0);
+    const num = (v) => n(v).toLocaleString();
+    const folders = [...new Set(rows.map(r => r.folder))]
+      .sort((a, b) => rows.filter(x => x.folder === b).reduce((t, x) => t + n(x.files), 0)
+                    - rows.filter(x => x.folder === a).reduce((t, x) => t + n(x.files), 0));
+
+    const T = (label, right) => `<th style="text-align:${right ? 'right' : 'left'};font-family:var(--mono);font-size:9px;
+      letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);padding:6px 10px;border-bottom:1px solid var(--rule);">${label}</th>`;
+    const D = (v, right, style) => `<td style="text-align:${right ? 'right' : 'left'};font-family:var(--mono);font-size:11px;
+      padding:5px 10px;border-bottom:1px solid var(--bone-2);${style || ''}">${v}</td>`;
+
+    // Read-through is the number that matters: unread documents are the gap
+    // between what a retailer sent and what Keel can see.
+    const bar = (parsed, files) => {
+      const pct = files ? Math.round(parsed / files * 100) : 0;
+      const col = pct >= 90 ? 'var(--won)' : pct >= 40 ? 'var(--gold, #b8860b)' : 'var(--lost)';
+      return `<div style="display:flex;align-items:center;gap:6px;justify-content:flex-end;">
+        <div style="width:52px;height:5px;background:var(--bone-2);border-radius:3px;overflow:hidden;">
+          <div style="width:${pct}%;height:100%;background:${col};"></div></div>
+        <span style="color:${col};min-width:30px;text-align:right;">${pct}%</span></div>`;
+    };
+
+    const tot = (list, k) => list.reduce((t, r) => t + n(r[k]), 0);
+    let html = '';
+    for (const f of folders) {
+      const g = rows.filter(r => r.folder === f).sort((a, b) => n(b.files) - n(a.files));
+      html += `<div style="margin-bottom:26px;">
+        <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;text-transform:uppercase;
+                    color:var(--ink-2);margin-bottom:6px;">${esc(f)}
+          <span style="color:var(--ink-3);text-transform:none;letter-spacing:0;"> \u00b7 ${num(tot(g,'files'))} files \u00b7 ${num(tot(g,'parsed'))} read</span></div>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>${T('Customer')}${T('Files', true)}${T('Distinct content', true)}${T('Also filed elsewhere', true)}
+            ${T('Read', true)}${T('Unread', true)}${T('Unreadable', true)}${T('Read-through', true)}</tr></thead>
+          <tbody>
+            ${g.map(r => `<tr>
+              ${D(esc(r.customer))}
+              ${D(num(r.files), true)}
+              ${D(num(r.distinct_content), true, 'color:var(--ink-3);')}
+              ${D(n(r.copy_elsewhere) ? num(r.copy_elsewhere) : '\u00b7', true, 'color:var(--ink-3);')}
+              ${D(num(r.parsed), true)}
+              ${D(n(r.unread) ? num(r.unread) : '\u00b7', true, n(r.unread) ? 'color:var(--lost);' : 'color:var(--rule);')}
+              ${D(n(r.unreadable) ? num(r.unreadable) : '\u00b7', true, 'color:var(--ink-3);')}
+              ${D(bar(n(r.parsed), n(r.files)), true)}
+            </tr>`).join('')}
+            <tr style="background:var(--bone-2);">
+              ${D('<strong>Total</strong>')}${D('<strong>' + num(tot(g,'files')) + '</strong>', true)}
+              ${D(num(tot(g,'distinct_content')), true)}${D(num(tot(g,'copy_elsewhere')), true)}
+              ${D('<strong>' + num(tot(g,'parsed')) + '</strong>', true)}${D(num(tot(g,'unread')), true)}
+              ${D(num(tot(g,'unreadable')), true)}${D(bar(tot(g,'parsed'), tot(g,'files')), true)}
+            </tr>
+          </tbody></table></div>`;
+    }
+
+    const allFiles = tot(rows, 'files'), allParsed = tot(rows, 'parsed'), allUnread = tot(rows, 'unread');
+    body.innerHTML = `
+      <p style="font-family:var(--serif);font-size:13px;color:var(--ink-2);line-height:1.6;margin-bottom:18px;">
+        ${num(allFiles)} documents catalogued, ${num(allParsed)} read, <strong>${num(allUnread)} never opened</strong>.
+        A document Keel has not read contributes nothing to any total on this page \u2014 so an unread pile is the
+        difference between a number that is low and a number that is wrong.
+      </p>
+      ${html}
+      <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);line-height:1.55;">
+        <em>Also filed elsewhere</em> counts documents whose exact bytes appear at another path \u2014 the same backup
+        filed under both a check folder and a customer folder. Loading both would double-count, so the loaders skip
+        on content hash; it is listed here because it explains why a raw file count overstates the book.
+        <em>Unreadable</em> is a document that was opened and could not be parsed, which is a different problem
+        from one that has never been tried.
+      </p>`;
+  }
+
   async function _dedRenderUpload(body, sb, brandId, esc, money, refresh) {
     const st = (s, c) => `<span style="font-family:var(--mono);font-size:9px;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:${c};color:var(--paper);">${s}</span>`;
 
@@ -30330,7 +30443,18 @@ render();
       // files), so distributor is resolved from the check when there is one and
       // from the UNFI- reason-code prefix when there is not — otherwise every
       // unattached UNFI line would vanish from a UNFI-scoped view.
-      _dedDistCounts = { KeHE: 0, UNFI: 0 };
+      // BUILT FROM THE DATA, not from a fixed pair. Kroger and Harris Teeter
+      // loaded and were invisible here because this object -- and the pill row
+      // and the headline sentence below -- all named KeHE and UNFI literally.
+      // Seeding every distributor present in the check list means the next
+      // source appears the day its first check lands, with no edit here.
+      _dedDistCounts = {};
+      for (const c of checks) {
+        const d = c.distributor || 'KeHE';
+        if (!(d in _dedDistCounts)) _dedDistCounts[d] = 0;
+      }
+      if (!('KeHE' in _dedDistCounts)) _dedDistCounts.KeHE = 0;
+      if (!('UNFI' in _dedDistCounts)) _dedDistCounts.UNFI = 0;
       const _ckDist = new Map(checks.map(c => [c.id, c.distributor || 'KeHE']));
       // Whatever the check's `distributor` column says — so a third source (C&S,
       // a direct customer) appears on the Overview the day its first check lands,
@@ -30446,6 +30570,7 @@ render();
       ['checks',     'Checks'],
       ['exceptions', 'Exceptions'],
       ['upload',     'Upload backup'],
+      ['catalogue',  'Catalogue'],
     ];
 
     // DECLARED HERE, ABOVE FIRST USE. These were further down the function while
@@ -30484,7 +30609,7 @@ render();
            needs doing — and the counters sit underneath as supporting detail. -->
       <div style="padding:6px 2px 14px;">
         <div style="font-family:var(--serif);font-size:21px;line-height:1.45;color:var(--ink);max-width:820px;">
-          ${_dedDist === 'all' ? 'KeHE and UNFI took' : DSHORT + ' took'}
+          ${_dedDist === 'all' ? _dedDistNames() + ' took' : DSHORT + ' took'}
           <strong>${money(-totalAmt)}</strong> in ${yr}${unattribHint ? `, of which <strong style="color:var(--lost);">${money(unattribHint)}</strong> is not yet matched to a customer` : ''}.
         </div>
         ${notTied.length ? `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:8px;">
@@ -30500,8 +30625,12 @@ render();
 
       <div style="margin:14px 0 2px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
         <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:4px;">Distributor</span>
-        ${[['all', 'All'], ['KeHE', 'KeHE'], ['UNFI', 'UNFI']].map(([d, lbl]) => {
-          const n = d === 'all' ? (_dedDistCounts.KeHE + _dedDistCounts.UNFI) : (_dedDistCounts[d] || 0);
+        ${[['all', 'All'], ...Object.keys(_dedDistCounts)
+             .sort((a, b) => (_dedDistCounts[b] || 0) - (_dedDistCounts[a] || 0))
+             .map(d => [d, d])].map(([d, lbl]) => {
+          const n = d === 'all'
+            ? Object.values(_dedDistCounts).reduce((t, v) => t + (Number(v) || 0), 0)
+            : (_dedDistCounts[d] || 0);
           const nLbl = n >= 1000 ? '$' + Math.round(n / 1000).toLocaleString() + 'k' : (n ? '$' + Math.round(n) : '');
           return `<button class="hl-ded-dist" data-d="${d}" ${n ? '' : 'disabled'}
             style="font-family:var(--mono);font-size:12.5px;padding:9px 18px;border-radius:6px;cursor:${n ? 'pointer' : 'default'};
@@ -30752,6 +30881,13 @@ render();
     // fetch, which is ~16.5k rows this view never reads.
     if (_dedView === 'upload') {
       await _dedRenderUpload(body, sb, brandId, esc, money, () => renderDeductions(hostEl, filtersEl, year));
+      return;
+    }
+
+    // Answered before the register aggregation for the same reason as upload:
+    // it reads one small aggregate and none of the checks, lines or detail.
+    if (_dedView === 'catalogue') {
+      await _dedRenderCatalogue(body, sb, brandId, esc);
       return;
     }
 
