@@ -32579,58 +32579,15 @@ ${(() => {
     }));
     const _planYear = _promoYear < 2027;
     const addBtn = document.getElementById('hl-promo-add');
-    const tplLink = document.getElementById('hl-promo-template');
-    if (tplLink) tplLink.addEventListener('click', async (ev) => {
-      ev.preventDefault();
-      if (typeof XLSX === 'undefined') { alert('Still loading — try again in a moment.'); return; }
-      // GENERATED FROM THE APP, not shipped as a static file. The retailer list
-      // and the promo groups come from the same source the parser validates
-      // against, so a template can never offer a value the import will reject.
-      const sb2 = window.Auth.getClient();
-      const bId = (await window.BrandLibrary.getSession()).brandId;
-      const { data: rets } = await sb2.from('retailers').select('name').eq('brand_id', bId).order('name');
-      // COLUMNS AND ORDER MATCH THE SHEET ATG ALREADY CIRCULATES, plus the one
-      // it was missing: '# Items'. Every field here is a field on the Add promo
-      // form, so an uploaded promo and a hand-entered one compute identically.
-      // The valid-values lists sit in far columns beside the data, the way the
-      // existing sheet does it, rather than on separate tabs.
-      const hdr = ['Retailer','Promo Name / ID','Product / SKU','Type','EDLP?','EDLP $',
-                   'ATG Gross Price','Dist Markup %','Cur Retail / SRP','Base UPSPW (Velocity)',
-                   '# Items','Doors','Lift %','Wks per Event','Promo Cost ($/unit)',
-                   'Event Start Date','Distributor Fee % (Scan)','Ad Fees ($/yr)','Other Fees ($/yr)'];
-      const names = (rets || []).map(r => r.name);
-      const grps = allPromoGroups();
-      const ex = [names[0] || 'Big Y', 'Spring scan', grps[0], 'Scan', 'Yes', 1.2,
-                  8.29, 11, 13.49, 5.4, 5, 95, 35, 4, 1.4, '2027-02-01', 0, 550, 0];
-      // Reference lists live in columns X and Z, clear of the 19 data columns,
-      // so a wide paste can never overwrite them and the parser -- which binds
-      // 'Retailer', not 'Retailer name' -- cannot mistake one for data.
-      const PAD = (n) => Array(n).fill(null);
-      const aoa = [
-        [...hdr, ...PAD(4), 'Retailer name', null, 'Promo group'],
-        [...ex,  ...PAD(4), names[0] ?? null, null, grps[0] ?? null],
-      ];
-      const depth = Math.max(names.length, grps.length);
-      for (let i = 1; i < depth; i++)
-        aoa.push([...PAD(19), ...PAD(4), names[i] ?? null, null, grps[i] ?? null]);
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
-      ws['!cols'] = [{wch:26},{wch:18},{wch:16},{wch:10},{wch:8},{wch:9},{wch:15},{wch:13},
-                     {wch:16},{wch:19},{wch:9},{wch:8},{wch:8},{wch:13},{wch:17},{wch:16},
-                     {wch:20},{wch:14},{wch:15},{wch:3},{wch:3},{wch:3},{wch:3},{wch:34},{wch:3},{wch:16}];
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Promos');
-      XLSX.writeFile(wb, 'keel-promo-template.xlsx');
-    });
-
     const upBtn = document.getElementById('hl-promo-upload');
     if (_planYear) { addBtn.style.display = 'none'; upBtn.textContent = '↥ Upload Vividly export'; }
-    addBtn.addEventListener('click', () => openPromoCard(null));
-    upBtn.addEventListener('click', () => document.getElementById('hl-promo-upload-input').click());
-    document.getElementById('hl-promo-upload-input').addEventListener('change', (e) => {
-      const f = e.target.files?.[0];
-      if (f) { if (_planYear) handleVividlyUpload(f); else handlePromoExcelUpload(f); }
-      e.target.value = '';
-    });
+    // DELEGATED FROM document, INSTALLED ONCE. These used to be bound per render:
+    // every sub-tab switch replaced main.innerHTML, and any path that rebuilt the
+    // markup without re-running this block left three dead buttons behind. The
+    // only way back was reloading the page, which is what made it feel broken.
+    // A delegated listener does not care how often the DOM is rebuilt, and
+    // cannot stack duplicates when it is.
+    _promoInstallDelegates();
     if (_planYear) {
       const sEl = document.getElementById('hl-promo-summary'), fEl = document.getElementById('hl-promo-filters');
       if (_promoView === 'analyzer') await renderTradeAnalyzer(sEl, fEl, _promoYear);
@@ -33538,6 +33495,115 @@ ${(() => {
     return null;
   };
 
+  // Installed at most once, whatever calls it. The flag is on window rather than
+  // a module let so a hot reload cannot double-install either.
+  // Pulled out of the per-render binding so the delegate can call it. Generated
+  // from the app's own vocabulary, so the template can never offer a retailer or
+  // promo group the importer would reject.
+  async function _promoDownloadTemplate() {
+      if (typeof XLSX === 'undefined') { alert('Still loading — try again in a moment.'); return; }
+      // GENERATED FROM THE APP, not shipped as a static file. The retailer list
+      // and the promo groups come from the same source the parser validates
+      // against, so a template can never offer a value the import will reject.
+      const sb2 = window.Auth.getClient();
+      const bId = (await window.BrandLibrary.getSession()).brandId;
+      const { data: rets } = await sb2.from('retailers').select('name').eq('brand_id', bId).order('name');
+      // COLUMNS AND ORDER MATCH THE SHEET ATG ALREADY CIRCULATES, plus the one
+      // it was missing: '# Items'. Every field here is a field on the Add promo
+      // form, so an uploaded promo and a hand-entered one compute identically.
+      // The valid-values lists sit in far columns beside the data, the way the
+      // existing sheet does it, rather than on separate tabs.
+      const hdr = ['Retailer','Promo Name / ID','Product / SKU','Type','EDLP?','EDLP $',
+                   'ATG Gross Price','Dist Markup %','Cur Retail / SRP','Base UPSPW (Velocity)',
+                   '# Items','Doors','Lift %','Wks per Event','Promo Cost ($/unit)',
+                   'Event Start Date','Distributor Fee % (Scan)','Ad Fees ($/yr)','Other Fees ($/yr)'];
+      const names = (rets || []).map(r => r.name);
+      const grps = allPromoGroups();
+      const ex = [names[0] || 'Big Y', 'Spring scan', grps[0], 'Scan', 'Yes', 1.2,
+                  8.29, 11, 13.49, 5.4, 5, 95, 35, 4, 1.4, '2027-02-01', 0, 550, 0];
+      // Reference lists live in columns X and Z, clear of the 19 data columns,
+      // so a wide paste can never overwrite them and the parser -- which binds
+      // 'Retailer', not 'Retailer name' -- cannot mistake one for data.
+      const PAD = (n) => Array(n).fill(null);
+      const aoa = [
+        [...hdr, ...PAD(4), 'Retailer name', null, 'Promo group'],
+        [...ex,  ...PAD(4), names[0] ?? null, null, grps[0] ?? null],
+      ];
+      const depth = Math.max(names.length, grps.length);
+      for (let i = 1; i < depth; i++)
+        aoa.push([...PAD(19), ...PAD(4), names[i] ?? null, null, grps[i] ?? null]);
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = [{wch:26},{wch:18},{wch:16},{wch:10},{wch:8},{wch:9},{wch:15},{wch:13},
+                     {wch:16},{wch:19},{wch:9},{wch:8},{wch:8},{wch:13},{wch:17},{wch:16},
+                     {wch:20},{wch:14},{wch:15},{wch:3},{wch:3},{wch:3},{wch:3},{wch:34},{wch:3},{wch:16}];
+      // 'Items' CARRIES A FORMULA, not a number. =COUNTIF against the Items tab
+      // means choosing a promo group fills the count itself, and a subset promo
+      // is a matter of typing over one cell. A blank still imports -- the parser
+      // falls back to the whole group -- but the sheet shows the number first,
+      // which is the difference between a promo you checked and one you hoped
+      // about.
+      for (let r = 2; r <= 200; r++)
+        ws['K' + r] = { t: 'n', f: `IF($C${r}="","",COUNTIF(Items!$A:$A,$C${r}))` };
+      ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: 199, c: 25 } });
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Promos');
+
+      // The product list travels WITH the template. A separate file is a file
+      // someone forgets, and the COUNTIF above needs it present to resolve.
+      const { data: prodRows } = await sb2.from('products')
+        .select('item_description,unit_upc,case_gtin,product_line,srp,wholesale_unit_price')
+        .eq('brand_id', bId).order('product_line');
+      const items = (prodRows || []).map(pr => [
+        promoGroupForLine(pr.product_line) || '(no promo group)', pr.product_line,
+        pr.item_description, String(pr.unit_upc ?? ''), String(pr.case_gtin ?? ''),
+        pr.srp, pr.wholesale_unit_price]);
+      const iws = XLSX.utils.aoa_to_sheet([
+        ['Promo group','Product line','Item description','Unit UPC','Case GTIN','SRP','Wholesale unit'],
+        ...items]);
+      iws['!cols'] = [{wch:16},{wch:16},{wch:42},{wch:15},{wch:16},{wch:9},{wch:14}];
+      XLSX.utils.book_append_sheet(wb, iws, 'Items');
+      XLSX.writeFile(wb, 'keel-promo-template.xlsx');
+  }
+
+  function _promoInstallDelegates() {
+    if (window.__keelPromoDelegates) return;
+    window.__keelPromoDelegates = true;
+
+    document.addEventListener('click', (ev) => {
+      const add = ev.target.closest && ev.target.closest('#hl-promo-add');
+      if (add) { ev.preventDefault(); openPromoCard(null); return; }
+      const up = ev.target.closest && ev.target.closest('#hl-promo-upload');
+      if (up) {
+        ev.preventDefault();
+        const input = document.getElementById('hl-promo-upload-input');
+        // Looked up at CLICK time, not at bind time. The input is re-created by
+        // every render, so a captured reference goes stale the moment the page
+        // repaints -- the original failure.
+        if (input) input.click();
+        else alert('The file picker is not on the page \u2014 switch to the Plan tab and try again.');
+        return;
+      }
+      const tpl = ev.target.closest && ev.target.closest('#hl-promo-template');
+      if (tpl) { ev.preventDefault(); _promoDownloadTemplate(); }
+    });
+
+    // 'change' bubbles, so one document-level listener covers every re-created
+    // input without needing to find it first.
+    document.addEventListener('change', async (ev) => {
+      if (!ev.target || ev.target.id !== 'hl-promo-upload-input') return;
+      const f = ev.target.files && ev.target.files[0];
+      // Cleared BEFORE the work. A file input fires no 'change' when the same
+      // file is chosen twice, so a handler that throws before the reset leaves
+      // the control dead until a reload.
+      ev.target.value = '';
+      if (!f) return;
+      try { await (_planYear ? handleVividlyUpload(f) : handlePromoExcelUpload(f)); }
+      catch (err) { console.error('[PROMO] upload failed:', err);
+                    alert('Upload failed: ' + (err && err.message ? err.message : err)); }
+    });
+  }
+
   async function handlePromoExcelUpload(file) {
     const sb = window.Auth.getClient();
     const brandId = (await window.BrandLibrary.getSession()).brandId;
@@ -33562,6 +33628,26 @@ ${(() => {
     const retByName = new Map((retailers || []).map(r => [_puNorm(r.name), r.id]));
     const groups = allPromoGroups(); const groupByNorm = new Map(groups.map(g => [_puNorm(g), g]));
 
+    // HOW MANY SKUs A PROMO GROUP CONTAINS. The Add promo form fills '# Items'
+    // from the items you tick; a spreadsheet has nothing to tick, so a blank
+    // cell falls back to every item in the group -- which is what promoting a
+    // whole group means. Counted from Brand Library through the same
+    // product_line map the form uses, so the two can never disagree.
+    const { data: prods } = await sb.from('products')
+      .select('id,item_description,unit_upc,product_line').eq('brand_id', brandId);
+    const itemsPerGroup = new Map();
+    // Items are named in the sheet by DESCRIPTION (that is what the dropdown
+    // offers) but a UPC pasted in the same cell should work too -- people copy
+    // from wherever they have the number. Both resolve to the same product.
+    const prodByDesc = new Map(), prodByUpc = new Map();
+    for (const pr of (prods || [])) {
+      const g = promoGroupForLine(pr.product_line);
+      if (g) itemsPerGroup.set(g, (itemsPerGroup.get(g) || 0) + 1);
+      if (pr.item_description) prodByDesc.set(_puNorm(pr.item_description), { ...pr, group: g });
+      const u = String(pr.unit_upc || '').replace(/\D/g, '');
+      if (u) prodByUpc.set(u, { ...pr, group: g });
+    }
+
     // WHAT MAKES TWO PROMOS THE SAME ONE. A promo is a retailer, a group, a type
     // and an event start -- that is what the Add promo form asks for, and two
     // records agreeing on all four are the same event entered twice, not a
@@ -33575,7 +33661,7 @@ ${(() => {
     const existingKeys = new Set((existingPromos || []).map(promoKey));
     const seenInFile = new Map();          // the same event twice in one sheet
 
-    const out = [], problems = [], dupes = [];
+    const out = [], problems = [], dupes = [], defaulted = [];
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i]; if (!r || !r.length) continue;
       const rowNo = i + 1;
@@ -33625,9 +33711,40 @@ ${(() => {
         edlp_lift_override: 0,
         p1_events: 1, start_date: start,
       };
+      // ITEM 1..5 NAME THE ACTUAL SKUs. Reading them is what lets a promo be tied
+      // back to a deduction later; a count alone says how many were promoted and
+      // never which. An item that resolves but belongs to a different group is
+      // reported rather than accepted -- that is a picking mistake, and silently
+      // storing it would put the wrong SKU behind a promo's spend.
+      const itemIds = [], itemMiss = [];
+      for (let n = 1; n <= 12; n++) {
+        const raw = get(r, `Item ${n}`);
+        if (!raw) continue;
+        const txt = String(raw).trim();
+        const hit = prodByDesc.get(_puNorm(txt)) || prodByUpc.get(txt.replace(/\D/g, ''));
+        if (!hit) { itemMiss.push(`Item ${n} "${txt}" is not in Brand Library`); continue; }
+        if (hit.group && hit.group !== promoted_group) {
+          itemMiss.push(`Item ${n} "${txt}" is in ${hit.group}, not ${promoted_group}`); continue;
+        }
+        if (!itemIds.includes(hit.id)) itemIds.push(hit.id);
+      }
+      if (itemMiss.length) { problems.push(`Row ${rowNo}: ` + itemMiss.join('; ')); continue; }
+      // Named items win over any typed count: the two cannot disagree if only
+      // one of them is ever used.
+      if (itemIds.length) inputs.num_items = itemIds.length;
+
+      // A blank falls back to the whole group. Still an error if the group has
+      // no items at all -- Pizza Shell is offered on the form but no product
+      // maps to it, so that promo would compute to zero and should say so
+      // rather than save as a $0 line.
       if (!inputs.num_items) {
-        problems.push(`Row ${rowNo}: "# Items" is blank — every promo would compute to zero units`);
-        continue;
+        const auto = itemsPerGroup.get(promoted_group) || 0;
+        if (!auto) {
+          problems.push(`Row ${rowNo}: "${promoted_group}" has no items in Brand Library, so this promo would compute to zero units`);
+          continue;
+        }
+        inputs.num_items = auto;
+        defaulted.push(`Row ${rowNo}: Items blank \u2014 used all ${auto} in ${promoted_group}`);
       }
       // ALREADY IN KEEL -> reported and skipped. The import only ever INSERTs,
       // so nothing already saved is touched either way; skipping is about not
@@ -33644,7 +33761,7 @@ ${(() => {
       seenInFile.set(key, rowNo);
 
       const c = computePromoLine(inputs);
-      out.push({ rowNo, retName, label: promoLabel, inputs, computed: c });
+      out.push({ rowNo, retName, label: promoLabel, inputs, computed: c, itemIds });
     }
 
     const unbound = [...idx.keys()].filter(k => !bound.has(k));
@@ -33661,6 +33778,11 @@ ${(() => {
       `${out.length} NEW promo line${out.length === 1 ? '' : 's'} from ${file.name}.`,
       `Annual trade spend: $${Math.round(spend).toLocaleString()}`,
       `\nNothing already in Keel is changed \u2014 this only adds rows.`,
+      (() => { const withItems = out.filter(o => (o.itemIds || []).length).length;
+        return withItems ? `${withItems} of ${out.length} name their specific items.`
+                         : 'None name specific items \u2014 Item 1..5 were empty.'; })(),
+      defaulted.length ? `\n${defaulted.length} row(s) had no item count \u2014 defaulted to the whole group:\n`
+                         + defaulted.slice(0, 6).join('\n') : '',
       dupes.length ? `\n${dupes.length} row(s) SKIPPED as duplicates:\n` + dupes.slice(0, 10).join('\n')
                      + (dupes.length > 10 ? `\n\u2026and ${dupes.length - 10} more` : '') : '',
       problems.length ? `\n${problems.length} row(s) SKIPPED with problems:\n` + problems.slice(0, 10).join('\n') : '',
@@ -33671,7 +33793,9 @@ ${(() => {
 
     let written = 0; const failed = [];
     for (const o of out) {
-      const row = { brand_id: brandId, ...o.inputs, event_dates: [], item_ids: [],
+      const row = { brand_id: brandId, ...o.inputs,
+        event_dates: o.inputs.start_date ? [{ start: o.inputs.start_date, end: '' }] : [],
+        item_ids: o.itemIds || [],
         retailer_margin: o.computed.retailer_margin, annual_units: o.computed.annual_units,
         annual_gross_sales: o.computed.annual_gross_sales, annual_trade_spend: o.computed.annual_trade_spend,
         trade_rate: o.computed.trade_rate, net_sales: o.computed.net_sales,
@@ -33683,7 +33807,21 @@ ${(() => {
     alert(`Imported ${written} of ${out.length} new promo(s).`
       + (dupes.length ? `\n${dupes.length} skipped as already present.` : '')
       + (failed.length ? '\n\nFailed:\n' + failed.slice(0, 8).join('\n') : ''));
-    renderPromosPage();
+
+    // LAND ON THE YEAR THE PROMOS ARE IN. The page filters by year, so importing
+    // 2027 events while looking at 2026 shows an unchanged screen and reads like
+    // the upload did nothing. Jump to the year actually imported.
+    const yr = Number(String(out[0].inputs.start_date || '').slice(0, 4));
+    if (yr && yr !== _promoYear) {
+      _promoYear = yr;
+      try { localStorage.setItem('keel_promo_year', String(yr)); } catch (_e) {}
+    }
+    // AWAITED, and its failure surfaced. Fire-and-forget meant a re-render that
+    // threw left the old list on screen with no error anywhere -- which is what
+    // "I had to refresh the page" actually was.
+    try { await renderPromosPage(); }
+    catch (e) { console.error('[PROMO] re-render after import failed:', e);
+                alert('Imported, but the page could not refresh itself. Reload to see the new promos.'); }
   }
 
   // (Service Levels moved to its own page under Operations — 2026-07. The old
