@@ -32703,6 +32703,10 @@ ${(() => {
         const wks = Number(ls[0].p1_wks_per_event) || 0;
         rows.push({ key, rid: ls[0].retailer_id, group: ls[0].promoted_group,
           name: retById.get(ls[0].retailer_id) || '(unknown retailer)',
+          // `lines` is what the group-level checkbox selects. perRec already holds
+          // the per-event view; this is the raw records, whose ids the delete
+          // path needs.
+          lines: ls,
           perRec, atg, baseUnits, edlpOnce, annualUnits, grossSales, tradeSpend, events, margin, tradeRate, wks });
       }
       rows.sort((a,b)=> b.grossSales - a.grossSales || a.name.localeCompare(b.name));
@@ -32719,7 +32723,13 @@ ${(() => {
             <tbody>
               ${rows.map((row, idx) => `
                 <tr class="hl-promo-srow" data-idx="${idx}" style="cursor:pointer;border-top:1px solid var(--rule-soft);">
-                  <td class="text" style="padding:9px 10px;font-weight:600;">${esc(row.name)} <span style="color:var(--ink-3);font-weight:normal;">· ${esc(row.group || '—')}</span></td>
+                  <td class="text" style="padding:9px 10px;font-weight:600;">
+                    <label style="display:inline-flex;align-items:center;gap:9px;cursor:pointer;" title="Select every event in this group">
+                      <input type="checkbox" class="hl-promo-groupcb" data-idx="${idx}"
+                             ${row.lines.every(l => selectedToDelete.has(l.id)) ? 'checked' : ''} />
+                      <span>${esc(row.name)} <span style="color:var(--ink-3);font-weight:normal;">· ${esc(row.group || '—')}</span></span>
+                    </label>
+                  </td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${pct(row.margin)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${num(row.events)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${row.wks ? row.wks.toFixed(0) : '—'}</td>
@@ -32727,7 +32737,13 @@ ${(() => {
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${money(row.grossSales)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${money(row.tradeSpend)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${pct(row.tradeRate)}</td>
-                  <td style="text-align:right;padding:9px 10px;font-family:var(--mono);color:var(--ink-3);"><span class="hl-promo-caret" data-idx="${idx}">▸</span></td>
+                  <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">
+                    <span class="hl-promo-caret" data-idx="${idx}" style="display:inline-flex;align-items:center;gap:5px;
+                          padding:3px 9px;border:1px solid var(--rule);border-radius:11px;font-size:10px;
+                          color:var(--ink-2);background:var(--paper);white-space:nowrap;">
+                      <span class="hl-promo-caret-ico" style="display:inline-block;transition:transform .12s;">▸</span>${row.events} event${row.events === 1 ? '' : 's'}
+                    </span>
+                  </td>
                 </tr>
                 <tr class="hl-promo-detail" data-idx="${idx}" style="display:none;">
                   <td colspan="9" style="padding:0;background:var(--bone-2);">
@@ -32788,19 +32804,47 @@ ${(() => {
       `;
       // expand/collapse
       summaryEl.querySelectorAll('.hl-promo-srow').forEach(tr => tr.addEventListener('click', (ev) => {
-        if (ev.target.closest('.hl-promo-edit') || ev.target.closest('.hl-promo-dup') || ev.target.closest('.hl-promo-delcb')) return;
+        // The group checkbox sits inside this row; clicking it must not also
+        // open the group.
+        if (ev.target.closest('.hl-promo-edit') || ev.target.closest('.hl-promo-dup')
+            || ev.target.closest('.hl-promo-delcb') || ev.target.closest('.hl-promo-groupcb')) return;
         const idx = tr.dataset.idx;
         const detail = summaryEl.querySelector(`.hl-promo-detail[data-idx="${idx}"]`);
         const caret = summaryEl.querySelector(`.hl-promo-caret[data-idx="${idx}"]`);
         const open = detail.style.display !== 'none';
         detail.style.display = open ? 'none' : '';
-        if (caret) caret.textContent = open ? '▸' : '▾';
+        // The label stays ("3 events"); only the arrow turns, and the pill fills
+        // in when open so an expanded group is obvious while scrolling a long
+        // list. Replacing the whole label with a glyph was why nobody noticed
+        // there was anything to expand.
+        if (caret) {
+          const ico = caret.querySelector('.hl-promo-caret-ico');
+          if (ico) ico.style.transform = open ? '' : 'rotate(90deg)';
+          caret.style.background = open ? 'var(--paper)' : 'var(--ink)';
+          caret.style.color = open ? 'var(--ink-2)' : 'var(--paper)';
+          caret.style.borderColor = open ? 'var(--rule)' : 'var(--ink)';
+        }
       }));
       summaryEl.querySelectorAll('.hl-promo-edit').forEach(btn => btn.addEventListener('click', () => openPromoCard(btn.dataset.id)));
       summaryEl.querySelectorAll('.hl-promo-dup').forEach(btn => btn.addEventListener('click', () => {
         const rec = promos.find(p => String(p.id) === String(btn.dataset.id));
         if (rec) openPromoCard(null, seedFromPromoRecord(rec));
       }));
+      // A GROUP CHECKBOX SELECTS EVERY EVENT UNDER IT. Deleting a whole promo
+      // meant expanding the group and ticking each date; on a group with a dozen
+      // events that is a dozen clicks and one easy miss.
+      summaryEl.querySelectorAll('.hl-promo-groupcb').forEach(cb => cb.addEventListener('change', (ev) => {
+        ev.stopPropagation();                      // do not also toggle the row open
+        const row = rows[Number(cb.dataset.idx)];
+        if (!row) return;
+        for (const l of row.lines) {
+          if (cb.checked) selectedToDelete.add(l.id); else selectedToDelete.delete(l.id);
+        }
+        renderSummary();
+      }));
+      summaryEl.querySelectorAll('.hl-promo-groupcb').forEach(cb =>
+        cb.addEventListener('click', (ev) => ev.stopPropagation()));
+
       summaryEl.querySelectorAll('.hl-promo-delcb').forEach(cb => cb.addEventListener('change', () => {
         if (cb.checked) selectedToDelete.add(cb.dataset.id); else selectedToDelete.delete(cb.dataset.id);
         const delBtn = document.getElementById('hl-promo-delete');
