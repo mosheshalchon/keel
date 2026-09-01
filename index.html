@@ -32639,9 +32639,16 @@ ${(() => {
         <select id="hl-pf-type" class="hl-pf" style="padding:7px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
           <option value="">All promo types</option>${fTypes.map(t => `<option value="${esc(t)}">${esc(typeLabel(t))}</option>`).join('')}
         </select>
-        <button id="hl-pf-clear" style="background:transparent;border:1px solid var(--rule-soft);border-radius:4px;font-family:var(--mono);font-size:10px;padding:6px 12px;cursor:pointer;text-transform:uppercase;color:var(--ink-3);">Clear</button>
+        <!-- CLEAR REMOVED. Three dropdowns that each already offer "All …" make a
+             fourth control that only means "set those three back to All" — it
+             sat beside a red Delete button and read like part of the same
+             group, which is a bad place for an ambiguous verb. -->
+        <!-- BESIDE Clear, not banished behind a flex spacer at the far right of a
+             wide row. It only appears once something is ticked, so it has to
+             appear where the eye already is; at the opposite end of the screen
+             it read as "there is no way to delete". -->
+        <button id="hl-promo-delete" style="display:none;background:var(--lost);color:var(--paper);border:none;border-radius:4px;font-family:var(--sans);font-size:12px;font-weight:600;padding:7px 14px;cursor:pointer;">\u2715 Delete selected (<span id="hl-promo-delcount">0</span>)</button>
         <div style="flex:1;"></div>
-        <button id="hl-promo-delete" style="display:none;background:var(--lost);color:var(--paper);border:none;border-radius:4px;font-family:var(--sans);font-size:12px;padding:7px 14px;cursor:pointer;">Delete selected (<span id="hl-promo-delcount">0</span>)</button>
       </div>
     `;
 
@@ -32707,18 +32714,26 @@ ${(() => {
           // the per-event view; this is the raw records, whose ids the delete
           // path needs.
           lines: ls,
+          // Every distinct type in the group, not the first one. A retailer can
+          // run a scan and an MCB on the same product group in a year, and
+          // showing only one would misdescribe the other.
+          types: [...new Set(ls.map(l => typeLabel(l.promo_type)).filter(Boolean))].join(', ') || '—',
           perRec, atg, baseUnits, edlpOnce, annualUnits, grossSales, tradeSpend, events, margin, tradeRate, wks });
       }
       rows.sort((a,b)=> b.grossSales - a.grossSales || a.name.localeCompare(b.name));
 
-      const colgroup = `<colgroup><col style="width:24%"><col style="width:11%"><col style="width:8%"><col style="width:8%"><col style="width:12%"><col style="width:13%"><col style="width:13%"><col style="width:8%"><col style="width:3%"></colgroup>`;
+      // Product group and promo type get their own columns. The group used to be
+      // appended to the retailer name in one cell, so it could not be scanned
+      // down or sorted by eye, and the promo type was only visible after
+      // expanding a group -- you could not tell a scan from an MCB at a glance.
+      const colgroup = `<colgroup><col style="width:17%"><col style="width:11%"><col style="width:9%"><col style="width:9%"><col style="width:7%"><col style="width:7%"><col style="width:10%"><col style="width:11%"><col style="width:11%"><col style="width:5%"><col style="width:3%"></colgroup>`;
       const actBtn = 'background:transparent;border:1px solid var(--rule-soft);border-radius:3px;font-family:var(--mono);font-size:9px;padding:3px 6px;cursor:pointer;text-transform:uppercase;';
       summaryEl.innerHTML = `
         <div class="hl-master-table-wrap">
           <table class="hl-master-table" style="font-size:12px;table-layout:fixed;width:100%;">
             ${colgroup}
             <thead><tr>
-              ${th('Retailer · group')}${th('Retailer margin', true)}${th('# Events', true)}${th('Wks/event', true)}${th('Annual units', true)}${th('Annual gross sales', true)}${th('Annual trade spend', true)}${th('Trade rate', true)}${th('')}
+              ${th('Retailer')}${th('Product group')}${th('Promo type')}${th('Retailer margin', true)}${th('# Events', true)}${th('Wks/event', true)}${th('Annual units', true)}${th('Annual gross sales', true)}${th('Annual trade spend', true)}${th('Trade rate', true)}${th('')}
             </tr></thead>
             <tbody>
               ${rows.map((row, idx) => `
@@ -32727,9 +32742,11 @@ ${(() => {
                     <label style="display:inline-flex;align-items:center;gap:9px;cursor:pointer;" title="Select every event in this group">
                       <input type="checkbox" class="hl-promo-groupcb" data-idx="${idx}"
                              ${row.lines.every(l => selectedToDelete.has(l.id)) ? 'checked' : ''} />
-                      <span>${esc(row.name)} <span style="color:var(--ink-3);font-weight:normal;">· ${esc(row.group || '—')}</span></span>
+                      <span>${esc(row.name)}</span>
                     </label>
                   </td>
+                  <td class="text" style="padding:9px 10px;color:var(--ink-2);">${esc(row.group || '—')}</td>
+                  <td class="text" style="padding:9px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-2);">${esc(row.types)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${pct(row.margin)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${num(row.events)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${row.wks ? row.wks.toFixed(0) : '—'}</td>
@@ -32746,7 +32763,7 @@ ${(() => {
                   </td>
                 </tr>
                 <tr class="hl-promo-detail" data-idx="${idx}" style="display:none;">
-                  <td colspan="9" style="padding:0;background:var(--bone-2);">
+                  <td colspan="11" style="padding:0;background:var(--bone-2);">
                     <div style="padding:7px 12px;font-family:var(--serif);font-style:italic;font-size:11px;color:var(--ink-3);">Base + EDLP are counted once for this retailer · group; each event row shows its incremental contribution. Base + events = group total.</div>
                     <table style="width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;">
                       <colgroup><col style="width:15%"><col style="width:9%"><col style="width:8%"><col style="width:7%"><col style="width:12%"><col style="width:13%"><col style="width:13%"><col style="width:8%"><col style="width:15%"></colgroup>
@@ -32833,6 +32850,15 @@ ${(() => {
       // A GROUP CHECKBOX SELECTS EVERY EVENT UNDER IT. Deleting a whole promo
       // meant expanding the group and ticking each date; on a group with a dozen
       // events that is a dozen clicks and one easy miss.
+      // ONE PLACE decides whether the delete control is visible and what it says.
+      // Two handlers each maintaining it is how it went missing.
+      const syncDeleteButton = () => {
+        const delBtn = document.getElementById('hl-promo-delete');
+        const cnt = document.getElementById('hl-promo-delcount');
+        if (cnt) cnt.textContent = selectedToDelete.size;
+        if (delBtn) delBtn.style.display = selectedToDelete.size ? '' : 'none';
+      };
+
       summaryEl.querySelectorAll('.hl-promo-groupcb').forEach(cb => cb.addEventListener('change', (ev) => {
         ev.stopPropagation();                      // do not also toggle the row open
         const row = rows[Number(cb.dataset.idx)];
@@ -32847,16 +32873,19 @@ ${(() => {
 
       summaryEl.querySelectorAll('.hl-promo-delcb').forEach(cb => cb.addEventListener('change', () => {
         if (cb.checked) selectedToDelete.add(cb.dataset.id); else selectedToDelete.delete(cb.dataset.id);
-        const delBtn = document.getElementById('hl-promo-delete');
-        const cnt = document.getElementById('hl-promo-delcount');
-        if (cnt) cnt.textContent = selectedToDelete.size;
-        if (delBtn) delBtn.style.display = selectedToDelete.size ? '' : 'none';
+        syncDeleteButton();
       }));
+      // ALWAYS run at the end of a render, not only from a checkbox handler.
+      // Selecting a whole group ticks its boxes and re-renders, so the button's
+      // visibility lived in the one path that no longer ran -- ticking a group
+      // selected three promos and showed no way to delete them.
+      syncDeleteButton();
     };
 
     // wire filters
     filtersEl.querySelectorAll('.hl-pf').forEach(sel => sel.addEventListener('change', renderSummary));
-    document.getElementById('hl-pf-clear').addEventListener('click', () => {
+    const clearBtn = document.getElementById('hl-pf-clear');
+    if (clearBtn) clearBtn.addEventListener('click', () => {
       filtersEl.querySelectorAll('.hl-pf').forEach(sel => sel.value = '');
       renderSummary();
     });
