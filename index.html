@@ -32726,14 +32726,14 @@ ${(() => {
       // appended to the retailer name in one cell, so it could not be scanned
       // down or sorted by eye, and the promo type was only visible after
       // expanding a group -- you could not tell a scan from an MCB at a glance.
-      const colgroup = `<colgroup><col style="width:17%"><col style="width:11%"><col style="width:9%"><col style="width:9%"><col style="width:7%"><col style="width:7%"><col style="width:10%"><col style="width:11%"><col style="width:11%"><col style="width:5%"><col style="width:3%"></colgroup>`;
+      const colgroup = `<colgroup><col style="width:20%"><col style="width:11%"><col style="width:9%"><col style="width:9%"><col style="width:7%"><col style="width:7%"><col style="width:10%"><col style="width:11%"><col style="width:11%"><col style="width:5%"></colgroup>`;
       const actBtn = 'background:transparent;border:1px solid var(--rule-soft);border-radius:3px;font-family:var(--mono);font-size:9px;padding:3px 6px;cursor:pointer;text-transform:uppercase;';
       summaryEl.innerHTML = `
         <div class="hl-master-table-wrap">
           <table class="hl-master-table" style="font-size:12px;table-layout:fixed;width:100%;">
             ${colgroup}
             <thead><tr>
-              ${th('Retailer')}${th('Product group')}${th('Promo type')}${th('Retailer margin', true)}${th('# Events', true)}${th('Wks/event', true)}${th('Annual units', true)}${th('Annual gross sales', true)}${th('Annual trade spend', true)}${th('Trade rate', true)}${th('')}
+              ${th('Retailer')}${th('Product group')}${th('Promo type')}${th('Retailer margin', true)}${th('# Events', true)}${th('Wks/event', true)}${th('Annual units', true)}${th('Annual gross sales', true)}${th('Annual trade spend', true)}${th('Trade rate', true)}
             </tr></thead>
             <tbody>
               ${rows.map((row, idx) => `
@@ -32742,6 +32742,13 @@ ${(() => {
                     <label style="display:inline-flex;align-items:center;gap:9px;cursor:pointer;" title="Select every event in this group">
                       <input type="checkbox" class="hl-promo-groupcb" data-idx="${idx}"
                              ${row.lines.every(l => selectedToDelete.has(l.id)) ? 'checked' : ''} />
+                      <!-- A CHEVRON WHERE THE ROW BEGINS. The pill on the far
+                           right restated the # Events column and sat 1,200px
+                           from the name it belonged to; a triangle beside the
+                           label is the thing people already look for, and it
+                           costs no column. -->
+                      <span class="hl-promo-caret" data-idx="${idx}" style="display:inline-block;width:9px;
+                            color:var(--ink-3);font-size:9px;transition:transform .12s;transform-origin:50% 50%;">\u25b8</span>
                       <span>${esc(row.name)}</span>
                     </label>
                   </td>
@@ -32754,16 +32761,9 @@ ${(() => {
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${money(row.grossSales)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${money(row.tradeSpend)}</td>
                   <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">${pct(row.tradeRate)}</td>
-                  <td style="text-align:right;padding:9px 10px;font-family:var(--mono);">
-                    <span class="hl-promo-caret" data-idx="${idx}" style="display:inline-flex;align-items:center;gap:5px;
-                          padding:3px 9px;border:1px solid var(--rule);border-radius:11px;font-size:10px;
-                          color:var(--ink-2);background:var(--paper);white-space:nowrap;">
-                      <span class="hl-promo-caret-ico" style="display:inline-block;transition:transform .12s;">▸</span>${row.events} event${row.events === 1 ? '' : 's'}
-                    </span>
-                  </td>
                 </tr>
                 <tr class="hl-promo-detail" data-idx="${idx}" style="display:none;">
-                  <td colspan="11" style="padding:0;background:var(--bone-2);">
+                  <td colspan="10" style="padding:0;background:var(--bone-2);">
                     <div style="padding:7px 12px;font-family:var(--serif);font-style:italic;font-size:11px;color:var(--ink-3);">Base + EDLP are counted once for this retailer · group; each event row shows its incremental contribution. Base + events = group total.</div>
                     <table style="width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;">
                       <colgroup><col style="width:15%"><col style="width:9%"><col style="width:8%"><col style="width:7%"><col style="width:12%"><col style="width:13%"><col style="width:13%"><col style="width:8%"><col style="width:15%"></colgroup>
@@ -32835,12 +32835,12 @@ ${(() => {
         // list. Replacing the whole label with a glyph was why nobody noticed
         // there was anything to expand.
         if (caret) {
-          const ico = caret.querySelector('.hl-promo-caret-ico');
-          if (ico) ico.style.transform = open ? '' : 'rotate(90deg)';
-          caret.style.background = open ? 'var(--paper)' : 'var(--ink)';
-          caret.style.color = open ? 'var(--ink-2)' : 'var(--paper)';
-          caret.style.borderColor = open ? 'var(--rule)' : 'var(--ink)';
+          caret.style.transform = open ? '' : 'rotate(90deg)';
+          caret.style.color = open ? 'var(--ink)' : 'var(--ink-3)';
         }
+        // The open row itself is tinted, so an expanded group stays findable
+        // when its detail runs past the top of the screen.
+        tr.style.background = open ? '' : 'var(--bone-2)';
       }));
       summaryEl.querySelectorAll('.hl-promo-edit').forEach(btn => btn.addEventListener('click', () => openPromoCard(btn.dataset.id)));
       summaryEl.querySelectorAll('.hl-promo-dup').forEach(btn => btn.addEventListener('click', () => {
