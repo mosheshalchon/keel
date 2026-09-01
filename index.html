@@ -32556,8 +32556,9 @@ ${(() => {
           <p class="page-meta">${_viewMeta}</p>
         </div>
         <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;${_promoView === 'plan' ? '' : 'display:none;'}">
-          <button id="hl-promo-add" style="background:var(--ink);color:var(--paper);border:none;border-radius:6px;padding:10px 20px;font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer;">+ Add promo</button>
-          <button id="hl-promo-upload" style="background:transparent;color:var(--ink-2);border:1px solid var(--rule-soft);border-radius:6px;padding:7px 16px;font-family:var(--sans);font-size:12px;cursor:pointer;">↥ Upload promos (Excel)</button>
+          <button id="hl-promo-add" style="background:var(--ink);color:var(--paper);border:none;border-radius:6px;padding:12px 22px;min-width:210px;font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer;">+ Add promo</button>
+          <button id="hl-promo-upload" style="background:var(--ink);color:var(--paper);border:none;border-radius:6px;padding:12px 22px;min-width:210px;font-family:var(--sans);font-size:13.5px;font-weight:600;cursor:pointer;">\u21a5 Upload promos (Excel)</button>
+          <a id="hl-promo-template" href="#" style="font-family:var(--mono);font-size:10px;color:var(--ink-3);text-decoration:underline;cursor:pointer;">download the template</a>
           <input type="file" id="hl-promo-upload-input" accept=".xlsx,.xls,.csv" style="display:none;" />
         </div>
       </div>
@@ -32578,6 +32579,49 @@ ${(() => {
     }));
     const _planYear = _promoYear < 2027;
     const addBtn = document.getElementById('hl-promo-add');
+    const tplLink = document.getElementById('hl-promo-template');
+    if (tplLink) tplLink.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      if (typeof XLSX === 'undefined') { alert('Still loading — try again in a moment.'); return; }
+      // GENERATED FROM THE APP, not shipped as a static file. The retailer list
+      // and the promo groups come from the same source the parser validates
+      // against, so a template can never offer a value the import will reject.
+      const sb2 = window.Auth.getClient();
+      const bId = (await window.BrandLibrary.getSession()).brandId;
+      const { data: rets } = await sb2.from('retailers').select('name').eq('brand_id', bId).order('name');
+      // COLUMNS AND ORDER MATCH THE SHEET ATG ALREADY CIRCULATES, plus the one
+      // it was missing: '# Items'. Every field here is a field on the Add promo
+      // form, so an uploaded promo and a hand-entered one compute identically.
+      // The valid-values lists sit in far columns beside the data, the way the
+      // existing sheet does it, rather than on separate tabs.
+      const hdr = ['Retailer','Promo Name / ID','Product / SKU','Type','EDLP?','EDLP $',
+                   'ATG Gross Price','Dist Markup %','Cur Retail / SRP','Base UPSPW (Velocity)',
+                   '# Items','Doors','Lift %','Wks per Event','Promo Cost ($/unit)',
+                   'Event Start Date','Distributor Fee % (Scan)','Ad Fees ($/yr)','Other Fees ($/yr)'];
+      const names = (rets || []).map(r => r.name);
+      const grps = allPromoGroups();
+      const ex = [names[0] || 'Big Y', 'Spring scan', grps[0], 'Scan', 'Yes', 1.2,
+                  8.29, 11, 13.49, 5.4, 5, 95, 35, 4, 1.4, '2027-02-01', 0, 550, 0];
+      // Reference lists live in columns X and Z, clear of the 19 data columns,
+      // so a wide paste can never overwrite them and the parser -- which binds
+      // 'Retailer', not 'Retailer name' -- cannot mistake one for data.
+      const PAD = (n) => Array(n).fill(null);
+      const aoa = [
+        [...hdr, ...PAD(4), 'Retailer name', null, 'Promo group'],
+        [...ex,  ...PAD(4), names[0] ?? null, null, grps[0] ?? null],
+      ];
+      const depth = Math.max(names.length, grps.length);
+      for (let i = 1; i < depth; i++)
+        aoa.push([...PAD(19), ...PAD(4), names[i] ?? null, null, grps[i] ?? null]);
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = [{wch:26},{wch:18},{wch:16},{wch:10},{wch:8},{wch:9},{wch:15},{wch:13},
+                     {wch:16},{wch:19},{wch:9},{wch:8},{wch:8},{wch:13},{wch:17},{wch:16},
+                     {wch:20},{wch:14},{wch:15},{wch:3},{wch:3},{wch:3},{wch:3},{wch:34},{wch:3},{wch:16}];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Promos');
+      XLSX.writeFile(wb, 'keel-promo-template.xlsx');
+    });
+
     const upBtn = document.getElementById('hl-promo-upload');
     if (_planYear) { addBtn.style.display = 'none'; upBtn.textContent = '↥ Upload Vividly export'; }
     addBtn.addEventListener('click', () => openPromoCard(null));
@@ -33466,8 +33510,180 @@ ${(() => {
     // initial load if editing (retailer+group preset)
     if (e.retailer_id && e.promoted_group) loadCarriedItems();
   }
+  // ── Promo upload from Excel ─────────────────────────────────────────────
+  // Header-driven, not positional: the sheet people actually circulate gains and
+  // loses columns, and a fixed index silently reads the wrong one. Every field
+  // is bound by name with aliases, and any header nothing matched is REPORTED --
+  // a column read as empty looks exactly like a column nobody filled in.
+  const _puNorm = (v) => String(v ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ')
+    .trim().toLowerCase().replace(/[^a-z0-9% ]/g, '');
+  const _puNum = (v) => {
+    if (v == null || v === '') return null;
+    const n = Number(String(v).replace(/[$,\s]/g, '').replace('%', ''));
+    return isFinite(n) ? n : null;
+  };
+  // 11 and 0.11 both mean 11%. The sheet is written by people, and both forms
+  // appear; anything above 1 is a whole percent.
+  const _puPct = (v) => { const n = _puNum(v); return n == null ? null : (n > 1 ? n / 100 : n); };
+  const _puDate = (v) => {
+    if (!v) return null;
+    if (v instanceof Date) return v.toISOString().slice(0, 10);
+    if (typeof v === 'number' && v > 20000 && v < 60000)
+      return new Date(Date.UTC(1899, 11, 30) + v * 864e5).toISOString().slice(0, 10);
+    const s = String(v).trim();
+    let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+    m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (m) { let y = m[3]; if (y.length === 2) y = '20' + y;
+             return `${y}-${String(m[1]).padStart(2,'0')}-${String(m[2]).padStart(2,'0')}`; }
+    return null;
+  };
+
   async function handlePromoExcelUpload(file) {
-    alert('Excel promo upload coming next — ' + file.name);
+    const sb = window.Auth.getClient();
+    const brandId = (await window.BrandLibrary.getSession()).brandId;
+    if (typeof XLSX === 'undefined') { alert('The spreadsheet library has not finished loading — try again in a moment.'); return; }
+    let rows;
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(new Uint8Array(buf), { type: 'array', cellDates: true });
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true, defval: null });
+    } catch (e) { alert('Could not read that file: ' + (e.message || e)); return; }
+    if (!rows || rows.length < 2) { alert('That sheet has no data rows.'); return; }
+
+    const idx = new Map(); const bound = new Set();
+    (rows[0] || []).forEach((h, i) => { const k = _puNorm(h); if (k && !idx.has(k)) idx.set(k, i); });
+    const get = (r, ...names) => {
+      for (const n of names) { const i = idx.get(_puNorm(n));
+        if (i != null) { bound.add(_puNorm(n)); if (r[i] !== undefined && r[i] !== null && r[i] !== '') return r[i]; } }
+      return null;
+    };
+
+    const { data: retailers } = await sb.from('retailers').select('id,name').eq('brand_id', brandId);
+    const retByName = new Map((retailers || []).map(r => [_puNorm(r.name), r.id]));
+    const groups = allPromoGroups(); const groupByNorm = new Map(groups.map(g => [_puNorm(g), g]));
+
+    // WHAT MAKES TWO PROMOS THE SAME ONE. A promo is a retailer, a group, a type
+    // and an event start -- that is what the Add promo form asks for, and two
+    // records agreeing on all four are the same event entered twice, not a
+    // variant. Rates and fees are deliberately NOT in the key: an uploaded sheet
+    // with a corrected rate is still the same promo, and importing it beside the
+    // original would double the spend on that event.
+    const { data: existingPromos } = await sb.from('promos')
+      .select('retailer_id,promoted_group,promo_type,start_date').eq('brand_id', brandId);
+    const promoKey = (o) => [o.retailer_id || '', _puNorm(o.promoted_group), _puNorm(o.promo_type),
+                             String(o.start_date || '').slice(0, 10)].join('|');
+    const existingKeys = new Set((existingPromos || []).map(promoKey));
+    const seenInFile = new Map();          // the same event twice in one sheet
+
+    const out = [], problems = [], dupes = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i]; if (!r || !r.length) continue;
+      const rowNo = i + 1;
+      const retName = get(r, 'Retailer', 'Customer', 'Account');
+      const grpName = get(r, 'Promo group', 'Product / SKU', 'Product Group', 'Group');
+      if (!retName && !grpName) continue;                    // blank row, not an error
+
+      const retailer_id = retName ? retByName.get(_puNorm(retName)) : null;
+      const promoted_group = grpName ? groupByNorm.get(_puNorm(grpName)) : null;
+      if (!retailer_id) { problems.push(`Row ${rowNo}: retailer "${retName ?? ''}" is not in the Retailer Library`); continue; }
+      if (!promoted_group) { problems.push(`Row ${rowNo}: promo group "${grpName ?? ''}" is not one of ${groups.join(', ')}`); continue; }
+
+      const start = _puDate(get(r, 'Event Start Date', 'Start date', 'Start'));
+      if (!start) { problems.push(`Row ${rowNo}: no readable event start date`); continue; }
+
+      // 'Promo Name / ID' is read for the preview and NOT written. promos has no
+      // such column -- the Add promo form does not save one either, and only the
+      // Vividly plan table carries promo_name. Inserting it would have failed
+      // every row with a schema-cache error, the same way ship_date did.
+      const promoLabel = get(r, 'Promo Name / ID', 'Promo name', 'Name') || null;
+      // EDLP? GATES THE AMOUNT, exactly as the form does: the toggle being No
+      // means zero however large the EDLP $ cell is. Reading the dollar figure
+      // alone would let an imported promo disagree with the same promo entered
+      // by hand.
+      const edlpOn = /^(y|yes|true|1)$/i.test(String(get(r, 'EDLP?', 'EDLP') ?? 'yes').trim());
+      const inputs = {
+        retailer_id, promoted_group,
+        promo_type: get(r, 'Type', 'Promo type') || null,
+        edlp: edlpOn ? (_puNum(get(r, 'EDLP $')) || 0) : 0,
+        atg_gross_price: _puNum(get(r, 'ATG Gross Price', 'ATG price')) || 0,
+        dist_markup: _puPct(get(r, 'Dist Markup %', 'Distributor markup %')) || 0,
+        srp: _puNum(get(r, 'Cur Retail / SRP', 'SRP', 'Retail')) || 0,
+        base_upspw: _puNum(get(r, 'Base UPSPW (Velocity)', 'Base UPSPW', 'UPSPW')) || 0,
+        doors: _puNum(get(r, 'Doors')) || 0,
+        lift: _puPct(get(r, 'Lift %', 'Lift')) || 0,
+        p1_wks_per_event: _puNum(get(r, 'Wks per Event', 'Weeks per event')) || 0,
+        scan_bb_unit: _puNum(get(r, 'Promo Cost ($/unit)', 'Scan', 'Rate')) || 0,
+        distributor_fee_pct: _puPct(get(r, 'Distributor Fee % (Scan)', 'Distributor fee %')) ?? 0.10,
+        ad_fees: _puNum(get(r, 'Ad Fees ($/yr)', 'Ad fees')) || 0,
+        other_fees: _puNum(get(r, 'Other Fees ($/yr)', 'Other fees')) || 0,
+        // WITHOUT THIS EVERY IMPORTED PROMO COMPUTES TO ZERO.
+        // avgWklyBaseUnits = doors x ITEMS x UPSPW, so a missing item count
+        // silently produces 0 units, $0 sales and $0 spend -- a promo that looks
+        // saved and is worth nothing. The form fills it from the items picked;
+        // an upload has to state it, so a blank is an error rather than a zero.
+        num_items: _puNum(get(r, '# Items', 'Num items', 'Items', '# items')),
+        edlp_lift_override: 0,
+        p1_events: 1, start_date: start,
+      };
+      if (!inputs.num_items) {
+        problems.push(`Row ${rowNo}: "# Items" is blank — every promo would compute to zero units`);
+        continue;
+      }
+      // ALREADY IN KEEL -> reported and skipped. The import only ever INSERTs,
+      // so nothing already saved is touched either way; skipping is about not
+      // creating a second copy of the same event.
+      const key = promoKey(inputs);
+      if (existingKeys.has(key)) {
+        dupes.push(`Row ${rowNo}: ${retName} \u00b7 ${promoted_group} \u00b7 ${inputs.promo_type || 'no type'} \u00b7 ${start} \u2014 already in Keel`);
+        continue;
+      }
+      if (seenInFile.has(key)) {
+        dupes.push(`Row ${rowNo}: same event as row ${seenInFile.get(key)} in this file`);
+        continue;
+      }
+      seenInFile.set(key, rowNo);
+
+      const c = computePromoLine(inputs);
+      out.push({ rowNo, retName, label: promoLabel, inputs, computed: c });
+    }
+
+    const unbound = [...idx.keys()].filter(k => !bound.has(k));
+    if (!out.length) {
+      // "everything was already here" is a success, not a failure, and must not
+      // read like the file was rejected.
+      alert(dupes.length && !problems.length
+        ? `Nothing to import \u2014 all ${dupes.length} row(s) are already in Keel.\n\n` + dupes.slice(0, 12).join('\n')
+        : 'Nothing could be imported.\n\n' + ([...dupes, ...problems].slice(0, 12).join('\n') || 'No rows found.'));
+      return;
+    }
+    const spend = out.reduce((n, o) => n + (Number(o.computed.annual_trade_spend) || 0), 0);
+    const msg = [
+      `${out.length} NEW promo line${out.length === 1 ? '' : 's'} from ${file.name}.`,
+      `Annual trade spend: $${Math.round(spend).toLocaleString()}`,
+      `\nNothing already in Keel is changed \u2014 this only adds rows.`,
+      dupes.length ? `\n${dupes.length} row(s) SKIPPED as duplicates:\n` + dupes.slice(0, 10).join('\n')
+                     + (dupes.length > 10 ? `\n\u2026and ${dupes.length - 10} more` : '') : '',
+      problems.length ? `\n${problems.length} row(s) SKIPPED with problems:\n` + problems.slice(0, 10).join('\n') : '',
+      unbound.length ? `\nColumns not recognised (ignored): ${unbound.slice(0, 8).join(', ')}` : '',
+      '\nImport now?',
+    ].filter(Boolean).join('\n');
+    if (!confirm(msg)) return;
+
+    let written = 0; const failed = [];
+    for (const o of out) {
+      const row = { brand_id: brandId, ...o.inputs, event_dates: [], item_ids: [],
+        retailer_margin: o.computed.retailer_margin, annual_units: o.computed.annual_units,
+        annual_gross_sales: o.computed.annual_gross_sales, annual_trade_spend: o.computed.annual_trade_spend,
+        trade_rate: o.computed.trade_rate, net_sales: o.computed.net_sales,
+        scan_dollars: o.computed.scan_dollars, distributor_fees: o.computed.distributor_fees,
+        annual_edlp_spend: o.computed.annual_edlp_spend, updated_at: new Date().toISOString() };
+      const { error } = await sb.from('promos').insert(row);
+      if (error) failed.push(`Row ${o.rowNo}: ${error.message}`); else written++;
+    }
+    alert(`Imported ${written} of ${out.length} new promo(s).`
+      + (dupes.length ? `\n${dupes.length} skipped as already present.` : '')
+      + (failed.length ? '\n\nFailed:\n' + failed.slice(0, 8).join('\n') : ''));
+    renderPromosPage();
   }
 
   // (Service Levels moved to its own page under Operations — 2026-07. The old
