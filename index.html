@@ -29123,10 +29123,16 @@ render();
   })();
   // "KeHE and UNFI" / "KeHE, UNFI and Kroger" / "KeHE, UNFI, Kroger and Harris
   // Teeter" -- reads as a sentence however many sources are loaded.
-  function _dedDistNames() {
-    const names = Object.keys(_dedDistCounts || {}).filter(d => _dedDistCounts[d]);
+  // TAKES THE COUNTS AS AN ARGUMENT. _dedDistCounts is a `let` inside
+  // renderDeductions; this function sits at module level and could not see it,
+  // so every render threw "_dedDistCounts is not defined" and the whole
+  // Deductions page stopped at "Loading deductions…". Passing it in is the fix
+  // that cannot regress — there is no outer name left to accidentally capture.
+  function _dedDistNames(counts) {
+    const c = counts || {};
+    const names = Object.keys(c).filter(d => c[d]);
     if (!names.length) return 'Deductions';
-    names.sort((a, b) => (_dedDistCounts[b] || 0) - (_dedDistCounts[a] || 0));
+    names.sort((a, b) => (c[b] || 0) - (c[a] || 0));
     if (names.length === 1) return names[0];
     return names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
   }
@@ -30617,7 +30623,7 @@ render();
            needs doing — and the counters sit underneath as supporting detail. -->
       <div style="padding:6px 2px 14px;">
         <div style="font-family:var(--serif);font-size:21px;line-height:1.45;color:var(--ink);max-width:820px;">
-          ${_dedDist === 'all' ? _dedDistNames() + ' took' : DSHORT + ' took'}
+          ${_dedDist === 'all' ? _dedDistNames(_dedDistCounts) + ' took' : DSHORT + ' took'}
           <strong>${money(-totalAmt)}</strong> in ${yr}${unattribHint ? `, of which <strong style="color:var(--lost);">${money(unattribHint)}</strong> is not yet matched to a customer` : ''}.
         </div>
         ${notTied.length ? `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:8px;">
