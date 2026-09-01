@@ -32577,6 +32577,9 @@ ${(() => {
       const y = Number(b.dataset.y);
       if (y !== _promoYear) { _promoYear = y; try { localStorage.setItem('keel_promo_year', String(y)); } catch (e) {} renderPromosPage(); }
     }));
+    // 2026 and earlier are the imported Vividly plan; 2027+ are promos built in
+    // Keel. The delegated upload listener restates this test because it cannot
+    // see this scope -- keep the two in step.
     const _planYear = _promoYear < 2027;
     const addBtn = document.getElementById('hl-promo-add');
     const upBtn = document.getElementById('hl-promo-upload');
@@ -33671,7 +33674,13 @@ ${(() => {
       // the control dead until a reload.
       ev.target.value = '';
       if (!f) return;
-      try { await (_planYear ? handleVividlyUpload(f) : handlePromoExcelUpload(f)); }
+      // DERIVED HERE, NOT CAPTURED. `_planYear` is a const inside
+      // renderPromosPage; this listener lives outside it, so referencing it threw
+      // "Can't find variable: _planYear" and the upload died before reading the
+      // file. _promoYear is module-level and is the thing _planYear was computed
+      // from, so the rule is restated rather than the variable borrowed.
+      const planYear = _promoYear < 2027;
+      try { await (planYear ? handleVividlyUpload(f) : handlePromoExcelUpload(f)); }
       catch (err) { console.error('[PROMO] upload failed:', err);
                     alert('Upload failed: ' + (err && err.message ? err.message : err)); }
     });
