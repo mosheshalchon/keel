@@ -29207,6 +29207,14 @@ render();
   let _dedOpen = new Set();       // which customers are expanded
   const DED_PAGE = 25;
   let _dedCustLimit = DED_PAGE;   // banners shown before "show more"
+  // A DOLLAR FLOOR, not a row count. UNFI and KeHE each serve dozens of
+  // retailers -- the Key Accounts list runs to ~40 across both -- so By customer
+  // is a long tail of banners worth a few hundred dollars sitting under the
+  // handful that matter. "Show 25 more" answers "how many rows", which is not a
+  // question anyone has; "everything above $5,000" is. Banners below the floor
+  // are FOLDED INTO A NAMED ROW carrying their dollars, never dropped: this
+  // screen's one invariant is that it foots to the register.
+  let _dedMinAmt = (() => { const v = Number(localStorage.getItem('keel_ded_minamt')); return isFinite(v) && v > 0 ? v : 0; })();
   let _dedGapLimit  = DED_PAGE;   // undocumented categories shown before "show more"
   let _dedCustMode = (() => {
     try { const v = localStorage.getItem('keel_ded_cust_mode');
@@ -32239,6 +32247,12 @@ ${(() => {
       }
 
       const list = [...banners.values()].sort((a, b) => b.amt - a.amt);
+      // `list` stays whole — every footer and share calculation reads it, so the
+      // floor must not touch it. `shown` is what the table renders.
+      const shown = _dedMinAmt ? list.filter(b => b.amt >= _dedMinAmt) : list;
+      const folded = _dedMinAmt ? list.filter(b => b.amt < _dedMinAmt) : [];
+      const foldedAmt = folded.reduce((n, b) => n + b.amt, 0);
+      const foldedRows = folded.reduce((n, b) => n + b.rows, 0);
       for (const b of list) {
         b.storeList = [...b.stores.values()].sort((x, y) => y.amt - x.amt);
         b.catList = [...b.cats.entries()].sort((x, y) => y[1] - x[1]);
@@ -32252,6 +32266,9 @@ ${(() => {
       const bar = `
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
           ${[['list', 'Customers'], ['months', 'By month']].map(([v, lbl]) => `<button class="hl-cust-mode" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;cursor:pointer;border:1px solid ${_dedCustMode === v ? 'var(--ink)' : 'var(--rule-soft)'};background:${_dedCustMode === v ? 'var(--ink)' : 'transparent'};color:${_dedCustMode === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
+          <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:12px;">min</span>
+          ${[[0, 'All'], [1000, '$1k'], [5000, '$5k'], [25000, '$25k']].map(([v, lbl]) =>
+            `<button class="hl-cust-min" data-v="${v}" style="font-family:var(--mono);font-size:10px;padding:5px 10px;border-radius:5px;cursor:pointer;border:1px solid ${_dedMinAmt === v ? 'var(--ink)' : 'var(--rule-soft)'};background:${_dedMinAmt === v ? 'var(--ink)' : 'transparent'};color:${_dedMinAmt === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
           <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:8px;">
             ${money(documented)} of ${money(grand)} traced to a store · ${grand ? Math.round(documented / grand * 100) : 0}%${withPlan ? ' · ' + money(withPlan) + ' linked to plan' : ''}
           </span>
@@ -32270,10 +32287,10 @@ ${(() => {
             <thead><tr>${th('Customer')}${MS.map(m => th(mLabel(m), true)).join('')}${th('Total', true)}</tr></thead>
             <tbody>
               ${list.slice(0, _dedCustLimit).map(b => `<tr>${td(esc(b.name))}${MS.map(m => td(b.months.get(m) ? money(b.months.get(m)) : '<span style="color:var(--rule);">\u00b7</span>', true)).join('')}${td(money(b.amt), true, 'font-weight:600;')}</tr>`).join('')}
-              ${list.length > _dedCustLimit ? `<tr><td colspan="${MS.length + 2}" style="padding:11px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
-                <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, list.length - _dedCustLimit)} more</button>
-                <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${list.length}</button>
-                <span style="margin-left:10px;">${list.length - _dedCustLimit} smaller customers hidden \u00b7 the row below still counts them</span>
+              ${shown.length > _dedCustLimit ? `<tr><td colspan="${MS.length + 2}" style="padding:11px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+                <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, shown.length - _dedCustLimit)} more</button>
+                <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${shown.length}</button>
+                <span style="margin-left:10px;">${shown.length - _dedCustLimit} smaller customers hidden \u00b7 the row below still counts them</span>
               </td></tr>` : ''}
               <!-- FOOT TO THE REGISTER. This tab used to end at "Traced to a store"
                    and push the remainder into a footnote, so it read $411,569
@@ -32291,7 +32308,7 @@ ${(() => {
           <table style="width:100%;border-collapse:collapse;">
             <thead><tr>${th('Customer')}${th('Stores', true)}${th('Lines', true)}${th('Plan customer')}${th('Deducted', true)}${th('Share', true)}</tr></thead>
             <tbody>
-              ${list.slice(0, _dedCustLimit).map(b => {
+              ${shown.slice(0, _dedCustLimit).map(b => {
                 const open = _dedOpen.has(b.name);
                 let out = `<tr class="hl-cust-row" data-b="${esc(b.name)}" style="cursor:pointer;">
                   ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span>${esc(b.name)}`)}
@@ -32346,10 +32363,18 @@ ${(() => {
                 }
                 return out;
               }).join('')}
-              ${list.length > _dedCustLimit ? `<tr><td colspan="6" style="padding:11px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
-                <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, list.length - _dedCustLimit)} more</button>
-                <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${list.length}</button>
-                <span style="margin-left:10px;">${list.length - _dedCustLimit} smaller customers hidden \u00b7 ${money(list.slice(_dedCustLimit).reduce((n, b) => n + b.amt, 0))} \u2014 the total below still counts them</span>
+              ${folded.length ? `<tr>
+                ${td('<span style="color:var(--ink-3);">' + folded.length + ' customers below ' + money(_dedMinAmt) + '</span>', false, 'border-top:1px solid var(--rule-soft);')}
+                ${td('<span style="color:var(--ink-3);">' + folded.reduce((n, b) => n + b.stores.size, 0) + '</span>', true, 'border-top:1px solid var(--rule-soft);')}
+                ${td('<span style="color:var(--ink-3);">' + foldedRows.toLocaleString() + '</span>', true, 'border-top:1px solid var(--rule-soft);')}
+                ${td('', false, 'border-top:1px solid var(--rule-soft);')}
+                ${td('<span style="color:var(--ink-3);">' + money(foldedAmt) + '</span>', true, 'border-top:1px solid var(--rule-soft);')}
+                ${td('<span style="color:var(--ink-3);">' + (grand ? Math.round(foldedAmt / grand * 100) : 0) + '%</span>', true, 'border-top:1px solid var(--rule-soft);')}
+              </tr>` : ''}
+              ${shown.length > _dedCustLimit ? `<tr><td colspan="6" style="padding:11px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+                <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, shown.length - _dedCustLimit)} more</button>
+                <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${shown.length}</button>
+                <span style="margin-left:10px;">${shown.length - _dedCustLimit} smaller customers hidden \u00b7 ${money(shown.slice(_dedCustLimit).reduce((n, b) => n + b.amt, 0))} \u2014 the total below still counts them</span>
               </td></tr>` : ''}
               ${unattributed ? `<tr>${td('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${td('', true)}${td('', true)}${td('')}${td(money(unattributed), true)}${td((unattributed / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>` : ''}
               ${gapList.length ? `<tr><td colspan="6" style="padding:16px 10px 6px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Not attributable to a store \u00b7 ${money(undoc)}</td></tr>` : ''}
@@ -32365,6 +32390,15 @@ ${(() => {
           </table>`;
       }
 
+      body.querySelectorAll('.hl-cust-min').forEach(btn => btn.onclick = () => {
+        _dedMinAmt = Number(btn.dataset.v) || 0;
+        // Reset the row cap too: a floor and a row count fighting each other
+        // ("everything above $5k, but only the first 25") is not a state anyone
+        // asked for and reads as the filter having silently failed.
+        _dedCustLimit = DED_PAGE;
+        try { localStorage.setItem('keel_ded_minamt', String(_dedMinAmt)); } catch (_e) {}
+        renderDeductions(hostEl, filtersEl, year);
+      });
       body.querySelectorAll('.hl-cust-mode').forEach(b => b.onclick = () => {
         _dedCustMode = b.dataset.v;
         try { localStorage.setItem('keel_ded_cust_mode', _dedCustMode); } catch (e) {}
