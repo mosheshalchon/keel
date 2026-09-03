@@ -41201,10 +41201,18 @@ ${(() => {
     const sb = window.Auth.getClient();
     const brandId = session.brandId;
     const canEdit = window.Auth.canEdit();
-    // 'main-content' is what mountPage creates. Every other page in this file
-    // uses it; this one asked for 'hl-main', got null, and threw on the next
-    // line — so the page rendered nothing at all and showed no error.
+    // 'main-content' is what mountPage creates. This page asked for 'hl-main',
+    // got null, and threw on the next line — rendering nothing and showing no
+    // error.
+    //
+    // GUARDED, because mountPage does not always build the layout: when a tab is
+    // not permitted for the user's department it redirects and returns a TRUTHY
+    // session, so the `if (!session) return` above passes and #main-content
+    // still does not exist. Bailing quietly here is right — a redirect is
+    // already in flight — and it turns a console throw into nothing at all,
+    // which is what a redirect should look like.
     const main = document.getElementById('main-content');
+    if (!main) { console.warn('[sales-tools] layout not mounted — tab may not be permitted'); return; }
     main.innerHTML = `
       <div class="hl-eyebrow">— Sales tools · distributor mapping</div>
       <h1 class="hl-h1">Distributor mapping.</h1>
