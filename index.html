@@ -41213,6 +41213,13 @@ ${(() => {
     // which is what a redirect should look like.
     const main = document.getElementById('main-content');
     if (!main) { console.warn('[sales-tools] layout not mounted — tab may not be permitted'); return; }
+    // DEFINED LOCALLY. There are four `esc` helpers in this file, each private to
+    // its own scope and none of them visible here, so calling it threw
+    // "esc is not defined" the moment the table tried to draw — after a
+    // successful fetch, which is why the page sat on "Loading…" rather than
+    // showing an error.
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g,
+      (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     main.innerHTML = `
       <div class="hl-eyebrow">— Sales tools · distributor mapping</div>
       <h1 class="hl-h1">Distributor mapping.</h1>
