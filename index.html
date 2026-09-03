@@ -41183,21 +41183,125 @@ ${(() => {
   }
 
 
-  function renderSalesToolsPage() {
-    renderPlaceholder({
-      activeId: 'sales-tools',
-      eyebrow: '— Working library',
-      title: 'Sales Tools.',
-      subtitle: '<em>Margin calculators, broker contacts, regional maps</em> — the toolkit.',
-      scope: [
-        { title: 'Margin calculator', desc: 'Build to retail-price scenarios with instant net margin.' },
-        { title: 'Broker contact directory', desc: 'Per-region sales reps with last-touch logs.' },
-        { title: 'Retailer rules matrix', desc: 'Slotting fees, MCB requirements, payment terms by retailer.' },
-      ],
-      dataSummary: [
-        { key: 'Open todos', val: BrandLibrary.getTodos().length },
-      ],
-    });
+  // ─── Sales Tools → Distributor mapping ───────────────────────────────────
+  // Which distributor services each retailer. This is the join between the two
+  // halves of the trade picture: Vividly plans by RETAILER, deductions arrive by
+  // PAYER. Without it, Vividly's "UNFI" line ($222,130, UNFI as a direct
+  // customer) gets compared against UNFI's remittances ($1.6M across every
+  // retailer UNFI serves) and the two look wildly apart when they are simply
+  // not the same measure.
+  //
+  // SERVICED BY IS NOT BOUGHT FROM: Kroger and Harris Teeter appear on UNFI's
+  // warehouse-activation deck, but ATG sells to them direct and they deduct
+  // under their own name. Those are marked as overrides rather than silently
+  // corrected, so the disagreement with the deck stays visible.
+  async function renderSalesToolsPage() {
+    const session = HL.mountPage('sales-tools');
+    if (!session) return;
+    const sb = window.Auth.getClient();
+    const brandId = session.brandId;
+    const canEdit = window.Auth.canEdit();
+    const main = document.getElementById('hl-main');
+    main.innerHTML = `
+      <div class="hl-eyebrow">— Sales tools · distributor mapping</div>
+      <h1 class="hl-h1">Distributor mapping.</h1>
+      <p class="hl-sub">Which distributor services each retailer \u2014 and which we sell direct.</p>
+      <div id="hl-dm-body" class="hl-loading">Loading\u2026</div>`;
+    const body = document.getElementById('hl-dm-body');
+
+    let rows = [];
+    try {
+      const { data, error } = await sb.from('distributor_map')
+        .select('*').eq('brand_id', brandId).order('retailer');
+      if (error) throw new Error(error.message);
+      rows = data || [];
+    } catch (e) {
+      body.innerHTML = `<div style="font-family:var(--serif);font-size:13px;color:var(--ink-2);line-height:1.6;">
+        <p><strong>The distributor map isn't installed yet.</strong></p>
+        <p style="color:var(--ink-3);">Run <code style="font-family:var(--mono);font-size:11px;">distributor-map.sql</code>
+        in the SQL editor to create the table and seed it, then reload.</p>
+        <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(String(e.message || e))}</p></div>`;
+      return;
+    }
+
+    let filter = '', q = '';
+    const DISTS = ['UNFI', 'KeHE', 'Direct'];
+    const count = (d) => rows.filter(r => r.distributor === d).length;
+
+    const draw = () => {
+      const shown = rows.filter(r =>
+        (!filter || r.distributor === filter) &&
+        (!q || String(r.retailer).toLowerCase().includes(q.toLowerCase())));
+      const pill = (label, val, n) => `<button class="hl-dm-f" data-v="${val}"
+        style="font-family:var(--mono);font-size:10.5px;padding:6px 13px;border-radius:5px;cursor:pointer;
+        border:1px solid ${filter === val ? 'var(--ink)' : 'var(--rule-soft)'};
+        background:${filter === val ? 'var(--ink)' : 'transparent'};
+        color:${filter === val ? 'var(--paper)' : 'var(--ink-3)'};">${label} ${n}</button>`;
+
+      body.innerHTML = `
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;">
+          ${pill('All', '', rows.length)}
+          ${DISTS.map(d => pill(d, d, count(d))).join('')}
+          <input id="hl-dm-q" placeholder="Search retailer\u2026" value="${esc(q)}"
+            style="margin-left:8px;padding:6px 10px;border:1px solid var(--rule-soft);border-radius:5px;
+            font-family:var(--sans);font-size:12px;min-width:200px;" />
+        </div>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            <th style="text-align:left;padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.07em;
+                text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Retailer</th>
+            <th style="text-align:left;padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.07em;
+                text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Serviced by</th>
+            <th style="text-align:left;padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.07em;
+                text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Note</th>
+          </tr></thead>
+          <tbody>
+            ${shown.map(r => `<tr>
+              <td style="padding:7px 10px;font-family:var(--sans);font-size:13px;border-bottom:1px solid var(--bone-2);">
+                ${esc(r.retailer)}
+                ${r.is_override ? '<span title="Differs from the warehouse-activation deck" style="margin-left:7px;font-family:var(--mono);font-size:9px;color:var(--gold,#b8860b);">OVERRIDE</span>' : ''}
+              </td>
+              <td style="padding:5px 10px;border-bottom:1px solid var(--bone-2);">
+                ${canEdit ? `<select class="hl-dm-sel" data-r="${esc(r.retailer)}"
+                    style="font-family:var(--mono);font-size:11px;padding:4px 8px;border:1px solid var(--rule-soft);border-radius:4px;">
+                    ${DISTS.map(d => `<option value="${d}" ${r.distributor === d ? 'selected' : ''}>${d}</option>`).join('')}
+                  </select>`
+                  : `<span style="font-family:var(--mono);font-size:11px;">${esc(r.distributor)}</span>`}
+              </td>
+              <td style="padding:7px 10px;font-family:var(--serif);font-size:12px;color:var(--ink-3);border-bottom:1px solid var(--bone-2);">${esc(r.note || '')}</td>
+            </tr>`).join('')}
+            ${!shown.length ? '<tr><td colspan="3" style="padding:22px 10px;font-family:var(--serif);color:var(--ink-3);">No retailer matches.</td></tr>' : ''}
+          </tbody>
+        </table>
+        <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);line-height:1.55;margin-top:16px;">
+          Seeded from the Key Accounts warehouse-activation deck, plus every customer Sales Pacing knows about as
+          <em>Direct</em>. <strong>Serviced by is not the same as bought from</strong> \u2014 Kroger and Harris Teeter sit on
+          UNFI's slide but ATG sells to them direct, so their deductions arrive under their own name. Changing a row
+          marks it as an override, which is what makes a disagreement with the deck visible instead of silent.
+        </p>`;
+
+      body.querySelectorAll('.hl-dm-f').forEach(b => b.onclick = () => { filter = b.dataset.v; draw(); });
+      const qi = document.getElementById('hl-dm-q');
+      if (qi) { qi.oninput = () => { q = qi.value; draw(); qi === document.activeElement || document.getElementById('hl-dm-q').focus(); }; }
+      body.querySelectorAll('.hl-dm-sel').forEach(sel => sel.onchange = async () => {
+        const retailer = sel.dataset.r, val = sel.value;
+        const row = rows.find(r => r.retailer === retailer);
+        const wasSeeded = row && !row.is_override;
+        const { error } = await sb.from('distributor_map').update({
+          distributor: val,
+          // A hand change is ALWAYS an override, even back to the seeded value:
+          // the fact that someone looked and decided is itself worth recording.
+          is_override: true,
+          note: row && row.note ? row.note : 'changed in Keel',
+          updated_at: new Date().toISOString(),
+          updated_by: session.email || null,
+        }).eq('brand_id', brandId).eq('retailer', retailer);
+        if (error) { alert('Could not save: ' + error.message); return; }
+        if (row) { row.distributor = val; row.is_override = true; }
+        draw();
+      });
+    };
+    draw();
   }
 
   // ─── Settings page ───
