@@ -41201,7 +41201,10 @@ ${(() => {
     const sb = window.Auth.getClient();
     const brandId = session.brandId;
     const canEdit = window.Auth.canEdit();
-    const main = document.getElementById('hl-main');
+    // 'main-content' is what mountPage creates. Every other page in this file
+    // uses it; this one asked for 'hl-main', got null, and threw on the next
+    // line — so the page rendered nothing at all and showed no error.
+    const main = document.getElementById('main-content');
     main.innerHTML = `
       <div class="hl-eyebrow">— Sales tools · distributor mapping</div>
       <h1 class="hl-h1">Distributor mapping.</h1>
