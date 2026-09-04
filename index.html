@@ -30585,6 +30585,15 @@ render();
       ['exceptions', 'Exceptions'],
       ['upload',     'Upload backup'],
       ['catalogue',  'Catalogue'],
+      // A deduction needs TWO documents and they fail independently: a
+      // remittance advice proving the money was taken, and backup detail
+      // proving what for. Every other tab assumes the advice exists. This one
+      // is for the case that assumption breaks -- $284,443 of UNFI spend has
+      // full backup and NO advice, filed under folders named NULL/ and
+      // No_Check_Number/ because there was no payment document to file it
+      // under, and every UNFI check already foots to its own lines so there is
+      // no check for it to belong to.
+      ['support',    'Missing check support'],
     ];
 
     // DECLARED HERE, ABOVE FIRST USE. These were further down the function while
@@ -32476,6 +32485,73 @@ ${(() => {
     }
 
     // ── checks ──────────────────────────────────────────────────────────────
+    // ── missing check support ───────────────────────────────────────────────
+    // The INVERSE of the Exceptions tab's "no parsed backup" section. There the
+    // money is proven gone and nothing says what for; here the detail is fully
+    // known and nothing proves it was ever taken.
+    //
+    // THE DATABASE CANNOT TELL YOU WHICH IT IS. Either the advice PDF is simply
+    // missing from Dropbox (benign -- the money left, the paperwork did not
+    // follow), or UNFI produced the backup and never deducted, in which case
+    // this is spend counted against the promo plan that is still outstanding.
+    // Settling it means the bank, not this screen: each file names its period,
+    // so check whether the receipts for that period are short by that amount.
+    if (_dedView === 'support') {
+      const orphans = L.filter(l => l.is_deduction && !l.check_id)
+                       .sort((a, b) => Number(a.amount) - Number(b.amount));
+      const tot = orphans.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+      // The period is in the source filename (WE020726, ASMCB_01021426,
+      // WFMJAN26). It is the only handle accounting has for a bank match.
+      const per = (l) => {
+        const s = String(l.invoice_no || '');
+        const m = s.match(/(\d{6,8})/);
+        return m ? m[1] : '\u2014';
+      };
+      const byCode = new Map();
+      for (const l of orphans) {
+        const k = l.reason_code || '(none)';
+        const o = byCode.get(k) || { code: k, lines: 0, amt: 0 };
+        o.lines++; o.amt += Math.abs(Number(l.amount) || 0);
+        byCode.set(k, o);
+      }
+      body.innerHTML = `
+        <div style="margin-bottom:18px;">
+          <div style="font-family:var(--serif);font-size:19px;margin-bottom:4px;">
+            ${money(tot)} of deductions have no remittance advice.
+          </div>
+          <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0;line-height:1.55;max-width:860px;">
+            These carry full backup detail — stores, rates, amounts — but no payment document showing the
+            money was taken. They are counted in every total on this page because the spend is real and
+            classified. What is missing is the proof. Give this list to accounting: each row names the
+            period to check ATG's receipts against.
+          </p>
+        </div>
+        ${byCode.size ? `<table style="width:100%;border-collapse:collapse;margin-bottom:22px;">
+          <thead><tr>${th('Code')}${th('Lines', true)}${th('Amount', true)}</tr></thead>
+          <tbody>${[...byCode.values()].sort((a, b) => b.amt - a.amt).map(o => `<tr>
+            ${td('<strong>' + esc(o.code) + '</strong>')}${td(o.lines, true)}
+            ${td('<span style="color:var(--lost);">' + money(-o.amt) + '</span>', true)}
+          </tr>`).join('')}</tbody></table>` : ''}
+        ${orphans.length ? `<table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            ${th('Reference')}${th('Code')}${th('Retailer')}${th('Date')}${th('Period')}${th('Amount', true)}
+          </tr></thead>
+          <tbody>${orphans.map(l => `<tr>
+            ${td('<span style="font-size:10.5px;">' + esc(l.invoice_no || '—') + '</span>')}
+            ${td(esc(l.reason_code || '—'))}
+            ${td('<span style="font-size:10.5px;">' + esc(l.dc_name || '—') + '</span>')}
+            ${td(esc(String(l.doc_date || '—')))}
+            ${td('<span style="font-family:var(--mono);font-size:10.5px;">' + esc(per(l)) + '</span>')}
+            ${td(money(-Math.abs(Number(l.amount) || 0)), true)}
+          </tr>`).join('')}</tbody></table>`
+        : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">Every deduction sits on a remittance advice.</div>'}
+        <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:14px;line-height:1.55;max-width:860px;">
+          Nothing here can be fixed by loading more files. Every check already foots to its own lines, so
+          there is no payment for these to attach to — the advice was never filed, or never issued.
+        </p>`;
+      return;
+    }
+
     if (_dedView === 'checks') {
       body.innerHTML = `
         <table style="width:100%;border-collapse:collapse;">
