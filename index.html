@@ -32497,16 +32497,47 @@ ${(() => {
     // Settling it means the bank, not this screen: each file names its period,
     // so check whether the receipts for that period are short by that amount.
     if (_dedView === 'support') {
-      const orphans = L.filter(l => l.is_deduction && !l.check_id)
-                       .sort((a, b) => Number(a.amount) - Number(b.amount));
+      const dedL = L.filter(l => l.is_deduction);
+      const orphans = dedL.filter(l => !l.check_id)
+                          .sort((a, b) => Number(a.amount) - Number(b.amount));
       const tot = orphans.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
-      // The period is in the source filename (WE020726, ASMCB_01021426,
-      // WFMJAN26). It is the only handle accounting has for a bank match.
-      const per = (l) => {
-        const s = String(l.invoice_no || '');
-        const m = s.match(/(\d{6,8})/);
-        return m ? m[1] : '\u2014';
+
+      // ── SUPPORT MIX, for the distributor currently in scope ────────────────
+      // Switch the distributor pills above to compare. This is the number that
+      // matters and it was previously only visible in SQL: UNFI sits near 2.5%
+      // fully supported against KeHE's 82%, because almost all of UNFI's book
+      // is remittance lines with no backup document behind them.
+      const mix = [
+        ['Fully supported',    dedL.filter(l => l.check_id && l.detail_parsed)],
+        ['No backup detail',   dedL.filter(l => l.check_id && !l.detail_parsed)],
+        ['No remittance advice', orphans],
+      ];
+      const mixTot = dedL.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+
+      // ── CANDIDATE CHECK ───────────────────────────────────────────────────
+      // Replaces a "period" column that was reading raw digit runs out of the
+      // reference and landing in a different place per layout -- 02072601 from
+      // WE020726…, 2615930 from WFMJAN26…, which is meaningless. doc_date is
+      // already correct on every one of these, so the useful thing to show is
+      // WHICH advice it should have been on: the distributor's checks settling
+      // in the 45 days after the deduction date. This is a SUGGESTION for
+      // accounting to go looking with, never an anchor -- every check already
+      // foots to its own lines, so none of these can simply be attached.
+      const cand = (l) => {
+        const d = l.doc_date ? new Date(l.doc_date + 'T12:00:00') : null;
+        if (!d || isNaN(d)) return '\u2014';
+        const hits = (checks || []).filter(c => {
+          if (!c.check_date) return false;
+          const cd = new Date(String(c.check_date) + 'T12:00:00');
+          if (isNaN(cd)) return false;
+          const days = (cd - d) / 86400000;
+          return days >= 0 && days <= 45;
+        }).sort((a, b) => String(a.check_date).localeCompare(String(b.check_date)));
+        if (!hits.length) return '\u2014';
+        return hits.slice(0, 2).map(c => esc(c.check_no)).join(', ')
+             + (hits.length > 2 ? ` +${hits.length - 2}` : '');
       };
+
       const byCode = new Map();
       for (const l of orphans) {
         const k = l.reason_code || '(none)';
@@ -32515,15 +32546,36 @@ ${(() => {
         byCode.set(k, o);
       }
       body.innerHTML = `
-        <div style="margin-bottom:18px;">
+        <div style="margin-bottom:20px;">
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-2);text-transform:uppercase;margin-bottom:6px;">Support mix — ${esc(DSHORT)}</div>
+          <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0 0 9px;line-height:1.5;max-width:860px;">
+            A deduction needs two documents and they fail independently: a remittance advice proving the
+            money was taken, and backup detail proving what for. Switch the distributor above to compare.
+          </p>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Status')}${th('Lines', true)}${th('Amount', true)}${th('% of book', true)}</tr></thead>
+            <tbody>${mix.map(([name, rows]) => {
+              const a = rows.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+              const good = name === 'Fully supported';
+              return `<tr>
+                ${td(`<span style="${good ? 'color:var(--won);' : ''}">${esc(name)}</span>`)}
+                ${td(rows.length.toLocaleString(), true)}
+                ${td(money(-a), true)}
+                ${td(mixTot ? (a / mixTot * 100).toFixed(1) + '%' : '\u2014', true, 'color:var(--ink-3);')}
+              </tr>`;
+            }).join('')}</tbody>
+          </table>
+        </div>
+
+        <div style="margin-bottom:16px;">
           <div style="font-family:var(--serif);font-size:19px;margin-bottom:4px;">
-            ${money(tot)} of deductions have no remittance advice.
+            ${money(tot)} has no remittance advice.
           </div>
           <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0;line-height:1.55;max-width:860px;">
             These carry full backup detail — stores, rates, amounts — but no payment document showing the
             money was taken. They are counted in every total on this page because the spend is real and
-            classified. What is missing is the proof. Give this list to accounting: each row names the
-            period to check ATG's receipts against.
+            classified. What is missing is the proof. <strong>Possible check</strong> lists advices that
+            settled within 45 days of the deduction date; it is a place to start looking, not a match.
           </p>
         </div>
         ${byCode.size ? `<table style="width:100%;border-collapse:collapse;margin-bottom:22px;">
@@ -32534,20 +32586,21 @@ ${(() => {
           </tr>`).join('')}</tbody></table>` : ''}
         ${orphans.length ? `<table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Reference')}${th('Code')}${th('Retailer')}${th('Date')}${th('Period')}${th('Amount', true)}
+            ${th('Reference / source file')}${th('Code')}${th('Retailer')}${th('Date')}${th('Possible check')}${th('Amount', true)}
           </tr></thead>
           <tbody>${orphans.map(l => `<tr>
-            ${td('<span style="font-size:10.5px;">' + esc(l.invoice_no || '—') + '</span>')}
+            ${td('<span style="font-family:var(--mono);font-size:10.5px;">' + esc(l.invoice_no || '—') + '</span>')}
             ${td(esc(l.reason_code || '—'))}
             ${td('<span style="font-size:10.5px;">' + esc(l.dc_name || '—') + '</span>')}
             ${td(esc(String(l.doc_date || '—')))}
-            ${td('<span style="font-family:var(--mono);font-size:10.5px;">' + esc(per(l)) + '</span>')}
+            ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + cand(l) + '</span>')}
             ${td(money(-Math.abs(Number(l.amount) || 0)), true)}
           </tr>`).join('')}</tbody></table>`
         : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">Every deduction sits on a remittance advice.</div>'}
         <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:14px;line-height:1.55;max-width:860px;">
-          Nothing here can be fixed by loading more files. Every check already foots to its own lines, so
-          there is no payment for these to attach to — the advice was never filed, or never issued.
+          The reference doubles as the source filename — search Dropbox for it to find the backup. Nothing
+          here can be fixed by loading more files: every check already foots to its own lines, so there is
+          no payment for these to attach to. The advice was never filed, or never issued.
         </p>`;
       return;
     }
