@@ -32383,6 +32383,10 @@ ${(() => {
       const months = new Set();
       const detByLine = new Map();
       let documented = 0, unattributed = 0;
+      // Money the line-level fallback attributed to a customer without store
+      // rows. Tracked separately so `grand` still foots to the register: it is
+      // in neither `documented` (no document) nor `undoc` (it found a home).
+      let fallbackAttr = 0;
 
       // ── THIS VIEW IS THE SELECTED YEAR ONLY ─────────────────────────────
       // Promo date governs, so a detail row dated before January belongs to the
@@ -32442,14 +32446,22 @@ ${(() => {
       for (const l of L) {
         const g = Math.abs(Number(l.amount || 0)) - (detByLine.get(l.id) || 0);
         if (g <= 0.005) continue;
-        const k = catOf(l);
-        const e = gaps.get(k) || { cat: k, amt: 0, lines: 0 };
-        e.amt += g; e.lines++; gaps.set(k, e);
-        undoc += g;
         const rmL = rmapBy[l.reason_code];
         const nmLRaw = l.dc_name || (rmL && rmL.retailer) || null;
         const nmL = _notACustomer(nmLRaw) ? null : (_custName(nmLRaw) || null);
-        if (!nmL) continue;
+        // COUNT IT ONCE. This used to add g to `undoc` AND to the customer, so
+        // attributed-but-undocumented money rendered in the customer rows and
+        // again in the "not attributable" section -- UNFI read $2,116,311 in
+        // By customer against $2,044,369 everywhere else. The gap category and
+        // the undoc bucket now only take what no customer claimed.
+        if (!nmL) {
+          const k = catOf(l);
+          const e = gaps.get(k) || { cat: k, amt: 0, lines: 0 };
+          e.amt += g; e.lines++; gaps.set(k, e);
+          undoc += g;
+          continue;
+        }
+        fallbackAttr += g;
         let b2 = banners.get(nmL);
         if (!b2) banners.set(nmL, b2 = { name: nmL, amt: 0, rows: 0, plan: null,
                                          stores: new Map(), cats: new Map(), months: new Map() });
@@ -32482,7 +32494,7 @@ ${(() => {
       }
       const gapList = [...gaps.values()].sort((a, b) => b.amt - a.amt);
       const MS = [...months].sort();
-      const grand = documented + unattributed + undoc;
+      const grand = documented + unattributed + undoc + fallbackAttr;
       const maxAmt = Math.max(1, ...list.map(b => b.amt));
       const withPlan = list.filter(b => b.plan).reduce((n, b) => n + b.amt, 0);
 
@@ -32520,10 +32532,11 @@ ${(() => {
                    against a $637,257 register and looked like money had gone
                    missing. The undocumented remainder is a ROW now: same total as
                    every other tab, with the gap named rather than excused. -->
-              ${chargeAmt ? `<tr>${td('Other deductions \u2014 not customer-specific', false, 'color:var(--ink-3);border-top:1px solid var(--rule-soft);')}${MS.map(m => td(money(chargeRows.reduce((n, b) => n + (b.months.get(m) || 0), 0)) || '\u00b7', true, 'color:var(--ink-3);')).join('')}${td(money(chargeAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${chargeRows.length ? `<tr><td colspan="${MS.length + 2}" style="padding:16px 10px 6px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Other deductions \u00b7 not customer-specific \u00b7 ${money(chargeAmt)}</td></tr>` : ''}
+              ${chargeRows.map(b => `<tr>${td('<span style="color:var(--ink-2);">' + esc(b.name) + '</span>')}${MS.map(m => td(b.months.get(m) ? money(b.months.get(m)) : '<span style="color:var(--rule);">\u00b7</span>', true)).join('')}${td(money(b.amt), true)}</tr>`).join('')}
               <tr>${td('Other \u2014 no store-level detail', false, 'color:var(--ink-3);border-top:1px solid var(--rule-soft);')}${MS.map(() => td('\u00b7', true, 'color:var(--rule);')).join('')}${td(money(undoc + unattributed), true, 'color:var(--ink-3);')}</tr>
               ${priorExcluded ? `<tr>${td('<span style="color:var(--ink-3);">Before ' + esc(_dedMon(_yStart)) + ' \u2014 excluded</span>')}${MS.map(() => td('\u00b7', true, 'color:var(--rule);')).join('')}${td('<span style="color:var(--ink-3);">' + money(priorExcluded) + '</span>', true)}</tr>` : ''}
-              <tr>${td('<strong>Total</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(() => td('', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
+              <tr>${td('<strong>Total</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(m => td('<strong>' + money(list.reduce((n, b) => n + (b.months.get(m) || 0), 0) + chargeRows.reduce((n, b) => n + (b.months.get(m) || 0), 0)) + '</strong>', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table></div>
           `;
