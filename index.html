@@ -30480,7 +30480,17 @@ render();
       // Counting lines therefore made UNFI look like a rounding error next to
       // KeHE when it is in fact the larger book. Dollars are the same unit for
       // both, and the only honest comparator on that control.
+      //
+      // YEAR-SCOPED, exactly like `L` below. This loop used to run over every
+      // line in the register while the headline sentence beside it counted only
+      // the selected year, so the two disagreed on the same screen: UNFI read
+      // $2,381k on the pill against $1,709,237 for 2026, the difference being
+      // 2024 and 2025 lines the headline correctly excluded. The null-date test
+      // matches `inYear` deliberately -- an undated line is shown, not dropped.
+      const _pillYr = String(year);
+      const _pillIn = (d) => !d || String(d).slice(0, 4) === _pillYr;
       for (const l of lines) {
+        if (!_pillIn(l.doc_date)) continue;
         const d = _lineDist(l);
         _dedDistCounts[d] = (_dedDistCounts[d] || 0) + Math.abs(Number(l.amount) || 0);
       }
@@ -32547,7 +32557,7 @@ ${(() => {
       }
       body.innerHTML = `
         <div style="margin-bottom:20px;">
-          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-2);text-transform:uppercase;margin-bottom:6px;">Support mix — ${esc(DSHORT)}</div>
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-2);text-transform:uppercase;margin-bottom:6px;">Support mix — ${esc(_dedDist === 'all' ? 'all distributors' : _dedDist)}</div>
           <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0 0 9px;line-height:1.5;max-width:860px;">
             A deduction needs two documents and they fail independently: a remittance advice proving the
             money was taken, and backup detail proving what for. Switch the distributor above to compare.
