@@ -31443,10 +31443,27 @@ render();
       }
       // Whatever the register holds that no store row accounts for. Shown as a
       // row rather than a footnote, so the panel totals the register exactly.
+      // LINE-LEVEL RETAILER FALLBACK. Store detail is the better source and wins
+      // wherever it exists, but most UNFI lines have none -- and since Sep 3
+      // 2026 the retailer is known anyway, decoded from the reference itself
+      // (…3PTYNATGROC, WHFDSCAN…, FSRWGM…) and written to dc_name, or carried on
+      // the reason code's `retailer`. Without this the panel showed Whole Foods
+      // at $85,287 -- the ISE store rows alone -- while $378,751 of decoded
+      // Whole Foods spend sat invisible and the money surfaced as "undocumented".
+      //
+      // Only the UNDOCUMENTED REMAINDER of each line is attributed here, so a
+      // line carrying partial store detail is never counted twice, and the
+      // panel still foots to the register exactly.
       let undoc2 = 0;
       for (const l of L) {
         const g = Math.abs(Number(l.amount || 0)) - (perLine2.get(l.id) || 0);
-        if (g > 0.005) undoc2 += g;
+        if (g <= 0.005) continue;
+        const rm2 = rmapBy[l.reason_code];
+        const nm = l.dc_name || (rm2 && rm2.retailer) || null;
+        if (!nm) { undoc2 += g; continue; }
+        let e = cust2.get(nm);
+        if (!e) cust2.set(nm, e = { name: nm, amt: 0, plan: null, stores: new Set() });
+        e.amt += g;
       }
       // SIGN. Store detail is attributed on absolute bill_amount, matching the By
       // customer tab, so this panel totals GROSS movement. The register total
@@ -32260,6 +32277,16 @@ ${(() => {
       }
 
       // everything the register holds that no store detail explains
+      //
+      // LINE-LEVEL RETAILER FALLBACK, matching the Overview panel. Where a line
+      // has no store rows but its retailer IS known -- decoded from the
+      // reference into dc_name, or carried on the reason code -- the customer
+      // gets the money and the gap is recorded against them rather than
+      // disappearing into "no store detail". Only the undocumented remainder is
+      // attributed, so nothing is double counted, and `documented` deliberately
+      // still counts only real store rows: knowing WHO was charged is not the
+      // same as having a document for it, and the Missing check support tab
+      // depends on that distinction staying honest.
       const gaps = new Map();
       let undoc = 0;
       for (const l of L) {
@@ -32269,6 +32296,18 @@ ${(() => {
         const e = gaps.get(k) || { cat: k, amt: 0, lines: 0 };
         e.amt += g; e.lines++; gaps.set(k, e);
         undoc += g;
+        const rmL = rmapBy[l.reason_code];
+        const nmL = l.dc_name || (rmL && rmL.retailer) || null;
+        if (!nmL) continue;
+        let b2 = banners.get(nmL);
+        if (!b2) banners.set(nmL, b2 = { name: nmL, amt: 0, rows: 0, plan: null,
+                                         stores: new Map(), cats: new Map(), months: new Map() });
+        b2.amt += g;
+        b2.cats.set(catOf(l), (b2.cats.get(catOf(l)) || 0) + g);
+        if (l.doc_date) {
+          const mk2 = String(l.doc_date).slice(0, 7);
+          months.add(mk2); b2.months.set(mk2, (b2.months.get(mk2) || 0) + g);
+        }
       }
 
       const list = [...banners.values()].sort((a, b) => b.amt - a.amt);
@@ -32354,6 +32393,26 @@ ${(() => {
                 // inside the row was the same repetition that made By reason
                 // code redundant.
                 if (open) {
+                  // WHAT THIS CUSTOMER'S MONEY WAS FOR. A flat dump of
+                  // categories, months and stores as siblings was removed from
+                  // here once, correctly -- three kinds of thing at one indent.
+                  // This is the different question: the Category tab totals a
+                  // bucket across every customer and cannot answer "what did
+                  // Whole Foods get charged for", which is the one that decides
+                  // whether spend matches the promo plan. One band, above the
+                  // stores, ranked by dollars. b.catList was already being
+                  // computed and thrown away.
+                  if (b.catList && b.catList.length) {
+                    const cTot = b.catList.reduce((n, [, v]) => n + v, 0) || 1;
+                    out += `<tr><td colspan="6" style="padding:8px 10px 12px 34px;background:var(--rule-softer);">
+                      <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:6px;">By bucket</div>
+                      <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                        ${b.catList.map(([cat, v]) => `<span style="font-family:var(--mono);font-size:10.5px;border:1px solid var(--rule-soft);border-radius:4px;padding:3px 8px;white-space:nowrap;">
+                          ${esc(cat)} <strong>${money(v)}</strong>
+                          <span style="color:var(--ink-3);">${(v / cTot * 100).toFixed(0)}%</span>
+                        </span>`).join('')}
+                      </div></td></tr>`;
+                  }
                   out += b.storeList.map(st => {
                     const sk = b.name + '\u0000' + st.name;
                     const sOpen = _dedCustStore.has(sk);
