@@ -30966,8 +30966,24 @@ render();
       } catch (e) { return; }
       if (!rows.length) return;
 
+      // CORROBORATE BEFORE ACCUSING. An empty log and an idle loader look
+      // identical from sync_runs alone -- and they were not: for an hour the
+      // strip reported "detail has never written a row" while the loader was
+      // parsing files normally, because the log insert was being killed with
+      // the worker. deduction_files.updated_at is written by the loader itself,
+      // independently of logging, so if files were touched recently the
+      // pipeline is alive whatever the log says.
+      let filesTouchedAt = null;
+      try {
+        const { data: ft } = await sb.from('deduction_files')
+          .select('updated_at').eq('brand_id', brandId)
+          .order('updated_at', { ascending: false }).limit(1);
+        filesTouchedAt = (ft || [])[0]?.updated_at || null;
+      } catch (e) { /* corroboration is optional */ }
+
       const now = Date.now();
       const days = (t) => t ? (now - new Date(t).getTime()) / 86400000 : null;
+      const filesFresh = filesTouchedAt && days(filesTouchedAt) < 0.25;   // ~6 hours
       const bad = [];
       for (const r of rows) {
         const since = days(r.last_write_at);
@@ -30977,6 +30993,15 @@ render();
         else if (since > 3)                            bad.push([r, `last wrote ${Math.floor(since)} days ago`]);
       }
       if (!bad.length) return;                   // healthy is silent
+
+      // Files moving but the log empty means the LOG is broken, not the feed.
+      // Saying so is the difference between an hour of debugging and a glance.
+      const logSuspect = filesFresh && bad.every(([r]) => !r.last_write_at);
+      if (logSuspect) {
+        el.innerHTML = `<div style="margin:12px 0 0;padding:9px 12px;border:1px solid var(--rule);border-left-width:3px;border-radius:4px;font-family:var(--mono);font-size:10.5px;line-height:1.6;color:var(--ink-2);">
+          <strong>Run log not recording.</strong> Files were last touched ${esc(String(filesTouchedAt).slice(0,16).replace('T',' '))}, so the loaders are running — but nothing is reaching <code>sync_runs</code>. Trust the file counts, not this strip, until that is fixed.</div>`;
+        return;
+      }
 
       el.innerHTML = `<div style="margin:12px 0 0;padding:9px 12px;border:1px solid var(--lost);border-left-width:3px;border-radius:4px;background:rgba(168,56,31,0.06);font-family:var(--mono);font-size:10.5px;line-height:1.6;color:var(--ink-2);">
         <strong style="color:var(--lost);">Feed${bad.length === 1 ? '' : 's'} not writing.</strong>
