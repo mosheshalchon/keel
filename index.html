@@ -29234,6 +29234,31 @@ render();
   // the reconciliation and the All buckets tab. It used to be a const inside the
   // reconcile branch alone, so All buckets referenced a name that did not exist
   // there and threw the moment it was opened.
+    // NOT A CUSTOMER. dc_name answers "where did it go", which for one of ATG's
+  // own invoices is a warehouse, not a buyer -- so the line-level fallback
+  // below would otherwise seat ~$625K of KeHE distribution centres beside
+  // Sprouts and Publix in the customer panels (CHINO CA, DALLAS TX, NORTH
+  // EAST MD and eleven more). Almost all of it is INVATG, where the DC is
+  // correct data in the right field; only the read was wrong.
+  //
+  // Three shapes are rejected, and none of them can collide with a real
+  // retailer in promo_plan_lines:
+  //   CITY, ST      a location, never a plan customer
+  //   Zero Store    Kroger's non-selling placeholder codes (097, 540)
+  //   RASC          Kroger Regional Accounting Service Center
+  // Charge-type names that also sit in this column (FREIGHT SUPPORT,
+  // DELIVERED LATE, VENDOR RETURNS, INTRO ALLOWANCE, PROMOTIONAL MOVEMENT)
+  // arrive from a different source and are deliberately NOT handled here --
+  // they need their own rule once we know where they are written.
+  const _notACustomer = (raw) => {
+    const s = String(raw || '').trim();
+    if (!s) return true;
+    if (/,\s*[A-Z]{2}$/.test(s)) return true;
+    if (/zero\s*store/i.test(s)) return true;
+    if (/^RASC$/i.test(s)) return true;
+    return false;
+  };
+
   const _dedIsTradeFor = (rmapBy) => (l) => { const rm = rmapBy[l.reason_code]; return !!(rm && rm.is_trade_spend); };
 
   // ── THE RECONCILIATION, COMPUTED ONCE ───────────────────────────────────
@@ -29457,7 +29482,8 @@ render();
           // Date falls back to doc_date, which is the promo-date rule already
           // applied at load. Anything still unattributed stays undocumented.
           const rmF = rmapBy[l.reason_code];
-          const nmF = l.dc_name || (rmF && rmF.retailer) || null;
+          const nmFRaw = l.dc_name || (rmF && rmF.retailer) || null;
+          const nmF = _notACustomer(nmFRaw) ? null : nmFRaw;
           const pcF = nmF ? (_autoMatch(nmF) || nmF) : null;
           if (!pcF) { undocumented += amt; continue; }
           const _dsF = String(l.doc_date || '');
@@ -30529,6 +30555,7 @@ render();
       if (!s) return s;
       return _CUST_ALIAS[s.toLowerCase()] || s;
     };
+
     const rawKey = brandId + '|' + year;
     try {
       if (_dedRaw && _dedRaw.key === rawKey) {
@@ -31567,7 +31594,8 @@ render();
         const g = Math.abs(Number(l.amount || 0)) - (perLine2.get(l.id) || 0);
         if (g <= 0.005) continue;
         const rm2 = rmapBy[l.reason_code];
-        const nm = _custName(l.dc_name || (rm2 && rm2.retailer) || null) || null;
+        const nmRaw = l.dc_name || (rm2 && rm2.retailer) || null;
+        const nm = _notACustomer(nmRaw) ? null : (_custName(nmRaw) || null);
         if (!nm) { undoc2 += g; continue; }
         let e = cust2.get(nm);
         if (!e) cust2.set(nm, e = { name: nm, amt: 0, plan: null, stores: new Set() });
@@ -32405,7 +32433,8 @@ ${(() => {
         e.amt += g; e.lines++; gaps.set(k, e);
         undoc += g;
         const rmL = rmapBy[l.reason_code];
-        const nmL = _custName(l.dc_name || (rmL && rmL.retailer) || null) || null;
+        const nmLRaw = l.dc_name || (rmL && rmL.retailer) || null;
+        const nmL = _notACustomer(nmLRaw) ? null : (_custName(nmLRaw) || null);
         if (!nmL) continue;
         let b2 = banners.get(nmL);
         if (!b2) banners.set(nmL, b2 = { name: nmL, amt: 0, rows: 0, plan: null,
