@@ -29250,6 +29250,20 @@ render();
   // DELIVERED LATE, VENDOR RETURNS, INTRO ALLOWANCE, PROMOTIONAL MOVEMENT)
   // arrive from a different source and are deliberately NOT handled here --
   // they need their own rule once we know where they are written.
+  // CHARGE TYPES THAT SIT IN THE CUSTOMER COLUMN. These arrive as banners on
+  // the detail rows and are real deductions, but they name WHAT was charged,
+  // not WHO was charged -- so they belong below the customer list rather than
+  // ranked among Sprouts and Publix. An explicit list, not a heuristic: an
+  // all-caps rule would swallow ARS PROMO, which IS a retailer (ARSH =
+  // Foodtown), and that mistake has already been made once on this project.
+  const _CHARGE_TYPE_NAMES = new Set([
+    'freight support', 'freight services', 'freight out', 'delivered late',
+    'vendor returns', 'intro allowance', 'promotional movement', 'mcb promotion',
+    'product short', 'publix credit', 'publix reclamation', 'reclamation',
+    'shortage', 'shortages', 'spoilage', 'damages', 'unsaleables',
+  ]);
+  const _isChargeType = (raw) => _CHARGE_TYPE_NAMES.has(String(raw || '').trim().toLowerCase());
+
   const _notACustomer = (raw) => {
     const s = String(raw || '').trim();
     if (!s) return true;
@@ -32447,7 +32461,15 @@ ${(() => {
         }
       }
 
-      const list = [...banners.values()].sort((a, b) => b.amt - a.amt);
+      const allBanners = [...banners.values()].sort((a, b) => b.amt - a.amt);
+      // CHARGE TYPES OUT OF THE CUSTOMER RANKING. FREIGHT SUPPORT, DELIVERED
+      // LATE, VENDOR RETURNS and the rest are real deductions but they name a
+      // charge, not a buyer, so they were being ranked alongside Sprouts and
+      // Publix. They move to their own block below the customers and still
+      // count toward the register total -- moved, not dropped.
+      const chargeRows = allBanners.filter(b => _isChargeType(b.name));
+      const chargeAmt = chargeRows.reduce((n, b) => n + b.amt, 0);
+      const list = allBanners.filter(b => !_isChargeType(b.name));
       // `list` stays whole — every footer and share calculation reads it, so the
       // floor must not touch it. `shown` is what the table renders.
       const shown = _dedMinAmt ? list.filter(b => b.amt >= _dedMinAmt) : list;
@@ -32498,9 +32520,10 @@ ${(() => {
                    against a $637,257 register and looked like money had gone
                    missing. The undocumented remainder is a ROW now: same total as
                    every other tab, with the gap named rather than excused. -->
+              ${chargeAmt ? `<tr>${td('Other deductions \u2014 not customer-specific', false, 'color:var(--ink-3);border-top:1px solid var(--rule-soft);')}${MS.map(m => td(money(chargeRows.reduce((n, b) => n + (b.months.get(m) || 0), 0)) || '\u00b7', true, 'color:var(--ink-3);')).join('')}${td(money(chargeAmt), true, 'color:var(--ink-3);')}</tr>` : ''}
               <tr>${td('Other \u2014 no store-level detail', false, 'color:var(--ink-3);border-top:1px solid var(--rule-soft);')}${MS.map(() => td('\u00b7', true, 'color:var(--rule);')).join('')}${td(money(undoc + unattributed), true, 'color:var(--ink-3);')}</tr>
               ${priorExcluded ? `<tr>${td('<span style="color:var(--ink-3);">Before ' + esc(_dedMon(_yStart)) + ' \u2014 excluded</span>')}${MS.map(() => td('\u00b7', true, 'color:var(--rule);')).join('')}${td('<span style="color:var(--ink-3);">' + money(priorExcluded) + '</span>', true)}</tr>` : ''}
-              <tr>${td('<strong>Traced to a store</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(m => td('<strong>' + money(list.reduce((n, b) => n + (b.months.get(m) || 0), 0)) + '</strong>', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(documented) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
+              <tr>${td('<strong>Total</strong>', false, 'border-top:2px solid var(--ink);')}${MS.map(() => td('', true, 'border-top:2px solid var(--ink);')).join('')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table></div>
           `;
@@ -32598,6 +32621,8 @@ ${(() => {
                 <span style="margin-left:10px;">${shown.length - _dedCustLimit} smaller customers hidden \u00b7 ${money(shown.slice(_dedCustLimit).reduce((n, b) => n + b.amt, 0))} \u2014 the total below still counts them</span>
               </td></tr>` : ''}
               ${unattributed ? `<tr>${td('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${td('', true)}${td('', true)}${td('')}${td(money(unattributed), true)}${td((unattributed / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>` : ''}
+              ${chargeRows.length ? `<tr><td colspan="6" style="padding:16px 10px 6px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Other deductions \u00b7 not customer-specific \u00b7 ${money(chargeAmt)}</td></tr>` : ''}
+              ${chargeRows.map(b => `<tr>${td('<span style="color:var(--ink-2);">' + esc(b.name) + '</span>')}${td('', true)}${td(b.rows.toLocaleString(), true)}${td('')}${td(money(b.amt), true)}${td((b.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>`).join('')}
               ${gapList.length ? `<tr><td colspan="6" style="padding:16px 10px 6px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Not attributable to a store \u00b7 ${money(undoc)}</td></tr>` : ''}
               ${gapList.slice(0, _dedGapLimit).map(g => `<tr>${td('<span style="color:' + (g.cat.charAt(0) === '\u26A0' ? 'var(--lost)' : 'var(--ink-2)') + ';">' + esc(g.cat) + '</span>')}${td('', true)}${td(g.lines, true)}${td('')}${td(money(g.amt), true)}${td((g.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>`).join('')}
               ${gapList.length > _dedGapLimit ? `<tr><td colspan="6" style="padding:11px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
