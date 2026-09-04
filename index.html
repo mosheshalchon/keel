@@ -30814,6 +30814,11 @@ render();
            brand that doesn't crawl, not a fault worth shouting about. -->
       <div id="hl-ded-crawl"></div>
 
+      <!-- Feed health. Same contract as the catalogue strip: silent when the
+           table is absent, silent when everything is fine, loud only when a
+           feed has stopped writing. -->
+      <div id="hl-ded-feeds"></div>
+
       <div style="margin:14px 0 2px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
         <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:4px;">Distributor</span>
         ${[['all', 'All'], ...Object.keys(_dedDistCounts)
@@ -30937,6 +30942,49 @@ render();
          ${stale ? `<br><span style="color:var(--ink-3);">Last crawled ${ageDays} days ago — complete as of then, so anything filed since is not indexed.</span>` : ''}`);
     }
     _dedRenderCrawl().catch(e => console.error('[deductions] catalogue strip failed:', e));
+
+    // ── FEED HEALTH STRIP ─────────────────────────────────────────────────────
+    // The register that feeds every KeHE deduction stopped being imported on
+    // 2026-08-17 and nobody noticed for two and a half weeks: files kept
+    // arriving, no screen said the feed had gone quiet, and four checks worth
+    // $41,497 simply were not in the book. Separately a loader ran every minute
+    // for hours writing nothing. Both were invisible because pg_cron reports
+    // that the HTTP request was QUEUED, and this function always returns 200.
+    //
+    // ROWS WRITTEN is the only honest signal, so that is what this reads. Silent
+    // when healthy — a strip that shouts on a good day gets ignored on a bad one.
+    async function _dedRenderFeeds() {
+      const el = document.getElementById('hl-ded-feeds');
+      if (!el) return;
+      let rows;
+      try {
+        const { data, error } = await sb.from('sync_health')
+          .select('fn,mode,last_run_at,last_write_at,runs_24h,writes_24h,rows_24h,errors_24h')
+          .eq('brand_id', brandId);
+        if (error) return;                       // table absent — stay silent
+        rows = data || [];
+      } catch (e) { return; }
+      if (!rows.length) return;
+
+      const now = Date.now();
+      const days = (t) => t ? (now - new Date(t).getTime()) / 86400000 : null;
+      const bad = [];
+      for (const r of rows) {
+        const since = days(r.last_write_at);
+        if (!r.last_write_at)                          bad.push([r, 'has never written a row']);
+        else if ((r.runs_24h || 0) > 20 && !(r.writes_24h || 0))
+                                                       bad.push([r, `ran ${r.runs_24h}× today and wrote nothing`]);
+        else if (since > 3)                            bad.push([r, `last wrote ${Math.floor(since)} days ago`]);
+      }
+      if (!bad.length) return;                   // healthy is silent
+
+      el.innerHTML = `<div style="margin:12px 0 0;padding:9px 12px;border:1px solid var(--lost);border-left-width:3px;border-radius:4px;background:rgba(168,56,31,0.06);font-family:var(--mono);font-size:10.5px;line-height:1.6;color:var(--ink-2);">
+        <strong style="color:var(--lost);">Feed${bad.length === 1 ? '' : 's'} not writing.</strong>
+        ${bad.map(([r, why]) => `<div style="margin-top:3px;">${esc(r.fn)}${r.mode ? ' · ' + esc(r.mode) : ''} — ${esc(why)}${r.errors_24h ? ' · ' + r.errors_24h + ' errors today' : ''}</div>`).join('')}
+        <div style="margin-top:5px;color:var(--ink-3);">Deductions on this page are only as current as the feeds above.</div>
+      </div>`;
+    }
+    _dedRenderFeeds().catch(e => console.error('[deductions] feed strip failed:', e));
 
     hostEl.querySelectorAll('.hl-ded-view').forEach(b => b.onclick = () => {
       if (b.dataset.v === _dedView) return;
