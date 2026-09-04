@@ -30788,13 +30788,22 @@ render();
           // a disputable deduction -- it is a fee ATG pays for missing an AP
           // deadline, it is invisible inside the NCG total, and nothing else in
           // Keel would ever surface it.
+          // READ THE SPLIT, DO NOT RE-DERIVE IT. The fee was originally computed
+          // as total/6 because principal and penalty sat on one line. They are
+          // now separate codes, so deriving it again double-flagged the money:
+          // the strip claimed $21,021 of a $126,127 principal-only figure was a
+          // late fee, when the real $25,225 was already its own row.
           const ncg = L.filter(l => l.is_deduction && l.reason_code === 'UNFI-NCG');
-          if (!ncg.length) return '';
-          const tot = ncg.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
-          const fee = tot / 6;
+          const ncgFee = L.filter(l => l.is_deduction && l.reason_code === 'UNFI-NCG-LATEFEE');
+          if (!ncg.length && !ncgFee.length) return '';
+          const principal = ncg.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+          const fee = ncgFee.length
+            ? ncgFee.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0)
+            : principal / 6;                       // pre-split data
+          const tot = principal + fee;
           return `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:6px;">
             ${money(-fee)} of the ${money(-tot)} NCG deduction is a 20% late fee on past-due invoices
-            <span style="color:var(--ink-3);">(${ncg.length} deduction${ncg.length === 1 ? '' : 's'} — principal ${money(-(tot - fee))})</span></div>`;
+            <span style="color:var(--ink-3);">(${Math.max(ncg.length, ncgFee.length)} deduction${Math.max(ncg.length, ncgFee.length) === 1 ? '' : 's'} — principal ${money(-principal)})</span></div>`;
         })()}
       </div>
 
@@ -32414,7 +32423,7 @@ ${(() => {
         const name = _custName((m && m.banner) || raw || d.customer_name || null) || null;
         if (!name) { unattributed += amt; continue; }
         let b = banners.get(name);
-        if (!b) banners.set(name, b = { name, amt: 0, rows: 0, plan: (m && m.plan_customer) || null, stores: new Map(), cats: new Map(), months: new Map() });
+        if (!b) banners.set(name, b = { name, amt: 0, rows: 0, plan: (m && m.plan_customer) || null, stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map() });
         b.amt += amt; b.rows++;
         const store = d.customer_name || '(unnamed store)';
         let st = b.stores.get(store);
@@ -32424,6 +32433,15 @@ ${(() => {
         // qty, rate. Held by reference, not copied.
         st.items.push(d);
         b.cats.set(catOf(l), (b.cats.get(catOf(l)) || 0) + amt);
+        // Category x month, so a customer row can be opened the same way the
+        // Category tab opens: what was charged, then when.
+        {
+          const _ck = catOf(l);
+          let _cm = b.catMonths.get(_ck);
+          if (!_cm) b.catMonths.set(_ck, _cm = new Map());
+          const _mk = String(d.reference_date || l.doc_date || '').slice(0, 7);
+          if (_mk) _cm.set(_mk, (_cm.get(_mk) || 0) + amt);
+        }
         // A date before 2000 is a parser artefact, not an old promo; it lands in
         // the prior bucket with everything else pre-year rather than inventing a
         // year-1 column.
@@ -32464,9 +32482,16 @@ ${(() => {
         fallbackAttr += g;
         let b2 = banners.get(nmL);
         if (!b2) banners.set(nmL, b2 = { name: nmL, amt: 0, rows: 0, plan: null,
-                                         stores: new Map(), cats: new Map(), months: new Map() });
+                                         stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map() });
         b2.amt += g;
         b2.cats.set(catOf(l), (b2.cats.get(catOf(l)) || 0) + g);
+        {
+          const _ck = catOf(l);
+          let _cm = b2.catMonths.get(_ck);
+          if (!_cm) b2.catMonths.set(_ck, _cm = new Map());
+          const _mk = String(l.doc_date || '').slice(0, 7);
+          if (_mk) _cm.set(_mk, (_cm.get(_mk) || 0) + g);
+        }
         if (l.doc_date) {
           const mk2 = String(l.doc_date).slice(0, 7);
           months.add(mk2); b2.months.set(mk2, (b2.months.get(mk2) || 0) + g);
@@ -32577,14 +32602,29 @@ ${(() => {
                   // computed and thrown away.
                   if (b.catList && b.catList.length) {
                     const cTot = b.catList.reduce((n, [, v]) => n + v, 0) || 1;
-                    out += `<tr><td colspan="6" style="padding:8px 10px 12px 34px;background:var(--rule-softer);">
-                      <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;margin-bottom:6px;">By bucket</div>
-                      <div style="display:flex;flex-wrap:wrap;gap:6px;">
-                        ${b.catList.map(([cat, v]) => `<span style="font-family:var(--mono);font-size:10.5px;border:1px solid var(--rule-soft);border-radius:4px;padding:3px 8px;white-space:nowrap;">
-                          ${esc(cat)} <strong>${money(v)}</strong>
-                          <span style="color:var(--ink-3);">${(v / cTot * 100).toFixed(0)}%</span>
-                        </span>`).join('')}
-                      </div></td></tr>`;
+                    // CUSTOMER -> CATEGORY -> MONTH, mirroring how the Category
+                    // tab opens. A flat chip strip answered "what was charged"
+                    // but not "when", which is the question that turns a number
+                    // into something you can take to the distributor.
+                    out += `<tr><td colspan="6" style="padding:0;background:var(--rule-softer);">
+                      <div style="padding:8px 10px 4px 34px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;">By bucket</div>
+                      <table style="width:100%;border-collapse:collapse;">
+                        ${b.catList.map(([cat, v]) => {
+                          const ck = b.name + '||' + cat;
+                          const co = _dedOpen.has(ck);
+                          const cm = [...(b.catMonths.get(cat) || new Map()).entries()].sort();
+                          let r = `<tr class="hl-cust-cat" data-ck="${esc(ck)}" style="cursor:pointer;">
+                            <td style="padding:5px 10px 5px 46px;font-family:var(--mono);font-size:11px;">
+                              <span style="display:inline-block;width:12px;color:var(--ink-3);">${cm.length ? (co ? '\u2212' : '+') : ''}</span>${esc(cat)}</td>
+                            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(v)}</td>
+                            <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);width:60px;">${(v / cTot * 100).toFixed(0)}%</td></tr>`;
+                          if (co) r += cm.map(([mk, mv]) => `<tr>
+                            <td style="padding:4px 10px 4px 74px;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);">${esc(_dedMon(mk))}</td>
+                            <td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);">${money(mv)}</td>
+                            <td></td></tr>`).join('');
+                          return r;
+                        }).join('')}
+                      </table></td></tr>`;
                   }
                   out += b.storeList.map(st => {
                     const sk = b.name + '\u0000' + st.name;
@@ -32677,6 +32717,14 @@ ${(() => {
       });
       body.querySelectorAll('.hl-cust-row').forEach(tr => tr.onclick = () => {
         const n = tr.dataset.b; _dedOpen.has(n) ? _dedOpen.delete(n) : _dedOpen.add(n);
+        renderDeductions(hostEl, filtersEl, year);
+      });
+      // Same stopPropagation rule as the store rows below: a category sits
+      // inside the customer row's expansion, so without it opening a category
+      // collapses its parent.
+      body.querySelectorAll('.hl-cust-cat').forEach(tr => tr.onclick = (ev) => {
+        ev.stopPropagation();
+        const k = tr.dataset.ck; _dedOpen.has(k) ? _dedOpen.delete(k) : _dedOpen.add(k);
         renderDeductions(hostEl, filtersEl, year);
       });
       // stopPropagation, or opening a store also collapses the customer it sits
