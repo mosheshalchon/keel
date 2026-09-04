@@ -29279,10 +29279,33 @@ render();
       const _planCusts = [...new Set(P.lines.map(pl => pl.customer).filter(Boolean))];
       const _planIdx = new Map();
       for (const pc of _planCusts) { const k = _dedNorm(pc); if (k && !_planIdx.has(k)) _planIdx.set(k, pc); }
+      // The plan and the deduction reference name the same retailer
+      // differently: Vividly says NGVC, the UNFI reference says NATGROC and
+      // Keel's fallback writes 'Natural Grocers'. None of the three match by
+      // string, so $137,420 of Natural Grocers read as a -97% variance against
+      // plan. This is a spelling bridge, not a hierarchy -- keep it factual and
+      // short, and prefer fixing the source naming where that is possible.
+      const _PLAN_ALIAS = {
+        'natural grocers': 'NGVC',
+        'natural grocers by vitamin cottage': 'NGVC',
+        'natgroc': 'NGVC',
+        'whole foods market': 'Whole Foods',
+        'wholefoods': 'Whole Foods',
+        'wfm': 'Whole Foods',
+        'the fresh market': 'TFM',
+        'thrive': 'Thrive Market',
+        'ahold': 'Ahold Delhaize',
+      };
       const _autoMatch = (raw) => {
         const k = _dedNorm(raw);
         if (!k) return null;
         if (_planIdx.has(k)) return _planIdx.get(k);
+        // Try the alias, then re-enter the plan index with the plan's own name.
+        const al = _PLAN_ALIAS[k];
+        if (al) {
+          const ak = _dedNorm(al);
+          if (_planIdx.has(ak)) return _planIdx.get(ak);
+        }
         for (const [pk, pc] of _planIdx) {
           if (pk.length >= 4 && (k.startsWith(pk + ' ') || k === pk)) return pc;
         }
@@ -29422,7 +29445,34 @@ render();
         catsSeen.add(normCat(cat));
         const rows = detByLine.get(l.id) || [];
         const base = rows.reduce((s2, d) => s2 + Math.abs(Number(d.bill_amount || 0)), 0);
-        if (!rows.length || base <= 0) { undocumented += amt; continue; }
+        if (!rows.length || base <= 0) {
+          // LINE-LEVEL RETAILER FALLBACK. Without this the tab could only see
+          // money that has store rows, so Natural Grocers read $3,029 against
+          // $111,543 planned while $137,420 of it sat on lines attributed from
+          // the reference (…3PTYNATGROC) with no detail behind them -- a -97%
+          // variance that was an artefact of the join, not of ATG's spend.
+          // The retailer is known; only the itemisation is missing.
+          //
+          // The whole line moves, since there are no rows to apportion across.
+          // Date falls back to doc_date, which is the promo-date rule already
+          // applied at load. Anything still unattributed stays undocumented.
+          const rmF = rmapBy[l.reason_code];
+          const nmF = l.dc_name || (rmF && rmF.retailer) || null;
+          const pcF = nmF ? (_autoMatch(nmF) || nmF) : null;
+          if (!pcF) { undocumented += amt; continue; }
+          const _dsF = String(l.doc_date || '');
+          const mkF = (_dsF && _dsF >= VALID_FROM) ? _dsF.slice(0, 7) : '';
+          placed += amt;
+          let cF = cells.get(pcF);
+          if (!cF) cells.set(pcF, cF = { name: pcF, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(pcF) });
+          cF.ded += amt;
+          const ckF = normCat(cat);
+          let ccF = cF.cats.get(ckF);
+          if (!ccF) cF.cats.set(ckF, ccF = { key: ckF, label: cat, ded: 0, plan: 0, months: new Map(), pmonths: new Map() });
+          ccF.ded += amt;
+          if (mkF) ccF.months.set(mkF, (ccF.months.get(mkF) || 0) + amt);
+          continue;
+        }
         for (const d of rows) {
           const share = amt * (Math.abs(Number(d.bill_amount || 0)) / base);
           const raw = d.banner || null;
