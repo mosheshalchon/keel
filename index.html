@@ -30642,7 +30642,7 @@ render();
       // No_Check_Number/ because there was no payment document to file it
       // under, and every UNFI check already foots to its own lines so there is
       // no check for it to belong to.
-      ['support',    'Missing check support'],
+      ['support',    'Support gaps'],
     ];
 
     // DECLARED HERE, ABOVE FIRST USE. These were further down the function while
@@ -30686,6 +30686,25 @@ render();
         </div>
         ${notTied.length ? `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:8px;">
           ${notTied.length} of ${checks.length} checks do not tie to their line detail</div>` : ''}
+        ${(() => {
+          // NCG LIQUIDATED DAMAGES. National Co+op Grocers collects past-due
+          // invoices through UNFI and adds a 20% late fee, so the deduction is
+          // principal x 1.2 and the PENALTY IS EXACTLY ONE SIXTH of it. That is
+          // arithmetic, not an estimate: the deduction forms read $32,033.28 =
+          // $26,694.40 + $5,338.88 and $78,799.08 = $65,665.90 + $13,133.18,
+          // and both divide clean.
+          // Worth its own line on the page because it is neither trade spend nor
+          // a disputable deduction -- it is a fee ATG pays for missing an AP
+          // deadline, it is invisible inside the NCG total, and nothing else in
+          // Keel would ever surface it.
+          const ncg = L.filter(l => l.is_deduction && l.reason_code === 'UNFI-NCG');
+          if (!ncg.length) return '';
+          const tot = ncg.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+          const fee = tot / 6;
+          return `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:6px;">
+            ${money(-fee)} of the ${money(-tot)} NCG deduction is a 20% late fee on past-due invoices
+            <span style="color:var(--ink-3);">(${ncg.length} deduction${ncg.length === 1 ? '' : 's'} — principal ${money(-(tot - fee))})</span></div>`;
+        })()}
       </div>
 
       <div style="padding:2px 2px 14px;border-bottom:1px solid var(--rule-soft);"></div>
@@ -32713,7 +32732,68 @@ ${(() => {
           The reference doubles as the source filename — search Dropbox for it to find the backup. Nothing
           here can be fixed by loading more files: every check already foots to its own lines, so there is
           no payment for these to attach to. The advice was never filed, or never issued.
-        </p>`;
+        </p>
+        ${(() => {
+          // ── TRADE SPEND WITH NO ITEMISED BACKUP ────────────────────────────
+          // The SECOND kind of gap, and the one that actually blocks
+          // reconciliation. A missing advice means nobody proved the money left;
+          // this means the money is proven gone, the charge is promotional, and
+          // no document names the stores, rates or promo number it should
+          // reconcile against.
+          //
+          // SCOPED TO TRADE SPEND DELIBERATELY. Most undocumented UNFI money is
+          // freight, reclaim, late fees, growth incentives and compliance
+          // penalties -- none of which HAS a promo to match, so counting them in
+          // a reconciliation gap overstates it. A freight charge has no promo
+          // number because there is no promo. Only trade spend belongs here.
+          const gaps = dedL.filter(l => {
+            if (l.detail_parsed) return false;
+            const rm = rmapBy[l.reason_code];
+            return rm && rm.is_trade_spend;
+          });
+          if (!gaps.length) return '';
+          const gTot = gaps.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+          const tradeAll = dedL.filter(l => {
+            const rm = rmapBy[l.reason_code];
+            return rm && rm.is_trade_spend;
+          });
+          const tradeTot = tradeAll.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+          const byCat = new Map();
+          for (const l of gaps) {
+            const rm = rmapBy[l.reason_code];
+            const k = (rm && rm.keel_category) || 'Uncategorised';
+            const e = byCat.get(k) || { cat: k, lines: 0, amt: 0, codes: new Set() };
+            e.lines++; e.amt += Math.abs(Number(l.amount) || 0);
+            if (l.reason_code) e.codes.add(l.reason_code);
+            byCat.set(k, e);
+          }
+          return `
+          <div style="margin:30px 0 16px;padding-top:22px;border-top:1px solid var(--rule-soft);">
+            <div style="font-family:var(--serif);font-size:19px;margin-bottom:4px;">
+              ${money(-gTot)} of trade spend has no promo-level documentation.
+            </div>
+            <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0;line-height:1.55;max-width:860px;">
+              ${tradeTot ? (gTot / tradeTot * 100).toFixed(0) : 0}% of ${esc(_dedDist === 'all' ? 'all' : _dedDist)} trade spend.
+              These deductions are proven taken and correctly classified, but no document names the stores,
+              rates or promo number they should reconcile against. Fees, freight, reclaim and penalties are
+              excluded — those have no promotion to match in the first place.
+            </p>
+          </div>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Bucket')}${th('Codes')}${th('Lines', true)}${th('Undocumented', true)}</tr></thead>
+            <tbody>${[...byCat.values()].sort((a, b) => b.amt - a.amt).map(e => `<tr>
+              ${td('<strong>' + esc(e.cat) + '</strong>')}
+              ${td('<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">'
+                   + esc([...e.codes].sort().join(' · ')) + '</span>')}
+              ${td(e.lines, true)}
+              ${td('<span style="color:var(--lost);">' + money(-e.amt) + '</span>', true)}
+            </tr>`).join('')}
+            <tr>${td('<strong>Total</strong>', false, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
+              ${td('<strong>' + gaps.length + '</strong>', true, 'border-top:2px solid var(--ink);')}
+              ${td('<strong>' + money(-gTot) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
+            </tbody>
+          </table>`;
+        })()}`;
       // CSV rather than a real .xlsx: Excel opens it natively, it needs no
       // library in the page, and this list is meant to be forwarded to
       // accounting or to the distributor, not formatted.
