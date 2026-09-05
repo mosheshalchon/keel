@@ -32546,7 +32546,7 @@ ${(() => {
           continue;
         }
         let b = banners.get(name);
-        if (!b) banners.set(name, b = { name, amt: 0, rows: 0, plan: (m && m.plan_customer) || null, stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map() });
+        if (!b) banners.set(name, b = { name, amt: 0, rows: 0, plan: (m && m.plan_customer) || null, stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map(), catLines: new Map() });
         b.amt += amt; b.rows++;
         const store = d.customer_name || '(unnamed store)';
         let st = b.stores.get(store);
@@ -32564,6 +32564,16 @@ ${(() => {
           if (!_cm) b.catMonths.set(_ck, _cm = new Map());
           const _mk = String(d.reference_date || l.doc_date || '').slice(0, 7);
           if (_mk) _cm.set(_mk, (_cm.get(_mk) || 0) + amt);
+          // The deduction lines themselves, so a customer opens all the way
+          // down to the money: bucket -> the actual charges that made it up.
+          // Keyed by line id because one line contributes many detail rows.
+          let _cl = b.catLines.get(_ck);
+          if (!_cl) b.catLines.set(_ck, _cl = new Map());
+          const _e = _cl.get(l.id);
+          if (_e) _e.amt += amt;
+          else _cl.set(l.id, { id: l.id, ref: l.invoice_no, code: l.reason_code,
+                               date: String(d.reference_date || l.doc_date || '').slice(0, 10),
+                               amt });
         }
         // A date before 2000 is a parser artefact, not an old promo; it lands in
         // the prior bucket with everything else pre-year rather than inventing a
@@ -32606,7 +32616,7 @@ ${(() => {
         fallbackAttr += g;
         let b2 = banners.get(nmL);
         if (!b2) banners.set(nmL, b2 = { name: nmL, amt: 0, rows: 0, plan: null,
-                                         stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map() });
+                                         stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map(), catLines: new Map() });
         b2.amt += g;
         b2.cats.set(catOf(l), (b2.cats.get(catOf(l)) || 0) + g);
         {
@@ -32615,6 +32625,10 @@ ${(() => {
           if (!_cm) b2.catMonths.set(_ck, _cm = new Map());
           const _mk = String(l.doc_date || '').slice(0, 7);
           if (_mk) _cm.set(_mk, (_cm.get(_mk) || 0) + g);
+          let _cl = b2.catLines.get(_ck);
+          if (!_cl) b2.catLines.set(_ck, _cl = new Map());
+          _cl.set(l.id, { id: l.id, ref: l.invoice_no, code: l.reason_code,
+                          date: String(l.doc_date || '').slice(0, 10), amt: g });
         }
         if (l.doc_date) {
           const mk2 = String(l.doc_date).slice(0, 7);
@@ -32742,10 +32756,25 @@ ${(() => {
                               <span style="display:inline-block;width:12px;color:var(--ink-3);">${cm.length ? (co ? '\u2212' : '+') : ''}</span>${esc(cat)}</td>
                             <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(v)}</td>
                             <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);width:60px;">${(v / cTot * 100).toFixed(0)}%</td></tr>`;
-                          if (co) r += cm.map(([mk, mv]) => `<tr>
-                            <td style="padding:4px 10px 4px 74px;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);">${esc(_dedMon(mk))}</td>
-                            <td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);">${money(mv)}</td>
-                            <td></td></tr>`).join('');
+                          if (co) {
+                            // Months first, then the charges themselves — the
+                            // same shape the Category tab uses, so a customer
+                            // opens all the way to the money rather than
+                            // stopping at a subtotal.
+                            r += cm.map(([mk, mv]) => `<tr>
+                              <td style="padding:4px 10px 4px 74px;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);">${esc(_dedMon(mk))}</td>
+                              <td style="padding:4px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);">${money(mv)}</td>
+                              <td></td></tr>`).join('');
+                            const cl = [...(b.catLines.get(cat) || new Map()).values()]
+                              .sort((x, y) => y.amt - x.amt).slice(0, 40);
+                            if (cl.length) {
+                              r += `<tr><td colspan="3" style="padding:8px 10px 3px 74px;font-family:var(--mono);font-size:9px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);">Deductions</td></tr>`;
+                              r += cl.map(x => `<tr>
+                                <td style="padding:3px 10px 3px 74px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(x.ref || '—')}<span style="margin-left:8px;">${esc(x.code || '')}</span><span style="margin-left:8px;">${esc(x.date || '')}</span></td>
+                                <td style="padding:3px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${money(x.amt)}</td>
+                                <td></td></tr>`).join('');
+                            }
+                          }
                           return r;
                         }).join('')}
                       </table></td></tr>`;
