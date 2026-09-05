@@ -29063,7 +29063,14 @@ render();
   let _dedOthCode = new Set();    // Other charges: expanded reason codes
   let _dedOthMon = new Set();     // Other charges: expanded months -> the lines themselves
   let _dedSumOpen = new Set();    // which summary buckets are expanded
-  let _dedRecOpen = new Set();    // which plan customers are expanded on Reconcile
+  let _dedRecOpen = new Set();    // Reconcile: which plan customers are expanded
+  // TOP 15, WITH THE REST FOLDED RATHER THAN DROPPED. The table ran to every
+  // customer in the book, so the accounts that matter sat above a long tail of
+  // rows worth a few hundred dollars. The hidden rows are still summed into a
+  // named row, because this screen's invariant is that it foots to the
+  // reconciled total -- a "show more" that changes the TOTAL is a bug.
+  const DED_REC_TOP = 15;
+  let _dedRecAll = false;
   // Reconcile grain: 'customer' (the original) or 'month'. Same cells, summed on
   // a different axis — a calendar question and an account question are not the
   // same question, and the customer table could not answer the first one.
@@ -29368,7 +29375,7 @@ render();
   // from module state and writes nothing back, so both callers are guaranteed
   // the same answer for the same inputs. Nothing about the arithmetic changed
   // when it moved here — only where it lives.
-  function _dedComputeRecon({ L, rmapBy, D, P, scopedIds, dist, completedOnly, includePartial, year }) {
+  function _dedComputeRecon({ L, rmapBy, D, P, scopedIds, dist, distNames, completedOnly, includePartial, year }) {
       // deduction_detail has no distributor column, so it is fetched whole and
       // narrowed here to the lines in scope — otherwise By customer and the
       // reconciliation would total every distributor's stores under one label.
@@ -29597,6 +29604,58 @@ render();
         return _dedRefMonth(l.invoice_no);
       };
 
+      // WHICH RECEIVERS THE PLAN SIDE ADMITS. This used to be the hardcoded
+      // pair /kehe|unfi/, written when those were the only two distributors
+      // loaded -- and it silently went wrong the moment Kroger and Harris
+      // Teeter arrived in the register. Two separate defects came out of it:
+      //   1. On 'All', Kroger's plan lines were excluded while Kroger's
+      //      DEDUCTIONS were counted, so Kroger could only ever read as
+      //      massively over plan. Only the Kroger promos that happen to ship
+      //      through UNFI got a plan at all.
+      //   2. Selecting the Kroger or Harris Teeter pill fell through to the
+      //      final else and compared their deductions against KEHE's plan.
+      // The scope is now derived from the register itself, so a distributor
+      // added tomorrow is admitted without another edit here.
+      //
+      // Declared HERE rather than beside the plan loop because the deduction
+      // loop below needs the same scope to build the not-closed index.
+      const _rx = (s) => new RegExp(String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const _scopeNames = (distNames && distNames.length ? distNames : ['KeHE', 'UNFI'])
+        .filter(Boolean);
+      const _recvRx = (dist === 'all' ? _scopeNames : [dist]).map(_rx);
+      const _recvOkOf = (pl) => _recvRx.some(r => r.test(
+        String(pl.first_receiver || '') + ' ' + String(pl.customer || '')));
+
+      // ── "COMPLETED PROMOS ONLY" HAS TO CUT BOTH SIDES ────────────────────
+      // The toggle drops plan lines that have not closed, because an Approved
+      // or Running promo has no deduction yet and counting it reads as
+      // under-spend. True for a promo that has not started. NOT true for one
+      // that is mid-flight: Whole Foods' August plan is Running, so its
+      // $52,555 was excluded while August's DEDUCTIONS -- which are inside the
+      // window -- were still counted. Whole Foods then read +174% over plan
+      // when the like-for-like figure is +112%. Every mid-flight month did
+      // this, on every customer.
+      //
+      // So a customer-month whose plan is entirely not-closed now holds its
+      // deductions out too, and the money gets its own bridge row rather than
+      // disappearing. A month with ANY completed line stays in: it has a plan
+      // to answer to, and holding out the rest would hide real over-deduction.
+      const _planStat = new Map();      // 'customer|YYYY-MM' -> { done, open }
+      for (const pl of P.lines) {
+        if (!_recvOkOf(pl)) continue;
+        const k = (pl.customer || '(no customer)') + '|' + planMonthOf(pl);
+        let e = _planStat.get(k);
+        if (!e) _planStat.set(k, e = { done: 0, open: 0 });
+        if (/completed/i.test(String(pl.status || ''))) e.done++; else e.open++;
+      }
+      const _notClosedCM = (pc, mk) => {
+        if (!completedOnly || !pc || !mk) return false;
+        const e = _planStat.get(pc + '|' + mk);
+        return !!(e && e.open > 0 && e.done === 0);
+      };
+      let dedNotClosed = 0;
+      const dedNotClosedBy = new Map();  // customer -> amount held out
+
       let dedOutOfWindow = 0, dedUndated = 0, dedPriorPeriod = 0;
       const outOfWindowBy = new Map();  // month -> amount held out
       const priorPeriodBy = new Map();  // month -> amount from before the window
@@ -29649,6 +29708,11 @@ render();
           // The month is the one the bridge already placed this line in, so a
           // line cannot reconcile into one month and be counted in another.
           const mkF = lmk;
+          if (_notClosedCM(pcF, mkF)) {
+            dedNotClosed += amt;
+            dedNotClosedBy.set(pcF, (dedNotClosedBy.get(pcF) || 0) + amt);
+            continue;
+          }
           placed += amt;
           placedLine += amt;
           lineOnlyBy.set(pcF, (lineOnlyBy.get(pcF) || 0) + amt);
@@ -29688,6 +29752,11 @@ render();
             unattribBy.set(k, (unattribBy.get(k) || 0) + share);
             continue;
           }
+          if (_notClosedCM(pcR, mk2)) {
+            dedNotClosed += share;
+            dedNotClosedBy.set(pcR, (dedNotClosedBy.get(pcR) || 0) + share);
+            continue;
+          }
           placed += share;
           if (pc) placedStore += share;
           else { placedLine += share; lineOnlyBy.set(pcR, (lineOnlyBy.get(pcR) || 0) + share); }
@@ -29716,16 +29785,15 @@ render();
       // so no deduction will ever exist for them) from the ones that are really
       // a vocabulary gap.
       const planExcludedTypeBy = new Map();
+      const planExcludedRecvBy = new Map();
       for (const pl of P.lines) {
-        const recv = String(pl.first_receiver || '') + ' ' + String(pl.customer || '');
         const exp = Number(pl.expected_spend || 0);
-        // The plan side follows the distributor scope. Without this, scoping to
-        // UNFI compares UNFI's deductions against KeHE's plan — a variance made
-        // entirely of the mismatch.
-        const recvOk = dist === 'all' ? /kehe|unfi/i.test(recv)
-                     : dist === 'UNFI' ? /unfi/i.test(recv)
-                     : /kehe/i.test(recv);
-        if (!recvOk) { planExcludedRecv += exp; continue; }
+        if (!_recvOkOf(pl)) {
+          planExcludedRecv += exp;
+          const k = String(pl.first_receiver || '(no receiver)');
+          planExcludedRecvBy.set(k, (planExcludedRecvBy.get(k) || 0) + exp);
+          continue;
+        }
         const ck = normCat(pl.promo_type);
         if (!catsSeen.has(ck)) {
           planExcludedType += exp;
@@ -29757,11 +29825,12 @@ render();
     return { cells, rows, totPlan, totDed, unattrib, undocumented, placed, autoMatched,
              placedStore, placedLine, lineOnlyBy, lineOnlyList,
              dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
+             dedNotClosed, dedNotClosedBy,
              registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
              planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
-             planExcludedTypeBy };
+             planExcludedTypeBy, planExcludedRecvBy };
   }
 
   // ══ PROMOTIONS BY RETAILER PROMO NUMBER ═══════════════════════════════════
@@ -31956,7 +32025,7 @@ render();
       // ── 4 · versus plan. Same function the Reconcile tab calls, same inputs,
       // so these ten rows cannot disagree with that screen.
       const P2 = _dedPlan || { lines: [], err: null };
-      const R2 = _dedComputeRecon({ L, rmapBy, D: D2, P: P2, scopedIds: _scopedLineIds, dist: _dedDist,
+      const R2 = _dedComputeRecon({ L, rmapBy, D: D2, P: P2, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}),
                                     completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       // Catch-all and unattributable rows are excluded: a variance there is an
       // artefact of the plan naming no retailer, not a retailer out of line.
@@ -32041,7 +32110,7 @@ render();
     if (_dedView === 'reconcile') {
       const D = _dedDetail || { det: [], bmap: [] };
       const P = _dedPlan || { lines: [], err: null };
-      const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist,
+      const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}),
                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       const { planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
               planExcludedTypeBy } = R;
@@ -32049,6 +32118,7 @@ render();
               placedStore, placedLine, lineOnlyList,
               tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
               dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
+              dedNotClosed, dedNotClosedBy,
               registerTotal, nonTradeTotal, nonTradeBy } = R;
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
@@ -32077,6 +32147,13 @@ render();
           + ' \u00b7 answers to the prior year\u2019s plan'],
         ['After ' + (winEnd ? _dedMon(winEnd) : 'the window'), -dedOutOfWindow, 'sub',
           outOfWindowBy && outOfWindowBy.size ? [...outOfWindowBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => _dedMon(m) + ' ' + money(v)).join(', ') : ''],
+        // The mirror of the plan side's 'Not closed yet'. Without it the two
+        // sides used different months and every mid-flight promo read as
+        // over-deducted.
+        ['Promos not closed yet', -dedNotClosed, 'sub',
+          (dedNotClosedBy && dedNotClosedBy.size
+            ? [...dedNotClosedBy.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 3).map(([k, v]) => esc(k) + ' ' + money(v)).join(', ') + ' \u00b7 '
+            : '') + 'plan for that month is still Running or Approved'],
         // THESE TWO USED TO OVERSTATE THE GAP. "No store detail" counted every
         // line without an itemisation, including the ones whose reference names
         // the retailer outright -- so money that was perfectly reconcilable at
@@ -32116,7 +32193,13 @@ render();
       // eating $178,951 of Whole Foods on a category-name mismatch.
       const planBridge = [
         ['Plan book ' + esc(yr), planBookTotal, null, 'Every line Vividly holds for the year.'],
-        ['Not a KeHE or UNFI line', -planExcludedRecv, 'sub', 'no deductions arrive through this receiver'],
+        ['Not a ' + (_dedDist === 'all' ? _dedDistNames(_dedDistCounts) : esc(_dedDist)) + ' line', -planExcludedRecv, 'sub',
+          (() => {
+            const m = R.planExcludedRecvBy;
+            if (!m || !m.size) return 'no deductions arrive through this receiver';
+            return [...m.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 3)
+              .map(([k, v]) => esc(k) + ' ' + money(v)).join(', ') + ' \u00b7 no deductions arrive through this receiver';
+          })()],
         ['Promo type with no matching deductions', -planExcludedType, 'sub',
           (() => {
             if (!planExcludedTypeBy || !planExcludedTypeBy.size) return '';
@@ -32251,7 +32334,14 @@ ${(() => {
             ${th('Plan customer')}${th('Planned $', true)}${th('Deducted $', true)}${th('Variance', true)}${th('vs plan', true)}${th('Status')}
           </tr></thead>
           <tbody>
-            ${rows.map(c => {
+            ${(() => {
+              // rows arrives sorted by plan + deducted, so slicing takes the
+              // accounts that carry the money and leaves the tail.
+              const shown = _dedRecAll ? rows : rows.slice(0, DED_REC_TOP);
+              const hidden = _dedRecAll ? [] : rows.slice(DED_REC_TOP);
+              const hPlan = hidden.reduce((s2, c) => s2 + c.plan, 0);
+              const hDed  = hidden.reduce((s2, c) => s2 + c.ded, 0);
+              return shown.map(c => {
               const open = _dedRecOpen.has(c.name);
               const tierTag = c.tier === 'retailer' ? ''
                 : `<span style="font-family:var(--mono);font-size:8.5px;letter-spacing:0.05em;padding:2px 6px;border-radius:3px;background:var(--rule-soft);color:var(--ink-3);margin-left:8px;">${c.tier === 'catch-all' ? 'CATCH-ALL' : 'UNATTRIBUTABLE'}</span>`;
@@ -32293,7 +32383,18 @@ ${(() => {
                 }).join('');
               }
               return out;
-            }).join('')}
+            }).join('')
+            + (hidden.length ? `<tr class="hl-rec-more" style="cursor:pointer;background:var(--rule-softer);">
+                ${td('<span style="display:inline-block;width:12px;color:var(--ink-3);">+</span><span style="font-family:var(--serif);font-size:13px;color:var(--ink-2);">' + hidden.length + ' more customer' + (hidden.length === 1 ? '' : 's') + '</span><span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;">already counted in the total \u2014 click to show</span>')}
+                ${td(hPlan ? '<span style="color:var(--ink-2);">' + money(hPlan) + '</span>' : '<span style="color:var(--ink-3);">\u2014</span>', true)}
+                ${td(hDed ? '<span style="color:var(--ink-2);">' + money(hDed) + '</span>' : '<span style="color:var(--ink-3);">\u2014</span>', true)}
+                ${td('', true)}${td('', true)}${td('')}
+              </tr>` : '')
+            + (_dedRecAll && rows.length > DED_REC_TOP ? `<tr class="hl-rec-less" style="cursor:pointer;">
+                ${td('<span style="display:inline-block;width:12px;color:var(--ink-3);">\u2212</span><span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">Show top ' + DED_REC_TOP + ' only</span>')}
+                ${td('')}${td('')}${td('')}${td('')}${td('')}
+              </tr>` : '');
+            })()}
           </tbody>
           <tfoot><tr style="border-top:2px solid var(--ink);">
             ${td('<strong>TOTAL</strong>')}${td('<strong>' + money(totPlan) + '</strong>', true)}
@@ -32406,6 +32507,14 @@ ${(() => {
         const n = tr.dataset.c;
         _dedRecOpen.has(n) ? _dedRecOpen.delete(n) : _dedRecOpen.add(n);
         renderDeductions(hostEl, filtersEl, year);
+      });
+      // The folded remainder, and the way back. Both re-render from cache --
+      // the register is immutable between syncs, so neither refetches.
+      body.querySelectorAll('.hl-rec-more').forEach(tr => tr.onclick = () => {
+        _dedRecAll = true; renderDeductions(hostEl, filtersEl, year);
+      });
+      body.querySelectorAll('.hl-rec-less').forEach(tr => tr.onclick = () => {
+        _dedRecAll = false; renderDeductions(hostEl, filtersEl, year);
       });
       return;
     }
