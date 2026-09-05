@@ -29074,7 +29074,47 @@ render();
   // Reconcile grain: 'customer' (the original) or 'month'. Same cells, summed on
   // a different axis — a calendar question and an account question are not the
   // same question, and the customer table could not answer the first one.
-  let _dedRecBy = (() => { try { return localStorage.getItem('keel_ded_rec_by') === 'month' ? 'month' : 'customer'; } catch (e) { return 'customer'; } })();
+  let _dedRecBy = (() => { try { const v = localStorage.getItem('keel_ded_rec_by'); return (v === 'month' || v === 'quarter') ? v : 'customer'; } catch (e) { return 'customer'; } })();
+  // ── QUARTERLY MATURITY ───────────────────────────────────────────────────
+  // Moshe reconciles on a QUARTER, calendar quarters on a Dec-31 year end. A
+  // quarter that has not finished receiving its deductions must not be read
+  // beside a settled one, or the mail still coming looks like underspend.
+  //
+  // 60, NOT 90, AND THE NUMBER IS MEASURED RATHER THAN ASSUMED. Both his prior
+  // analysis (~60-70% inside 30 days) and the first query I wrote were wrong:
+  // that query defined promo month as the detail date FALLING BACK to doc_date,
+  // so every line without store detail -- the majority -- had a lag of zero by
+  // construction and reported 100% at 30 days. Joining only to lines that carry
+  // a real promo date gives the true curve: 95.5% inside 30 days, 95.5% by 60,
+  // 96.0% by 90 across months with a full 90 days elapsed. Months still inside
+  // the curve confirm the shape -- Jun 93%->100% and Jul 84%->100% between 30
+  // and 60 days, then flat. Days 61-90 buy half a percent and cost a whole
+  // quarter of usable comparison.
+  // Re-measure before changing this; it is one constant on purpose.
+  // Runs from the QUARTER's close, not each promo month -- his call, and it
+  // keeps the unit of measurement the same as the unit of review.
+  const DED_SETTLE_DAYS = 60;
+  const _dedQOf = (mk) => {
+    if (!mk || mk === '0000-00' || mk.length < 7) return null;
+    return mk.slice(0, 4) + '-Q' + Math.ceil(Number(mk.slice(5, 7)) / 3);
+  };
+  const _dedQEnd = (qk) => {           // last day of the quarter, as YYYY-MM-DD
+    const y = Number(qk.slice(0, 4)), q = Number(qk.slice(6));
+    return [null, y + '-03-31', y + '-06-30', y + '-09-30', y + '-12-31'][q] || '';
+  };
+  const _dedQMaturity = (qk, asOf) => {
+    const end = _dedQEnd(qk);
+    if (!end || !asOf) return { state: 'unknown', label: '', days: 0 };
+    if (asOf < end) return { state: 'open', label: 'quarter still open', days: 0 };
+    const d = new Date(end + 'T12:00:00');
+    d.setDate(d.getDate() + DED_SETTLE_DAYS);
+    const settleBy = d.toISOString().slice(0, 10);
+    if (asOf < settleBy) {
+      const left = Math.max(1, Math.round((new Date(settleBy) - new Date(asOf)) / 86400000));
+      return { state: 'receiving', label: 'still receiving · ' + left + 'd to settle', days: left };
+    }
+    return { state: 'settled', label: 'settled', days: 0 };
+  };
 
   // 1,173 distinct KeHE banner strings against ~10 plan customers. Hand-picking
   // that from dropdowns is not a workflow, so the mapper PROPOSES and Moshe
@@ -29560,6 +29600,14 @@ render();
       // deduction side, attributed
       const cells = new Map();          // customer -> {cats: cat -> {months: m -> amt}}
       const catsSeen = new Set();
+      // AS OF: the newest payment date in the register, not today's date. The
+      // maturity of a quarter is a question about what has ARRIVED, so it must
+      // be measured against the data's own horizon -- if a sync is three days
+      // stale, every quarter is three days less mature, and saying otherwise
+      // would quietly claim deductions we have not seen.
+      let asOf = '';
+      for (const l of L) { const d = String(l.doc_date || ''); if (d > asOf) asOf = d; }
+
       let unattrib = 0, undocumented = 0, placed = 0, autoMatched = 0;
       // CATEGORIZED IS NOT DOCUMENTED, and the same distinction applies one
       // level down: money reconciled from store rows and money reconciled from
@@ -29825,7 +29873,7 @@ render();
     return { cells, rows, totPlan, totDed, unattrib, undocumented, placed, autoMatched,
              placedStore, placedLine, lineOnlyBy, lineOnlyList,
              dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
-             dedNotClosed, dedNotClosedBy,
+             dedNotClosed, dedNotClosedBy, asOf,
              registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
@@ -32118,7 +32166,7 @@ render();
               placedStore, placedLine, lineOnlyList,
               tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
               dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
-              dedNotClosed, dedNotClosedBy,
+              dedNotClosed, dedNotClosedBy, asOf,
               registerTotal, nonTradeTotal, nonTradeBy } = R;
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
@@ -32280,13 +32328,63 @@ ${(() => {
 })()}
 <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin:0 0 10px;">
           <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:3px;">Reconcile by</span>
-          ${[['customer', 'Customer'], ['month', 'Month']].map(([v, lbl]) => `<button class="hl-rec-by" data-v="${v}"
+          ${[['customer', 'Customer'], ['month', 'Month'], ['quarter', 'Quarter']].map(([v, lbl]) => `<button class="hl-rec-by" data-v="${v}"
             style="font-family:var(--mono);font-size:11px;padding:6px 14px;border-radius:5px;cursor:pointer;
                    border:1px solid ${_dedRecBy === v ? 'var(--ink)' : 'var(--rule-soft)'};
                    background:${_dedRecBy === v ? 'var(--ink)' : 'transparent'};
                    color:${_dedRecBy === v ? 'var(--paper)' : 'var(--ink-3)'};">${lbl}</button>`).join('')}
         </div>
-        ${_dedRecBy === 'month' ? (() => {
+        ${_dedRecBy === 'quarter' ? (() => {
+          // Same cells as every other grain, summed into calendar quarters, and
+          // then SPLIT BY MATURITY rather than shown as one list. The subtotals
+          // are the point: a settled quarter is a real verdict, a quarter still
+          // receiving is a progress report, and averaging them together is how
+          // an in-flight period gets mistaken for underspend.
+          const qm = new Map();
+          for (const c of cells.values()) for (const cc of c.cats.values()) {
+            for (const [k0, v] of cc.months)  { const q = _dedQOf(k0); if (!q) continue; const e = qm.get(q) || { q, ded: 0, plan: 0 }; e.ded  += v; qm.set(q, e); }
+            for (const [k0, v] of cc.pmonths) { const q = _dedQOf(k0); if (!q) continue; const e = qm.get(q) || { q, ded: 0, plan: 0 }; e.plan += v; qm.set(q, e); }
+          }
+          const qs = [...qm.values()].sort((a, b2) => a.q.localeCompare(b2.q));
+          if (!qs.length) return '<div style="padding:18px;font-family:var(--serif);font-size:13px;color:var(--ink-3);">No dated plan or deduction rows in this window.</div>';
+          qs.forEach(q => { q.mat = _dedQMaturity(q.q, R.asOf); });
+          const settled = qs.filter(q => q.mat.state === 'settled');
+          const openish = qs.filter(q => q.mat.state !== 'settled');
+          const sum = (arr, f) => arr.reduce((s2, x) => s2 + f(x), 0);
+          const matCol = (st) => st === 'settled' ? 'var(--ink-3)' : st === 'receiving' ? 'var(--lost)' : 'var(--ink-3)';
+          const qRow = (q) => `<tr>
+            ${td('<span style="font-family:var(--serif);font-size:13.5px;">' + q.q.replace('-', ' ') + '</span>')}
+            ${td(q.plan ? money(q.plan) : '<span style="color:var(--rule);">\u00b7</span>', true)}
+            ${td(q.ded ? money(q.ded) : '<span style="color:var(--rule);">\u00b7</span>', true)}
+            ${td((q.ded - q.plan > 0 ? '+' : '') + money(q.ded - q.plan), true, 'color:' + dCol(q.ded, q.plan) + ';font-weight:600;')}
+            ${td(q.plan ? dPct(q.ded, q.plan) : '\u2014', true, 'color:var(--ink-3);')}
+            ${td('<span style="font-family:var(--mono);font-size:10px;color:' + matCol(q.mat.state) + ';">' + esc(q.mat.label) + '</span>')}
+          </tr>`;
+          const subRow = (label, arr, note) => {
+            const p = sum(arr, x => x.plan), d = sum(arr, x => x.ded);
+            return `<tr style="border-top:1px solid var(--rule);background:var(--rule-softer);">
+              ${td('<strong style="font-family:var(--serif);font-size:13px;">' + label + '</strong><span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;">' + note + '</span>')}
+              ${td('<strong>' + money(p) + '</strong>', true)}
+              ${td('<strong>' + money(d) + '</strong>', true)}
+              ${td('<strong>' + (d - p > 0 ? '+' : '') + money(d - p) + '</strong>', true, 'color:' + dCol(d, p) + ';')}
+              ${td(p ? dPct(d, p) : '\u2014', true, 'color:var(--ink-3);')}${td('')}
+            </tr>`;
+          };
+          return `<table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${th('Quarter')}${th('Planned $', true)}${th('Deducted $', true)}${th('Variance', true)}${th('vs plan', true)}${th('Maturity')}</tr></thead>
+            <tbody>
+              ${settled.map(qRow).join('')}
+              ${settled.length ? subRow('Settled', settled, 'closed more than ' + DED_SETTLE_DAYS + ' days \u2014 compare these') : ''}
+              ${openish.map(qRow).join('')}
+              ${openish.length ? subRow('Still receiving', openish, 'deductions have not finished arriving \u2014 read as progress, not verdict') : ''}
+            </tbody>
+          </table>
+          <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;line-height:1.55;">
+            Calendar quarters on a December year end. A quarter counts as settled ${DED_SETTLE_DAYS} days after it closes,
+            measured against the newest payment date in the register${R.asOf ? ' (' + esc(R.asOf) + ')' : ''} rather than today \u2014
+            a stale sync makes every quarter less mature, and it should say so. Quarters come from when the promo ran,
+            not from when the check cleared.</p>`;
+        })() : _dedRecBy === 'month' ? (() => {
           // SAME CELLS, SUMMED ON THE OTHER AXIS. Deduction months come from the
           // store detail's own date (reference_date, falling back to the line's
           // doc_date); plan months from the promo's start_date, falling back to
@@ -32417,6 +32515,55 @@ ${(() => {
             <table style="width:100%;border-collapse:collapse;">${bridge.map(brRow).join('')}</table>
           </div>
         </div>
+        ${(() => {
+          // ── EARLY PAY: PLANNED VS ACTUALLY TAKEN ──────────────────────────
+          // The one piece of trade spend that never appears in the deduction
+          // book at all. UNFI and Kroger both take it by PAYING LESS -- it is a
+          // column on the remittance, not a chargeback -- so the reconciliation
+          // correctly drops it as a promo type nothing can match, and the whole
+          // planned amount then sits outside every number on this page.
+          // Now that the loader writes deduction_checks.discount_total, it can
+          // be compared. Shown apart from both bridges on purpose: folding it
+          // into either one would put non-deduction money in the deduction book.
+          const planned = (() => {
+            if (!planExcludedTypeBy) return 0;
+            let n = 0;
+            for (const [t, v] of planExcludedTypeBy) if (/early ?pay/i.test(t)) n += v;
+            return n;
+          })();
+          const inWin = (c) => {
+            const d = String(c.check_date || '').slice(0, 7);
+            return d && (!winStart || d >= winStart) && (!winEnd || d <= winEnd);
+          };
+          const withCol = checks.filter(c => c.discount_total != null);
+          const taken = checks.filter(inWin)
+            .reduce((s2, c) => s2 + Math.abs(Number(c.discount_total || 0)), 0);
+          const gross = checks.filter(inWin)
+            .reduce((s2, c) => s2 + Math.abs(Number(c.invoice_total || 0)), 0);
+          if (!planned && !taken) return '';
+          // Never state a rate off zero, and never let a partially-loaded set
+          // read as a real shortfall: until every check carries the column, the
+          // taken figure is a floor, not a total.
+          const rate = gross ? (taken / gross * 100) : 0;
+          const covered = checks.length ? Math.round(withCol.length / checks.length * 100) : 0;
+          return `<div style="border:1px solid var(--rule);border-radius:7px;padding:10px 12px;margin:0 0 16px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">
+              Early pay \u00b7 taken as a payment discount, never as a deduction
+            </div>
+            <div style="display:flex;gap:26px;flex-wrap:wrap;align-items:baseline;">
+              <span style="font-family:var(--serif);font-size:13px;">Planned <strong style="font-family:var(--mono);">${money(planned)}</strong></span>
+              <span style="font-family:var(--serif);font-size:13px;">Taken <strong style="font-family:var(--mono);">${money(taken)}</strong></span>
+              ${rate ? `<span style="font-family:var(--serif);font-size:13px;color:var(--ink-2);">Effective rate <strong style="font-family:var(--mono);">${rate.toFixed(2)}%</strong> of gross</span>` : ''}
+              ${planned && taken ? `<span style="font-family:var(--mono);font-size:11px;color:${dCol(taken, planned)};">${(taken - planned > 0 ? '+' : '') + money(taken - planned)} vs plan</span>` : ''}
+            </div>
+            <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:6px;line-height:1.55;">
+              ${covered < 100
+                ? 'Only ' + covered + '% of checks in scope carry a discount figure yet, so Taken is a FLOOR, not a total \u2014 re-run the remittance and register loaders to fill the rest.'
+                : 'Every check in scope carries a discount figure.'}
+              Excluded from the plan bridge above as a promo type with no matching deductions, which is correct: no chargeback is ever raised for it.
+            </div>
+          </div>`;
+        })()}
         ${P.err ? `<div style="margin-top:12px;font-family:var(--mono);font-size:11px;color:var(--lost);">Plan could not be loaded: ${esc(P.err)}</div>` : ''}`;
 
       // ── in-app crosswalk editor. plan_customer must equal promo_plan_lines.customer
