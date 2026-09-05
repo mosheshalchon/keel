@@ -29270,8 +29270,95 @@ render();
     if (/,\s*[A-Z]{2}$/.test(s)) return true;
     if (/zero\s*store/i.test(s)) return true;
     if (/^RASC$/i.test(s)) return true;
+    // KROGER DIVISION CODES sit in the same column as a customer name:
+    // "0097 - Harris Teeter Operating", "092 - REGIONAL ACCOUNTING CENTER",
+    // "620 - King Sooper KMA". A leading numeric code and a dash is a
+    // division; no plan customer is written that way, so this cannot collide.
+    if (/^\d{2,4}\s*-\s*\S/.test(s)) return true;
+    // WHAT was charged, not WHO. The explicit list is deliberate -- an
+    // all-caps or "contains ALLOWANCE" heuristic would swallow ARS PROMO,
+    // which IS a retailer (ARSH = Foodtown), and that mistake has already
+    // been made once on this project.
+    if (_isChargeType(s)) return true;
     return false;
   };
+
+  // ── THE REFERENCE STRING NAMES THE CUSTOMER AND THE PERIOD ───────────────
+  // UNFI's invoice_no is not an opaque identifier. Its grammar is PROGRAM +
+  // CUSTOMER/REGION + SUPPLIER + PERIOD, in varying order, and decoding it
+  // classified ~$1.4M of ATG's book without opening a single document.
+  //
+  // This is what turns line-level reconciliation from a fallback into a real
+  // path: the "undocumented" trade spend is missing its STORE ROWS, not its
+  // customer. WHFDSCAN is Whole Foods whether or not a detail file ever
+  // arrived, and Moshe's ruling is that store level does not matter -- the
+  // grain is customer x period x amount.
+  //
+  // Decoded here, in the app, rather than only in the loader, so it applies to
+  // rows already in the table whichever SQL passes have been run. The durable
+  // home is sync-deductions' UNFI path; that move is the portability work and
+  // is deliberately deferred, not forgotten.
+  const _DED_REF_CUST = {
+    NATGROC: 'Natural Grocers', THRIVE: 'Thrive Market', AHOLD: 'Ahold Delhaize',
+    NWSESN: 'New Seasons', ROCHE: 'Roche Bros', WKFERN: 'Wakefern',
+    TFM: 'The Fresh Market', EFA: 'Earth Fare', DIBRGS: 'Dierbergs',
+    HEINEN: 'Heinens', WINDIX: 'Winn-Dixie', NWLEAF: 'New Leaf',
+    BFARM: 'Bristol Farms', DAVEM: 'Daves Market', CUB: 'Cub Foods',
+    HARVES: 'Harvest', AKINS: 'Akins', HANAFD: 'Hannaford',
+    SCHNCK: 'Schnucks', LAM: 'Lassens', WGM: 'Wegmans', HEN: 'Heinens',
+  };
+  function _dedRefCustomer(invNo) {
+    const s = String(invNo || '').toUpperCase().trim();
+    if (!s) return null;
+    let m;
+    // THE CODE IS 3PTY, NOT PTY -- read the digit boundaries, not the letters.
+    // One advice runs 03803274·3PTY·NWSESN, 03803275·SCAN·NWSESN,
+    // 03803276·3PTY·NWSESN: the invoice numbers are sequential, so the
+    // trailing 3 belongs to the code. Matching on PTY eats it into the number.
+    // 3PTY = a retailer's promotion billed to ATG through UNFI, which is also
+    // why these retailers have no Dropbox folder of their own.
+    if ((m = s.match(/^\d{8}3PTY([A-Z]+)$/)))          return _DED_REF_CUST[m[1]] || null;
+    if ((m = s.match(/^\d{8}(?:CPN|SCAN)([A-Z]+)$/))) return _DED_REF_CUST[m[1]] || null;
+    if ((m = s.match(/^FSR([A-Z]+)/)))                 return _DED_REF_CUST[m[1]] || null;
+    if (/^WHFD[A-Z]/.test(s)) return 'Whole Foods';
+    if (/^WFM(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}/.test(s)) return 'Whole Foods';
+    if (/^NCG/.test(s)) return 'NCG';
+    return null;
+  }
+  const _DED_MON3 = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  const _dedMMYY = (mm, yy) => {
+    const m = Number(mm), y = Number(yy);
+    // Validate the month before building a date. An unvalidated pattern turns
+    // region 41 into month 41 and the failure is silent.
+    if (!(m >= 1 && m <= 12)) return '';
+    return String(2000 + y) + '-' + String(m).padStart(2, '0');
+  };
+  function _dedRefMonth(invNo) {
+    const s = String(invNo || '').toUpperCase().trim();
+    if (!s) return '';
+    let m;
+    // ORDER IS LOAD-BEARING, and getting it wrong cost three regexes. A
+    // prefix-first rule pulls 4100 out of EREPL41007596.0526.01 -- that is
+    // region 41, not a month. The dotted period is unambiguous, so it goes
+    // first, and every pattern validates the month before returning.
+    if ((m = s.match(/\.(\d{2})(\d{2})\./)))                              return _dedMMYY(m[1], m[2]);
+    if ((m = s.match(/^MCB(\d{4})(\d{2})\d{2}/))) {
+      const mo = Number(m[2]);
+      return (mo >= 1 && mo <= 12) ? m[1] + '-' + m[2] : '';
+    }
+    if ((m = s.match(/^(?:ER|WR)(?:DTCE|SLOFE|DC|TTS)(\d{2})(\d{2})/)))   return _dedMMYY(m[1], m[2]);
+    if ((m = s.match(/^FBB(\d{2})(\d{2})/)))                              return _dedMMYY(m[1], m[2]);
+    // YYMM here -- REVERSED against every other pattern in this list.
+    if ((m = s.match(/_(?:TPR|PA|SPDA)_(\d{2})(\d{2})/)))                 return _dedMMYY(m[2], m[1]);
+    if ((m = s.match(/^WHFD[A-Z]+(\d{2})(\d{2})/)))                       return _dedMMYY(m[1], m[2]);
+    if ((m = s.match(/^CMQ(\d{2})\d{2}(\d{2})/)))                         return _dedMMYY(m[1], m[2]);
+    // WFM ISE: month NAME, not digits. These are the 16 lines that carried no
+    // date at all and were invisible to every date-filtered view.
+    if ((m = s.match(/^WFM([A-Z]{3})(\d{2})/)) && _DED_MON3.indexOf(m[1]) >= 0) {
+      return _dedMMYY(_DED_MON3.indexOf(m[1]) + 1, m[2]);
+    }
+    return '';
+  }
 
   const _dedIsTradeFor = (rmapBy) => (l) => { const rm = rmapBy[l.reason_code]; return !!(rm && rm.is_trade_spend); };
 
@@ -29333,18 +29420,40 @@ render();
         'wfm': 'Whole Foods',
         'the fresh market': 'TFM',
         'thrive': 'Thrive Market',
+        'thrive market': 'Thrive Market',
         'ahold': 'Ahold Delhaize',
+        // Spellings the reference decoder emits, mapped to the plan's own.
+        // Retailers the plan does not cover at all (Winn-Dixie, Roche Bros,
+        // New Leaf, Lassens, Daves, Cub, Akins, Harvest -- about $48K) are
+        // deliberately absent: they should surface as unmatched retailers,
+        // which is a finding, not be forced onto a neighbouring account.
+        'giant carlisle': 'Giant Carlisle',
+        'giant landover': 'Giant Landover',
       };
+      // THE ALIAS LOOKUP WAS DEAD CODE. _PLAN_ALIAS is keyed on lowercase
+      // phrases ('natural grocers'), but it was being probed with _dedNorm's
+      // output, which is UPPERCASE and strips noise words -- so 'Natural
+      // Grocers' normalised to the EMPTY STRING and could never hit a key.
+      // That is why $137,420 of Natural Grocers still read as a -97% variance
+      // against NGVC even after the alias was added to fix exactly that.
+      //
+      // The alias must therefore be probed with a LIGHT normalisation that
+      // keeps the words, and only the alias's own value goes through _dedNorm
+      // to re-enter the plan index. Keying the alias on _dedNorm would also be
+      // actively dangerous: every noise-only name collapses to '', so a single
+      // '' entry would send every unrecognised retailer to one plan customer.
+      const _lite = (s) => String(s || '').toLowerCase()
+        .replace(/['\u2019\u02BC]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
       const _autoMatch = (raw) => {
-        const k = _dedNorm(raw);
-        if (!k) return null;
-        if (_planIdx.has(k)) return _planIdx.get(k);
-        // Try the alias, then re-enter the plan index with the plan's own name.
-        const al = _PLAN_ALIAS[k];
+        const lk = _lite(raw);
+        const al = lk ? _PLAN_ALIAS[lk] : null;
         if (al) {
           const ak = _dedNorm(al);
           if (_planIdx.has(ak)) return _planIdx.get(ak);
         }
+        const k = _dedNorm(raw);
+        if (!k) return null;
+        if (_planIdx.has(k)) return _planIdx.get(k);
         for (const [pk, pc] of _planIdx) {
           if (pk.length >= 4 && (k.startsWith(pk + ' ') || k === pk)) return pc;
         }
@@ -29359,6 +29468,30 @@ render();
         if (n === 'all customers' || n === '(no customer)') return 'unattributable';
         if (/^(unfi|kehe)( all other)?$/.test(n) || /all other/.test(n)) return 'catch-all';
         return 'retailer';
+      };
+
+      // ── THE LINE'S OWN CUSTOMER, from three places, best evidence first ──
+      // This is the change that makes line-level reconciliation a real path
+      // rather than a fallback. Previously a line only reached a plan customer
+      // through its STORE ROWS, so money whose retailer was perfectly well
+      // known -- because the reference says so -- reported as unreconcilable
+      // for want of an itemisation nobody needs.
+      //
+      // Order is by how hard the evidence is to argue with:
+      //   1. the reference string, decoded deterministically from the document
+      //      the distributor sent (…3PTYNATGROC is Natural Grocers, full stop)
+      //   2. dc_name, which is real data but OVERLOADED -- it means "where it
+      //      went", so the guard above has to reject warehouses and divisions
+      //   3. the reason map's retailer, which is per-CODE and therefore the
+      //      coarsest of the three, and may be flagged 'inferred'
+      const _lineCust = (l) => {
+        const rm = rmapBy[l.reason_code];
+        const cands = [_dedRefCustomer(l.invoice_no), l.dc_name, rm && rm.retailer];
+        for (const c of cands) {
+          if (!c || _notACustomer(c)) continue;
+          return _autoMatch(c) || c;
+        }
+        return null;
       };
 
       const isTrade = _dedIsTradeFor(rmapBy);
@@ -29421,6 +29554,13 @@ render();
       const cells = new Map();          // customer -> {cats: cat -> {months: m -> amt}}
       const catsSeen = new Set();
       let unattrib = 0, undocumented = 0, placed = 0, autoMatched = 0;
+      // CATEGORIZED IS NOT DOCUMENTED, and the same distinction applies one
+      // level down: money reconciled from store rows and money reconciled from
+      // the line's own reference are both reconciled, but they are not the same
+      // grade of evidence. Pooling them would repeat the exact conflation that
+      // has cost this project hours, so they are counted apart and printed apart.
+      let placedStore = 0, placedLine = 0;
+      const lineOnlyBy = new Map();     // plan customer -> amount placed without store rows
       // Counted, not just skipped. This is the largest single reason the
       // reconciliation total is smaller than trade spend, and it used to leave
       // no trace at all — the loop simply continued, so the money vanished
@@ -29449,7 +29589,12 @@ render();
         }
         if (best) return best.slice(0, 7);
         const dd = String(l.doc_date || '');
-        return (dd && dd >= VALID_FROM) ? dd.slice(0, 7) : '';
+        if (dd && dd >= VALID_FROM) return dd.slice(0, 7);
+        // LAST RESORT: the period encoded in the reference itself. A line with
+        // no detail row and no doc_date is not necessarily undated -- the WFM
+        // ISE lines carry their month as a NAME (WFMJAN26) and sat outside
+        // every date-filtered view because nothing ever read it.
+        return _dedRefMonth(l.invoice_no);
       };
 
       let dedOutOfWindow = 0, dedUndated = 0, dedPriorPeriod = 0;
@@ -29484,6 +29629,10 @@ render();
         catsSeen.add(normCat(cat));
         const rows = detByLine.get(l.id) || [];
         const base = rows.reduce((s2, d) => s2 + Math.abs(Number(d.bill_amount || 0)), 0);
+        // Resolved ONCE per line, then used by both branches below: it seats a
+        // line that has no store rows at all, and it catches the individual
+        // rows within a documented line whose banner is not crosswalked.
+        const lc = _lineCust(l);
         if (!rows.length || base <= 0) {
           // LINE-LEVEL RETAILER FALLBACK. Without this the tab could only see
           // money that has store rows, so Natural Grocers read $3,029 against
@@ -29495,14 +29644,14 @@ render();
           // The whole line moves, since there are no rows to apportion across.
           // Date falls back to doc_date, which is the promo-date rule already
           // applied at load. Anything still unattributed stays undocumented.
-          const rmF = rmapBy[l.reason_code];
-          const nmFRaw = l.dc_name || (rmF && rmF.retailer) || null;
-          const nmF = _notACustomer(nmFRaw) ? null : nmFRaw;
-          const pcF = nmF ? (_autoMatch(nmF) || nmF) : null;
+          const pcF = lc;
           if (!pcF) { undocumented += amt; continue; }
-          const _dsF = String(l.doc_date || '');
-          const mkF = (_dsF && _dsF >= VALID_FROM) ? _dsF.slice(0, 7) : '';
+          // The month is the one the bridge already placed this line in, so a
+          // line cannot reconcile into one month and be counted in another.
+          const mkF = lmk;
           placed += amt;
+          placedLine += amt;
+          lineOnlyBy.set(pcF, (lineOnlyBy.get(pcF) || 0) + amt);
           let cF = cells.get(pcF);
           if (!cF) cells.set(pcF, cF = { name: pcF, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(pcF) });
           cF.ded += amt;
@@ -29525,16 +29674,25 @@ render();
                   || null;
           if (pc && !(m && m.plan_customer)) autoMatched += Math.abs(Number(d.bill_amount || 0));
           const _ds = String(d.reference_date || d.date_from || l.doc_date || '');
-          const mk2 = (_ds && _ds >= VALID_FROM) ? _ds.slice(0, 7) : '';
-          if (!pc) {
+          const mk2 = (_ds && _ds >= VALID_FROM) ? _ds.slice(0, 7) : lmk;
+          // A DOCUMENTED LINE CAN STILL HAVE UNMAPPED ROWS, and losing those
+          // was the second half of the same mistake: the store rows arrived,
+          // their banner is not crosswalked, and the money fell out even
+          // though the LINE says plainly who it belongs to. The row's own
+          // banner still wins -- it is the finer evidence -- and the line only
+          // catches what the banner could not place.
+          const pcR = pc || lc;
+          if (!pcR) {
             unattrib += share;
             const k = raw || d.customer_name || '(no banner)';
             unattribBy.set(k, (unattribBy.get(k) || 0) + share);
             continue;
           }
           placed += share;
-          let c = cells.get(pc);
-          if (!c) cells.set(pc, c = { name: pc, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(pc) });
+          if (pc) placedStore += share;
+          else { placedLine += share; lineOnlyBy.set(pcR, (lineOnlyBy.get(pcR) || 0) + share); }
+          let c = cells.get(pcR);
+          if (!c) cells.set(pcR, c = { name: pcR, cats: new Map(), ded: 0, plan: 0, tier: _tierOf(pcR) });
           c.ded += share;
           const ck = normCat(cat);
           let cc = c.cats.get(ck);
@@ -29595,7 +29753,9 @@ render();
       const totPlan = rows.reduce((s2, c) => s2 + c.plan, 0);
       const totDed = rows.reduce((s2, c) => s2 + c.ded, 0);
       const unattribList = [...unattribBy.entries()].sort((a, b) => b[1] - a[1]);
+    const lineOnlyList = [...lineOnlyBy.entries()].sort((a, b) => b[1] - a[1]);
     return { cells, rows, totPlan, totDed, unattrib, undocumented, placed, autoMatched,
+             placedStore, placedLine, lineOnlyBy, lineOnlyList,
              dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
              registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
@@ -31886,6 +32046,7 @@ render();
       const { planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
               planExcludedTypeBy } = R;
       const { cells, rows, totPlan, totDed, unattrib, undocumented, autoMatched,
+              placedStore, placedLine, lineOnlyList,
               tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
               dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
               registerTotal, nonTradeTotal, nonTradeBy } = R;
@@ -31916,17 +32077,30 @@ render();
           + ' \u00b7 answers to the prior year\u2019s plan'],
         ['After ' + (winEnd ? _dedMon(winEnd) : 'the window'), -dedOutOfWindow, 'sub',
           outOfWindowBy && outOfWindowBy.size ? [...outOfWindowBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => _dedMon(m) + ' ' + money(v)).join(', ') : ''],
-        ['No store detail', -undocumented, 'sub', 'no banner to place it by'],
+        // THESE TWO USED TO OVERSTATE THE GAP. "No store detail" counted every
+        // line without an itemisation, including the ones whose reference names
+        // the retailer outright -- so money that was perfectly reconcilable at
+        // customer x period read as missing. Both rows now mean what they say:
+        // nothing anywhere on the line or its rows identifies a customer.
+        ['No customer anywhere on the line', -undocumented, 'sub', 'not in the reference, dc_name or the reason map'],
         ['Banner not mapped', -unattrib, 'sub', unattribList.length ? esc(unattribList.slice(0, 3).map(u => u[0]).join(', ')) : ''],
         ['Reconciled against plan', totDed, 'tot', ''],
-      ].filter(r => r[2] !== 'sub' || Math.abs(r[1]) > 0.005);
+        // Reconciled, but not equally well evidenced. Both grades answer "did
+        // this match what we agreed" at customer x period, which is the grain
+        // Moshe set; only the first can also be checked item by item.
+        ['from store-level detail', placedStore, 'note', 'itemised: store, item, units x rate'],
+        ['from the line\u2019s own reference', placedLine, 'note',
+          lineOnlyList && lineOnlyList.length
+            ? esc(lineOnlyList.slice(0, 3).map(u => u[0]).join(', ')) + ' \u00b7 customer and period, no itemisation'
+            : 'customer and period, no itemisation'],
+      ].filter(r => (r[2] !== 'sub' && r[2] !== 'note') || Math.abs(r[1]) > 0.005);
       const brRow = ([label, val, kind, note]) => `
         <tr>
-          <td style="padding:5px 10px;font-family:var(--serif);font-size:13px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'padding-left:26px;color:var(--ink-2);' : ''}">
-            ${kind === 'sub' ? '<span style="color:var(--ink-3);">\u2212 </span>' : ''}${label}
+          <td style="padding:5px 10px;font-family:var(--serif);font-size:${kind === 'note' ? '12' : '13'}px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'padding-left:26px;color:var(--ink-2);' : kind === 'note' ? 'padding-left:26px;color:var(--ink-3);font-style:italic;' : ''}">
+            ${kind === 'sub' ? '<span style="color:var(--ink-3);">\u2212 </span>' : kind === 'note' ? '<span style="color:var(--rule);">\u2514 </span>' : ''}${label}
             ${note ? `<span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;">${note}</span>` : ''}
           </td>
-          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:13px;white-space:nowrap;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'color:var(--ink-2);' : ''}">
+          <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:${kind === 'note' ? '11.5' : '13'}px;white-space:nowrap;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'color:var(--ink-2);' : kind === 'note' ? 'color:var(--ink-3);' : ''}">
             ${money(Math.abs(val))}
           </td>
           <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);white-space:nowrap;${kind === 'tot' ? 'border-top:2px solid var(--ink);' : kind === 'mid' ? 'border-top:1px solid var(--rule);' : ''}">
@@ -31986,7 +32160,7 @@ render();
         ${(unattrib + undocumented) ? `<div style="border:1px solid var(--rule);border-radius:6px;padding:12px 14px;margin-bottom:16px;background:rgba(0,0,0,.015);">
           <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Not yet placed \u00b7 ${money(unattrib + undocumented)}</div>
           <div style="font-family:var(--serif);font-size:12.5px;color:var(--ink-2);line-height:1.6;">
-            ${money(undocumented)} has no store-level detail, so there is no banner to place it by.
+            ${money(undocumented)} names no customer anywhere \u2014 not in the reference string, not in <code>dc_name</code>, not on the reason code. <code>UNFI-ASMCB</code> is the structural case: it is billed against a warehouse, so no mapping will ever fix it.
             ${money(unattrib)} has a banner with no <strong>plan customer</strong> mapped${unattribList.length ? ' \u2014 ' + esc(unattribList.slice(0, 5).map(u => u[0]).join(', ')) + (unattribList.length > 5 ? ' and ' + (unattribList.length - 5) + ' more' : '') : ''}.
             ${unattribList.length ? `<button id="hl-rec-mapbtn" style="margin-left:6px;font-family:var(--mono);font-size:10px;padding:4px 11px;border-radius:5px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Map customers</button>` : ''}
           </div>
