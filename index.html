@@ -29415,7 +29415,7 @@ render();
   // from module state and writes nothing back, so both callers are guaranteed
   // the same answer for the same inputs. Nothing about the arithmetic changed
   // when it moved here — only where it lives.
-  function _dedComputeRecon({ L, rmapBy, D, P, scopedIds, dist, distNames, completedOnly, includePartial, year }) {
+  function _dedComputeRecon({ L, rmapBy, D, P, scopedIds, dist, distNames, lineRates, completedOnly, includePartial, year }) {
       // deduction_detail has no distributor column, so it is fetched whole and
       // narrowed here to the lines in scope — otherwise By customer and the
       // reconciliation would total every distributor's stores under one label.
@@ -29540,6 +29540,57 @@ render();
         }
         return null;
       };
+
+      // ── EDLP, IDENTIFIED BY RATE ─────────────────────────────────────────
+      // EDLP is the largest promo type in the plan ($422,824 for 2026) and none
+      // of it is visible, because Keel classifies by DOCUMENT TYPE and EDLP
+      // never arrives on a document that says EDLP: KeHE bills it through the
+      // SCAN channel, UNFI as deal-type 'E'. The Sprouts advice SN000173234 is
+      // stamped SCAN and every one of its 1,414 rows is $0.45 -- the exact
+      // Sprouts rate in the plan.
+      //
+      // So the rate is the identifier. CUSTOMER + RATE, never rate alone: $0.52
+      // is both Giant Carlisle and Giant Landover, $0.15 is both Giant Landover
+      // and Stop & Shop.
+      //
+      // Carved OUT of the plan comparison on purpose. EDLP is not an event --
+      // it is a per-unit rate on everything sold, all year -- so "over plan"
+      // only means volume beat the forecast, which is not a trade-spend
+      // finding. The question worth asking is whether the rate charged is the
+      // rate agreed, and that IS answerable here because the detail carries
+      // units and a rate that must multiply out to the amount.
+      const EDLP_RATE_TOL = 0.005;
+      const edlpRates = new Map();       // plan customer -> Set(agreed rates)
+      for (const pl of P.lines) {
+        if (!/edlp/i.test(String(pl.promo_type || ''))) continue;
+        const r = Number(pl.spend_rate);
+        if (!isFinite(r) || r <= 0) continue;
+        const c = _autoMatch(pl.customer) || pl.customer;
+        if (!c) continue;
+        if (!edlpRates.has(c)) edlpRates.set(c, new Set());
+        edlpRates.get(c).add(Math.round(r * 10000) / 10000);
+      }
+      const ratesByLine = new Map();
+      for (const rr of (lineRates || [])) ratesByLine.set(rr.line_id, rr);
+      // A line is EDLP when its detail sits at ONE rate and that rate is one
+      // this customer has an EDLP agreement for. distinct_rates > 1 means a
+      // mixed document, which is a scan, not a flat programme.
+      const _edlpHit = (l, cust) => {
+        const rr = ratesByLine.get(l.id);
+        if (!rr || Number(rr.distinct_rates) !== 1) return null;
+        const set = edlpRates.get(cust);
+        if (!set) return null;
+        const charged = Number(rr.rate_min);
+        for (const agreed of set) {
+          if (Math.abs(charged - agreed) <= EDLP_RATE_TOL) {
+            return { agreed, charged, units: Number(rr.units) || 0,
+                     implied: Number(rr.implied_rate) || 0 };
+          }
+        }
+        return null;
+      };
+      let edlpTotal = 0;
+      const edlpBy = new Map();          // customer -> { amt, units, agreed, charged, offRate }
 
       const isTrade = _dedIsTradeFor(rmapBy);
       const catOfLine = (l) => { const rm = rmapBy[l.reason_code]; return (rm && rm.keel_category) || l.reason_code || 'Unresolved'; };
@@ -29753,6 +29804,15 @@ render();
           // applied at load. Anything still unattributed stays undocumented.
           const pcF = lc;
           if (!pcF) { undocumented += amt; continue; }
+          const eF = _edlpHit(l, pcF);
+          if (eF) {
+            edlpTotal += amt;
+            const e0 = edlpBy.get(pcF) || { amt: 0, units: 0, agreed: eF.agreed, charged: eF.charged, offRate: 0, lines: 0 };
+            e0.amt += amt; e0.units += eF.units; e0.lines++;
+            if (Math.abs(eF.implied - eF.charged) > EDLP_RATE_TOL) e0.offRate += amt;
+            edlpBy.set(pcF, e0);
+            continue;
+          }
           // The month is the one the bridge already placed this line in, so a
           // line cannot reconcile into one month and be counted in another.
           const mkF = lmk;
@@ -29794,6 +29854,17 @@ render();
           // banner still wins -- it is the finer evidence -- and the line only
           // catches what the banner could not place.
           const pcR = pc || lc;
+          // Checked once per LINE, not per detail row -- the rate summary is a
+          // property of the whole line, so a hit takes the entire line out.
+          if (pcR && _edlpHit(l, pcR)) {
+            const eR = _edlpHit(l, pcR);
+            edlpTotal += share;
+            const e1 = edlpBy.get(pcR) || { amt: 0, units: 0, agreed: eR.agreed, charged: eR.charged, offRate: 0, lines: 0 };
+            e1.amt += share;
+            if (Math.abs(eR.implied - eR.charged) > EDLP_RATE_TOL) e1.offRate += share;
+            edlpBy.set(pcR, e1);
+            continue;
+          }
           if (!pcR) {
             unattrib += share;
             const k = raw || d.customer_name || '(no banner)';
@@ -29873,7 +29944,7 @@ render();
     return { cells, rows, totPlan, totDed, unattrib, undocumented, placed, autoMatched,
              placedStore, placedLine, lineOnlyBy, lineOnlyList,
              dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
-             dedNotClosed, dedNotClosedBy, asOf,
+             dedNotClosed, dedNotClosedBy, asOf, edlpTotal, edlpBy, edlpRates,
              registerTotal, nonTradeTotal, nonTradeBy,
              unattribBy, unattribList, tradeTotal, catsSeen,
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
@@ -30798,7 +30869,7 @@ render();
     };
 
 
-    let checks = [], lines = [], rmap = [], detAgg = [];
+    let checks = [], lines = [], rmap = [], detAgg = [], lineRates = [];
     let _dedDistCounts = { KeHE: 0, UNFI: 0 };
     let _scopedLineIds = new Set();
     let _dedFp = '';
@@ -30850,14 +30921,24 @@ render();
     const rawKey = brandId + '|' + year;
     try {
       if (_dedRaw && _dedRaw.key === rawKey) {
-        ({ checks, lines, rmap } = _dedRaw);
+        ({ checks, lines, rmap, lineRates = [] } = _dedRaw);
       } else {
-        [checks, lines, rmap] = await Promise.all([
+        [checks, lines, rmap, lineRates] = await Promise.all([
           paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
           paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
           paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
+          // PER-LINE UNIT RATES. The rollup that feeds the detail does not carry
+          // ship_qty or unit_chargeback, and the RATE is the only thing that
+          // identifies EDLP: KeHE bills it through the SCAN channel and UNFI as
+          // deal-type 'E', so no document anywhere says the word. Caught rather
+          // than awaited hard -- the view is a separate migration, and a page
+          // that dies because one optional aggregate is missing is worse than a
+          // page with no EDLP section.
+          paged(() => sb.from('deduction_line_rates')
+            .select('line_id,distinct_rates,rate_min,rate_max,units,amount,implied_rate')
+            .eq('brand_id', brandId).order('line_id', { ascending: true })).catch(() => []),
         ]);
-        _dedRaw = { key: rawKey, checks, lines, rmap };
+        _dedRaw = { key: rawKey, checks, lines, rmap, lineRates };
       }
       // Scope applied AFTER caching, so switching distributor is instant and
       // never refetches. A UNFI line can have a null check (their unfiled
@@ -32073,7 +32154,7 @@ render();
       // ── 4 · versus plan. Same function the Reconcile tab calls, same inputs,
       // so these ten rows cannot disagree with that screen.
       const P2 = _dedPlan || { lines: [], err: null };
-      const R2 = _dedComputeRecon({ L, rmapBy, D: D2, P: P2, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}),
+      const R2 = _dedComputeRecon({ L, rmapBy, D: D2, P: P2, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates,
                                     completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       // Catch-all and unattributable rows are excluded: a variance there is an
       // artefact of the plan naming no retailer, not a retailer out of line.
@@ -32158,7 +32239,7 @@ render();
     if (_dedView === 'reconcile') {
       const D = _dedDetail || { det: [], bmap: [] };
       const P = _dedPlan || { lines: [], err: null };
-      const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}),
+      const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates,
                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       const { planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
               planExcludedTypeBy } = R;
@@ -32166,7 +32247,7 @@ render();
               placedStore, placedLine, lineOnlyList,
               tradeTotal, winStart, winEnd, partialMonth, monthLines, unattribList,
               dedOutOfWindow, dedUndated, dedPriorPeriod, outOfWindowBy, priorPeriodBy,
-              dedNotClosed, dedNotClosedBy, asOf,
+              dedNotClosed, dedNotClosedBy, asOf, edlpTotal, edlpBy,
               registerTotal, nonTradeTotal, nonTradeBy } = R;
       const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
       const mLabel = k => { const p = String(k).split('-'); return (MN[Number(p[1]) - 1] || '?') + " '" + String(p[0]).slice(2); };
@@ -32182,44 +32263,78 @@ render();
       // silently. Every step is named now and the arithmetic closes, so the
       // question "why is this only half my deductions" is answered on the
       // screen that raises it rather than by reading the source.
-      const _top3 = (m) => m && m.size
-        ? [...m.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 3).map(([k, v]) => esc(k) + ' ' + money(v)).join(', ')
-        : '';
+      // ── BREAKDOWNS ARE ROWS, NOT A SENTENCE ──────────────────────────────
+      // Every one of these used to be crammed into a 9.5px mono note beside the
+      // label: "Merchandising $13,145, Early Pay $12,000, Returns - Shortages -
+      // Allowances $6,000, other 1 type $2,096". Moshe, correctly: impossible to
+      // see. The parts of a subtraction are the reviewable content of a bridge,
+      // so they get their own indented rows with the amount in the amount
+      // column, where the eye already is. One helper, used by BOTH bridges.
+      //
+      // Folding rule: show the parts that carry the row, fold the tail into a
+      // counted 'Other'. Never DROP a part -- shown plus folded must equal the
+      // row, or the bridge stops being a bridge.
+      const B_ITEM_MAX = 6, B_ITEM_MIN_PCT = 0.01;
+      const _bItems = (src, fmt) => {
+        if (!src) return [];
+        const es = (src instanceof Map ? [...src.entries()] : src)
+          .map(([k, v]) => [fmt ? fmt(k) : String(k), Math.abs(Number(v) || 0)])
+          .filter(e => e[1] > 0.005)
+          .sort((a, b2) => b2[1] - a[1]);
+        if (!es.length) return [];
+        const tot = es.reduce((n, e) => n + e[1], 0);
+        const keep = es.filter((e, i) => i < B_ITEM_MAX && e[1] / tot >= B_ITEM_MIN_PCT);
+        const rest = es.slice(keep.length);
+        const out = keep.map(([k, v]) => ({ label: k, amt: v }));
+        if (rest.length) out.push({
+          label: 'Other \u00b7 ' + rest.length,
+          amt: rest.reduce((n, e) => n + e[1], 0), dim: true,
+        });
+        return out;
+      };
+      const _bItemRows = (items, denom) => (items || []).map(it => `
+        <tr>
+          <td style="padding:2px 10px 2px 42px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);${it.dim ? 'font-style:italic;' : ''}">${esc(it.label)}</td>
+          <td style="padding:2px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);white-space:nowrap;">${money(it.amt)}</td>
+          <td style="padding:2px 10px;text-align:right;font-family:var(--mono);font-size:9.5px;color:var(--rule);white-space:nowrap;">${denom ? (it.amt / denom * 100).toFixed(1) + '%' : ''}</td>
+        </tr>`).join('');
+
       const bridge = [
         ['All deductions' + (_dedDist === 'all' ? '' : ' \u00b7 ' + esc(_dedDist)), registerTotal, null, ''],
-        ['Not trade spend', -nonTradeTotal, 'sub', nonTradeBy && nonTradeBy.size ? _top3(nonTradeBy) : 'freight, fees, shortages'],
+        ['Not trade spend', -nonTradeTotal, 'sub', 'freight, fees, shortages', _bItems(nonTradeBy)],
         ['Trade spend', tradeTotal, 'mid', ''],
         ['No date on the line', -dedUndated, 'sub', 'cannot be placed in a month'],
         ['Promos that ran before ' + (winStart ? _dedMon(winStart) : 'the window'), -dedPriorPeriod, 'sub',
-          (priorPeriodBy && priorPeriodBy.size ? [...priorPeriodBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => _dedMon(m) + ' ' + money(v)).join(', ') : '')
-          + ' \u00b7 answers to the prior year\u2019s plan'],
+          'answers to the prior year\u2019s plan', _bItems(priorPeriodBy, _dedMon)],
         ['After ' + (winEnd ? _dedMon(winEnd) : 'the window'), -dedOutOfWindow, 'sub',
-          outOfWindowBy && outOfWindowBy.size ? [...outOfWindowBy.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([m,v]) => _dedMon(m) + ' ' + money(v)).join(', ') : ''],
+          '', _bItems(outOfWindowBy, _dedMon)],
         // The mirror of the plan side's 'Not closed yet'. Without it the two
         // sides used different months and every mid-flight promo read as
         // over-deducted.
         ['Promos not closed yet', -dedNotClosed, 'sub',
-          (dedNotClosedBy && dedNotClosedBy.size
-            ? [...dedNotClosedBy.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 3).map(([k, v]) => esc(k) + ' ' + money(v)).join(', ') + ' \u00b7 '
-            : '') + 'plan for that month is still Running or Approved'],
+          'plan for that month is still Running or Approved', _bItems(dedNotClosedBy)],
+        // EDLP leaves before the comparison, not after. It is a per-unit rate
+        // on everything sold, so a monthly plan variance on it measures volume
+        // rather than trade spend. Its own panel below asks the question that
+        // does apply: is the rate charged the rate agreed?
+        ['EDLP', -edlpTotal, 'sub', 'a per-unit rate, not an event \u2014 checked on rate below',
+          _bItems(new Map([...(edlpBy || new Map())].map(([k, v]) => [k, v.amt])))],
         // THESE TWO USED TO OVERSTATE THE GAP. "No store detail" counted every
         // line without an itemisation, including the ones whose reference names
         // the retailer outright -- so money that was perfectly reconcilable at
         // customer x period read as missing. Both rows now mean what they say:
         // nothing anywhere on the line or its rows identifies a customer.
         ['No customer anywhere on the line', -undocumented, 'sub', 'not in the reference, dc_name or the reason map'],
-        ['Banner not mapped', -unattrib, 'sub', unattribList.length ? esc(unattribList.slice(0, 3).map(u => u[0]).join(', ')) : ''],
+        ['Banner not mapped', -unattrib, 'sub', '', _bItems(unattribList)],
         ['Reconciled against plan', totDed, 'tot', ''],
         // Reconciled, but not equally well evidenced. Both grades answer "did
         // this match what we agreed" at customer x period, which is the grain
         // Moshe set; only the first can also be checked item by item.
         ['from store-level detail', placedStore, 'note', 'itemised: store, item, units x rate'],
         ['from the line\u2019s own reference', placedLine, 'note',
-          lineOnlyList && lineOnlyList.length
-            ? esc(lineOnlyList.slice(0, 3).map(u => u[0]).join(', ')) + ' \u00b7 customer and period, no itemisation'
-            : 'customer and period, no itemisation'],
+          'customer and period, no itemisation', _bItems(lineOnlyList)],
       ].filter(r => (r[2] !== 'sub' && r[2] !== 'note') || Math.abs(r[1]) > 0.005);
-      const brRow = ([label, val, kind, note]) => `
+      const brRow = ([label, val, kind, note, items]) => `
         <tr>
           <td style="padding:5px 10px;font-family:var(--serif);font-size:${kind === 'note' ? '12' : '13'}px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'mid' ? 'border-top:1px solid var(--rule);font-weight:600;' : kind === 'sub' ? 'padding-left:26px;color:var(--ink-2);' : kind === 'note' ? 'padding-left:26px;color:var(--ink-3);font-style:italic;' : ''}">
             ${kind === 'sub' ? '<span style="color:var(--ink-3);">\u2212 </span>' : kind === 'note' ? '<span style="color:var(--rule);">\u2514 </span>' : ''}${label}
@@ -32231,7 +32346,7 @@ render();
           <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);white-space:nowrap;${kind === 'tot' ? 'border-top:2px solid var(--ink);' : kind === 'mid' ? 'border-top:1px solid var(--rule);' : ''}">
             ${registerTotal ? (Math.abs(val) / registerTotal * 100).toFixed(1) + '%' : ''}
           </td>
-        </tr>`;
+        </tr>${_bItemRows(items, registerTotal)}`;
 
       // ── THE PLAN SIDE'S OWN BRIDGE ────────────────────────────────────────
       // The deduction side has explained itself since the bridge went in; the
@@ -32242,35 +32357,21 @@ render();
       const planBridge = [
         ['Plan book ' + esc(yr), planBookTotal, null, 'Every line Vividly holds for the year.'],
         ['Not a ' + (_dedDist === 'all' ? _dedDistNames(_dedDistCounts) : esc(_dedDist)) + ' line', -planExcludedRecv, 'sub',
-          (() => {
-            const m = R.planExcludedRecvBy;
-            if (!m || !m.size) return 'no deductions arrive through this receiver';
-            return [...m.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 3)
-              .map(([k, v]) => esc(k) + ' ' + money(v)).join(', ') + ' \u00b7 no deductions arrive through this receiver';
-          })()],
+          'no deductions arrive through this receiver', _bItems(R.planExcludedRecvBy)],
         ['Promo type with no matching deductions', -planExcludedType, 'sub',
-          (() => {
-            if (!planExcludedTypeBy || !planExcludedTypeBy.size) return '';
-            const es = [...planExcludedTypeBy.entries()].filter(e => e[1] > 0.5).sort((a, b2) => b2[1] - a[1]);
-            const MIN = 1000;
-            const big = es.filter(e => e[1] >= MIN).slice(0, 3);
-            const rest = es.filter(e => !big.includes(e));
-            const restAmt = rest.reduce((s2, e) => s2 + e[1], 0);
-            return big.map(([t, v]) => esc(t) + ' ' + money(v)).join(', ')
-              + (rest.length ? (big.length ? ', ' : '') + 'other ' + rest.length + ' type' + (rest.length === 1 ? '' : 's') + ' ' + money(restAmt) : '');
-          })()],
+          '', _bItems(planExcludedTypeBy)],
         ['Outside ' + (winStart ? _dedMon(winStart) + ' \u2013 ' + _dedMon(winEnd) : 'the window'), -planOutOfWindow, 'sub', ''],
         ['Not closed yet', -planNotClosed, 'sub', 'no final spend to compare against'],
         ['Compared against deductions', totPlan, 'tot', ''],
       ].filter(r => r[2] !== 'sub' || Math.abs(r[1]) > 0.005);
-      const pbRow = ([label, val, kind, note]) => `
+      const pbRow = ([label, val, kind, note, items]) => `
         <tr>
           <td style="padding:5px 10px;font-family:var(--serif);font-size:13px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'sub' ? 'padding-left:24px;color:var(--ink-2);' : ''}">
             ${kind === 'sub' ? '<span style="color:var(--ink-3);">\u2212 </span>' : ''}${label}
             ${note ? `<span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;">${note}</span>` : ''}</td>
           <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:12.5px;${kind === 'tot' ? 'border-top:2px solid var(--ink);font-weight:600;' : kind === 'sub' ? 'color:var(--ink-2);' : ''}">${money(Math.abs(val))}</td>
           <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);${kind === 'tot' ? 'border-top:2px solid var(--ink);' : ''}">${planBookTotal ? (Math.abs(val) / planBookTotal * 100).toFixed(1) + '%' : ''}</td>
-        </tr>`;
+        </tr>${_bItemRows(items, planBookTotal)}`;
 
       body.innerHTML = `
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:18px;margin:0 0 16px;">
@@ -32515,6 +32616,58 @@ ${(() => {
             <table style="width:100%;border-collapse:collapse;">${bridge.map(brRow).join('')}</table>
           </div>
         </div>
+        ${(() => {
+          // ── EDLP: RATE COMPLIANCE, NOT PLAN VARIANCE ──────────────────────
+          // The only category where the arithmetic can be checked rather than
+          // the total. A per-unit programme must satisfy units x rate = amount,
+          // and the agreed rate is in the plan, so "are they charging what we
+          // agreed" is answerable per customer. Comparing it to a monthly plan
+          // would only tell you whether volume beat the forecast.
+          if (!edlpBy || !edlpBy.size) return '';
+          const rows = [...edlpBy.entries()].sort((a, b2) => b2[1].amt - a[1].amt);
+          const tot = rows.reduce((n, r) => n + r[1].amt, 0);
+          const totU = rows.reduce((n, r) => n + (r[1].units || 0), 0);
+          const off = rows.reduce((n, r) => n + (r[1].offRate || 0), 0);
+          const planEdlp = P.lines.filter(pl => /edlp/i.test(String(pl.promo_type || '')))
+            .reduce((n, pl) => n + Number(pl.expected_spend || 0), 0);
+          return `<div style="border:1px solid var(--rule);border-radius:7px;padding:10px 12px;margin:0 0 12px;">
+            <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:2px;">
+              EDLP \u00b7 a per-unit rate on everything sold, carved out of the comparison above
+            </div>
+            <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-bottom:8px;line-height:1.55;">
+              Identified by RATE, not by document \u2014 KeHE bills EDLP through the scan channel and UNFI as deal type E, so nothing here is labelled EDLP.
+              Matched on customer + agreed rate.
+            </div>
+            <table style="width:100%;border-collapse:collapse;">
+              <thead><tr>${th('Customer')}${th('Agreed', true)}${th('Charged', true)}${th('Units', true)}${th('Deducted $', true)}${th('Rate check')}</tr></thead>
+              <tbody>
+                ${rows.map(([c, v]) => `<tr>
+                  ${td('<span style="font-family:var(--serif);font-size:13px;">' + esc(_custName(c)) + '</span>')}
+                  ${td('<span style="font-family:var(--mono);font-size:11.5px;">$' + Number(v.agreed).toFixed(2) + '</span>', true)}
+                  ${td('<span style="font-family:var(--mono);font-size:11.5px;">$' + Number(v.charged).toFixed(2) + '</span>', true)}
+                  ${td(v.units ? '<span style="color:var(--ink-2);">' + Math.round(v.units).toLocaleString() + '</span>' : '<span style="color:var(--rule);">\u00b7</span>', true)}
+                  ${td(money(v.amt), true)}
+                  ${td(v.offRate > 0.005
+                       ? '<span style="font-family:var(--mono);font-size:10px;color:var(--lost);">' + money(v.offRate) + ' does not multiply out</span>'
+                       : '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">units \u00d7 rate ties</span>')}
+                </tr>`).join('')}
+                <tr style="border-top:2px solid var(--ink);">
+                  ${td('<strong style="font-family:var(--serif);font-size:13px;">Total</strong>')}
+                  ${td('')}${td('')}
+                  ${td('<strong>' + (totU ? Math.round(totU).toLocaleString() : '\u2014') + '</strong>', true)}
+                  ${td('<strong>' + money(tot) + '</strong>', true)}
+                  ${td('')}
+                </tr>
+              </tbody>
+            </table>
+            <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:7px;line-height:1.55;">
+              ${planEdlp ? 'Plan carries ' + money(planEdlp) + ' of EDLP for the year across every customer and receiver \u2014 shown for scale, NOT as a variance: a full-year per-unit programme and an in-window deduction are not the same measurement. ' : ''}
+              ${off > 0.005
+                ? money(off) + ' has a detail total that does not equal units \u00d7 the charged rate. That is the one arithmetic error this category makes visible \u2014 worth opening before anything else here.'
+                : 'Every line multiplies out: units \u00d7 rate equals the amount billed.'}
+            </div>
+          </div>`;
+        })()}
         ${(() => {
           // ── EARLY PAY: PLANNED VS ACTUALLY TAKEN ──────────────────────────
           // The one piece of trade spend that never appears in the deduction
