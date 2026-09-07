@@ -31989,13 +31989,24 @@ render();
               .in('line_id', needRefs).not('reference_no', 'is', null)
               .order('line_id', { ascending: true }).range(from, from + 999);
             if (error) throw error;
+            const byId = new Map(shown.map(x => [String(x.id), x]));
             for (const r of (data || [])) {
               const k = String(r.line_id);
+              const l0 = byId.get(k) || {};
               // A promo number is 6-10 digits. reference_no ALSO holds dates,
               // invoice ids, 'See attached' and a bare 0 -- the same filter
               // deduction_promo_rollup uses, for the same reason.
               const v = String(r.reference_no || '').trim();
-              if (!/^[0-9]{6,10}$/.test(v) && !/^[A-Z]/i.test(v)) continue;
+              // DIGITS ONLY. Allowing letter-led values put WFMDEC2515930ISEGR
+              // beside invoice WFMDEC2515930ISEGR -- on the WFM ISE layout
+              // reference_no simply repeats the invoice, so the column echoed
+              // the cell next to it. This is the same filter
+              // deduction_promo_rollup uses, for the same reason: that column
+              // also holds dates, invoice ids, 'See attached' and a bare 0.
+              if (!/^[0-9]{6,10}$/.test(v)) continue;
+              // And never a number that IS the invoice -- repeating it teaches
+              // the reader nothing and hides the lines that carry a real one.
+              if (String(l0.invoice_no || '').includes(v)) continue;
               if (!seen.has(k)) seen.set(k, new Set());
               seen.get(k).add(v);
             }
@@ -32284,7 +32295,7 @@ render();
             cur.units += Number(r.ship_qty || 0);
             cur.amt += Math.abs(Number(r.bill_amount || 0));
             const pr = String(r.reference_no || '').trim();
-            if (/^[0-9]{6,10}$/.test(pr)) cur.promos.add(pr);
+            if (/^[0-9]{6,10}$/.test(pr) && !String(line.invoice_no || '').includes(pr)) cur.promos.add(pr);
             by.set(key, cur);
           }
           // The Brand Library mapping, fetched once per session. `product_line`
