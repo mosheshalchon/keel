@@ -30988,7 +30988,7 @@ render();
           // Caught, not awaited hard: the table is its own migration, and a brand
           // that has not run it should see the page rather than a stack trace.
           paged(() => sb.from('deduction_overrides')
-            .select('id,scope,match_value,customer,promo_type,promo_date,amount,source_note,active')
+            .select('id,scope,match_value,customer,promo_type,promo_date,amount,source_note,backup_exists,active')
             .eq('brand_id', brandId).eq('active', true).order('id', { ascending: true })).catch(() => []),
         ]);
         _dedRaw = { key: rawKey, checks, lines, rmap, lineRates, overrides };
@@ -31863,7 +31863,7 @@ render();
 
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Deducted', true)}${th('Share', true)}
+            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Deducted', true)}${th('Share', true)}${th('')}
           </tr></thead>
           <tbody>
             ${shown.map(l => {
@@ -31884,30 +31884,40 @@ render();
                   // a wrong attribution needs correcting at least as much as a
                   // missing one, and hiding it on resolved lines is how a bad
                   // parse becomes permanent.
-                  const btn = (t) => `<button class="hl-dl-ovr" data-l="${esc(String(l.id))}" title="Set who was charged"
-                      style="margin-left:8px;font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;
-                             padding:2px 7px;border:1px solid var(--rule-soft);border-radius:3px;background:transparent;
-                             color:var(--ink-3);cursor:pointer;">${t}</button>`;
-                  if (!c.name) return td('<span style="color:var(--lost);">\u2014</span>' + btn('set'));
+                  if (!c.name) return td('<span style="color:var(--lost);">\u2014</span>');
                   return td(`<span>${esc(c.name)}</span>`
                     + (c.extra ? `<span style="color:var(--ink-3);font-family:var(--mono);font-size:9.5px;" title="the detail also names ${c.extra} other banner${c.extra === 1 ? '' : 's'}"> +${c.extra}</span>` : '')
                     + (ev ? `<span style="font-family:var(--mono);font-size:9px;color:${ev.color};margin-left:6px;opacity:.8;">${ev.label}</span>` : '')
-                    + (c.conflict ? `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:6px;" title="the documents say ${esc(String(c.was))} \u2014 one of the two is wrong">\u26A0 was ${esc(String(c.was))}</span>` : '')
-                    + btn('edit'));
+                    + (c.conflict ? `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:6px;" title="the documents say ${esc(String(c.was))} \u2014 one of the two is wrong">\u26A0 was ${esc(String(c.was))}</span>` : ''));
                 })()}
                 ${td(cat ? esc(cat) : '<span style="color:var(--lost);">\u26A0 unmapped</span>')}
                 ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(l.reason_code || '\u2014') + '</span>')}
-                ${td(l.detail_parsed
-                     ? '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + ((detBy.get(l.id) || []).length ? (detBy.get(l.id) || []).length.toLocaleString() + ' rows' : 'parsed') + '</span>'
-                     : '<span style="color:var(--lost);font-family:var(--mono);font-size:10px;">none</span>')}
+                ${(() => {
+                  const rows = detBy.get(l.id) || [];
+                  if (l.detail_parsed)
+                    return td('<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + (rows.length ? rows.length.toLocaleString() + ' rows' : 'parsed') + '</span>');
+                  // "none" has always meant NO PARSER WROTE ROWS, and been read
+                  // as NO DOCUMENT EXISTS. Those are different problems and only
+                  // a person can tell them apart today, so the assertion gets
+                  // its own words rather than overwriting the parse state.
+                  const o = _dedOverrideFor(l, overrides);
+                  const be = o ? o.backup_exists : null;
+                  if (be === true)  return td('<span style="font-family:var(--mono);font-size:10px;color:var(--accent, #8a6d1f);" title="a document is in the folder and has not been read \u2014 a parsing job, not a missing file">in folder \u00b7 unread</span>');
+                  if (be === false) return td('<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="no document exists, e.g. a flat fee \u2014 complete, not a gap">no doc exists</span>');
+                  return td('<span style="color:var(--lost);font-family:var(--mono);font-size:10px;">none</span>');
+                })()}
                 ${td('<strong>' + money(Math.abs(Number(l.amount || 0))) + '</strong>', true)}
                 ${td(registerAmt ? (Math.abs(Number(l.amount || 0)) / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
+                ${td(`<button class="hl-dl-ovr" data-l="${esc(String(l.id))}" title="Set who was charged, and whether a document exists"
+                      style="font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;
+                             border:1px solid var(--rule-soft);border-radius:3px;background:transparent;color:var(--ink-3);cursor:pointer;"
+                      >${_dedOverrideFor(l, overrides) ? 'edit' : 'set'}</button>`, true)}
               </tr>`;
               return out;
             }).join('')}
-            ${!shown.length ? `<tr><td colspan="8" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
+            ${!shown.length ? `<tr><td colspan="9" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
               No deduction matches ${terms.length ? '\u201c' + esc(_dedLinesQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
-            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="8" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="9" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
               <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
               <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
               <span style="margin-left:10px;">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
@@ -31921,6 +31931,7 @@ render();
               ${td('', false, 'border-top:2px solid var(--ink);')}
               ${td('<strong>' + money(filteredAmt) + '</strong>', true, 'border-top:2px solid var(--ink);')}
               ${td(registerAmt ? (filteredAmt / registerAmt * 100).toFixed(1) + '%' : '', true, 'border-top:2px solid var(--ink);color:var(--ink-3);')}
+              ${td('', true, 'border-top:2px solid var(--ink);')}
             </tr>` : ''}
             <!-- THE REGISTER TOTAL STAYS ON SCREEN WHATEVER IS FILTERED. It sums
                  the same line array the page headline sums, so this tab cannot
@@ -31931,6 +31942,7 @@ render();
               ${td('', true)}${td('')}${td('')}${td('')}${td('')}
               ${td('<strong>' + money(registerAmt) + '</strong>', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
               ${td('100%', true, 'color:var(--ink-3);' + (isFiltered ? '' : 'border-top:2px solid var(--ink);'))}
+              ${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
             </tr>
           </tfoot>
         </table>
@@ -32020,6 +32032,21 @@ render();
               <input id="hl-ovr-amt" type="number" step="0.01" value="${cur && cur.amount != null ? esc(String(cur.amount)) : ''}" placeholder="leave blank" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
           </div>
 
+          <div style="margin-top:14px;font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Is there a supporting document?</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            ${[['true', 'Yes \u2014 it is in the folder', 'A document exists and has not been read. That is a parsing job, and it keeps the line counted as a real gap.'],
+               ['false', 'No \u2014 none exists', 'A flat fee or a notice with nothing to itemise. Complete, not a gap.'],
+               ['', 'Not sure', 'The honest default. Nothing is asserted either way.']].map(([v, lbl, tip]) => {
+              const on = String(cur && cur.backup_exists != null ? cur.backup_exists : '') === v;
+              return `<label title="${esc(tip)}" style="flex:1 1 150px;display:flex;gap:7px;align-items:flex-start;padding:7px 9px;border:1px solid var(--rule-soft);border-radius:5px;cursor:pointer;">
+                <input type="radio" name="hl-ovr-bk" value="${v}" ${on ? 'checked' : ''} style="margin-top:2px;">
+                <span style="font-family:var(--mono);font-size:10.5px;color:var(--ink);">${lbl}</span></label>`;
+            }).join('')}
+          </div>
+          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:5px;line-height:1.5;">
+            The Backup column reads \u201cnone\u201d when no parser wrote rows \u2014 which is not the same as
+            no document existing. This is the only place that difference can be recorded.</div>
+
           <label style="display:block;margin-top:11px;font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">How you know
             <textarea id="hl-ovr-note" rows="2" placeholder="Opened the file in Dropbox \u2014 K-Solve cover reads SHOPPER MARKETING - AD FEE OTH" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:11.5px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);resize:vertical;">${esc((cur && cur.source_note) || '')}</textarea></label>
           <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:4px;line-height:1.5;">
@@ -32043,16 +32070,21 @@ render();
         document.getElementById('hl-ovr-save').onclick = async () => {
           const scope = (wrap.querySelector('input[name=hl-ovr-scope]:checked') || {}).value || 'line';
           const customer = document.getElementById('hl-ovr-cust').value.trim();
-          if (!customer) { msg('A customer is the one field worth requiring.'); return; }
+          const bkRaw = (wrap.querySelector('input[name=hl-ovr-bk]:checked') || {}).value;
+          if (!customer && !bkRaw) { msg('Set a customer, or answer the document question.'); return; }
           const amtRaw = document.getElementById('hl-ovr-amt').value.trim();
           const row = {
             brand_id: brandId, scope,
             match_value: scope === 'line' ? String(l.id) : scope === 'reason_code' ? code : pfx,
-            customer,
+            customer: customer || null,
             promo_type: document.getElementById('hl-ovr-type').value.trim() || null,
             promo_date: document.getElementById('hl-ovr-date').value || null,
             amount: amtRaw === '' ? null : Number(amtRaw),
             source_note: document.getElementById('hl-ovr-note').value.trim() || null,
+            backup_exists: (() => {
+              const v = (wrap.querySelector('input[name=hl-ovr-bk]:checked') || {}).value;
+              return v === 'true' ? true : v === 'false' ? false : null;   // '' -> null, not false
+            })(),
             active: true, updated_at: new Date().toISOString(),
           };
           msg('Saving\u2026');
