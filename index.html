@@ -30273,6 +30273,38 @@ render();
         if (total) return out;
       } catch (e) { /* try the next encoding */ }
     }
+    // ── UNCOMPRESSED STREAMS ────────────────────────────────────────────────
+    // Returning null here meant "no text", and it was wrong for a whole family
+    // of documents. The ImageIt Distributor Charge PDFs carry NO FlateDecode at
+    // all -- 1,692 streams, every one plain `BT /F7 10 Tf (...) Tj ET`. Both
+    // decompressors threw on every single one, so a file whose text was sitting
+    // there in the open reported "no text layer -- this is a scan", and the
+    // whole family was routed to OCR that it never needed.
+    //
+    // A PDF stream is only compressed if its dictionary says so, and plenty of
+    // generators emit none. So when decompression fails, read the bytes as they
+    // are -- same line scan, same text-operator filter -- and let the operator
+    // check decide whether this is content or binary. Binary noise does not
+    // end in Tj or TJ, which is exactly what that check is for.
+    try {
+      const dv = new TextDecoder('latin1');
+      let out = '', start = 0;
+      for (let k = 0; k < raw.length; k++) {
+        if (raw[k] !== 0x0a) continue;
+        let stop = k;
+        if (stop > start && raw[stop - 1] === 0x0d) stop--;
+        const len = stop - start;
+        if (len > 1 && len < 2000 && _dedIsTextOp(raw[stop - 2], raw[stop - 1]))
+          out += dv.decode(raw.subarray(start, stop)) + '\n';
+        start = k + 1;
+      }
+      if (start < raw.length && raw.length - start > 2) {
+        let stop = raw.length;
+        if (raw[stop - 1] === 0x0d) stop--;
+        if (_dedIsTextOp(raw[stop - 2], raw[stop - 1])) out += dv.decode(raw.subarray(start, stop)) + '\n';
+      }
+      if (out) return out;
+    } catch (e) { /* fall through to null -- genuinely unreadable */ }
     return null;
   }
 
