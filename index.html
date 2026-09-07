@@ -29372,6 +29372,53 @@ render();
     if (/^NCG/.test(s)) return 'NCG';
     return null;
   }
+  // ── MANUAL OVERRIDES ─────────────────────────────────────────────────────
+  // The crawler cannot reach everything. Moshe opened Dropbox, found
+  // SA000175464 and knew it was a $15,700 Sprouts shopper-marketing ad fee --
+  // the K-Solve cover says "SHOPPER MARKETING - AD FEE OTH" and names no
+  // retailer anywhere, so no parser could ever have got there. That knowledge
+  // had nowhere to go until this table.
+  //
+  // THREE SCOPES, BECAUSE A CORRECTION AND A RULE ARE DIFFERENT THINGS.
+  // Tagging one invoice fixes one invoice, and next month's line arrives
+  // unattributed again. What was actually learned is often "this CODE is this
+  // retailer", which should apply to lines that do not exist yet.
+  //   line -> one deduction line   reason_code / invoice_prefix -> a standing rule
+  // Most specific wins, mirroring deduction_override_for() in SQL so the app
+  // and the database can never disagree about precedence.
+  function _dedOverrideFor(l, ovrs) {
+    if (!l || !ovrs || !ovrs.length) return null;
+    const id = String(l.id), code = String(l.reason_code || ''), inv = String(l.invoice_no || '');
+    let best = null, bestRank = 9;
+    for (const o of ovrs) {
+      if (o.active === false) continue;
+      let rank = 9;
+      if (o.scope === 'line' && o.match_value === id) rank = 1;
+      else if (o.scope === 'reason_code' && code && o.match_value === code) rank = 2;
+      else if (o.scope === 'invoice_prefix' && o.match_value && inv.startsWith(o.match_value)) rank = 3;
+      if (rank === 9) continue;
+      // Within a scope the LONGER match is the more specific one, so a prefix
+      // rule for WHFDSCAN beats a broader one for WHFD.
+      if (rank < bestRank || (rank === bestRank && String(o.match_value).length > String(best.match_value).length)) {
+        best = o; bestRank = rank;
+      }
+    }
+    return best;
+  }
+
+  // How hard the evidence is to argue with. Ordered deliberately, and the order
+  // is the point: a store row naming PUBLIX SUPERMARKET 1770 is a fact from the
+  // document; a reason-map retailer is a guess about a whole code. Manual sits
+  // OUTSIDE this ladder -- it is what a person asserted, and it is shown as
+  // such rather than being allowed to impersonate a parsed document.
+  const _DED_EV = {
+    detail:   { label: 'store detail', rank: 1, color: 'var(--ink-3)' },
+    reference:{ label: 'reference',    rank: 2, color: 'var(--ink-3)' },
+    dc:       { label: 'line',         rank: 3, color: 'var(--ink-3)' },
+    code:     { label: 'code',         rank: 4, color: 'var(--ink-3)' },
+    manual:   { label: 'manual',       rank: 5, color: 'var(--accent, #8a6d1f)' },
+  };
+
   const _DED_MON3 = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
   const _dedMMYY = (mm, yy) => {
     const m = Number(mm), y = Number(yy);
@@ -30869,7 +30916,7 @@ render();
     };
 
 
-    let checks = [], lines = [], rmap = [], detAgg = [], lineRates = [];
+    let checks = [], lines = [], rmap = [], detAgg = [], lineRates = [], overrides = [];
     let _dedDistCounts = { KeHE: 0, UNFI: 0 };
     let _scopedLineIds = new Set();
     let _dedFp = '';
@@ -30921,9 +30968,9 @@ render();
     const rawKey = brandId + '|' + year;
     try {
       if (_dedRaw && _dedRaw.key === rawKey) {
-        ({ checks, lines, rmap, lineRates = [] } = _dedRaw);
+        ({ checks, lines, rmap, lineRates = [], overrides = [] } = _dedRaw);
       } else {
-        [checks, lines, rmap, lineRates] = await Promise.all([
+        [checks, lines, rmap, lineRates, overrides] = await Promise.all([
           paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
           paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
           paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
@@ -30937,8 +30984,14 @@ render();
           paged(() => sb.from('deduction_line_rates')
             .select('line_id,distinct_rates,rate_min,rate_max,units,amount,implied_rate')
             .eq('brand_id', brandId).order('line_id', { ascending: true })).catch(() => []),
+          // MANUAL ATTRIBUTION -- what the person knows that no parser can reach.
+          // Caught, not awaited hard: the table is its own migration, and a brand
+          // that has not run it should see the page rather than a stack trace.
+          paged(() => sb.from('deduction_overrides')
+            .select('id,scope,match_value,customer,promo_type,promo_date,amount,source_note,active')
+            .eq('brand_id', brandId).eq('active', true).order('id', { ascending: true })).catch(() => []),
         ]);
-        _dedRaw = { key: rawKey, checks, lines, rmap, lineRates };
+        _dedRaw = { key: rawKey, checks, lines, rmap, lineRates, overrides };
       }
       // Scope applied AFTER caching, so switching distributor is instant and
       // never refetches. A UNFI line can have a null check (their unfiled
@@ -31696,11 +31749,59 @@ render();
       const allMonths = [...new Set(L.map(monthOf).filter(Boolean))].sort();
       const undatedN = L.filter(l => !monthOf(l)).length;
 
+      // ── WHO WAS CHARGED, per line ────────────────────────────────────────
+      // The register has always known this and never showed it. Four sources,
+      // best evidence first, then the person's own override on top:
+      //   1. STORE DETAIL   the banners on the line's own rows -- a fact
+      //   2. REFERENCE      ...3PTYNATGROC is Natural Grocers, deterministically
+      //   3. dc_name        real data but overloaded ("where it went"), guarded
+      //   4. reason map     per-CODE, the coarsest, sometimes flagged inferred
+      //
+      // A line whose detail spans several banners shows the largest and counts
+      // the rest -- "Publix +3" beats "various", because the name is the useful
+      // half and the count says not to trust it as the whole story.
+      const custOf = (l) => {
+        const rows = detBy.get(l.id) || [];
+        if (rows.length) {
+          const by = new Map();
+          for (const d of rows) {
+            const nm = _custName(d.banner || d.customer_name || '');
+            if (!nm || _notACustomer(nm)) continue;
+            by.set(nm, (by.get(nm) || 0) + Math.abs(Number(d.amount || 0)));
+          }
+          if (by.size) {
+            const sorted = [...by.entries()].sort((a, b) => b[1] - a[1]);
+            return { name: sorted[0][0], extra: sorted.length - 1, via: 'detail' };
+          }
+        }
+        const ref = _dedRefCustomer(l.invoice_no);
+        if (ref && !_notACustomer(ref)) return { name: _custName(ref), extra: 0, via: 'reference' };
+        if (l.dc_name && !_notACustomer(l.dc_name)) return { name: _custName(l.dc_name), extra: 0, via: 'dc' };
+        const rm = rmapBy[l.reason_code];
+        if (rm && rm.retailer && !_notACustomer(rm.retailer))
+          return { name: _custName(rm.retailer), extra: 0, via: 'code' };
+        return null;
+      };
+
+      // Document evidence is resolved FIRST and kept even when an override
+      // exists, because the interesting case is when they disagree. A manual
+      // entry that contradicts a parsed document is not a conflict to settle
+      // quietly -- either the person is wrong or the parser is, and both are
+      // worth seeing.
+      const custFull = (l) => {
+        const doc = custOf(l);
+        const o = _dedOverrideFor(l, overrides);
+        if (!o || !o.customer) return { ...(doc || { name: null, extra: 0, via: null }), ovr: null, conflict: false };
+        return { name: _custName(o.customer), extra: 0, via: 'manual', ovr: o,
+                 conflict: !!(doc && doc.name && doc.name !== _custName(o.customer)), was: doc && doc.name };
+      };
+
       // Search covers what someone would actually have in hand: an invoice
       // number off a check stub, a reason code, a DC name, or a phrase from the
       // remarks. Tokenised so "WE0131 MCB" narrows rather than finding nothing.
       const terms = _dedLinesQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
-      const hay = (l) => [l.invoice_no, l.reason_code, l.dc_name, l.remarks, catOf(l)]
+      const hay = (l) => [l.invoice_no, l.reason_code, l.dc_name, l.remarks, catOf(l),
+                          (custFull(l) || {}).name]
         .filter(Boolean).join(' ').toLowerCase();
       const matches = (l) => {
         if (_dedLinesMonths.size) {
@@ -31762,7 +31863,7 @@ render();
 
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Invoice')}${th('Month', true)}${th('Category')}${th('Code')}${th('Backup')}${th('Deducted', true)}${th('Share', true)}
+            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Deducted', true)}${th('Share', true)}
           </tr></thead>
           <tbody>
             ${shown.map(l => {
@@ -31776,6 +31877,22 @@ render();
                 ${td(monthOf(l)
                      ? mLbl(monthOf(l)) + (monthIsDerived(l) ? '<span title="from the backup\u2019s own date; the register line carries none" style="color:var(--ink-3);opacity:.65;"> \u00b7 doc</span>' : '')
                      : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
+                ${(() => {
+                  const c = custFull(l);
+                  const ev = c.via ? _DED_EV[c.via] : null;
+                  // The edit affordance is on EVERY line, not only the blank
+                  // ones: a wrong attribution needs correcting at least as much
+                  // as a missing one, and hiding the control on resolved lines
+                  // is how a wrong parse becomes permanent.
+                  const pen = `<button class="hl-dl-ovr" data-l="${esc(String(l.id))}" title="Set the customer for this line"
+                      style="background:none;border:none;padding:0 0 0 6px;cursor:pointer;color:var(--ink-3);font-size:10px;opacity:.55;">\u270e</button>`;
+                  if (!c.name) return td('<span style="color:var(--lost);">\u2014</span>' + pen);
+                  return td(`<span>${esc(c.name)}</span>`
+                    + (c.extra ? `<span style="color:var(--ink-3);font-family:var(--mono);font-size:9.5px;" title="detail also names ${c.extra} other banner${c.extra === 1 ? '' : 's'}"> +${c.extra}</span>` : '')
+                    + (ev ? `<span style="font-family:var(--mono);font-size:9px;color:${ev.color};margin-left:6px;opacity:.8;">${ev.label}</span>` : '')
+                    + (c.conflict ? `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:6px;" title="the documents say ${esc(String(c.was))} \u2014 one of the two is wrong">\u26A0 was ${esc(String(c.was))}</span>` : '')
+                    + pen);
+                })()}
                 ${td(cat ? esc(cat) : '<span style="color:var(--lost);">\u26A0 unmapped</span>')}
                 ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(l.reason_code || '\u2014') + '</span>')}
                 ${td(l.detail_parsed
@@ -31790,6 +31907,7 @@ render();
                   ${td('<span style="padding-left:26px;color:var(--ink-2);">' + esc(c.name || '(no customer on the detail)') + '</span>'
                      + (c.name && !c.mapped ? '<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:8px;">unmapped banner</span>' : ''))}
                   ${td('', true)}
+                  ${td('')}
                   ${td(c.stores ? '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + c.stores.toLocaleString() + ' store' + (c.stores === 1 ? '' : 's') + '</span>' : '')}
                   ${td('')}${td('')}
                   ${td(money(c.amt), true, 'color:var(--ink-2);')}
@@ -31802,15 +31920,15 @@ render();
                 const csTot = cs.reduce((s2, c) => s2 + c.amt, 0);
                 if (Math.abs(amt - csTot) > 0.5) out += `<tr style="background:var(--rule-softer);">
                   ${td('<span style="padding-left:26px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">not traced to a customer \u2014 fee, or no detail behind it</span>')}
-                  ${td('', true)}${td('')}${td('')}${td('')}
+                  ${td('', true)}${td('')}${td('')}${td('')}${td('')}
                   ${td('<span style="color:var(--ink-3);">' + money(amt - csTot) + '</span>', true)}
                   ${td('', true)}</tr>`;
               }
               return out;
             }).join('')}
-            ${!shown.length ? `<tr><td colspan="7" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
+            ${!shown.length ? `<tr><td colspan="8" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
               No deduction matches ${terms.length ? '\u201c' + esc(_dedLinesQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
-            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="7" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="8" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
               <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
               <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
               <span style="margin-left:10px;">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
@@ -31821,6 +31939,7 @@ render();
               ${td('<strong>Matching these filters</strong>', false, 'border-top:2px solid var(--ink);')}
               ${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
               ${td('', false, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
+              ${td('', false, 'border-top:2px solid var(--ink);')}
               ${td('<strong>' + money(filteredAmt) + '</strong>', true, 'border-top:2px solid var(--ink);')}
               ${td(registerAmt ? (filteredAmt / registerAmt * 100).toFixed(1) + '%' : '', true, 'border-top:2px solid var(--ink);color:var(--ink-3);')}
             </tr>` : ''}
@@ -31830,7 +31949,7 @@ render();
                  look like it went missing. -->
             <tr>
               ${td('<strong>All deductions ' + esc(yr) + (_dedDist === 'all' ? '' : ' \u00b7 ' + esc(_dedDist)) + '</strong>', false, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
-              ${td('', true)}${td('')}${td('')}${td('')}
+              ${td('', true)}${td('')}${td('')}${td('')}${td('')}
               ${td('<strong>' + money(registerAmt) + '</strong>', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
               ${td('100%', true, 'color:var(--ink-3);' + (isFiltered ? '' : 'border-top:2px solid var(--ink);'))}
             </tr>
@@ -31867,6 +31986,125 @@ render();
         const k = tr.dataset.l;
         _dedLinesOpen.has(k) ? _dedLinesOpen.delete(k) : _dedLinesOpen.add(k);
         renderDeductions(hostEl, filtersEl, year);
+      });
+
+      // ── THE OVERRIDE EDITOR ──────────────────────────────────────────────
+      // Opened from the pencil on any line. A modal rather than an inline row
+      // because the scope choice needs explaining and a cramped row would hide
+      // the one decision that matters.
+      body.querySelectorAll('.hl-dl-ovr').forEach(btn => btn.onclick = (ev) => {
+        ev.stopPropagation();                       // do not toggle the detail rows
+        const l = L.find(x => String(x.id) === btn.dataset.l);
+        if (!l) return;
+        const cur = _dedOverrideFor(l, overrides);
+        const doc = custOf(l);
+        const code = String(l.reason_code || ''), inv = String(l.invoice_no || '');
+        // A sensible default prefix: the alpha head of the invoice number, which
+        // is what actually carries the meaning (SA, WHFDSCAN, NCG).
+        const pfx = (inv.match(/^[A-Z]+/i) || [inv.slice(0, 4)])[0];
+        // WHAT A RULE WOULD CATCH, priced before it is made. This is the guard
+        // against the MCBB trap: 151 lines looked like hand-allocation work and
+        // were in fact one missing OCR profile. A rule carrying six figures is a
+        // signal to write a parser, not a job well done.
+        const reach = (scope, val) => {
+          const hit = L.filter(x => scope === 'line' ? String(x.id) === String(l.id)
+            : scope === 'reason_code' ? String(x.reason_code || '') === val
+            : val && String(x.invoice_no || '').startsWith(val));
+          return { n: hit.length, amt: hit.reduce((n, x) => n + Math.abs(Number(x.amount || 0)), 0) };
+        };
+        const rLine = reach('line'), rCode = code ? reach('reason_code', code) : { n: 0, amt: 0 },
+              rPfx  = pfx ? reach('invoice_prefix', pfx) : { n: 0, amt: 0 };
+        const scopeRow = (v, lbl, r, dis) => `<label style="display:flex;gap:9px;align-items:flex-start;padding:8px 10px;border:1px solid var(--rule-soft);border-radius:5px;margin-bottom:6px;cursor:${dis ? 'not-allowed' : 'pointer'};opacity:${dis ? .45 : 1};">
+            <input type="radio" name="hl-ovr-scope" value="${v}" ${dis ? 'disabled' : ''} ${(cur ? cur.scope : 'line') === v ? 'checked' : ''} style="margin-top:2px;">
+            <span style="flex:1;">
+              <span style="font-family:var(--mono);font-size:11.5px;color:var(--ink);">${lbl}</span>
+              <span style="display:block;font-family:var(--mono);font-size:9.5px;color:${r.amt > 100000 ? 'var(--lost)' : 'var(--ink-3)'};margin-top:2px;">
+                applies to ${r.n.toLocaleString()} line${r.n === 1 ? '' : 's'} \u00b7 ${money(r.amt)}${r.amt > 100000 ? ' \u2014 that is a lot for a hand rule; a parser may be the better fix' : ''}</span>
+            </span></label>`;
+
+        const wrap = document.createElement('div');
+        wrap.id = 'hl-ovr-modal';
+        wrap.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.34);z-index:200;display:flex;align-items:center;justify-content:center;padding:24px;';
+        wrap.innerHTML = `<div style="background:var(--paper);border-radius:8px;max-width:560px;width:100%;max-height:88vh;overflow-y:auto;padding:22px 24px;box-shadow:0 10px 40px rgba(0,0,0,.24);">
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);">Tell Keel what this is</div>
+          <div style="font-family:var(--mono);font-size:13px;color:var(--ink);margin:6px 0 2px;">${esc(inv || '(no invoice no.)')} \u00b7 ${money(Math.abs(Number(l.amount || 0)))}</div>
+          <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-bottom:14px;">
+            code ${esc(code || '\u2014')}${doc && doc.name ? ' \u00b7 documents say <strong style="color:var(--ink-2);">' + esc(doc.name) + '</strong>' : ' \u00b7 no customer found'}</div>
+
+          <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:7px;">Apply to</div>
+          ${scopeRow('line', 'This line only', rLine, false)}
+          ${scopeRow('reason_code', 'Every line with code ' + esc(code || '\u2014'), rCode, !code)}
+          ${scopeRow('invoice_prefix', 'Every invoice starting ' + esc(pfx || '\u2014'), rPfx, !pfx)}
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px;">
+            <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Customer
+              <input id="hl-ovr-cust" value="${esc((cur && cur.customer) || '')}" placeholder="Sprouts" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+            <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo type
+              <input id="hl-ovr-type" value="${esc((cur && cur.promo_type) || '')}" placeholder="Ads - Fees - Display" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+            <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo date
+              <input id="hl-ovr-date" type="date" value="${esc((cur && cur.promo_date) || '')}" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+            <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Amount <span style="text-transform:none;opacity:.7;">(only if unreadable)</span>
+              <input id="hl-ovr-amt" type="number" step="0.01" value="${cur && cur.amount != null ? esc(String(cur.amount)) : ''}" placeholder="leave blank" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+          </div>
+
+          <label style="display:block;margin-top:11px;font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">How you know
+            <textarea id="hl-ovr-note" rows="2" placeholder="Opened the file in Dropbox \u2014 K-Solve cover reads SHOPPER MARKETING - AD FEE OTH" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:11.5px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);resize:vertical;">${esc((cur && cur.source_note) || '')}</textarea></label>
+          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:4px;line-height:1.5;">
+            Optional, and worth the ten seconds. In a year \u201cSprouts\u201d will not explain itself.</div>
+
+          <div style="display:flex;gap:8px;margin-top:18px;align-items:center;">
+            <button id="hl-ovr-save" style="font-family:var(--mono);font-size:11.5px;padding:9px 18px;border-radius:5px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Save</button>
+            <button id="hl-ovr-cancel" style="font-family:var(--mono);font-size:11.5px;padding:9px 16px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Cancel</button>
+            ${cur ? `<button id="hl-ovr-del" style="margin-left:auto;font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:5px;border:1px solid var(--rule-soft);background:transparent;color:var(--lost);cursor:pointer;">Remove override</button>` : ''}
+            <span id="hl-ovr-msg" style="font-family:var(--mono);font-size:10.5px;color:var(--lost);"></span>
+          </div>
+          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:12px;line-height:1.55;border-top:1px solid var(--rule-softer);padding-top:10px;">
+            Saved as <strong>manual</strong> \u2014 shown as weaker evidence than anything read from a document,
+            and never overwritten by a later parse. If a document later disagrees, both are shown.</div>
+        </div>`;
+        document.body.appendChild(wrap);
+        wrap.onclick = (e) => { if (e.target === wrap) wrap.remove(); };
+        const msg = (t) => { const m = document.getElementById('hl-ovr-msg'); if (m) m.textContent = t || ''; };
+        document.getElementById('hl-ovr-cancel').onclick = () => wrap.remove();
+
+        document.getElementById('hl-ovr-save').onclick = async () => {
+          const scope = (wrap.querySelector('input[name=hl-ovr-scope]:checked') || {}).value || 'line';
+          const customer = document.getElementById('hl-ovr-cust').value.trim();
+          if (!customer) { msg('A customer is the one field worth requiring.'); return; }
+          const amtRaw = document.getElementById('hl-ovr-amt').value.trim();
+          const row = {
+            brand_id: brandId, scope,
+            match_value: scope === 'line' ? String(l.id) : scope === 'reason_code' ? code : pfx,
+            customer,
+            promo_type: document.getElementById('hl-ovr-type').value.trim() || null,
+            promo_date: document.getElementById('hl-ovr-date').value || null,
+            amount: amtRaw === '' ? null : Number(amtRaw),
+            source_note: document.getElementById('hl-ovr-note').value.trim() || null,
+            active: true, updated_at: new Date().toISOString(),
+          };
+          msg('Saving\u2026');
+          // Count-verified, because a missing RLS policy returns success with
+          // zero rows and this project has lost data to that exact silence.
+          const { data, error } = await sb.from('deduction_overrides')
+            .upsert(row, { onConflict: 'brand_id,scope,match_value' }).select('id');
+          if (error) { msg(error.message); return; }
+          if (!data || !data.length) { msg('Saved nothing \u2014 check the RLS policy on deduction_overrides.'); return; }
+          _dedRaw = null;                       // the register cache holds the old overrides
+          wrap.remove();
+          renderDeductions(hostEl, filtersEl, year);
+        };
+
+        const del = document.getElementById('hl-ovr-del');
+        if (del) del.onclick = async () => {
+          msg('Removing\u2026');
+          const { data, error } = await sb.from('deduction_overrides')
+            .delete().eq('id', cur.id).select('id');
+          if (error) { msg(error.message); return; }
+          if (!data || !data.length) { msg('Removed nothing \u2014 check the DELETE policy.'); return; }
+          _dedRaw = null;
+          wrap.remove();
+          renderDeductions(hostEl, filtersEl, year);
+        };
       });
       body.querySelectorAll('.hl-dl-mon').forEach(cb => cb.onchange = () => {
         const k = cb.dataset.m;
