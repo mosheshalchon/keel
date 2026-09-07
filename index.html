@@ -29056,7 +29056,21 @@ render();
   // product questions cannot be answered from it at any price -- and pulling
   // every UPC for 1,945 lines up front, to serve the handful anyone actually
   // opens, would be a far worse trade than one fetch per click.
-  let _dedItemOpen = new Set(), _dedItemCache = new Map();
+  let _dedItemOpen = new Set(), _dedItemCache = new Map(), _dedProdMap = null;
+
+  // UPC NORMALISATION, because the same item is spelled three ways across the
+  // sources: products.unit_upc carries the check digit (892453001242), the
+  // deduction detail sometimes zero-pads to 13 (0089245300174), and some feeds
+  // drop the check digit entirely (89245300124). Zeros are stripped only when
+  // they are PADDING -- a genuine UPC-A beginning 0 keeps its own leading zero
+  // and still meets its 11-digit spelling, which a blanket strip would break.
+  const _dedUpc11 = (v) => {
+    const raw = String(v == null ? '' : v).replace(/\D/g, '');
+    const d = raw.length > 12 ? raw.replace(/^0+/, '') : raw;
+    if (d.length === 12) return d.slice(0, 11);
+    if (d.length > 12) return d.slice(-12, -1);
+    return d;
+  };
   let _dedLinesQ = '';            // free-text search over invoice / code / remarks
   let _dedLinesOpen = new Set();  // lines expanded to their customer split
   let _dedLinesMonths = new Set(); // empty = every month, matching the app's other multi-selects
@@ -32043,27 +32057,28 @@ render();
                   out += `<tr><td colspan="9" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">No item detail under this line.</td></tr>`;
                 } else {
-                  const tot = itRows.items.reduce((n, r) => n + r.amt, 0);
-                  const totU = itRows.items.reduce((n, r) => n + r.units, 0);
+                  const G = itRows.groups || [];
+                  const tot = G.reduce((n, r) => n + r.amt, 0);
+                  const totU = G.reduce((n, r) => n + r.units, 0);
                   out += `<tr><td colspan="9" style="padding:0;border-bottom:1px solid var(--rule-soft);background:var(--rule-softer);">
                     <table style="width:100%;border-collapse:collapse;margin:2px 0 6px 32px;">
-                      <thead><tr>${['Item', 'UPC', 'Units', 'Rate', 'Spend', '% of line'].map((h, i) =>
+                      <thead><tr>${['Product line', 'Items included', 'Units', 'Rate', 'Spend', '% of line'].map((h, i) =>
                         `<th style="text-align:${i > 1 ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
-                      <tbody>${itRows.items.map(r => `<tr>
-                        <td style="padding:5px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-2);">${esc(r.desc || '\u2014')}</td>
-                        <td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(r.upc || '\u2014')}</td>
-                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${r.units ? r.units.toLocaleString() : '\u2014'}</td>
-                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.units ? '$' + (r.amt / r.units).toFixed(2) : '\u2014'}</td>
-                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(r.amt)}</td>
-                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${tot ? (r.amt / tot * 100).toFixed(1) + '%' : ''}</td></tr>`).join('')}
+                      <tbody>${G.map(g => `<tr>
+                        <td style="padding:6px 10px;font-family:var(--mono);font-size:11.5px;color:${g.mapped ? 'var(--ink)' : 'var(--lost)'};">${esc(g.line)}</td>
+                        <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.45;">${esc(g.descs.slice(0, 4).join(', '))}${g.descs.length > 4 ? ' +' + (g.descs.length - 4) : ''}</td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${g.units ? g.units.toLocaleString() : '\u2014'}</td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014'}</td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${money(g.amt)}</td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${tot ? (g.amt / tot * 100).toFixed(1) + '%' : ''}</td></tr>`).join('')}
                       </tbody>
                       <tfoot><tr>
-                        <td style="padding:6px 10px;font-family:var(--mono);font-size:11px;border-top:1px solid var(--rule);"><strong>${itRows.items.length} item${itRows.items.length === 1 ? '' : 's'} \u00b7 ${itRows.rows.toLocaleString()} rows</strong></td>
+                        <td style="padding:7px 10px;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>Total</strong></td>
+                        <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">${itRows.items.length} item${itRows.items.length === 1 ? '' : 's'} \u00b7 ${itRows.rows.toLocaleString()} detail rows</td>
+                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${totU.toLocaleString()}</strong></td>
                         <td style="border-top:1px solid var(--rule);"></td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;border-top:1px solid var(--rule);"><strong>${totU.toLocaleString()}</strong></td>
-                        <td style="border-top:1px solid var(--rule);"></td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;border-top:1px solid var(--rule);"><strong>${money(tot)}</strong></td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">100%</td>
+                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${money(tot)}</strong></td>
+                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">100%</td>
                       </tr></tfoot></table></td></tr>`;
                 }
               }
@@ -32168,7 +32183,33 @@ render();
             cur.amt += Math.abs(Number(r.bill_amount || 0));
             by.set(key, cur);
           }
-          _dedItemCache.set(k, { items: [...by.values()].sort((a, b) => b.amt - a.amt), rows: rows.length });
+          // The Brand Library mapping, fetched once per session. `product_line`
+          // is ATG's own grouping -- the same names the plan uses -- so the
+          // rollup below is the plan's vocabulary rather than a guess made from
+          // the description text.
+          if (!_dedProdMap) {
+            _dedProdMap = new Map();
+            const { data: prods } = await sb.from('products')
+              .select('unit_upc,product_line,item_description').eq('brand_id', brandId);
+            for (const pr of (prods || [])) {
+              const key = _dedUpc11(pr.unit_upc);
+              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null });
+            }
+          }
+          const items = [...by.values()].sort((a, b) => b.amt - a.amt);
+          // GROUPED BY PRODUCT LINE, with every item that fed it named. An
+          // unmatched UPC gets its own row rather than being folded into a
+          // neighbouring group -- a mapping gap should be visible, not absorbed.
+          const gm = new Map();
+          for (const it of items) {
+            const hit = _dedProdMap.get(_dedUpc11(it.upc));
+            const key = (hit && hit.line) || '\u2014 not in Brand Library';
+            const g = gm.get(key) || { line: key, units: 0, amt: 0, descs: [], mapped: !!(hit && hit.line) };
+            g.units += it.units; g.amt += it.amt;
+            if (it.desc) g.descs.push(it.desc);
+            gm.set(key, g);
+          }
+          _dedItemCache.set(k, { items, groups: [...gm.values()].sort((a, b) => b.amt - a.amt), rows: rows.length });
         } catch (err) {
           _dedItemCache.set(k, { items: [], rows: 0, err: 'Could not read the detail: ' + (err && err.message || err) });
         }
