@@ -31960,6 +31960,56 @@ render();
       // Search covers what someone would actually have in hand: an invoice
       // number off a check stub, a reason code, a DC name, or a phrase from the
       // remarks. Tokenised so "WE0131 MCB" narrows rather than finding nothing.
+      const monthChip = (k, lbl, n, amt) => {
+        const on = _dedLinesMonths.has(k);
+        return `<label style="display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;font-family:var(--mono);font-size:11.5px;white-space:nowrap;">
+          <input type="checkbox" class="hl-dl-mon" data-m="${esc(k)}" ${on ? 'checked' : ''} style="margin:0;cursor:pointer;">
+          <span style="flex:1;">${esc(lbl)}</span>
+          <span style="color:var(--ink-3);">${n}</span>
+        </label>`;
+      };
+      const monLabel = !_dedLinesMonths.size ? 'All months'
+        : _dedLinesMonths.size === 1 ? mLbl([..._dedLinesMonths][0])
+        : _dedLinesMonths.size + ' months';
+
+      body.innerHTML = `
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
+          <input id="hl-dl-q" type="search" placeholder="Search invoice, code, DC or remarks\u2026" value="${esc(_dedLinesQ)}"
+            style="flex:1 1 300px;min-width:220px;font-family:var(--mono);font-size:12px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
+          <div style="position:relative;">
+            <button id="hl-dl-mon-toggle" type="button"
+              style="font-family:var(--mono);font-size:12px;padding:9px 14px;border:1px solid ${_dedLinesMonths.size ? 'var(--ink)' : 'var(--rule)'};border-radius:6px;background:var(--paper);cursor:pointer;display:flex;align-items:center;gap:10px;">
+              <span style="color:var(--ink);">${esc(monLabel)}</span><span style="color:var(--ink-3);font-size:10px;">\u25be</span>
+            </button>
+            <div id="hl-dl-mon-menu" style="display:none;position:absolute;top:100%;right:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,0.10);z-index:60;min-width:220px;max-height:320px;overflow-y:auto;">
+              <div style="padding:6px 10px;border-bottom:1px solid var(--rule-softer);display:flex;gap:6px;">
+                <button id="hl-dl-mon-all" type="button" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:3px 8px;cursor:pointer;text-transform:uppercase;border-radius:3px;">Select all</button>
+                <button id="hl-dl-mon-none" type="button" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:3px 8px;cursor:pointer;text-transform:uppercase;border-radius:3px;">Clear</button>
+              </div>
+              <div style="padding:4px 0;">
+                ${allMonths.map(m => monthChip(m, mLbl(m), L.filter(l => monthOf(l) === m).length)).join('')}
+                ${undatedN ? monthChip('(undated)', 'No date', undatedN) : ''}
+              </div>
+            </div>
+          </div>
+          ${(_dedLinesQ.trim() || _dedLinesMonths.size) ? `<button id="hl-dl-clear" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear filters</button>` : ''}
+        </div>
+
+        <div id="hl-dl-results"></div>`;
+
+      // ── RESULTS RENDER SEPARATELY FROM THEIR FILTERS ──────────────────────
+      // Every keystroke used to rebuild the ENTIRE page -- headline, pills, tab
+      // bar, filters and table -- which destroyed the search input mid-word and
+      // recreated it empty of focus. Restoring the caret by hand papered over
+      // it; this removes the cause. The filter bar above is written once and
+      // never touched again; only this container is repainted.
+      let filteredLen = 0;
+      const paintResults = async () => {
+        const host = document.getElementById('hl-dl-results');
+        if (!host) return;
+        // FILTERING HAPPENS HERE, not once at page build. It used to sit above
+        // body.innerHTML, so repainting this container alone would have shown
+        // the results of whatever was typed the LAST time the page rebuilt.
       const terms = _dedLinesQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
       const hay = (l) => [l.invoice_no, l.reason_code, l.dc_name, l.remarks, catOf(l),
                           (custFull(l) || {}).name,
@@ -32024,42 +32074,8 @@ render();
           for (const id of needRefs) _dedPromoRefs.set(String(id), []);
         }
       }
-
-      const monthChip = (k, lbl, n, amt) => {
-        const on = _dedLinesMonths.has(k);
-        return `<label style="display:flex;align-items:center;gap:8px;padding:5px 12px;cursor:pointer;font-family:var(--mono);font-size:11.5px;white-space:nowrap;">
-          <input type="checkbox" class="hl-dl-mon" data-m="${esc(k)}" ${on ? 'checked' : ''} style="margin:0;cursor:pointer;">
-          <span style="flex:1;">${esc(lbl)}</span>
-          <span style="color:var(--ink-3);">${n}</span>
-        </label>`;
-      };
-      const monLabel = !_dedLinesMonths.size ? 'All months'
-        : _dedLinesMonths.size === 1 ? mLbl([..._dedLinesMonths][0])
-        : _dedLinesMonths.size + ' months';
-
-      body.innerHTML = `
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
-          <input id="hl-dl-q" type="search" placeholder="Search invoice, code, DC or remarks\u2026" value="${esc(_dedLinesQ)}"
-            style="flex:1 1 300px;min-width:220px;font-family:var(--mono);font-size:12px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
-          <div style="position:relative;">
-            <button id="hl-dl-mon-toggle" type="button"
-              style="font-family:var(--mono);font-size:12px;padding:9px 14px;border:1px solid ${_dedLinesMonths.size ? 'var(--ink)' : 'var(--rule)'};border-radius:6px;background:var(--paper);cursor:pointer;display:flex;align-items:center;gap:10px;">
-              <span style="color:var(--ink);">${esc(monLabel)}</span><span style="color:var(--ink-3);font-size:10px;">\u25be</span>
-            </button>
-            <div id="hl-dl-mon-menu" style="display:none;position:absolute;top:100%;right:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,0.10);z-index:60;min-width:220px;max-height:320px;overflow-y:auto;">
-              <div style="padding:6px 10px;border-bottom:1px solid var(--rule-softer);display:flex;gap:6px;">
-                <button id="hl-dl-mon-all" type="button" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:3px 8px;cursor:pointer;text-transform:uppercase;border-radius:3px;">Select all</button>
-                <button id="hl-dl-mon-none" type="button" style="background:var(--paper);color:var(--ink-3);border:1px solid var(--rule-soft);font-family:var(--mono);font-size:9px;letter-spacing:0.04em;padding:3px 8px;cursor:pointer;text-transform:uppercase;border-radius:3px;">Clear</button>
-              </div>
-              <div style="padding:4px 0;">
-                ${allMonths.map(m => monthChip(m, mLbl(m), L.filter(l => monthOf(l) === m).length)).join('')}
-                ${undatedN ? monthChip('(undated)', 'No date', undatedN) : ''}
-              </div>
-            </div>
-          </div>
-          ${isFiltered ? `<button id="hl-dl-clear" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear filters</button>` : ''}
-        </div>
-
+        filteredLen = filtered.length;
+        host.innerHTML = `
         <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:0 0 10px;">
           ${isFiltered
             ? `${filtered.length.toLocaleString()} of ${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(filteredAmt)}</strong> of ${money(registerAmt)}`
@@ -32236,20 +32252,37 @@ render();
         </table>
         ${!DL ? `<p style="font-family:var(--mono);font-size:10px;color:var(--lost);margin-top:10px;line-height:1.55;">
           Store-level detail could not be loaded, so rows cannot be expanded and months fall back to the register line's own date.</p>` : ''}`;
+        wireRows(host);
+      };
+      // ── ROW HANDLERS, RE-ATTACHABLE ──────────────────────────────────────
+      // Called after every results repaint, because innerHTML replaces the rows
+      // and takes their listeners with it. Declared before paintResults uses it
+      // -- function declarations hoist, which is why this is not a const.
+      function wireRows(host) {
+        host.querySelectorAll('.hl-dl-item').forEach(tr => tr.onclick = (ev) => onItemClick(tr, ev));
+        host.querySelectorAll('.hl-dl-ovr').forEach(btn => btn.onclick = (ev) => onOvrClick(btn, ev));
+        host.querySelectorAll('.hl-dl-up').forEach(btn => btn.onclick = (ev) => onUpClick(btn, ev));
+        const more = host.querySelector('#hl-dl-more');
+        if (more) more.onclick = () => { _dedLinesLimit += DED_PAGE; paintResults(); };
+        const all = host.querySelector('#hl-dl-all');
+        if (all) all.onclick = () => { _dedLinesLimit = filteredLen; paintResults(); };
+      }
 
       // ── handlers ──
       const q = document.getElementById('hl-dl-q');
       if (q) {
-        // Re-render on a pause, not per keystroke: each render rebuilds the whole
-        // table, and typing an invoice number is eight of those.
+        // THE INPUT IS NEVER DESTROYED NOW, so there is no caret to restore and
+        // no scroll to put back -- only the table below it changes. Debounce
+        // stays because filtering 1,945 lines and repainting 25 rows is real
+        // work, just no longer work that eats the thing you are typing into.
         let t = null;
         q.oninput = () => {
           clearTimeout(t);
           t = setTimeout(() => {
             _dedLinesQ = q.value;
             _dedLinesLimit = 25;
-            renderDeductions(hostEl, filtersEl, year);
-          }, 220);
+            paintResults();
+          }, 180);
         };
       }
       const mt = document.getElementById('hl-dl-mon-toggle');
@@ -32265,17 +32298,17 @@ render();
       // Fetched once per line and cached for the session: opening the same row
       // twice should not hit the database twice, and the numbers cannot change
       // underneath without a reload anyway.
-      body.querySelectorAll('.hl-dl-item').forEach(tr => tr.onclick = async (ev) => {
+      async function onItemClick(tr, ev) {
         // The action column carries its own buttons; a click there is not a
         // request to expand.
         if (ev.target.closest('button')) return;
         const k = tr.dataset.l;
         const line = L.find(x => String(x.id) === k);
         if (!line || !line.detail_parsed) return;
-        if (_dedItemOpen.has(k)) { _dedItemOpen.delete(k); renderDeductions(hostEl, filtersEl, year); return; }
+        if (_dedItemOpen.has(k)) { _dedItemOpen.delete(k); await paintResults(); return; }
         _dedItemOpen.add(k);
-        if (_dedItemCache.has(k)) { renderDeductions(hostEl, filtersEl, year); return; }
-        renderDeductions(hostEl, filtersEl, year);          // paint "Reading…" first
+        if (_dedItemCache.has(k)) { await paintResults(); return; }
+        await paintResults();                               // paint "Reading…" first
         try {
           // Paged: a single KeHE chargeback runs to thousands of store rows and
           // PostgREST caps a select at 1,000 with no error, which is exactly how
@@ -32335,7 +32368,7 @@ render();
           _dedItemCache.set(k, { items: [], rows: 0, err: 'Could not read the detail: ' + (err && err.message || err) });
         }
         renderDeductions(hostEl, filtersEl, year);
-      });
+      }
 
       // ── PER-LINE DOCUMENT UPLOAD ─────────────────────────────────────────
       // The Upload tab reads a document and then goes LOOKING for the register
@@ -32346,7 +32379,7 @@ render();
       // invoice number becomes a CHECK rather than a lookup, which is strictly
       // safer, and it is the only sane place to put this for someone who has
       // just found the file in Dropbox.
-      body.querySelectorAll('.hl-dl-up').forEach(btn => btn.onclick = (ev) => {
+      function onUpClick(btn, ev) {
         ev.stopPropagation();
         const l = L.find(x => String(x.id) === btn.dataset.l);
         if (!l) return;
@@ -32474,7 +32507,7 @@ render();
             arm(true); go.textContent = 'Import';
           }
         };
-      });
+      }
 
       // ── THE OVERRIDE EDITOR ──────────────────────────────────────────────
       // Opened from the pencil on any line. A modal rather than an inline row
@@ -32507,7 +32540,7 @@ render();
         return _dedPickLists;
       };
 
-      body.querySelectorAll('.hl-dl-ovr').forEach(btn => btn.onclick = async (ev) => {
+      async function onOvrClick(btn, ev) {
         ev.stopPropagation();                       // do not toggle the detail rows
         const l = L.find(x => String(x.id) === btn.dataset.l);
         if (!l) return;
@@ -32672,23 +32705,24 @@ render();
           wrap.remove();
           renderDeductions(hostEl, filtersEl, year);
         };
-      });
+      }
       body.querySelectorAll('.hl-dl-mon').forEach(cb => cb.onchange = () => {
         const k = cb.dataset.m;
         cb.checked ? _dedLinesMonths.add(k) : _dedLinesMonths.delete(k);
         _dedLinesLimit = 25;
-        renderDeductions(hostEl, filtersEl, year);
+        paintResults();
       });
       const mAll = document.getElementById('hl-dl-mon-all');
-      if (mAll) mAll.onclick = () => { _dedLinesMonths = new Set(allMonths.concat(undatedN ? ['(undated)'] : [])); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
+      if (mAll) mAll.onclick = () => { _dedLinesMonths = new Set(allMonths.concat(undatedN ? ['(undated)'] : [])); _dedLinesLimit = 25; paintResults(); };
       const mNone = document.getElementById('hl-dl-mon-none');
-      if (mNone) mNone.onclick = () => { _dedLinesMonths = new Set(); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
+      if (mNone) mNone.onclick = () => { _dedLinesMonths = new Set(); _dedLinesLimit = 25; paintResults(); };
       const clr = document.getElementById('hl-dl-clear');
+      // Clear DOES rebuild: the Clear button itself only exists when a filter
+      // is set, so the bar above has to be redrawn without it.
       if (clr) clr.onclick = () => { _dedLinesQ = ''; _dedLinesMonths = new Set(); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
-      const more = document.getElementById('hl-dl-more');
-      if (more) more.onclick = () => { _dedLinesLimit += DED_PAGE; renderDeductions(hostEl, filtersEl, year); };
-      const all = document.getElementById('hl-dl-all');
-      if (all) all.onclick = () => { _dedLinesLimit = filtered.length; renderDeductions(hostEl, filtersEl, year); };
+      // Paging lives in wireRows -- those buttons are inside the results
+      // container and are recreated on every repaint.
+      await paintResults();
       return;
     }
 
