@@ -29051,6 +29051,12 @@ render();
   let _dedCustStore = new Set();  // By customer: expanded stores -> the item rows
   // Deductions tab: the register at line grain.
   let _dedLinesLimit = 25;        // rows shown; grows by DED_PAGE
+  // Item detail is fetched PER LINE, on demand. The rollup that feeds the
+  // customer column groups by (line_id, banner, month) and carries no UPC, so
+  // product questions cannot be answered from it at any price -- and pulling
+  // every UPC for 1,945 lines up front, to serve the handful anyone actually
+  // opens, would be a far worse trade than one fetch per click.
+  let _dedItemOpen = new Set(), _dedItemCache = new Map();
   let _dedLinesQ = '';            // free-text search over invoice / code / remarks
   let _dedLinesOpen = new Set();  // lines expanded to their customer split
   let _dedLinesMonths = new Set(); // empty = every month, matching the app's other multi-selects
@@ -31973,8 +31979,10 @@ render();
               const rows = detBy.get(l.id) || [];
               const open = _dedLinesOpen.has(String(l.id));
               const canOpen = rows.length > 0;
-              return `<tr data-l="${esc(String(l.id))}">
-                ${td(`<span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>`)}
+              const itOpen = _dedItemOpen.has(String(l.id));
+              const itRows = _dedItemCache.get(String(l.id));
+              let out = `<tr class="hl-dl-item" data-l="${esc(String(l.id))}" style="cursor:pointer;">
+                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${l.detail_parsed ? (itOpen ? '\u2212' : '+') : ''}</span><span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>`)}
                 ${td(monthOf(l)
                      ? mLbl(monthOf(l)) + (monthIsDerived(l) ? '<span title="from the backup\u2019s own date; the register line carries none" style="color:var(--ink-3);opacity:.65;"> \u00b7 doc</span>' : '')
                      : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
@@ -32018,6 +32026,48 @@ render();
                              border:1px solid var(--rule-soft);border-radius:3px;background:transparent;color:var(--ink-3);cursor:pointer;"
                       >file</button>`, true)}
               </tr>`;
+              // ── WHAT WAS ACTUALLY BOUGHT ────────────────────────────────
+              // Item grain, from the document's own UPCs and descriptions --
+              // not a product GROUP, which would mean guessing which of ATG's
+              // groups each description belongs to. The words are KeHE's; the
+              // arithmetic is the document's. Percentages are of this line's
+              // detail, not of the register, so they always sum to 100.
+              if (itOpen) {
+                if (!itRows) {
+                  out += `<tr><td colspan="9" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                    font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">Reading the detail\u2026</td></tr>`;
+                } else if (itRows.err) {
+                  out += `<tr><td colspan="9" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                    font-family:var(--mono);font-size:10.5px;color:var(--lost);background:var(--rule-softer);">${esc(itRows.err)}</td></tr>`;
+                } else if (!itRows.items.length) {
+                  out += `<tr><td colspan="9" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                    font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">No item detail under this line.</td></tr>`;
+                } else {
+                  const tot = itRows.items.reduce((n, r) => n + r.amt, 0);
+                  const totU = itRows.items.reduce((n, r) => n + r.units, 0);
+                  out += `<tr><td colspan="9" style="padding:0;border-bottom:1px solid var(--rule-soft);background:var(--rule-softer);">
+                    <table style="width:100%;border-collapse:collapse;margin:2px 0 6px 32px;">
+                      <thead><tr>${['Item', 'UPC', 'Units', 'Rate', 'Spend', '% of line'].map((h, i) =>
+                        `<th style="text-align:${i > 1 ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
+                      <tbody>${itRows.items.map(r => `<tr>
+                        <td style="padding:5px 10px;font-family:var(--mono);font-size:11px;color:var(--ink-2);">${esc(r.desc || '\u2014')}</td>
+                        <td style="padding:5px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${esc(r.upc || '\u2014')}</td>
+                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${r.units ? r.units.toLocaleString() : '\u2014'}</td>
+                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${r.units ? '$' + (r.amt / r.units).toFixed(2) : '\u2014'}</td>
+                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;">${money(r.amt)}</td>
+                        <td style="padding:5px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${tot ? (r.amt / tot * 100).toFixed(1) + '%' : ''}</td></tr>`).join('')}
+                      </tbody>
+                      <tfoot><tr>
+                        <td style="padding:6px 10px;font-family:var(--mono);font-size:11px;border-top:1px solid var(--rule);"><strong>${itRows.items.length} item${itRows.items.length === 1 ? '' : 's'} \u00b7 ${itRows.rows.toLocaleString()} rows</strong></td>
+                        <td style="border-top:1px solid var(--rule);"></td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;border-top:1px solid var(--rule);"><strong>${totU.toLocaleString()}</strong></td>
+                        <td style="border-top:1px solid var(--rule);"></td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;border-top:1px solid var(--rule);"><strong>${money(tot)}</strong></td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">100%</td>
+                      </tr></tfoot></table></td></tr>`;
+                }
+              }
+              return out;
               return out;
             }).join('')}
             ${!shown.length ? `<tr><td colspan="9" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
@@ -32078,6 +32128,53 @@ render();
         mm.onclick = (ev) => ev.stopPropagation();
         document.addEventListener('click', () => { if (mm) mm.style.display = 'none'; }, { once: true });
       }
+      // ── EXPAND A LINE TO ITS ITEMS ───────────────────────────────────────
+      // Fetched once per line and cached for the session: opening the same row
+      // twice should not hit the database twice, and the numbers cannot change
+      // underneath without a reload anyway.
+      body.querySelectorAll('.hl-dl-item').forEach(tr => tr.onclick = async (ev) => {
+        // The action column carries its own buttons; a click there is not a
+        // request to expand.
+        if (ev.target.closest('button')) return;
+        const k = tr.dataset.l;
+        const line = L.find(x => String(x.id) === k);
+        if (!line || !line.detail_parsed) return;
+        if (_dedItemOpen.has(k)) { _dedItemOpen.delete(k); renderDeductions(hostEl, filtersEl, year); return; }
+        _dedItemOpen.add(k);
+        if (_dedItemCache.has(k)) { renderDeductions(hostEl, filtersEl, year); return; }
+        renderDeductions(hostEl, filtersEl, year);          // paint "Reading…" first
+        try {
+          // Paged: a single KeHE chargeback runs to thousands of store rows and
+          // PostgREST caps a select at 1,000 with no error, which is exactly how
+          // a total quietly comes back short.
+          const rows = [];
+          for (let from = 0; ; from += 1000) {
+            const { data, error } = await sb.from('deduction_detail')
+              .select('upc,item_desc,ship_qty,bill_amount')
+              .eq('brand_id', brandId).eq('line_id', line.id)
+              .order('id', { ascending: true }).range(from, from + 999);
+            if (error) throw new Error(error.message);
+            rows.push(...(data || []));
+            if (!data || data.length < 1000) break;
+          }
+          // Grouped on the UPC where there is one, else the description -- two
+          // spellings of the same item would otherwise show as two products.
+          const by = new Map();
+          for (const r of rows) {
+            const key = (r.upc || '') || (r.item_desc || '\u2014');
+            const cur = by.get(key) || { upc: r.upc || null, desc: r.item_desc || null, units: 0, amt: 0 };
+            if (!cur.desc && r.item_desc) cur.desc = r.item_desc;
+            cur.units += Number(r.ship_qty || 0);
+            cur.amt += Math.abs(Number(r.bill_amount || 0));
+            by.set(key, cur);
+          }
+          _dedItemCache.set(k, { items: [...by.values()].sort((a, b) => b.amt - a.amt), rows: rows.length });
+        } catch (err) {
+          _dedItemCache.set(k, { items: [], rows: 0, err: 'Could not read the detail: ' + (err && err.message || err) });
+        }
+        renderDeductions(hostEl, filtersEl, year);
+      });
+
       // ── PER-LINE DOCUMENT UPLOAD ─────────────────────────────────────────
       // The Upload tab reads a document and then goes LOOKING for the register
       // line it belongs to, off the invoice number on its cover -- and that
@@ -32207,6 +32304,7 @@ render();
               + '<div style="color:var(--ink-3);margin-top:6px;">The store views read a stored snapshot \u2014 run '
               + '<code>refresh materialized view concurrently public.deduction_detail_rollup;</code> alone in a SQL tab to see them there.</div>';
             try { _dedBust(); } catch (e4) {}
+            _dedItemCache.delete(String(l.id));   // it just changed underneath
             _dedRaw = null;
             setTimeout(() => { wrap.remove(); renderDeductions(hostEl, filtersEl, year); }, 1400);
           } catch (err) {
