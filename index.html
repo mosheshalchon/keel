@@ -29057,6 +29057,14 @@ render();
   // every UPC for 1,945 lines up front, to serve the handful anyone actually
   // opens, would be a far worse trade than one fetch per click.
   let _dedItemOpen = new Set(), _dedItemCache = new Map(), _dedProdMap = null;
+  // PROMO NUMBERS PER LINE, fetched only for the rows on screen. reference_no
+  // is populated on ~96% of detail rows and is the RETAILER'S own promo number
+  // -- issued before the promo runs, so it exists on both sides before money
+  // moves, which is exactly what Vividly's random promotion_key never gave us.
+  // The rollup does not carry it (it groups on line x banner x month), and
+  // pulling it for 334k detail rows to serve 25 visible ones would be absurd,
+  // so this is a small keyed fetch per page.
+  let _dedPromoRefs = new Map();
 
   // UPC NORMALISATION, because the same item is spelled three ways across the
   // sources: products.unit_upc carries the check digit (892453001242), the
@@ -31109,7 +31117,7 @@ render();
           // Caught, not awaited hard: the table is its own migration, and a brand
           // that has not run it should see the page rather than a stack trace.
           paged(() => sb.from('deduction_overrides')
-            .select('id,scope,match_value,customer,promo_type,promo_date,amount,source_note,backup_exists,active')
+            .select('id,scope,match_value,customer,promo_type,promo_date,amount,source_note,backup_exists,promo_ref,promo_name,active')
             .eq('brand_id', brandId).eq('active', true).order('id', { ascending: true })).catch(() => []),
         ]);
         _dedRaw = { key: rawKey, checks, lines, rmap, lineRates, overrides };
@@ -31297,6 +31305,13 @@ render();
       // under, and every UNFI check already foots to its own lines so there is
       // no check for it to belong to.
       ['support',    'Support gaps'],
+      // EVERY WARNING IN ONE PLACE. These lived stacked above the distributor
+      // pills -- double counts, the NCG late fee, catalogue freshness, feed
+      // health -- so the landing page opened with four red boxes before any
+      // number, and the search box sat below a block whose height changed as
+      // each async strip resolved. Moved wholesale: same content, one tab,
+      // nothing deleted.
+      ['callouts',   'Callouts'],
     ];
 
     // DECLARED HERE, ABOVE FIRST USE. These were further down the function while
@@ -31306,6 +31321,10 @@ render();
     // The screen said "KeHE" everywhere because KeHE was once the only
     // distributor. Under All or UNFI those labels are simply false, so the name
     // now comes from the scope in one place rather than a dozen literal strings.
+    // Collected while the headline renders, shown on the Callouts tab. Assigning
+    // inside the template and emitting '' keeps ONE source for each warning --
+    // duplicating the markup is how two versions of the same number drift.
+    const _dedCallouts = { tie: '', dbl: '', ncg: '' };
     const DNAME = _dedDist === 'all' ? 'the distributors' : _dedDist;
     const DSHORT = _dedDist === 'all' ? 'Distributor' : _dedDist;
 
@@ -31338,9 +31357,9 @@ render();
           ${_dedDist === 'all' ? _dedDistNames(_dedDistCounts) + ' took' : DSHORT + ' took'}
           <strong>${money(-totalAmt)}</strong> in ${yr}${unattribHint ? `, of which <strong style="color:var(--lost);">${money(unattribHint)}</strong> is not yet matched to a customer` : ''}.
         </div>
-        ${notTied.length ? `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:8px;">
-          ${notTied.length} of ${checks.length} checks do not tie to their line detail</div>` : ''}
-        ${overClaimed.length ? `<div style="margin-top:10px;padding:9px 12px;border:1px solid var(--lost);border-left-width:3px;border-radius:4px;background:rgba(168,56,31,0.06);font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--ink-2);">
+        ${(_dedCallouts.tie = `${notTied.length ? `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:8px;">
+          ${notTied.length} of ${checks.length} checks do not tie to their line detail</div>` : ''}`, '')}
+        ${''}${(_dedCallouts.dbl = `${overClaimed.length ? `<div style="margin-top:10px;padding:9px 12px;border:1px solid var(--lost);border-left-width:3px;border-radius:4px;background:rgba(168,56,31,0.06);font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--ink-2);">
           <strong style="color:var(--lost);">Possible double count \u00b7 ${money(-overClaimedTotal)}.</strong>
           ${overClaimed.length} check${overClaimed.length === 1 ? '' : 's'} carr${overClaimed.length === 1 ? 'ies' : 'y'} more in deduction lines than the check itself states.
           <div style="margin-top:4px;color:var(--ink-3);">${overClaimed.slice(0, 5).map(x =>
@@ -31348,8 +31367,8 @@ render();
             + ' \u00b7 over by ' + money(-x.excess)).join('<br>')}${overClaimed.length > 5
             ? '<br>+ ' + (overClaimed.length - 5) + ' more' : ''}</div>
           <div style="margin-top:5px;color:var(--ink-3);">Usually one charge entered twice \u2014 a remittance line and an itemised file line for the same money. Open the Checks tab to see the lines.</div>
-        </div>` : ''}
-        ${(() => {
+        </div>` : ''}`, '')}
+        ${(_dedCallouts.ncg = (() => {
           // NCG LIQUIDATED DAMAGES. National Co+op Grocers collects past-due
           // invoices through UNFI and adds a 20% late fee, so the deduction is
           // principal x 1.2 and the PENALTY IS EXACTLY ONE SIXTH of it. That is
@@ -31376,20 +31395,16 @@ render();
           return `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);margin-top:6px;">
             ${money(-fee)} of the ${money(-tot)} NCG deduction is a 20% late fee on past-due invoices
             <span style="color:var(--ink-3);">(${Math.max(ncg.length, ncgFee.length)} deduction${Math.max(ncg.length, ncgFee.length) === 1 ? '' : 's'} — principal ${money(-principal)})</span></div>`;
-        })()}
+        })(), '')}
       </div>
 
       <div style="padding:2px 2px 14px;border-bottom:1px solid var(--rule-soft);"></div>
 
-      <!-- Filled asynchronously by _dedRenderCrawl(). Empty until it resolves, and
-           empty forever if the table isn't there — an absent catalogue table is a
-           brand that doesn't crawl, not a fault worth shouting about. -->
-      <div id="hl-ded-crawl"></div>
-
-      <!-- Feed health. Same contract as the catalogue strip: silent when the
-           table is absent, silent when everything is fine, loud only when a
-           feed has stopped writing. -->
-      <div id="hl-ded-feeds"></div>
+      <!-- The catalogue and feed strips now render inside the Callouts tab.
+           These placeholders stay because _dedRenderCrawl and _dedRenderFeeds
+           write into them by id and must not throw when the tab is elsewhere. -->
+      <div id="hl-ded-crawl" style="display:none;"></div>
+      <div id="hl-ded-feeds" style="display:none;"></div>
 
       <div style="margin:14px 0 2px;display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
         <span style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-right:4px;">Distributor</span>
@@ -31722,6 +31737,26 @@ render();
 
     // Answered before the register aggregation for the same reason as upload:
     // it reads one small aggregate and none of the checks, lines or detail.
+    if (_dedView === 'callouts') {
+      // ONE SCREEN OF WHAT NEEDS ATTENTION. Nothing new is computed here -- the
+      // same strings the headline built, plus the two async strips relocated
+      // whole. Quiet when there is nothing wrong, which is the point: a page
+      // that always shows four red boxes stops being read.
+      const parts = [_dedCallouts.tie, _dedCallouts.dbl, _dedCallouts.ncg].filter(Boolean);
+      body.innerHTML = `
+        <div style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin:2px 0 12px;">What needs attention</div>
+        ${parts.length ? parts.join('') : `<p style="font-family:var(--serif);font-size:14px;color:var(--ink-3);">Nothing flagged on ${esc(DSHORT)} for ${esc(String(yr))}. Checks tie to their line detail and no check carries more in lines than it states.</p>`}
+        <div style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin:26px 0 10px;padding-top:16px;border-top:1px solid var(--rule-soft);">Feeds and catalogue</div>
+        <div id="hl-ded-crawl"></div>
+        <div id="hl-ded-feeds"></div>`;
+      // Re-run against the freshly created hosts. Both fail silent when their
+      // table is absent, so a brand without a crawl sees an empty section
+      // rather than an error.
+      _dedRenderCrawl().catch(e => console.error('[deductions] catalogue strip failed:', e));
+      _dedRenderFeeds().catch(e => console.error('[deductions] feed strip failed:', e));
+      return;
+    }
+
     if (_dedView === 'catalogue') {
       await _dedRenderCatalogue(body, sb, brandId, esc);
       return;
@@ -31922,7 +31957,8 @@ render();
       // remarks. Tokenised so "WE0131 MCB" narrows rather than finding nothing.
       const terms = _dedLinesQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
       const hay = (l) => [l.invoice_no, l.reason_code, l.dc_name, l.remarks, catOf(l),
-                          (custFull(l) || {}).name]
+                          (custFull(l) || {}).name,
+                          ...(_dedPromoRefs.get(String(l.id)) || [])]
         .filter(Boolean).join(' ').toLowerCase();
       const matches = (l) => {
         if (_dedLinesMonths.size) {
@@ -31940,6 +31976,38 @@ render();
       const registerAmt = L.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
       const shown = filtered.slice(0, _dedLinesLimit);
       const isFiltered = terms.length > 0 || _dedLinesMonths.size > 0;
+
+      // Only the ids not already known, so paging further down costs one small
+      // query rather than re-reading everything above it.
+      const needRefs = shown.filter(l => l.detail_parsed && !_dedPromoRefs.has(String(l.id))).map(l => l.id);
+      if (needRefs.length) {
+        try {
+          const seen = new Map();
+          for (let from = 0; ; from += 1000) {
+            const { data, error } = await sb.from('deduction_detail')
+              .select('line_id,reference_no').eq('brand_id', brandId)
+              .in('line_id', needRefs).not('reference_no', 'is', null)
+              .order('line_id', { ascending: true }).range(from, from + 999);
+            if (error) throw error;
+            for (const r of (data || [])) {
+              const k = String(r.line_id);
+              // A promo number is 6-10 digits. reference_no ALSO holds dates,
+              // invoice ids, 'See attached' and a bare 0 -- the same filter
+              // deduction_promo_rollup uses, for the same reason.
+              const v = String(r.reference_no || '').trim();
+              if (!/^[0-9]{6,10}$/.test(v) && !/^[A-Z]/i.test(v)) continue;
+              if (!seen.has(k)) seen.set(k, new Set());
+              seen.get(k).add(v);
+            }
+            if (!data || data.length < 1000) break;
+          }
+          for (const id of needRefs) _dedPromoRefs.set(String(id), [...(seen.get(String(id)) || [])]);
+        } catch (e) {
+          // A promo number is a nicety; the register is not. Mark them read so a
+          // failure does not re-query on every keystroke.
+          for (const id of needRefs) _dedPromoRefs.set(String(id), []);
+        }
+      }
 
       const monthChip = (k, lbl, n, amt) => {
         const on = _dedLinesMonths.has(k);
@@ -31996,7 +32064,28 @@ render();
               const itOpen = _dedItemOpen.has(String(l.id));
               const itRows = _dedItemCache.get(String(l.id));
               let out = `<tr class="hl-dl-item" data-l="${esc(String(l.id))}" style="cursor:pointer;">
-                ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${l.detail_parsed ? (itOpen ? '\u2212' : '+') : ''}</span><span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>`)}
+                ${(() => {
+                  const o = _dedOverrideFor(l, overrides);
+                  // The person's own entry first -- on a fee document with no
+                  // detail it is the only promo number there is.
+                  const refs = [...new Set([...(o && o.promo_ref ? [o.promo_ref] : []),
+                                            ...(_dedPromoRefs.get(String(l.id)) || [])])];
+                  // THREE IS THE CEILING, MEASURED RATHER THAN GUESSED. Across
+                  // the book, 368 lines worth $327,195 carry three promo numbers
+                  // or fewer -- there the number IS the promo and belongs beside
+                  // the invoice. But 450 lines worth $455,681, over half the
+                  // documented money, carry more than ten: bundled chargebacks
+                  // covering dozens of events, where "1004821 1004822 +42" says
+                  // nothing at all. Those get a count that leads into the
+                  // expansion, which is the only place the split is legible.
+                  const many = refs.length > 3;
+                  const tag = !refs.length ? ''
+                    : many
+                      ? `<span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;" title="a bundled chargeback \u2014 open the row to see them by product line">${refs.length} promos</span>`
+                      : `<span style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-left:8px;" title="retailer promo number">${refs.map(esc).join(' ')}</span>`;
+                  return td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${l.detail_parsed ? (itOpen ? '\u2212' : '+') : ''}</span>`
+                    + `<span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>` + tag);
+                })()}
                 ${td(monthOf(l)
                      ? mLbl(monthOf(l)) + (monthIsDerived(l) ? '<span title="from the backup\u2019s own date; the register line carries none" style="color:var(--ink-3);opacity:.65;"> \u00b7 doc</span>' : '')
                      : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
@@ -32011,7 +32100,8 @@ render();
                   return td(`<span>${esc(c.name)}</span>`
                     + (c.extra ? `<span style="color:var(--ink-3);font-family:var(--mono);font-size:9.5px;" title="the detail also names ${c.extra} other banner${c.extra === 1 ? '' : 's'}"> +${c.extra}</span>` : '')
                     + (ev ? `<span style="font-family:var(--mono);font-size:9px;color:${ev.color};margin-left:6px;opacity:.8;">${ev.label}</span>` : '')
-                    + (c.conflict ? `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:6px;" title="the documents say ${esc(String(c.was))} \u2014 one of the two is wrong">\u26A0 was ${esc(String(c.was))}</span>` : ''));
+                    + (c.conflict ? `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:6px;" title="the documents say ${esc(String(c.was))} \u2014 one of the two is wrong">\u26A0 was ${esc(String(c.was))}</span>` : '')
+                    + (c.ovr && c.ovr.promo_ref ? `<span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-left:6px;" title="${esc(c.ovr.promo_name || 'retailer promo reference')}">\u00b7 promo ${esc(c.ovr.promo_ref)}</span>` : ''));
                 })()}
                 ${td(cat ? esc(cat) : '<span style="color:var(--lost);">\u26A0 unmapped</span>')}
                 ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(l.reason_code || '\u2014') + '</span>')}
@@ -32062,11 +32152,19 @@ render();
                   const totU = G.reduce((n, r) => n + r.units, 0);
                   out += `<tr><td colspan="9" style="padding:0;border-bottom:1px solid var(--rule-soft);background:var(--rule-softer);">
                     <table style="width:100%;border-collapse:collapse;margin:2px 0 6px 32px;">
-                      <thead><tr>${['Product line', 'Items included', 'Units', 'Rate', 'Spend', '% of line'].map((h, i) =>
-                        `<th style="text-align:${i > 1 ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
+                      <thead><tr>${['Product line', 'Items included', 'Promos', 'Units', 'Rate', 'Spend', '% of line'].map((h, i) =>
+                        `<th style="text-align:${i > 2 ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
                       <tbody>${G.map(g => `<tr>
                         <td style="padding:6px 10px;font-family:var(--mono);font-size:11.5px;color:${g.mapped ? 'var(--ink)' : 'var(--lost)'};">${esc(g.line)}</td>
                         <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.45;">${esc(g.descs.slice(0, 4).join(', '))}${g.descs.length > 4 ? ' +' + (g.descs.length - 4) : ''}</td>
+                        <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.45;" title="${esc([...g.promos].join(' '))}">${(() => {
+                          const P = [...g.promos];
+                          if (!P.length) return '\u2014';
+                          // Legible at this grain where it was not at line grain:
+                          // a bundled chargeback splits across product lines, so a
+                          // group usually carries a handful rather than forty.
+                          return P.length <= 4 ? P.map(esc).join(' ') : esc(P.slice(0, 3).join(' ')) + ' +' + (P.length - 3);
+                        })()}</td>
                         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${g.units ? g.units.toLocaleString() : '\u2014'}</td>
                         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014'}</td>
                         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${money(g.amt)}</td>
@@ -32075,6 +32173,10 @@ render();
                       <tfoot><tr>
                         <td style="padding:7px 10px;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>Total</strong></td>
                         <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">${itRows.items.length} item${itRows.items.length === 1 ? '' : 's'} \u00b7 ${itRows.rows.toLocaleString()} detail rows</td>
+                        <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">${(() => {
+                          const all = new Set(); for (const g of G) for (const pr of g.promos) all.add(pr);
+                          return all.size ? all.size + ' promo' + (all.size === 1 ? '' : 's') : '';
+                        })()}</td>
                         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${totU.toLocaleString()}</strong></td>
                         <td style="border-top:1px solid var(--rule);"></td>
                         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${money(tot)}</strong></td>
@@ -32165,7 +32267,7 @@ render();
           const rows = [];
           for (let from = 0; ; from += 1000) {
             const { data, error } = await sb.from('deduction_detail')
-              .select('upc,item_desc,ship_qty,bill_amount')
+              .select('upc,item_desc,ship_qty,bill_amount,reference_no')
               .eq('brand_id', brandId).eq('line_id', line.id)
               .order('id', { ascending: true }).range(from, from + 999);
             if (error) throw new Error(error.message);
@@ -32177,10 +32279,12 @@ render();
           const by = new Map();
           for (const r of rows) {
             const key = (r.upc || '') || (r.item_desc || '\u2014');
-            const cur = by.get(key) || { upc: r.upc || null, desc: r.item_desc || null, units: 0, amt: 0 };
+            const cur = by.get(key) || { upc: r.upc || null, desc: r.item_desc || null, units: 0, amt: 0, promos: new Set() };
             if (!cur.desc && r.item_desc) cur.desc = r.item_desc;
             cur.units += Number(r.ship_qty || 0);
             cur.amt += Math.abs(Number(r.bill_amount || 0));
+            const pr = String(r.reference_no || '').trim();
+            if (/^[0-9]{6,10}$/.test(pr)) cur.promos.add(pr);
             by.set(key, cur);
           }
           // The Brand Library mapping, fetched once per session. `product_line`
@@ -32204,9 +32308,10 @@ render();
           for (const it of items) {
             const hit = _dedProdMap.get(_dedUpc11(it.upc));
             const key = (hit && hit.line) || '\u2014 not in Brand Library';
-            const g = gm.get(key) || { line: key, units: 0, amt: 0, descs: [], mapped: !!(hit && hit.line) };
+            const g = gm.get(key) || { line: key, units: 0, amt: 0, descs: [], promos: new Set(), mapped: !!(hit && hit.line) };
             g.units += it.units; g.amt += it.amt;
             if (it.desc) g.descs.push(it.desc);
+            for (const pr of it.promos) g.promos.add(pr);
             gm.set(key, g);
           }
           _dedItemCache.set(k, { items, groups: [...gm.values()].sort((a, b) => b.amt - a.amt), rows: rows.length });
@@ -32410,6 +32515,10 @@ render();
               <input id="hl-ovr-type" value="${esc((cur && cur.promo_type) || '')}" placeholder="Ads - Fees - Display" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo date
               <input id="hl-ovr-date" type="date" value="${esc((cur && cur.promo_date) || '')}" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
+            <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo / voucher no.
+              <input id="hl-ovr-pref" value="${esc((cur && cur.promo_ref) || '')}" placeholder="64706" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
+            <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo name
+              <input id="hl-ovr-pname" value="${esc((cur && cur.promo_name) || '')}" placeholder="FEBB-FEB B" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Amount <span style="text-transform:none;opacity:.7;">(only if unreadable)</span>
               <input id="hl-ovr-amt" type="number" step="0.01" value="${cur && cur.amount != null ? esc(String(cur.amount)) : ''}" placeholder="leave blank" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
           </div>
@@ -32447,7 +32556,8 @@ render();
           const scope = (wrap.querySelector('input[name=hl-ovr-scope]:checked') || {}).value || 'line';
           const customer = document.getElementById('hl-ovr-cust').value.trim();
           const bkRaw = (wrap.querySelector('input[name=hl-ovr-bk]:checked') || {}).value;
-          if (!customer && !bkRaw) { msg('Set a customer, or answer the document question.'); return; }
+          const prefRaw = document.getElementById('hl-ovr-pref').value.trim();
+          if (!customer && !bkRaw && !prefRaw) { msg('Set a customer, a promo number, or answer the document question.'); return; }
           const amtRaw = document.getElementById('hl-ovr-amt').value.trim();
           const row = {
             brand_id: brandId, scope,
@@ -32456,6 +32566,11 @@ render();
             promo_type: document.getElementById('hl-ovr-type').value.trim() || null,
             promo_date: document.getElementById('hl-ovr-date').value || null,
             amount: amtRaw === '' ? null : Number(amtRaw),
+            // THE RETAILER'S OWN PROMO NUMBER, which is the join key to the
+            // plan and often the only thing on a fee document worth keeping.
+            // WHFDSADS prints no detail at all but does print Voucher 64706.
+            promo_ref: document.getElementById('hl-ovr-pref').value.trim() || null,
+            promo_name: document.getElementById('hl-ovr-pname').value.trim() || null,
             source_note: document.getElementById('hl-ovr-note').value.trim() || null,
             backup_exists: (() => {
               const v = (wrap.querySelector('input[name=hl-ovr-bk]:checked') || {}).value;
