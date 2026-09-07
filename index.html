@@ -29065,6 +29065,11 @@ render();
   // pulling it for 334k detail rows to serve 25 visible ones would be absurd,
   // so this is a small keyed fetch per page.
   let _dedPromoRefs = new Map();
+  // Pick lists for the override editor, fetched once. Typing a customer by hand
+  // is how "Whole Foods", "whole foods" and "Whole Foods Market" end up as three
+  // customers -- and the plan is the authority on the spelling, so the list
+  // comes from it rather than from anything typed here before.
+  let _dedPickLists = null;
 
   // UPC NORMALISATION, because the same item is spelled three ways across the
   // sources: products.unit_upc carries the check digit (892453001242), the
@@ -32475,10 +32480,38 @@ render();
       // Opened from the pencil on any line. A modal rather than an inline row
       // because the scope choice needs explaining and a cramped row would hide
       // the one decision that matters.
-      body.querySelectorAll('.hl-dl-ovr').forEach(btn => btn.onclick = (ev) => {
+      // ONE FETCH FOR THE PICK LISTS, before any modal opens. The plan is the
+      // authority on customer spelling -- promo_plan_lines.customer is what the
+      // reconciliation joins on, so a hand-typed "whole foods" reconciles
+      // against nothing while looking perfectly correct on screen.
+      const _dedLoadPicks = async () => {
+        if (_dedPickLists) return _dedPickLists;
+        const custs = new Set(), types = new Set();
+        try {
+          for (let from = 0; ; from += 1000) {
+            const { data, error } = await sb.from('promo_plan_lines')
+              .select('customer,promo_type').eq('brand_id', brandId)
+              .order('customer', { ascending: true }).range(from, from + 999);
+            if (error) throw error;
+            for (const r of (data || [])) {
+              if (r.customer) custs.add(String(r.customer).trim());
+              if (r.promo_type) types.add(String(r.promo_type).trim());
+            }
+            if (!data || data.length < 1000) break;
+          }
+        } catch (e) { /* a missing list is a free-text field, not a broken editor */ }
+        // Retailers the plan does not cover are real -- Winn-Dixie, Roche Bros,
+        // Lassens and the rest -- so anything already used here joins the list.
+        for (const o of overrides) if (o.customer) custs.add(String(o.customer).trim());
+        _dedPickLists = { custs: [...custs].sort(), types: [...types].sort() };
+        return _dedPickLists;
+      };
+
+      body.querySelectorAll('.hl-dl-ovr').forEach(btn => btn.onclick = async (ev) => {
         ev.stopPropagation();                       // do not toggle the detail rows
         const l = L.find(x => String(x.id) === btn.dataset.l);
         if (!l) return;
+        const picks = await _dedLoadPicks();
         const cur = _dedOverrideFor(l, overrides);
         const doc = custOf(l);
         const code = String(l.reason_code || ''), inv = String(l.invoice_no || '');
@@ -32521,9 +32554,11 @@ render();
 
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:20px;">
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Customer
-              <input id="hl-ovr-cust" value="${esc((cur && cur.customer) || '')}" placeholder="Sprouts" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
+              <input id="hl-ovr-cust" list="hl-ovr-custs" value="${esc((cur && cur.customer) || '')}" placeholder="Sprouts" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
+              <datalist id="hl-ovr-custs">${picks.custs.map(c => `<option value="${esc(c)}">`).join('')}</datalist></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo type
-              <input id="hl-ovr-type" value="${esc((cur && cur.promo_type) || '')}" placeholder="Ads - Fees - Display" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
+              <input id="hl-ovr-type" list="hl-ovr-types" value="${esc((cur && cur.promo_type) || '')}" placeholder="Ads - Fees - Display" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
+              <datalist id="hl-ovr-types">${picks.types.map(t => `<option value="${esc(t)}">`).join('')}</datalist></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo date
               <input id="hl-ovr-date" type="date" value="${esc((cur && cur.promo_date) || '')}" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo / voucher no.
@@ -32566,6 +32601,14 @@ render();
         document.getElementById('hl-ovr-save').onclick = async () => {
           const scope = (wrap.querySelector('input[name=hl-ovr-scope]:checked') || {}).value || 'line';
           const customer = document.getElementById('hl-ovr-cust').value.trim();
+          // A CUSTOMER THE PLAN DOES NOT CARRY reconciles against nothing while
+          // looking right on screen. Not blocked -- Winn-Dixie and Roche Bros
+          // are real and the plan genuinely omits them -- but said out loud, so
+          // a typo is caught here rather than as a -100% variance later.
+          if (customer && picks.custs.length && !picks.custs.includes(customer)) {
+            const near = picks.custs.find(c => c.toLowerCase() === customer.toLowerCase());
+            if (near) { msg('The plan spells that "' + near + '". Use that spelling or it will not reconcile.'); return; }
+          }
           const bkRaw = (wrap.querySelector('input[name=hl-ovr-bk]:checked') || {}).value;
           const prefRaw = document.getElementById('hl-ovr-pref').value.trim();
           if (!customer && !bkRaw && !prefRaw) { msg('Set a customer, a promo number, or answer the document question.'); return; }
@@ -32590,10 +32633,27 @@ render();
             active: true, updated_at: new Date().toISOString(),
           };
           msg('Saving\u2026');
-          // Count-verified, because a missing RLS policy returns success with
-          // zero rows and this project has lost data to that exact silence.
-          const { data, error } = await sb.from('deduction_overrides')
-            .upsert(row, { onConflict: 'brand_id,scope,match_value' }).select('id');
+          // FIND, THEN UPDATE OR INSERT -- deliberately not an upsert. The unique
+          // index on this table is PARTIAL (`where active`), and PostgREST cannot
+          // name a partial index as an ON CONFLICT target: the request hangs on
+          // "Saving..." with no error to read. Two plain statements have no such
+          // dependency on the index shape.
+          //
+          // Count-verified either way, because a missing RLS policy returns
+          // success with zero rows and this project has lost data to that
+          // exact silence.
+          let data, error;
+          const { data: found, error: fErr } = await sb.from('deduction_overrides')
+            .select('id').eq('brand_id', brandId).eq('scope', scope)
+            .eq('match_value', row.match_value).eq('active', true).limit(1);
+          if (fErr) { msg(fErr.message); return; }
+          if (found && found.length) {
+            ({ data, error } = await sb.from('deduction_overrides')
+              .update(row).eq('id', found[0].id).select('id'));
+          } else {
+            ({ data, error } = await sb.from('deduction_overrides')
+              .insert(row).select('id'));
+          }
           if (error) { msg(error.message); return; }
           if (!data || !data.length) { msg('Saved nothing \u2014 check the RLS policy on deduction_overrides.'); return; }
           _dedRaw = null;                       // the register cache holds the old overrides
