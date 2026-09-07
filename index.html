@@ -18189,7 +18189,7 @@ render();
       </div>
 
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
           ${itemLevel ? '' : `<select id="hl-cmp-retailer" style="padding:6px 10px;font-size:12px;border:1px solid var(--rule-soft);border-radius:4px;background:var(--paper);">
             <option value="">All retailers</option>
             ${retailers.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join('')}
@@ -30522,9 +30522,78 @@ render();
   }
 
   function _dedIsoDate(s) {
-    const m = String(s == null ? '' : s).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    // TWO-DIGIT YEARS TOO. The Distributor Charge layout prints 2/24/26 on every
+    // detail row, and a null date here is not cosmetic -- reference_date is what
+    // the promo-date rule reconciles on, so an unparsed year silently pushes the
+    // whole document into "no date on the line".
+    const m = String(s == null ? '' : s).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
     if (!m) return null;
-    return m[3] + '-' + String(m[1]).padStart(2, '0') + '-' + String(m[2]).padStart(2, '0');
+    const y = m[3].length === 2 ? String(2000 + Number(m[3])) : m[3];
+    return y + '-' + String(m[1]).padStart(2, '0') + '-' + String(m[2]).padStart(2, '0');
+  }
+
+  // ── THE DISTRIBUTOR CHARGE LAYOUT ────────────────────────────────────────
+  // The upload tab REFUSED these and pointed at sync-deductions mode=detail,
+  // which cannot read them: every one of these documents is a scan with no text
+  // layer, so mode=detail returned "pdf produced no rows" 1,320 times a day.
+  // The layout was never the problem -- nothing had been written for it.
+  //
+  // Shape, from ImageIt_0362563: a page header stating INVOICE # and the period,
+  // a totals block (TOTAL MCB / TOTAL FEE / TOTAL PAYABLE), then repeating
+  // SOLD TO blocks -- store name, address, then a city line whose leading digits
+  // are the store number -- each followed by rows of
+  //   UPC | QTY SHIP | DESCRIPTION | REF NBR | REF DATE | COMMENT | COST | DISC | EXT-COST
+  //
+  // SELF-VERIFYING TWICE: the rows sum to the document's stated TOTAL MCB, and
+  // TOTAL MCB + TOTAL FEE equals TOTAL PAYABLE, which is the register line. Both
+  // are checked rather than trusted -- verified on the real file at 102 rows,
+  // $13,292.19, and $13,292.19 + $1,063.37 = $14,355.56.
+  function _dedParseDistCharge(text) {
+    const t = String(text || '').replace(/\r/g, '');
+    const num = (v) => { const n = Number(String(v).replace(/[$,%\s]/g, '')); return isNaN(n) ? null : n; };
+    const head = {
+      invoice_no: (t.match(/INVOICE\s*#\s*(\d{5,})/i) || [])[1] || null,
+      period_from: (t.match(/INVOICE\s*#\s*\d+\s+(\d{2}\/\d{2}\/\d{4})/i) || [])[1] || null,
+      period_to: (t.match(/INVOICE\s*#\s*\d+\s+\d{2}\/\d{2}\/\d{4}\s*-\s*(\d{2}\/\d{2}\/\d{4})/i) || [])[1] || null,
+      dc: ((t.match(/DISTRIBUTOR CHARGE\s+(.+?)\s*$/im) || [])[1] || '').trim() || null,
+      total_mcb: num((t.match(/TOTAL\s+MCB\s+([\d,]+\.\d{2})/i) || [])[1]),
+      total_fee: num((t.match(/TOTAL\s+FEE\s+([\d,]+\.\d{2})/i) || [])[1]),
+      total_payable: num((t.match(/TOTAL\s+PAYABLE\s+([\d,]+\.\d{2})/i) || [])[1]),
+      type: 'Distributor Charge',
+    };
+    head.total = head.total_mcb;
+    const rows = [];
+    let cust = null, custNo = null, awaitNo = false;
+    for (const raw of t.split('\n')) {
+      const line = raw.trim();
+      let m;
+      if ((m = line.match(/^SOLD\s+TO:\s*(.+?)\s*$/i))) { cust = m[1].trim(); custNo = null; awaitNo = true; continue; }
+      if (awaitNo && (m = line.match(/^(\d{3,8})\s+\S/))) { custNo = m[1]; awaitNo = false; }
+      if (/^UPC|^-{5}|^QTY|^Date\s|^INVOICE\s*#|TELEPHONE|TOL User/i.test(line)) continue;
+      if (!(m = line.match(/^(\d{11,14})\s+(\d+)\s+(.+)$/))) continue;
+      const upc = m[1], qty = Number(m[2]);
+      const dm = m[3].trim().match(/^(.+?)\s+(\d{5,})\s+(\d{1,2}\/\d{1,2}\/\d{2})\s+(.*)$/);
+      if (!dm) continue;
+      const tk = dm[4].trim().split(/\s+/).filter(Boolean);
+      if (tk.length < 3) continue;
+      // EXT-COST is always last. The discount is either a dollar figure or a
+      // percentage printed as two tokens ("12 %"), so the tail is read
+      // backwards rather than by position -- a fixed column index gets the
+      // percentage rows wrong and those are the largest lines in the file.
+      const ext = num(tk[tk.length - 1]);
+      let pct = null, cost;
+      if (tk[tk.length - 2] === '%') { pct = num(tk[tk.length - 3]); cost = num(tk[tk.length - 4]); }
+      else { cost = num(tk[tk.length - 3]); }
+      if (ext == null) continue;
+      rows.push({
+        upc, item_desc: dm[1].trim(), reference_no: dm[2], ship_date: dm[3],
+        customer_name: cust, customer_no: custNo,
+        ship_qty: qty, unit_cost: cost, discount_pct: pct, bill_amount: ext,
+      });
+    }
+    const line_total = Math.round(rows.reduce((n, r) => n + r.bill_amount, 0) * 100) / 100;
+    return { head, rows, line_total,
+             ties: head.total_mcb != null && Math.abs(line_total - head.total_mcb) < 0.02 };
   }
 
   // ── UPLOAD VIEW ───────────────────────────────────────────────────────────
@@ -31911,7 +31980,11 @@ render();
                 ${td(`<button class="hl-dl-ovr" data-l="${esc(String(l.id))}" title="Set who was charged, and whether a document exists"
                       style="font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;
                              border:1px solid var(--rule-soft);border-radius:3px;background:transparent;color:var(--ink-3);cursor:pointer;"
-                      >${_dedOverrideFor(l, overrides) ? 'edit' : 'set'}</button>`, true)}
+                      >${_dedOverrideFor(l, overrides) ? 'edit' : 'set'}</button>`
+                   + `<button class="hl-dl-up" data-l="${esc(String(l.id))}" title="Upload the backup document for this line"
+                      style="margin-left:5px;font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;
+                             border:1px solid var(--rule-soft);border-radius:3px;background:transparent;color:var(--ink-3);cursor:pointer;"
+                      >file</button>`, true)}
               </tr>`;
               return out;
             }).join('')}
@@ -31973,6 +32046,144 @@ render();
         mm.onclick = (ev) => ev.stopPropagation();
         document.addEventListener('click', () => { if (mm) mm.style.display = 'none'; }, { once: true });
       }
+      // ── PER-LINE DOCUMENT UPLOAD ─────────────────────────────────────────
+      // The Upload tab reads a document and then goes LOOKING for the register
+      // line it belongs to, off the invoice number on its cover -- and that
+      // number is read positionally when the labels are graphics, so a document
+      // can key itself off one of its own detail rows and attach to the wrong
+      // line. Here the line is already known, because it was clicked. The
+      // invoice number becomes a CHECK rather than a lookup, which is strictly
+      // safer, and it is the only sane place to put this for someone who has
+      // just found the file in Dropbox.
+      body.querySelectorAll('.hl-dl-up').forEach(btn => btn.onclick = (ev) => {
+        ev.stopPropagation();
+        const l = L.find(x => String(x.id) === btn.dataset.l);
+        if (!l) return;
+        const amt = Math.abs(Number(l.amount || 0));
+
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.34);z-index:200;display:flex;align-items:center;justify-content:center;padding:28px;';
+        wrap.innerHTML = `<div style="background:var(--paper);border-radius:8px;max-width:720px;width:100%;max-height:90vh;overflow-y:auto;padding:30px 34px;box-shadow:0 10px 40px rgba(0,0,0,.24);">
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);">Upload the backup</div>
+          <div style="font-family:var(--mono);font-size:16px;color:var(--ink);margin:8px 0 3px;">${esc(l.invoice_no || '(no invoice no.)')} \u00b7 ${money(amt)}</div>
+          <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-bottom:20px;">
+            The rows land against THIS line. Nothing is written until the document's own total agrees with it.</div>
+          <input id="hl-up-file" type="file" accept="application/pdf,.pdf"
+            style="font-family:var(--mono);font-size:12px;padding:14px;border:1px dashed var(--rule);border-radius:6px;width:100%;background:var(--paper);color:var(--ink);cursor:pointer;">
+          <div id="hl-up-out" style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin-top:16px;line-height:1.6;"></div>
+          <div style="display:flex;gap:9px;margin-top:22px;align-items:center;">
+            <button id="hl-up-go" disabled style="font-family:var(--mono);font-size:12.5px;padding:11px 26px;border-radius:6px;border:1px solid var(--rule-soft);background:transparent;color:var(--rule);cursor:default;">Import</button>
+            <button id="hl-up-cancel" style="font-family:var(--mono);font-size:12.5px;padding:11px 20px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Cancel</button>
+          </div>
+        </div>`;
+        document.body.appendChild(wrap);
+        wrap.onclick = (e) => { if (e.target === wrap) wrap.remove(); };
+        document.getElementById('hl-up-cancel').onclick = () => wrap.remove();
+        const out = document.getElementById('hl-up-out');
+        const go = document.getElementById('hl-up-go');
+        const arm = (on) => {
+          go.disabled = !on;
+          go.style.cursor = on ? 'pointer' : 'default';
+          go.style.border = '1px solid ' + (on ? 'var(--ink)' : 'var(--rule-soft)');
+          go.style.background = on ? 'var(--ink)' : 'transparent';
+          go.style.color = on ? 'var(--paper)' : 'var(--rule)';
+        };
+        let parsed = null;
+
+        document.getElementById('hl-up-file').onchange = async (e2) => {
+          const f = e2.target.files && e2.target.files[0];
+          if (!f) return;
+          parsed = null; arm(false);
+          out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026</span>';
+          try {
+            const text = await _dedPdfText(await f.arrayBuffer(),
+              (n) => { out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026 ' + n + ' streams</span>'; });
+            if (!text || text.replace(/\s/g, '').length < 40) {
+              out.innerHTML = '<span style="color:var(--lost);">No text layer \u2014 this is a scan. Those go through the OCR pass (<code>mode=ocr</code>), not here.</span>';
+              return;
+            }
+            // Route on what the document says it is, not on its filename.
+            const p = /DISTRIBUTOR CHARGE/i.test(text) ? _dedParseDistCharge(text) : _dedParseKsolve(text);
+            if (!p.rows.length) { out.innerHTML = '<span style="color:var(--lost);">Read the file but found no detail rows.</span>'; return; }
+            if (!p.ties) {
+              out.innerHTML = '<span style="color:var(--lost);">The rows sum to ' + money(p.line_total)
+                + ' against the document\u2019s own stated total of ' + (p.head.total == null ? 'none found' : money(p.head.total))
+                + '. Not imported \u2014 a document that does not agree with itself cannot be trusted.</span>';
+              return;
+            }
+            // THE INVOICE NUMBER IS A CHECK HERE, NOT A LOOKUP. Wrong file on
+            // the right line is the failure this catches, and it is the one a
+            // person makes at 6pm with forty tabs open.
+            const inv = String(l.invoice_no || '').trim();
+            const dInv = String(p.head.invoice_no || '').trim();
+            const invOk = !inv || !dInv || inv === dInv || inv.endsWith(dInv) || dInv.endsWith(inv);
+            // Rows exclude KeHE's fee; the register line includes it.
+            const gap = Math.round((amt - p.line_total) * 100) / 100;
+            const feeOk = p.line_total <= amt + 0.01 && (amt <= 0 || gap / amt <= 0.15);
+            const cust = {};
+            for (const r of p.rows) if (r.customer_name) cust[r.customer_name] = (cust[r.customer_name] || 0) + Math.abs(r.bill_amount);
+            const top = Object.entries(cust).sort((a, b) => b[1] - a[1]);
+            out.innerHTML = `
+              <div>${p.rows.length.toLocaleString()} rows \u00b7 <strong>${money(p.line_total)}</strong>${p.head.total_fee != null ? ' + ' + money(p.head.total_fee) + ' fee' : ''}
+                ${gap ? ' \u00b7 <span style="color:var(--ink-3);">' + money(gap) + ' short of the line, consistent with the fee</span>' : ''}</div>
+              <div style="color:var(--ink-3);margin-top:4px;">document invoice ${esc(dInv || '\u2014')}${invOk ? '' : ' \u2014 <span style="color:var(--lost);">does not match this line</span>'}
+                ${p.head.dc ? ' \u00b7 ' + esc(p.head.dc) : ''}</div>
+              <div style="margin-top:10px;">${top.slice(0, 5).map(([k, v]) =>
+                  `<div style="display:flex;justify-content:space-between;gap:14px;"><span>${esc(k)}</span><span style="color:var(--ink-3);">${money(v)}</span></div>`).join('')}
+                ${top.length > 5 ? `<div style="color:var(--ink-3);margin-top:3px;">+ ${top.length - 5} more</div>` : ''}</div>`;
+            if (!invOk) { out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 this document belongs to a different invoice.</div>'; return; }
+            if (!feeOk) {
+              out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 ' + money(p.line_total)
+                + ' against a ' + money(amt) + ' deduction is too far apart to be the processing fee.</div>';
+              return;
+            }
+            parsed = p; arm(true);
+          } catch (err) {
+            out.innerHTML = '<span style="color:var(--lost);">Failed to read: ' + esc(String(err && err.message || err)) + '</span>';
+          }
+        };
+
+        go.onclick = async () => {
+          if (!parsed) return;
+          arm(false); go.textContent = 'Importing\u2026';
+          try {
+            const bmap = new Map();
+            try {
+              const { data } = await sb.from('deduction_banner_map').select('banner_raw,banner').eq('brand_id', brandId);
+              for (const b of (data || [])) if (b.banner) bmap.set(b.banner_raw, b.banner);
+            } catch (e3) { /* an unmapped banner is survivable; a failed import is not */ }
+            // DELETE FIRST, so re-uploading the same file replaces its rows
+            // rather than adding a second copy. Idempotent by construction, not
+            // by trusting detail_parsed.
+            const { error: dErr } = await sb.from('deduction_detail').delete().eq('line_id', l.id);
+            if (dErr) throw new Error('clearing existing rows: ' + dErr.message);
+            const rows = parsed.rows.map(r => {
+              const cand = _dedBannerCandidate(r.customer_name);
+              return _dedDetailRow(r, brandId, l.id, (cand && bmap.get(cand)) || cand);
+            });
+            for (let k = 0; k < rows.length; k += 500) {
+              const { error } = await sb.from('deduction_detail').insert(rows.slice(k, k + 500));
+              if (error) throw new Error(error.message);
+            }
+            const { error: uErr } = await sb.from('deduction_lines').update({
+              detail_parsed: true,
+              detail_line_total: parsed.line_total,
+              detail_variance: Math.round((amt - parsed.line_total) * 100) / 100,
+            }).eq('id', l.id);
+            if (uErr) throw new Error('updating the register line: ' + uErr.message);
+            out.innerHTML = '<span style="color:var(--won);">Imported ' + rows.length.toLocaleString() + ' rows.</span>'
+              + '<div style="color:var(--ink-3);margin-top:6px;">The store views read a stored snapshot \u2014 run '
+              + '<code>refresh materialized view concurrently public.deduction_detail_rollup;</code> alone in a SQL tab to see them there.</div>';
+            try { _dedBust(); } catch (e4) {}
+            _dedRaw = null;
+            setTimeout(() => { wrap.remove(); renderDeductions(hostEl, filtersEl, year); }, 1400);
+          } catch (err) {
+            out.innerHTML = '<span style="color:var(--lost);">Import failed: ' + esc(String(err && err.message || err)) + '</span>';
+            arm(true); go.textContent = 'Import';
+          }
+        };
+      });
+
       // ── THE OVERRIDE EDITOR ──────────────────────────────────────────────
       // Opened from the pencil on any line. A modal rather than an inline row
       // because the scope choice needs explaining and a cramped row would hide
@@ -31999,68 +32210,62 @@ render();
         };
         const rLine = reach('line'), rCode = code ? reach('reason_code', code) : { n: 0, amt: 0 },
               rPfx  = pfx ? reach('invoice_prefix', pfx) : { n: 0, amt: 0 };
-        const scopeRow = (v, lbl, r, dis) => `<label style="display:flex;gap:9px;align-items:flex-start;padding:8px 10px;border:1px solid var(--rule-soft);border-radius:5px;margin-bottom:6px;cursor:${dis ? 'not-allowed' : 'pointer'};opacity:${dis ? .45 : 1};">
+        const scopeRow = (v, lbl, r, dis) => `<label style="display:flex;gap:9px;align-items:flex-start;padding:12px 14px;border:1px solid var(--rule-soft);border-radius:6px;margin-bottom:8px;cursor:${dis ? 'not-allowed' : 'pointer'};opacity:${dis ? .45 : 1};">
             <input type="radio" name="hl-ovr-scope" value="${v}" ${dis ? 'disabled' : ''} ${(cur ? cur.scope : 'line') === v ? 'checked' : ''} style="margin-top:2px;">
             <span style="flex:1;">
-              <span style="font-family:var(--mono);font-size:11.5px;color:var(--ink);">${lbl}</span>
+              <span style="font-family:var(--mono);font-size:13px;color:var(--ink);">${lbl}</span>
               <span style="display:block;font-family:var(--mono);font-size:9.5px;color:${r.amt > 100000 ? 'var(--lost)' : 'var(--ink-3)'};margin-top:2px;">
                 applies to ${r.n.toLocaleString()} line${r.n === 1 ? '' : 's'} \u00b7 ${money(r.amt)}${r.amt > 100000 ? ' \u2014 that is a lot for a hand rule; a parser may be the better fix' : ''}</span>
             </span></label>`;
 
         const wrap = document.createElement('div');
         wrap.id = 'hl-ovr-modal';
-        wrap.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.34);z-index:200;display:flex;align-items:center;justify-content:center;padding:24px;';
-        wrap.innerHTML = `<div style="background:var(--paper);border-radius:8px;max-width:560px;width:100%;max-height:88vh;overflow-y:auto;padding:22px 24px;box-shadow:0 10px 40px rgba(0,0,0,.24);">
+        wrap.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.34);z-index:200;display:flex;align-items:center;justify-content:center;padding:28px;';
+        wrap.innerHTML = `<div style="background:var(--paper);border-radius:8px;max-width:720px;width:100%;max-height:90vh;overflow-y:auto;padding:30px 34px;box-shadow:0 10px 40px rgba(0,0,0,.24);">
           <div style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);">Tell Keel what this is</div>
-          <div style="font-family:var(--mono);font-size:13px;color:var(--ink);margin:6px 0 2px;">${esc(inv || '(no invoice no.)')} \u00b7 ${money(Math.abs(Number(l.amount || 0)))}</div>
-          <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-bottom:14px;">
+          <div style="font-family:var(--mono);font-size:16px;color:var(--ink);margin:8px 0 3px;">${esc(inv || '(no invoice no.)')} \u00b7 ${money(Math.abs(Number(l.amount || 0)))}</div>
+          <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-bottom:20px;">
             code ${esc(code || '\u2014')}${doc && doc.name ? ' \u00b7 documents say <strong style="color:var(--ink-2);">' + esc(doc.name) + '</strong>' : ' \u00b7 no customer found'}</div>
 
-          <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:7px;">Apply to</div>
+          <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:9px;">Apply to</div>
           ${scopeRow('line', 'This line only', rLine, false)}
           ${scopeRow('reason_code', 'Every line with code ' + esc(code || '\u2014'), rCode, !code)}
           ${scopeRow('invoice_prefix', 'Every invoice starting ' + esc(pfx || '\u2014'), rPfx, !pfx)}
 
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:20px;">
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Customer
-              <input id="hl-ovr-cust" value="${esc((cur && cur.customer) || '')}" placeholder="Sprouts" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+              <input id="hl-ovr-cust" value="${esc((cur && cur.customer) || '')}" placeholder="Sprouts" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo type
-              <input id="hl-ovr-type" value="${esc((cur && cur.promo_type) || '')}" placeholder="Ads - Fees - Display" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+              <input id="hl-ovr-type" value="${esc((cur && cur.promo_type) || '')}" placeholder="Ads - Fees - Display" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Promo date
-              <input id="hl-ovr-date" type="date" value="${esc((cur && cur.promo_date) || '')}" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+              <input id="hl-ovr-date" type="date" value="${esc((cur && cur.promo_date) || '')}" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
             <label style="font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Amount <span style="text-transform:none;opacity:.7;">(only if unreadable)</span>
-              <input id="hl-ovr-amt" type="number" step="0.01" value="${cur && cur.amount != null ? esc(String(cur.amount)) : ''}" placeholder="leave blank" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:12px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);"></label>
+              <input id="hl-ovr-amt" type="number" step="0.01" value="${cur && cur.amount != null ? esc(String(cur.amount)) : ''}" placeholder="leave blank" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);"></label>
           </div>
 
-          <div style="margin-top:14px;font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:6px;">Is there a supporting document?</div>
+          <div style="margin-top:14px;font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Is there a supporting document?</div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;">
             ${[['true', 'Yes \u2014 it is in the folder', 'A document exists and has not been read. That is a parsing job, and it keeps the line counted as a real gap.'],
                ['false', 'No \u2014 none exists', 'A flat fee or a notice with nothing to itemise. Complete, not a gap.'],
                ['', 'Not sure', 'The honest default. Nothing is asserted either way.']].map(([v, lbl, tip]) => {
               const on = String(cur && cur.backup_exists != null ? cur.backup_exists : '') === v;
-              return `<label title="${esc(tip)}" style="flex:1 1 150px;display:flex;gap:7px;align-items:flex-start;padding:7px 9px;border:1px solid var(--rule-soft);border-radius:5px;cursor:pointer;">
-                <input type="radio" name="hl-ovr-bk" value="${v}" ${on ? 'checked' : ''} style="margin-top:2px;">
-                <span style="font-family:var(--mono);font-size:10.5px;color:var(--ink);">${lbl}</span></label>`;
+              return `<label title="${esc(tip)}" style="flex:1 1 175px;display:flex;gap:9px;align-items:center;padding:12px 13px;border:1px solid var(--rule-soft);border-radius:6px;cursor:pointer;white-space:nowrap;">
+                <input type="radio" name="hl-ovr-bk" value="${v}" ${on ? 'checked' : ''}>
+                <span style="font-family:var(--mono);font-size:12px;color:var(--ink);">${lbl}</span></label>`;
             }).join('')}
           </div>
-          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:5px;line-height:1.5;">
-            The Backup column reads \u201cnone\u201d when no parser wrote rows \u2014 which is not the same as
-            no document existing. This is the only place that difference can be recorded.</div>
 
-          <label style="display:block;margin-top:11px;font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">How you know
-            <textarea id="hl-ovr-note" rows="2" placeholder="Opened the file in Dropbox \u2014 K-Solve cover reads SHOPPER MARKETING - AD FEE OTH" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:11.5px;padding:7px 9px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);resize:vertical;">${esc((cur && cur.source_note) || '')}</textarea></label>
-          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:4px;line-height:1.5;">
-            Optional, and worth the ten seconds. In a year \u201cSprouts\u201d will not explain itself.</div>
+          <label style="display:block;margin-top:20px;font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3);">Note \u00b7 optional
+            <textarea id="hl-ovr-note" rows="3" placeholder="How you know \u2014 in a year \u201cSprouts\u201d will not explain itself" style="width:100%;margin-top:4px;font-family:var(--mono);font-size:13px;padding:10px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);resize:vertical;line-height:1.5;">${esc((cur && cur.source_note) || '')}</textarea></label>
 
-          <div style="display:flex;gap:8px;margin-top:18px;align-items:center;">
-            <button id="hl-ovr-save" style="font-family:var(--mono);font-size:11.5px;padding:9px 18px;border-radius:5px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Save</button>
-            <button id="hl-ovr-cancel" style="font-family:var(--mono);font-size:11.5px;padding:9px 16px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Cancel</button>
+          <div style="display:flex;gap:9px;margin-top:24px;align-items:center;">
+            <button id="hl-ovr-save" style="font-family:var(--mono);font-size:12.5px;padding:11px 26px;border-radius:6px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Save</button>
+            <button id="hl-ovr-cancel" style="font-family:var(--mono);font-size:12.5px;padding:11px 20px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Cancel</button>
             ${cur ? `<button id="hl-ovr-del" style="margin-left:auto;font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:5px;border:1px solid var(--rule-soft);background:transparent;color:var(--lost);cursor:pointer;">Remove override</button>` : ''}
             <span id="hl-ovr-msg" style="font-family:var(--mono);font-size:10.5px;color:var(--lost);"></span>
           </div>
-          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:12px;line-height:1.55;border-top:1px solid var(--rule-softer);padding-top:10px;">
-            Saved as <strong>manual</strong> \u2014 shown as weaker evidence than anything read from a document,
-            and never overwritten by a later parse. If a document later disagrees, both are shown.</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:16px;line-height:1.55;border-top:1px solid var(--rule-softer);padding-top:12px;">
+            Saved as <strong>manual</strong>. A later parse never overwrites it \u2014 if the two disagree, both are shown.</div>
         </div>`;
         document.body.appendChild(wrap);
         wrap.onclick = (e) => { if (e.target === wrap) wrap.remove(); };
