@@ -32961,28 +32961,35 @@ render();
       // the line's own detail, doc_date as the fallback, and anything before
       // 2000 treated as no date rather than as a very old promo.
       const _VF = '2000-01-01';
+      // THE MONTH TAKEN WINS, ALWAYS, WHEN THERE IS ONE.
+      // For one afternoon this preferred the period the programme RAN, read off
+      // the deduction number, so WFMDEC2515930ISEGR displayed Dec '25. More
+      // informative, and wrong for this column: the year pills, the month chips
+      // and every total on the page scope on doc_date, so the register showed
+      // eleven rows dated '25 inside the 2026 book and read like a broken
+      // filter. A column cannot disagree with the total beside it.
+      //
+      // The derived period survives ONLY where there is no doc_date at all —
+      // the other half of the original problem, four ISE lines showing a red
+      // "no date" when their own number names the month. It can no longer
+      // contradict anything because it only speaks when nothing else does.
       const monthOf = (l) => {
+        const dd = String(l.doc_date || '');
+        if (dd && dd >= _VF) return dd.slice(0, 7);
         let best = null;
         for (const d of (detBy.get(l.id) || [])) {
-          const s = String(d.reference_date || d.date_from || '');
-          if (!s || s < _VF) continue;
-          if (!best || s < best) best = s;
+          const s2 = String(d.reference_date || d.date_from || '');
+          if (!s2 || s2 < _VF) continue;
+          if (!best || s2 < best) best = s2;
         }
         if (best) return best.slice(0, 7);
-        // THE PERIOD THE PROGRAMME RAN BEATS THE DATE IT WAS TAKEN. doc_date is
-        // the month UNFI pulled the money, which for these fees is always the
-        // month after the one being charged for — so a December programme read
-        // as January and sat in the wrong month chip. Where the deduction
-        // number names its own period, that wins.
-        const pr = _dedPeriodFromRef(l.invoice_no) || _dedPeriodFromRef(l.reference_no);
-        if (pr) return pr;
-        const dd = String(l.doc_date || '');
-        return (dd && dd >= _VF) ? dd.slice(0, 7) : '';
+        return _dedPeriodFromRef(l.invoice_no) || _dedPeriodFromRef(l.reference_no) || '';
       };
-      // WHERE THE MONTH CAME FROM. A month read off a document, parsed out of a
-      // reference, or stated by the register line are three different strengths
-      // of claim, and the reader should be able to tell which one they have.
+      // Only the two FALLBACKS are tagged. A month from the line itself is the
+      // norm and needs no mark.
       const monthSrc = (l) => {
+        const dd = String(l.doc_date || '');
+        if (dd && dd >= _VF) return 'line';
         for (const d of (detBy.get(l.id) || [])) {
           const s2 = String(d.reference_date || d.date_from || '');
           if (s2 && s2 >= _VF) return 'doc';
@@ -33060,7 +33067,7 @@ render();
           <div style="position:relative;">
             <button id="hl-dl-mon-toggle" type="button"
               style="font-family:var(--mono);font-size:12px;padding:9px 14px;border:1px solid ${_dedLinesMonths.size ? 'var(--ink)' : 'var(--rule)'};border-radius:6px;background:var(--paper);cursor:pointer;display:flex;align-items:center;gap:10px;">
-              <span style="color:var(--ink);">${esc(monLabel)}</span><span style="color:var(--ink-3);font-size:10px;">\u25be</span>
+              <span id="hl-dl-mon-lbl" style="color:var(--ink);">${esc(monLabel)}</span><span style="color:var(--ink-3);font-size:10px;">\u25be</span>
             </button>
             <div id="hl-dl-mon-menu" style="display:none;position:absolute;top:100%;right:0;margin-top:4px;background:var(--paper);border:1px solid var(--rule-soft);border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,0.10);z-index:60;min-width:220px;max-height:320px;overflow-y:auto;">
               <div style="padding:6px 10px;border-bottom:1px solid var(--rule-softer);display:flex;gap:6px;">
@@ -33073,7 +33080,11 @@ render();
               </div>
             </div>
           </div>
-          ${(_dedQ.trim() || _dedLinesMonths.size) ? `<button id="hl-dl-clear" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear filters</button>` : ''}
+          <!-- ALWAYS PRESENT, SHOWN CONDITIONALLY. Rendering it only when a
+               filter is set meant the button could not appear or disappear
+               without rebuilding the whole bar — and rebuilding the bar closes
+               the month menu the user is standing in. -->
+          <button id="hl-dl-clear" style="display:${(_dedQ.trim() || _dedLinesMonths.size) ? 'inline-block' : 'none'};font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear filters</button>
         </div>
 
         <div id="hl-dl-results"></div>`;
@@ -33203,11 +33214,7 @@ render();
                      ? mLbl(monthOf(l)) + (() => {
                          const sc = monthSrc(l);
                          if (sc === 'doc') return '<span title="from the backup\u2019s own date; the register line carries none" style="color:var(--ink-3);opacity:.65;"> \u00b7 doc</span>';
-                         if (sc === 'ran') {
-                           const dd = String(l.doc_date || '').slice(0, 7);
-                           return '<span title="the period the programme ran, named by the deduction number'
-                             + (dd ? ' \u2014 taken in ' + mLbl(dd) : '') + '" style="color:var(--ink-3);opacity:.65;"> \u00b7 ran</span>';
-                         }
+                         if (sc === 'ran') return '<span title="the register line carries no date at all \u2014 this is the period named by the deduction number" style="color:var(--ink-3);opacity:.65;"> \u00b7 ran</span>';
                          return '';
                        })()
                      : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
@@ -33943,16 +33950,57 @@ render();
           renderDeductions(hostEl, filtersEl, year);
         };
       }
+      // ── THE CONTROL AND THE STATE, KEPT IN STEP ───────────────────────────
+      // paintResults() repaints the RESULTS ONLY — the month menu lives in the
+      // bar above it and was never redrawn. So Select all set every month and
+      // left every box unticked; Clear emptied the set and left the ticks
+      // where they were; and the button went on reading 'All months' while the
+      // table below showed one. The state was right every time and the control
+      // lied about it, which is worse than a filter that simply does not work.
+      //
+      // The bar cannot be re-rendered instead: that closes the open menu the
+      // moment you click inside it. So the four things that depend on the
+      // selection are updated in place, from one function, called by every
+      // path that can change it.
+      const syncMonthUi = () => {
+        body.querySelectorAll('.hl-dl-mon').forEach(cb => {
+          cb.checked = _dedLinesMonths.has(cb.dataset.m);
+        });
+        const n = _dedLinesMonths.size;
+        const lbl = document.getElementById('hl-dl-mon-lbl');
+        // mLbl splits a 'YYYY-MM' key on the hyphen, so the '(undated)' bucket
+        // comes back as "? 'ndated)". It is a real selectable option, so it
+        // needs a real name.
+        const one = n === 1 ? [..._dedLinesMonths][0] : null;
+        if (lbl) lbl.textContent = !n ? 'All months'
+          : one ? (one === '(undated)' ? 'No date' : mLbl(one))
+          : n + ' months';
+        const tg = document.getElementById('hl-dl-mon-toggle');
+        if (tg) tg.style.borderColor = n ? 'var(--ink)' : 'var(--rule)';
+        const cf = document.getElementById('hl-dl-clear');
+        if (cf) cf.style.display = (_dedQ.trim() || n) ? 'inline-block' : 'none';
+      };
+
       body.querySelectorAll('.hl-dl-mon').forEach(cb => cb.onchange = () => {
         const k = cb.dataset.m;
         cb.checked ? _dedLinesMonths.add(k) : _dedLinesMonths.delete(k);
         _dedLinesLimit = 25;
+        syncMonthUi();
         paintResults();
       });
       const mAll = document.getElementById('hl-dl-mon-all');
-      if (mAll) mAll.onclick = () => { _dedLinesMonths = new Set(allMonths.concat(undatedN ? ['(undated)'] : [])); _dedLinesLimit = 25; paintResults(); };
+      // EVERY MONTH TICKED IS THE SAME FILTER AS NONE TICKED, and showing it as
+      // 'All months' with empty boxes would be a third state the user cannot
+      // tell from the other two. Select all ticks every box and says so.
+      if (mAll) mAll.onclick = () => {
+        _dedLinesMonths = new Set(allMonths.concat(undatedN ? ['(undated)'] : []));
+        _dedLinesLimit = 25; syncMonthUi(); paintResults();
+      };
       const mNone = document.getElementById('hl-dl-mon-none');
-      if (mNone) mNone.onclick = () => { _dedLinesMonths = new Set(); _dedLinesLimit = 25; paintResults(); };
+      if (mNone) mNone.onclick = () => {
+        _dedLinesMonths = new Set();
+        _dedLinesLimit = 25; syncMonthUi(); paintResults();
+      };
       const clr = document.getElementById('hl-dl-clear');
       // Clear DOES rebuild: the Clear button itself only exists when a filter
       // is set, so the bar above has to be redrawn without it.
