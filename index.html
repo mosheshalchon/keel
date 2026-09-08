@@ -29169,7 +29169,8 @@ render();
   // "what did they take", the promo view answers "what did each promotion cost".
   let _dedEdlp = null;            // cached edlp_actuals() rows, keyed by year (see _dedBust)
   let _dedEdlpErr = null;
-  let _dedEdlpOpen = new Set();   // which customer x group rows are expanded to months
+  let _dedEdlpOpen = new Set();   // expanded rows, keyed by index ('c:0','g:3','m:5')
+  let _dedEdlpMode = 'customer';  // 'customer' | 'month'
   let _dedPromos = null;          // cached deduction_promo_rollup rows
   let _dedPromosErr = null;
   let _dedOthCat = new Set();     // Other charges: expanded categories
@@ -30279,6 +30280,9 @@ render();
     const variance    = covDeducted - totEarned;
 
     const tone = (v) => v > 0 ? 'var(--lost)' : 'var(--won)';
+    // money(-8709) renders "$-8,709". The sign belongs in front of the dollar.
+    const signed = (v) => (v < 0 ? '\u2212' : '+') + money(Math.abs(v));
+
     const fig = (lbl, val, sub, col) => `
       <div style="min-width:0;">
         <div style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--ink-3);">${lbl}</div>
@@ -30286,29 +30290,93 @@ render();
         ${sub ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:4px;line-height:1.5;">${sub}</div>` : ''}
       </div>`;
 
-    // A cell that has no unit source says so. It never renders as a dash that
-    // could be read as zero, and never as $0.
-    const noUnits = '<span style="color:var(--ink-3);font-size:10.5px;" title="no feed of units actually sold for this customer — EDLP earned cannot be computed">no units</span>';
-    const cell = (v, whenNull) => v == null ? (whenNull || noUnits) : money(v);
+    // A cell with no unit source says so. It never renders as a dash that could
+    // be read as zero, and never as $0.
+    const noUnits = '<span style="color:var(--ink-3);font-size:10.5px;" title="no feed of units actually sold for this customer \u2014 EDLP earned cannot be computed">no units</span>';
 
+    // KEYS ARE NUMBERS, NOT STRINGS BUILT FROM THE DATA. The first version keyed
+    // expansion on `customer + '\u0000' + group` and put that in a data-
+    // attribute. The HTML parser replaces a NUL with U+FFFD, so what came back
+    // out of dataset never equalled what went in and a product group could not
+    // be opened at all — clicking set a mangled key that the next render never
+    // looked for. Indices are stable across renders because the sort is
+    // deterministic, and they cannot be corrupted by a customer name.
     const rowHtml = (o, indent, cls, dataAttr, caret) => {
       const v = (o.earned == null) ? null : o.deducted - o.earned;
       return `<tr ${cls ? 'class="' + cls + '"' : ''} ${dataAttr || ''} style="${cls ? 'cursor:pointer;' : ''}">
         ${td(`<span style="padding-left:${indent}px;">${caret || ''}${esc(o.label)}</span>`)}
-        ${td(o.rate == null ? '<span style="color:var(--ink-3);">—</span>' : '$' + Number(o.rate).toFixed(2), true, 'color:var(--ink-3);')}
+        ${td(o.rate == null ? '<span style="color:var(--ink-3);">\u2014</span>' : '$' + Number(o.rate).toFixed(2), true, 'color:var(--ink-3);')}
         ${td(money(o.planned), true)}
-        ${td(cell(o.earned), true, o.earned == null ? '' : 'font-weight:600;')}
+        ${td(o.earned == null ? noUnits : money(o.earned), true, o.earned == null ? '' : 'font-weight:600;')}
         ${td(money(o.deducted), true)}
-        ${td(v == null ? noUnits : '<strong style="color:' + tone(v) + ';">' + (v > 0 ? '+' : '') + money(v) + '</strong>', true)}
+        ${td(v == null ? noUnits : '<strong style="color:' + tone(v) + ';">' + signed(v) + '</strong>', true)}
       </tr>`;
     };
+
+    // ── BY MONTH ────────────────────────────────────────────────────────────
+    // The same three columns down the calendar instead of down the customer
+    // list. EDLP is a monthly accrual and the question "which month did they
+    // over-take" is not answerable by opening sixteen customers one at a time.
+    const months = new Map();
+    for (const r of R) {
+      let m = months.get(r.month);
+      if (!m) months.set(r.month, m = { month: r.month, planned: 0, earned: null, deducted: 0,
+                                        hasUnits: false, custs: new Map() });
+      m.planned += r.planned;
+      m.deducted += r.deducted;
+      if (r.earned != null) { m.earned = (m.earned || 0) + r.earned; m.hasUnits = true; }
+      let c = m.custs.get(r.customer);
+      if (!c) m.custs.set(r.customer, c = { name: r.customer, planned: 0, earned: null, deducted: 0 });
+      c.planned += r.planned;
+      c.deducted += r.deducted;
+      if (r.earned != null) c.earned = (c.earned || 0) + r.earned;
+    }
+    const monthList = [...months.values()].sort((a, b) => a.month - b.month);
+
+    const modeBtn = (v, lbl) => `<button class="hl-edlp-mode ded-navbtn${_dedEdlpMode === v ? ' on' : ''}"
+      data-m="${v}" style="font-size:13px;padding:9px 16px;min-height:38px;">${lbl}</button>`;
+
+    let bodyRows = '';
+    if (_dedEdlpMode === 'month') {
+      bodyRows = monthList.map((m, mi) => {
+        const open = _dedEdlpOpen.has('m:' + mi);
+        let out = rowHtml({ label: MON[m.month] || '\u2014', rate: null, planned: m.planned, earned: m.earned, deducted: m.deducted },
+          0, 'hl-edlp-mrow', 'data-k="m:' + mi + '"',
+          `<span style="display:inline-block;width:14px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span>`);
+        if (!open) return out;
+        out += [...m.custs.values()].sort((a, b) => b.planned - a.planned).map(c =>
+          rowHtml({ label: c.name, rate: null, planned: c.planned, earned: c.earned, deducted: c.deducted }, 36, '', '', '')).join('');
+        return out;
+      }).join('');
+    } else {
+      let gi = 0;
+      bodyRows = custList.map((c, ci) => {
+        const cOpen = _dedEdlpOpen.has('c:' + ci);
+        let out = rowHtml({ label: c.name, rate: null, planned: c.planned, earned: c.earned, deducted: c.deducted },
+          0, 'hl-edlp-row', 'data-k="c:' + ci + '"',
+          `<span style="display:inline-block;width:14px;color:var(--ink-3);">${cOpen ? '\u2212' : '+'}</span>`);
+        for (const g of c.groups) {
+          const myGi = gi++;
+          if (!cOpen) continue;
+          const gOpen = _dedEdlpOpen.has('g:' + myGi);
+          out += rowHtml({ label: g.group, rate: g.rate, planned: g.planned, earned: g.earned, deducted: g.deducted },
+            22, 'hl-edlp-row', 'data-k="g:' + myGi + '"',
+            `<span style="display:inline-block;width:14px;color:var(--ink-3);">${gOpen ? '\u2212' : '+'}</span>`);
+          if (!gOpen) continue;
+          out += g.months.map(m => rowHtml(
+            { label: MON[m.month] || '\u2014', rate: m.rate, planned: m.planned, earned: m.earned, deducted: m.deducted },
+            58, '', '', '')).join('');
+        }
+        return out;
+      }).join('');
+    }
 
     body.innerHTML = `
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:20px;padding:4px 2px 6px;">
         ${fig('Planned ' + esc(yr), money(totPlanned), custList.length + ' customers \u00b7 ' + groups.length + ' groups')}
         ${fig('Earned', money(totEarned), covPct + '% of the plan has a unit feed')}
         ${fig('Deducted', money(totDeducted), 'matched on the agreed rate')}
-        ${fig('Deducted \u2212 earned', (variance > 0 ? '+' : '') + money(variance),
+        ${fig('Deducted \u2212 earned', signed(variance),
               'over the ' + withUnits.length + ' customer' + (withUnits.length === 1 ? '' : 's') + ' that can be measured',
               tone(variance))}
       </div>
@@ -30321,36 +30389,20 @@ render();
         feed of units sold. The rest show planned and deducted with earned left blank; blank is <em>unknown</em>, not zero.` : ''}
       </p>
 
-      <table class="ded-edlp-tbl" style="width:100%;border-collapse:collapse;margin-top:16px;">
-        <thead><tr>${th('Customer / product group')}${th('Rate', true)}${th('Planned', true)}${th('Earned', true)}${th('Deducted', true)}${th('Deducted \u2212 earned', true)}</tr></thead>
-        <tbody>
-          ${custList.map(c => {
-            const cOpen = _dedEdlpOpen.has(c.name);
-            let out = rowHtml(
-              { label: c.name + (c.hasUnits ? '' : ''), rate: null, planned: c.planned, earned: c.earned, deducted: c.deducted },
-              0, 'hl-edlp-cust', 'data-c="' + esc(c.name) + '"',
-              `<span style="display:inline-block;width:14px;color:var(--ink-3);">${cOpen ? '\u2212' : '+'}</span>`);
-            if (!cOpen) return out;
-            for (const g of c.groups) {
-              const gOpen = _dedEdlpOpen.has(g.key);
-              out += rowHtml({ label: g.group, rate: g.rate, planned: g.planned, earned: g.earned, deducted: g.deducted },
-                22, 'hl-edlp-grp', 'data-g="' + esc(g.key) + '"',
-                `<span style="display:inline-block;width:14px;color:var(--ink-3);">${gOpen ? '\u2212' : '+'}</span>`);
-              if (!gOpen) continue;
-              out += g.months.map(m => rowHtml(
-                { label: MON[m.month] || '\u2014', rate: m.rate, planned: m.planned, earned: m.earned, deducted: m.deducted },
-                58, '', '', '')).join('');
-            }
-            return out;
-          }).join('')}
-        </tbody>
+      <div style="display:flex;gap:6px;align-items:center;margin:18px 0 2px;">
+        ${modeBtn('customer', 'By customer')}${modeBtn('month', 'By month')}
+      </div>
+
+      <table style="width:100%;border-collapse:collapse;margin-top:10px;">
+        <thead><tr>${th(_dedEdlpMode === 'month' ? 'Month / customer' : 'Customer / product group')}${th('Rate', true)}${th('Planned', true)}${th('Earned', true)}${th('Deducted', true)}${th('Deducted \u2212 earned', true)}</tr></thead>
+        <tbody>${bodyRows}</tbody>
         <tfoot><tr style="border-top:2px solid var(--ink);">
           ${td('<strong>ALL EDLP ' + esc(yr) + '</strong>')}
           ${td('', true)}
           ${td('<strong>' + money(totPlanned) + '</strong>', true)}
           ${td('<strong>' + money(totEarned) + '</strong>', true)}
           ${td('<strong>' + money(totDeducted) + '</strong>', true)}
-          ${td('<strong style="color:' + tone(variance) + ';">' + (variance > 0 ? '+' : '') + money(variance) + '</strong>', true)}
+          ${td('<strong style="color:' + tone(variance) + ';">' + signed(variance) + '</strong>', true)}
         </tr></tfoot>
       </table>
 
@@ -30359,17 +30411,19 @@ render();
         planned and deducted cover all ${custList.length}. A deduction is identified as EDLP when its per-unit charge equals that
         customer's agreed rate for that product group \u2014 customer first, rate second, because $0.52 belongs to more than one
         Giant. Lines billed at one unit are excluded: a lump sum stored with quantity 1 presents its whole charge as a rate.
+        A customer reading <strong>$0 deducted</strong> against a real plan has no PARSED detail carrying a per-unit rate \u2014
+        a documentation gap, not a finding that they took nothing.
       </p>`;
 
-    body.querySelectorAll('.hl-edlp-cust').forEach(b => b.onclick = () => {
-      const k = b.dataset.c;
+    body.querySelectorAll('.hl-edlp-row, .hl-edlp-mrow').forEach(b => b.onclick = (ev) => {
+      ev.stopPropagation();
+      const k = b.dataset.k;
       if (_dedEdlpOpen.has(k)) _dedEdlpOpen.delete(k); else _dedEdlpOpen.add(k);
       rerender();
     });
-    body.querySelectorAll('.hl-edlp-grp').forEach(b => b.onclick = (ev) => {
-      ev.stopPropagation();
-      const k = b.dataset.g;
-      if (_dedEdlpOpen.has(k)) _dedEdlpOpen.delete(k); else _dedEdlpOpen.add(k);
+    body.querySelectorAll('.hl-edlp-mode').forEach(b => b.onclick = () => {
+      _dedEdlpMode = b.dataset.m;
+      _dedEdlpOpen = new Set();   // indices mean different things in the two modes
       rerender();
     });
   }
