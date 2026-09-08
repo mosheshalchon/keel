@@ -30597,6 +30597,87 @@ render();
     return y + '-' + String(m[1]).padStart(2, '0') + '-' + String(m[2]).padStart(2, '0');
   }
 
+  // ── NATURAL GROCERS / VITAMIN COTTAGE SCAN BACK (spreadsheet) ────────────
+  // A CROSS-TAB: one row per item, then one COLUMN per store -- 170-odd of
+  // them, and the count changes month to month, so the store list is read from
+  // the header every time. Units run across the row; every other feed runs down
+  // it.
+  //
+  // A CONTRACT CONTINUES ACROSS REPEATED HEADERS. `HHL OCT 2025` prints 25
+  // stores at a time and repeats its whole header for each further slice, with
+  // the same items and the same stated totals. Treating each header as a new
+  // block emits the items once per slice, and since every slice restates the
+  // same total, every copy ties and writes. Keyed by contract and barcode, a
+  // repeat contributes its STORES and never its money again.
+  //
+  // Self-verifying twice: Qty equals the sum of the row's store cells, and
+  // Qty x Scan $ equals the contract's stated total. Verified against the real
+  // files at $41,420.53 (August) and $36,974.08 (October).
+  function _dedParseNgScanback(rows) {
+    const U = (v) => String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9%$]/g, '');
+    const N = (v) => { if (v == null || String(v).trim() === '') return null;
+                       const n = Number(String(v).replace(/[$,]/g, '')); return isNaN(n) ? null : n; };
+    const isHdr = (r) => U(r[0]) === U('Article') && U(r[1]) === U('Description')
+                      && U(r[2]) === U('Barcode') && U(r[3]) === U('Scan $');
+    const contracts = new Map(), order = [], mismatches = [];
+
+    for (let h = 0; h < rows.length; h++) {
+      if (!isHdr(rows[h])) continue;
+      const nm = String((rows[h - 1] || [])[0] || '').trim() || '(unnamed contract)';
+      if (!contracts.has(nm)) { contracts.set(nm, { items: new Map(), qty: null, amt: null, win: null, slices: 0 }); order.push(nm); }
+      const C = contracts.get(nm); C.slices++;
+      for (let i = h + 1; i < rows.length; i++) {
+        const r = rows[i], lab = U(r[3] || '');
+        if (lab === U('Qty Total')) { if (C.qty == null) C.qty = N(r[4]); continue; }
+        if (lab === U('$ Total')) { if (C.amt == null) { C.amt = N(r[4]); C.win = String(r[0] || '').trim() || null; } break; }
+        if (isHdr(r)) break;
+        const bc = String(r[2] || '').replace(/\D/g, '');
+        if (!bc) continue;
+        const rate = N(r[3]), q = N(r[4]);
+        if (rate == null || q == null) continue;
+        let across = 0;
+        for (let c = 5; c < r.length; c++) { const v = N(r[c]); if (v != null) across += v; }
+        const seen = C.items.get(bc);
+        if (seen) seen.across += across;              // a repeat is a continuation
+        else C.items.set(bc, { bc, art: String(r[0] || '').trim() || null,
+                               desc: String(r[1] || '').trim() || null, rate, q, across });
+      }
+    }
+
+    const out = [];
+    let total = 0, contract0 = null;
+    for (const nm of order) {
+      const C = contracts.get(nm), items = [...C.items.values()];
+      if (!items.length) continue;
+      for (const it of items)
+        if (Math.abs(it.across - it.q) > 0.5)
+          mismatches.push(it.bc + ': qty ' + it.q + ' but stores sum ' + it.across);
+      const ext = Math.round(items.reduce((n, it) => n + it.rate * it.q, 0) * 100) / 100;
+      if (C.amt != null && Math.abs(ext - Math.abs(C.amt)) > 0.02) {
+        mismatches.push(nm + ': rows ' + ext + ' vs stated ' + C.amt + ' -- not written');
+        continue;                                     // tie or refuse, per contract
+      }
+      const m = (C.win || '').match(/(\d{1,2}\/\d{1,2}\/\d{2,4})\s*-\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/);
+      const dFrom = m ? _dedIsoDate(m[1]) : null, dTo = m ? _dedIsoDate(m[2]) : null;
+      contract0 = contract0 || nm;
+      for (const it of items) {
+        const amt = Math.round(it.rate * it.q * 100) / 100;
+        total += amt;
+        out.push({ upc: it.bc.replace(/^0+/, '') || null, item_desc: it.desc,
+                   // The contract name is the promo reference, and it is the
+                   // same string the Natural Grocers invoice prints as Debtor
+                   // Reference -- which is what lets the two be tied.
+                   reference_no: nm, ship_date: dFrom,
+                   customer_name: 'NATURAL GROCERS', customer_no: null,
+                   ship_qty: it.q, unit_cost: null, discount_pct: null, bill_amount: amt });
+      }
+    }
+    if (!out.length) return { error: 'natural grocers scanback: nothing tied', rows: [], mismatches };
+    const lt = Math.round(total * 100) / 100;
+    return { head: { invoice_no: null, total: lt, type: 'Natural Grocers scan back', dc: contract0 },
+             rows: out, line_total: lt, ties: true, mismatches };
+  }
+
   // ── THE DISTRIBUTOR CHARGE LAYOUT ────────────────────────────────────────
   // The upload tab REFUSED these and pointed at sync-deductions mode=detail,
   // which cannot read them: every one of these documents is a scan with no text
@@ -32392,8 +32473,9 @@ render();
           <div style="font-family:var(--mono);font-size:16px;color:var(--ink);margin:8px 0 3px;">${esc(l.invoice_no || '(no invoice no.)')} \u00b7 ${money(amt)}</div>
           <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-bottom:20px;">
             The rows land against THIS line. Nothing is written until the document's own total agrees with it.</div>
-          <input id="hl-up-file" type="file" accept="application/pdf,.pdf"
+          <input id="hl-up-file" type="file" accept=".pdf,.xlsx,.xls,.csv,.txt"
             style="font-family:var(--mono);font-size:12px;padding:14px;border:1px dashed var(--rule);border-radius:6px;width:100%;background:var(--paper);color:var(--ink);cursor:pointer;">
+          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:7px;">PDF, xlsx, xls, csv or txt. A scanned PDF has no text to read \u2014 it will offer the OCR route instead.</div>
           <div id="hl-up-out" style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin-top:16px;line-height:1.6;"></div>
           <div style="display:flex;gap:9px;margin-top:22px;align-items:center;">
             <button id="hl-up-go" disabled style="font-family:var(--mono);font-size:12.5px;padding:11px 26px;border-radius:6px;border:1px solid var(--rule-soft);background:transparent;color:var(--rule);cursor:default;">Import</button>
@@ -32420,15 +32502,93 @@ render();
           parsed = null; arm(false);
           out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026</span>';
           try {
-            const text = await _dedPdfText(await f.arrayBuffer(),
-              (n) => { out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026 ' + n + ' streams</span>'; });
-            if (!text || text.replace(/\s/g, '').length < 40) {
-              out.innerHTML = '<span style="color:var(--lost);">No text layer \u2014 this is a scan. Those go through the OCR pass (<code>mode=ocr</code>), not here.</span>';
-              return;
+            const name = String(f.name || '').toLowerCase();
+            const isSheet = /\.(xlsx|xls|csv|txt)$/.test(name);
+            let p = null;
+
+            if (isSheet) {
+              // ── SPREADSHEETS ─────────────────────────────────────────────
+              // A third of the deduction folder is xlsx and the uploader took
+              // none of it. SheetJS is already loaded for the Vividly and WFM
+              // imports, and the loader's own parsers work on a grid of
+              // strings -- so the same code that reads these server-side reads
+              // them here, with no second implementation to drift.
+              const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' });
+              const grid = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],
+                                                    { header: 1, defval: '', raw: false });
+              const rows = grid.map(r => (r || []).map(c => String(c == null ? '' : c)));
+              p = _dedParseNgScanback(rows);
+              if (p && p.error) {
+                // NAME THE COLUMNS WHEN NOTHING FITS. "Layout not recognised"
+                // is true and useless; the header row is what lets the next
+                // layout be written without anyone opening the file by hand.
+                let best = [], n = -1;
+                for (const r of rows.slice(0, 15)) {
+                  const filled = r.filter(c => c.trim() !== '');
+                  if (filled.length > n) { n = filled.length; best = filled; }
+                }
+                out.innerHTML = '<span style="color:var(--lost);">No layout recognised.</span>'
+                  + '<div style="color:var(--ink-3);margin-top:8px;">Widest header row (' + n + ' columns):</div>'
+                  + '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-2);margin-top:4px;word-break:break-word;">'
+                  + esc(best.slice(0, 30).join(' | ')) + (best.length > 30 ? ' \u2026' : '') + '</div>'
+                  + '<div style="color:var(--ink-3);margin-top:8px;">Send those column names on and the layout can be added.</div>';
+                return;
+              }
+            } else {
+              const text = await _dedPdfText(await f.arrayBuffer(),
+                (n) => { out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026 ' + n + ' streams</span>'; });
+              if (!text || text.replace(/\s/g, '').length < 40) {
+                // ── NO TEXT LAYER: OFFER THE ROUTE THAT DOES WORK ──────────
+                // Telling someone "use mode=ocr" is telling them to go and be
+                // a database administrator. The OCR pass reads the copy in
+                // Dropbox, so all that is needed is to put this line's file
+                // back in its queue and fire one call.
+                out.innerHTML = '<span style="color:var(--lost);">No text layer \u2014 this is a scan.</span>'
+                  + '<div style="color:var(--ink-3);margin-top:8px;">Nothing in the browser can read a picture of a table. '
+                  + 'The OCR pass can, working from the copy already in Dropbox.</div>'
+                  + '<button id="hl-up-ocr" style="margin-top:12px;font-family:var(--mono);font-size:12px;padding:9px 18px;border-radius:6px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Read it with OCR</button>';
+                const ob = document.getElementById('hl-up-ocr');
+                if (ob) ob.onclick = async () => {
+                  ob.disabled = true; ob.textContent = 'Queuing\u2026';
+                  try {
+                    const { data: fr, error: fe } = await sb.from('deduction_files')
+                      .update({ status: 'new', parse_note: null })
+                      .eq('brand_id', brandId)
+                      .ilike('filename', '%' + String(l.invoice_no || '').trim() + '%')
+                      .select('id,filename');
+                    if (fe) throw new Error(fe.message);
+                    if (!fr || !fr.length) throw new Error('no file in the catalogue matches ' + (l.invoice_no || 'this line'));
+                    out.innerHTML = '<span style="color:var(--ink-2);">Queued ' + fr.length + ' file(s): '
+                      + esc(fr.map(x => x.filename).join(', ')) + '.</span>'
+                      + '<div style="color:var(--ink-3);margin-top:8px;">The OCR pass will read them on its next run. '
+                      + 'Nothing is written unless the rows tie to the document\u2019s own total.</div>';
+                  } catch (e5) {
+                    out.innerHTML = '<span style="color:var(--lost);">Could not queue it: ' + esc(String(e5.message || e5)) + '</span>';
+                  }
+                };
+                return;
+              }
+              // EVERY LAYOUT IS TRIED, and the one that TIES wins. Routing on
+              // /DISTRIBUTOR CHARGE/ worked while there were two; it does not
+              // scale, and a document that ties is better evidence of its own
+              // layout than a phrase somewhere in its text.
+              const tried = [];
+              for (const [nm, fn] of [['Distributor Charge', _dedParseDistCharge], ['K-Solve', _dedParseKsolve]]) {
+                let r = null;
+                try { r = fn(text); } catch (e6) { tried.push(nm + ': threw'); continue; }
+                if (!r || !r.rows || !r.rows.length) { tried.push(nm + ': no rows'); continue; }
+                if (r.ties) { p = r; break; }
+                tried.push(nm + ': ' + r.rows.length + ' rows summing ' + money(r.line_total)
+                           + ' vs stated ' + (r.head && r.head.total != null ? money(r.head.total) : 'none'));
+                if (!p) p = r;                        // keep the best near-miss to report
+              }
+              if (!p) {
+                out.innerHTML = '<span style="color:var(--lost);">Read the file but no layout fitted.</span>'
+                  + '<div style="color:var(--ink-3);margin-top:6px;">' + esc(tried.join(' \u00b7 ')) + '</div>';
+                return;
+              }
             }
-            // Route on what the document says it is, not on its filename.
-            const p = /DISTRIBUTOR CHARGE/i.test(text) ? _dedParseDistCharge(text) : _dedParseKsolve(text);
-            if (!p.rows.length) { out.innerHTML = '<span style="color:var(--lost);">Read the file but found no detail rows.</span>'; return; }
+            if (!p.rows || !p.rows.length) { out.innerHTML = '<span style="color:var(--lost);">Read the file but found no detail rows.</span>'; return; }
             if (!p.ties) {
               out.innerHTML = '<span style="color:var(--lost);">The rows sum to ' + money(p.line_total)
                 + ' against the document\u2019s own stated total of ' + (p.head.total == null ? 'none found' : money(p.head.total))
