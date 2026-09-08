@@ -258,6 +258,8 @@ body::before {
 .ded-scopebtn.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 .ded-scopebtn[disabled] { opacity: .4; cursor: default; }
 .ded-navnum { opacity: .55; font-size: 12px; }
+.ded-searchbox { flex: 1 1 420px; min-width: 240px; font-family: var(--mono); font-size: 14px; padding: 12px 16px; min-height: 44px; border: 1.5px solid var(--rule); border-radius: 8px; background: var(--paper); color: var(--ink); box-sizing: border-box; }
+.ded-searchbox:focus { outline: none; border-color: var(--ink); }
 .ded-refreshbtn { flex: 0 0 auto; margin-left: auto; font-family: var(--mono); font-size: 13px; padding: 11px 18px; min-height: 44px; border-radius: 8px; border: 1.5px solid var(--rule); background: transparent; color: var(--ink-2); cursor: pointer; }
 .ded-refreshbtn:hover { border-color: var(--ink); color: var(--ink); }
 @media (max-width: 900px) {
@@ -29098,7 +29100,7 @@ render();
   // Overview -- the saved value failed the includes() test below and fell to the
   // default. Same class of bug as the tab_key drift: a string list that has to
   // be kept in step with another string list by hand.
-  const DED_VIEWS = ['execsum', 'exec', 'summary', 'reconcile', 'customer', 'checks', 'exceptions', 'upload', 'lines', 'promos', 'catalogue', 'support', 'callouts'];
+  const DED_VIEWS = ['execsum', 'exec', 'summary', 'reconcile', 'edlp', 'customer', 'checks', 'exceptions', 'upload', 'lines', 'promos', 'catalogue', 'support', 'callouts'];
   // 'category' and 'other' were retired into 'summary'. Anyone whose browser has
   // one of them saved would otherwise land on a view that no longer renders.
   // 'code' joined them: By reason code showed the same money as Category, split
@@ -29142,12 +29144,32 @@ render();
     if (d.length > 12) return d.slice(-12, -1);
     return d;
   };
-  let _dedLinesQ = '';            // free-text search over invoice / code / remarks
+  // ONE SEARCH BOX FOR THE WHOLE PAGE. Deductions and Promotions each had their
+  // own, in their own body, with their own state — so a search typed on one was
+  // silently dropped on arriving at the other, and the box moved down the screen
+  // depending which tab you were on. Now a single query lives in the page header
+  // above the tab rows, survives every tab switch, and each view says in its
+  // placeholder what it will match.
+  //
+  // _dedSearchRepaint lets a view repaint ONLY its results while the header
+  // input keeps focus and caret. It is cleared at the top of every render so a
+  // closure from the tab you just left can never be called against the tab you
+  // are now on.
+  let _dedQ = '';                 // free-text search, shared across the page
+  let _dedSearchRepaint = null;
+  // Set ONLY where a search action is about to rebuild the whole page (the
+  // Promotions repaint, and Enter carrying a query to the register). Views that
+  // repaint just their results never set it, so an ordinary tab click can never
+  // find a stale flag and steal focus into the search box.
+  let _dedQFocus = false;
   let _dedLinesOpen = new Set();  // lines expanded to their customer split
   let _dedLinesMonths = new Set(); // empty = every month, matching the app's other multi-selects
   // Deductions tab grain: 'line' (the register) or 'promo' (the retailer's own
   // promo number). Two ways of cutting the same money — the register answers
   // "what did they take", the promo view answers "what did each promotion cost".
+  let _dedEdlp = null;            // cached edlp_actuals() rows, keyed by year (see _dedBust)
+  let _dedEdlpErr = null;
+  let _dedEdlpOpen = new Set();   // which customer x group rows are expanded to months
   let _dedPromos = null;          // cached deduction_promo_rollup rows
   let _dedPromosErr = null;
   let _dedOthCat = new Set();     // Other charges: expanded categories
@@ -29266,6 +29288,33 @@ render();
   // so every render threw "_dedDistCounts is not defined" and the whole
   // Deductions page stopped at "Loading deductions…". Passing it in is the fix
   // that cannot regress — there is no outer name left to accidentally capture.
+  // ── THE MONTH A DEDUCTION RAN, READ OUT OF ITS OWN NUMBER ─────────────────
+  // UNFI's WFM deduction numbers name the period: WFMDEC2515930ISEGRA is the
+  // December 2025 programme, billed in January. The register only carries
+  // doc_date — when the money was taken — so the Deductions tab showed Jan '26
+  // against a December programme, and showed a red "no date" on the four ISE
+  // lines whose parsed detail carries no usable date at all.
+  //
+  // A month NAME followed by a two-digit year is required, never bare digits,
+  // so a numeric reference like WHFDSCAN0426015930 cannot be misread as April.
+  // Longer spellings are listed first because the alternation is ordered:
+  // JULY26 must match JULY before JUL leaves a stranded 'Y'.
+  const _DED_MONNUM = { JANUARY:1, FEBRUARY:2, MARCH:3, APRIL:4, MAY:5, JUNE:6, JULY:7,
+                        AUGUST:8, SEPTEMBER:9, SEPT:9, OCTOBER:10, NOVEMBER:11, DECEMBER:12,
+                        JAN:1, FEB:2, MAR:3, APR:4, JUN:6, JUL:7, AUG:8, SEP:9, OCT:10, NOV:11, DEC:12 };
+  const _DED_PERIOD_RE = /(JANUARY|FEBRUARY|SEPTEMBER|SEPT|DECEMBER|NOVEMBER|OCTOBER|FEBRUARY|AUGUST|MARCH|APRIL|JULY|JUNE|JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})/;
+  function _dedPeriodFromRef(s) {
+    const t = String(s == null ? '' : s).toUpperCase();
+    if (!t) return '';
+    const m = t.match(_DED_PERIOD_RE);
+    if (!m) return '';
+    const mo = _DED_MONNUM[m[1]];
+    if (!mo) return '';
+    const yy = Number(m[2]);
+    if (!isFinite(yy)) return '';
+    return (2000 + yy) + '-' + String(mo).padStart(2, '0');
+  }
+
   // SHORT LABELS FOR THE SCOPE ROW. At 14px, 'Harris Teeter' next to four
   // siblings wraps the row onto a second line for one word. Display only — the
   // full name stays in the title attribute and everywhere else on the page, and
@@ -29328,7 +29377,13 @@ render();
   // at the top of the next render, so a forced refresh refetches and rewrites
   // rather than permanently disabling the cache.
   let _dedSkipCache = false;
-  const _dedBust = () => { _dedRaw = null; _dedDetail = null; _dedPlan = null; _dedSkipCache = true; };
+  // Refresh must drop the EDLP result too. Running edlp-view.sql and then
+  // pressing Refresh has to show the new answer; a cache that survives the
+  // button is a cache that makes a fixed query look unfixed. _dedPromos is
+  // deliberately left alone — it is the one slot Refresh has never cleared, and
+  // changing that today would be an unrelated behaviour change.
+  const _dedBust = () => { _dedRaw = null; _dedDetail = null; _dedPlan = null;
+                           _dedEdlp = null; _dedEdlpErr = null; _dedSkipCache = true; };
   let _dedRecCompleted = true;    // Reconcile: measure closed promos only
   let _dedRecPartial = false;     // Reconcile: include the register's partial last month
   const _dedMon = (mk) => { const q = String(mk || '').split('-');
@@ -30109,10 +30164,215 @@ render();
   // rate, the event window, units and what was actually spent. This is the
   // actuals half of a promo-level plan; the other half is what was agreed, and
   // the export at the bottom is how you seed it.
-  let _dedPromoQ = '';
   let _dedPromoLimit = 50;
   let _dedPromoSort = 'spend';    // spend | rate | start | promo
   let _dedPromoYearOnly = true;   // scope to the selected year by event window
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // EDLP · PLANNED / EARNED / DEDUCTED
+  //
+  // Three columns at one grain — customer x product group x month:
+  //
+  //   PLANNED   the Nov-2025 forecast: agreed rate x FORECAST units
+  //   EARNED    the same agreed rate x UNITS ACTUALLY SOLD
+  //   DEDUCTED  what the distributor actually took, found by rate match
+  //
+  // EARNED is the column that matters, and it is why this tab exists rather
+  // than being a slice of Reconcile vs. plan. It depends on neither the plan's
+  // forecast nor the completeness of the document folder, so DEDUCTED - EARNED
+  // answers two questions at once: did they take what they earned, and what is
+  // the folder missing.
+  //
+  // THE HONEST LIMIT, STATED ON THE SCREEN: earned needs units actually sold,
+  // and Whole Foods is the only customer with a unit feed in Keel — 6.9% of the
+  // EDLP plan. The other 93% has no unit source except SPINS, which lives as a
+  // JSON blob in Storage that SQL cannot reach. Those customers show planned
+  // and deducted with earned BLANK and labelled, never zero: a customer with no
+  // unit feed and a customer that sold nothing must not look alike, and a blank
+  // that reads as zero would make every one of them look massively over-taken.
+  //
+  // All the arithmetic is in public.edlp_actuals(brand, year) — the same SQL as
+  // edlp-actuals.sql, which carries the record of the four defects found by
+  // reading it. Nothing is recomputed here; this renders what that returns.
+  // ═════════════════════════════════════════════════════════════════════════
+  async function _dedRenderEdlp(body, rows, err, U) {
+    const { esc, money, th, td, yr, rerender } = U;
+    const MON = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const num = (v) => (v == null || v === '') ? null : Number(v);
+
+    if (err) {
+      // The function is created by hand, so its absence is the expected first
+      // state rather than a fault. Say what to run.
+      const missing = /does not exist|42883|could not find the function|schema cache/i.test(err);
+      body.innerHTML = `
+        <div style="border:1px solid ${missing ? 'var(--rule)' : 'var(--lost)'};border-left-width:3px;border-radius:5px;padding:14px 16px;font-family:var(--mono);font-size:11px;line-height:1.65;color:var(--ink-2);max-width:820px;">
+          ${missing
+            ? `<strong>public.edlp_actuals() does not exist yet.</strong> Run <code>edlp-view.sql</code> once in the SQL editor, then press Refresh.
+               <div style="color:var(--ink-3);margin-top:7px;">It creates <code>upc11()</code> and <code>edlp_actuals(brand, year)</code> and reads
+               <code>promo_plan_lines</code>, <code>products</code>, <code>wfm_sales</code> and <code>deduction_detail</code>. It writes nothing and changes no existing number.</div>`
+            : `<strong>EDLP could not be loaded.</strong> ${esc(err)}`}
+        </div>`;
+      return;
+    }
+
+    const R = (rows || []).map(r => ({
+      customer: r.customer || '(no customer)',
+      group: r.product_group || '(no group)',
+      month: Number(r.month) || 0,
+      rate: num(r.rate),
+      plannedUnits: num(r.planned_units),
+      planned: num(r.planned) || 0,
+      actualUnits: num(r.actual_units),
+      earned: num(r.earned),
+      unitsSource: r.units_source || null,
+      deductedUnits: num(r.deducted_units),
+      deducted: num(r.deducted) || 0,
+    }));
+
+    if (!R.length) {
+      body.innerHTML = `<div style="padding:22px;font-family:var(--serif);font-size:14px;color:var(--ink-2);line-height:1.65;max-width:760px;">
+        No EDLP lines for ${esc(yr)}. The plan is read from <code style="font-family:var(--mono);font-size:12px;">promo_plan_lines</code>
+        where <code style="font-family:var(--mono);font-size:12px;">promo_type = 'EDLP'</code> — if the year's plan has not been loaded yet, that is why.</div>`;
+      return;
+    }
+
+    // ── roll up to customer x group, keeping the months underneath ──────────
+    const cg = new Map();
+    for (const r of R) {
+      const k = r.customer + '\u0000' + r.group;
+      let e = cg.get(k);
+      if (!e) cg.set(k, e = { key: k, customer: r.customer, group: r.group, rate: r.rate,
+                              planned: 0, earned: null, deducted: 0, hasUnits: false, months: [] });
+      e.planned += r.planned;
+      e.deducted += r.deducted;
+      if (r.earned != null) { e.earned = (e.earned || 0) + r.earned; e.hasUnits = true; }
+      if (r.rate != null && e.rate == null) e.rate = r.rate;
+      e.months.push(r);
+    }
+    const groups = [...cg.values()];
+    for (const g of groups) g.months.sort((a, b) => a.month - b.month);
+
+    // ── per customer, for the top table ────────────────────────────────────
+    const custs = new Map();
+    for (const g of groups) {
+      let c = custs.get(g.customer);
+      if (!c) custs.set(g.customer, c = { name: g.customer, planned: 0, earned: null, deducted: 0, hasUnits: false, groups: [] });
+      c.planned += g.planned;
+      c.deducted += g.deducted;
+      if (g.earned != null) { c.earned = (c.earned || 0) + g.earned; c.hasUnits = true; }
+      c.groups.push(g);
+    }
+    const custList = [...custs.values()].sort((a, b) => b.planned - a.planned);
+    for (const c of custList) c.groups.sort((a, b) => b.planned - a.planned);
+
+    const totPlanned  = custList.reduce((n, c) => n + c.planned, 0);
+    const totDeducted = custList.reduce((n, c) => n + c.deducted, 0);
+    const withUnits   = custList.filter(c => c.hasUnits);
+    const totEarned   = withUnits.reduce((n, c) => n + (c.earned || 0), 0);
+    const covPlanned  = withUnits.reduce((n, c) => n + c.planned, 0);
+    const covPct      = totPlanned ? Math.round(covPlanned / totPlanned * 100) : 0;
+    // The variance is only meaningful where earned exists, so it is summed over
+    // those customers alone and labelled as such. A page-wide "deducted minus
+    // earned" that quietly treated 93% of earned as zero would read as the
+    // distributors having over-taken by the entire book.
+    const covDeducted = withUnits.reduce((n, c) => n + c.deducted, 0);
+    const variance    = covDeducted - totEarned;
+
+    const tone = (v) => v > 0 ? 'var(--lost)' : 'var(--won)';
+    const fig = (lbl, val, sub, col) => `
+      <div style="min-width:0;">
+        <div style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--ink-3);">${lbl}</div>
+        <div style="font-family:var(--serif);font-size:30px;line-height:1.15;margin-top:5px;${col ? 'color:' + col + ';' : ''}">${val}</div>
+        ${sub ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:4px;line-height:1.5;">${sub}</div>` : ''}
+      </div>`;
+
+    // A cell that has no unit source says so. It never renders as a dash that
+    // could be read as zero, and never as $0.
+    const noUnits = '<span style="color:var(--ink-3);font-size:10.5px;" title="no feed of units actually sold for this customer — EDLP earned cannot be computed">no units</span>';
+    const cell = (v, whenNull) => v == null ? (whenNull || noUnits) : money(v);
+
+    const rowHtml = (o, indent, cls, dataAttr, caret) => {
+      const v = (o.earned == null) ? null : o.deducted - o.earned;
+      return `<tr ${cls ? 'class="' + cls + '"' : ''} ${dataAttr || ''} style="${cls ? 'cursor:pointer;' : ''}">
+        ${td(`<span style="padding-left:${indent}px;">${caret || ''}${esc(o.label)}</span>`)}
+        ${td(o.rate == null ? '<span style="color:var(--ink-3);">—</span>' : '$' + Number(o.rate).toFixed(2), true, 'color:var(--ink-3);')}
+        ${td(money(o.planned), true)}
+        ${td(cell(o.earned), true, o.earned == null ? '' : 'font-weight:600;')}
+        ${td(money(o.deducted), true)}
+        ${td(v == null ? noUnits : '<strong style="color:' + tone(v) + ';">' + (v > 0 ? '+' : '') + money(v) + '</strong>', true)}
+      </tr>`;
+    };
+
+    body.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:20px;padding:4px 2px 6px;">
+        ${fig('Planned ' + esc(yr), money(totPlanned), custList.length + ' customers \u00b7 ' + groups.length + ' groups')}
+        ${fig('Earned', money(totEarned), covPct + '% of the plan has a unit feed')}
+        ${fig('Deducted', money(totDeducted), 'matched on the agreed rate')}
+        ${fig('Deducted \u2212 earned', (variance > 0 ? '+' : '') + money(variance),
+              'over the ' + withUnits.length + ' customer' + (withUnits.length === 1 ? '' : 's') + ' that can be measured',
+              tone(variance))}
+      </div>
+
+      <p style="font-family:var(--serif);font-size:14px;color:var(--ink-2);line-height:1.65;max-width:80ch;margin:22px 0 4px;">
+        <strong>Earned</strong> is the agreed rate times the units that actually sold, so it depends on neither the forecast
+        nor the document folder. <strong>Deducted \u2212 earned</strong> is therefore two answers in one: whether the distributor
+        took what it was owed, and what the folder is still missing.
+        ${covPct < 100 ? `Only ${covPct}% of the plan can be measured that way today \u2014 Whole Foods is the only customer with a
+        feed of units sold. The rest show planned and deducted with earned left blank; blank is <em>unknown</em>, not zero.` : ''}
+      </p>
+
+      <table class="ded-edlp-tbl" style="width:100%;border-collapse:collapse;margin-top:16px;">
+        <thead><tr>${th('Customer / product group')}${th('Rate', true)}${th('Planned', true)}${th('Earned', true)}${th('Deducted', true)}${th('Deducted \u2212 earned', true)}</tr></thead>
+        <tbody>
+          ${custList.map(c => {
+            const cOpen = _dedEdlpOpen.has(c.name);
+            let out = rowHtml(
+              { label: c.name + (c.hasUnits ? '' : ''), rate: null, planned: c.planned, earned: c.earned, deducted: c.deducted },
+              0, 'hl-edlp-cust', 'data-c="' + esc(c.name) + '"',
+              `<span style="display:inline-block;width:14px;color:var(--ink-3);">${cOpen ? '\u2212' : '+'}</span>`);
+            if (!cOpen) return out;
+            for (const g of c.groups) {
+              const gOpen = _dedEdlpOpen.has(g.key);
+              out += rowHtml({ label: g.group, rate: g.rate, planned: g.planned, earned: g.earned, deducted: g.deducted },
+                22, 'hl-edlp-grp', 'data-g="' + esc(g.key) + '"',
+                `<span style="display:inline-block;width:14px;color:var(--ink-3);">${gOpen ? '\u2212' : '+'}</span>`);
+              if (!gOpen) continue;
+              out += g.months.map(m => rowHtml(
+                { label: MON[m.month] || '\u2014', rate: m.rate, planned: m.planned, earned: m.earned, deducted: m.deducted },
+                58, '', '', '')).join('');
+            }
+            return out;
+          }).join('')}
+        </tbody>
+        <tfoot><tr style="border-top:2px solid var(--ink);">
+          ${td('<strong>ALL EDLP ' + esc(yr) + '</strong>')}
+          ${td('', true)}
+          ${td('<strong>' + money(totPlanned) + '</strong>', true)}
+          ${td('<strong>' + money(totEarned) + '</strong>', true)}
+          ${td('<strong>' + money(totDeducted) + '</strong>', true)}
+          ${td('<strong style="color:' + tone(variance) + ';">' + (variance > 0 ? '+' : '') + money(variance) + '</strong>', true)}
+        </tr></tfoot>
+      </table>
+
+      <p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:12px;line-height:1.6;max-width:80ch;">
+        The footer's earned and variance cover only the ${withUnits.length} customer${withUnits.length === 1 ? '' : 's'} with a unit feed;
+        planned and deducted cover all ${custList.length}. A deduction is identified as EDLP when its per-unit charge equals that
+        customer's agreed rate for that product group \u2014 customer first, rate second, because $0.52 belongs to more than one
+        Giant. Lines billed at one unit are excluded: a lump sum stored with quantity 1 presents its whole charge as a rate.
+      </p>`;
+
+    body.querySelectorAll('.hl-edlp-cust').forEach(b => b.onclick = () => {
+      const k = b.dataset.c;
+      if (_dedEdlpOpen.has(k)) _dedEdlpOpen.delete(k); else _dedEdlpOpen.add(k);
+      rerender();
+    });
+    body.querySelectorAll('.hl-edlp-grp').forEach(b => b.onclick = (ev) => {
+      ev.stopPropagation();
+      const k = b.dataset.g;
+      if (_dedEdlpOpen.has(k)) _dedEdlpOpen.delete(k); else _dedEdlpOpen.add(k);
+      rerender();
+    });
+  }
 
   async function _dedRenderPromos(body, rows, err, U) {
     const { esc, money, th, td, yr, year, rerender, tradeTotal, promoBearingTotal } = U;
@@ -30150,7 +30410,7 @@ render();
       if (!s) return true;
       return !(e < ys || s > ye);
     };
-    const terms = _dedPromoQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const terms = _dedQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const hay = (p) => [p.promo_no, p.promo_name, p.plan_customer, p.banner, p.reason_codes, p.invoices]
       .filter(Boolean).join(' ').toLowerCase();
 
@@ -30192,8 +30452,6 @@ render();
 
     body.innerHTML = `
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 12px;">
-        <input id="hl-pr-q" type="search" placeholder="Search promo number, name, customer or invoice\u2026" value="${esc(_dedPromoQ)}"
-          style="flex:1 1 300px;min-width:220px;font-family:var(--mono);font-size:12px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
         <button id="hl-pr-yr" style="font-family:var(--mono);font-size:11.5px;padding:9px 14px;border-radius:6px;cursor:pointer;
           border:1px solid ${_dedPromoYearOnly ? 'var(--ink)' : 'var(--rule)'};background:${_dedPromoYearOnly ? 'var(--ink)' : 'transparent'};color:${_dedPromoYearOnly ? 'var(--paper)' : 'var(--ink-3)'};">${esc(yr)} only</button>
         ${[['spend', 'Spend'], ['rate', 'Rate'], ['start', 'Newest'], ['promo', 'Number']].map(([v, l]) => `<button class="hl-pr-sort" data-v="${v}"
@@ -30270,8 +30528,10 @@ render();
         differing is the variance worth catching. Export gives one row per promo number to seed that plan.
       </p>`;
 
-    const q = document.getElementById('hl-pr-q');
-    if (q) { let t = null; q.oninput = () => { clearTimeout(t); t = setTimeout(() => { _dedPromoQ = q.value; _dedPromoLimit = 50; rerender(); }, 220); }; }
+    // The header's search box drives this view; repainting is all it needs.
+    // rerender() rebuilds the whole page including the header input, so the
+    // caret has to be handed back explicitly.
+    _dedSearchRepaint = () => { _dedPromoLimit = 50; _dedQFocus = true; rerender(); };
     const yb = document.getElementById('hl-pr-yr');
     if (yb) yb.onclick = () => { _dedPromoYearOnly = !_dedPromoYearOnly; _dedPromoLimit = 50; rerender(); };
     body.querySelectorAll('.hl-pr-sort').forEach(b => b.onclick = () => { _dedPromoSort = b.dataset.v; rerender(); });
@@ -31506,6 +31766,7 @@ render();
       customer:   'Retailer',
       summary:    'Category',
       reconcile:  'Reconcile vs. plan',
+      edlp:       'EDLP',
       lines:      'Deductions',
       promos:     'Promotions',
       checks:     'Checks',
@@ -31515,10 +31776,18 @@ render();
       upload:     'Upload backup',
       catalogue:  'Catalogue',
     };
+    // WHAT THE BOX MATCHES, PER TAB. A shared search whose behaviour changes
+    // between views has to say so in the box itself; a generic "Search…" would
+    // leave the reader guessing why a customer name found nothing on the tab
+    // that only indexes reason codes.
+    const DED_SEARCH_PLACEHOLDER = {
+      lines:  'Search invoice, code, DC or remarks\u2026',
+      promos: 'Search promo number, name, customer or invoice\u2026',
+    };
     // Row 2 answers "how much, and from whom". Row 3 is everything that
     // supports that answer — the rows themselves, the documents, the plumbing.
     const VIEW_ROWS = [
-      ['Deduction overview', ['exec', 'customer', 'summary', 'reconcile', 'execsum']],
+      ['Deduction overview', ['exec', 'customer', 'summary', 'reconcile', 'edlp', 'execsum']],
       ['Support',            ['lines', 'promos', 'checks', 'support', 'exceptions', 'callouts', 'upload', 'catalogue']],
     ];
     // NOTES CARRIED OVER FROM THE FLAT LIST THIS REPLACED, because the reasons
@@ -31667,6 +31936,19 @@ render();
             ${ids.map(v => `<button class="hl-ded-view ded-navbtn${_dedView === v ? ' on' : ''}" data-v="${v}">${VIEW_LABELS[v] || v}</button>`).join('')}
           </span>
         </div>`).join('')}
+        <!-- ONE SEARCH BOX, ABOVE THE TABS. It keeps its position and its query
+             across every tab, so searching a deduction number on Deductions and
+             then opening Promotions shows the same thing rather than an empty
+             box. On the views that consume it the filter is live; on the rest
+             the box says so, and Enter carries the query to the register. -->
+        <div class="ded-navrow">
+          <span class="ded-navlbl">Search</span>
+          <span class="ded-navbtns">
+            <input id="hl-ded-q" type="search" class="ded-searchbox" value="${esc(_dedQ)}"
+              placeholder="${esc(DED_SEARCH_PLACEHOLDER[_dedView] || 'Search a deduction number, code or customer — Enter to search the register…')}">
+            ${_dedQ.trim() ? `<button id="hl-ded-q-clear" class="ded-refreshbtn" style="margin-left:0;">Clear</button>` : ''}
+          </span>
+        </div>
       </div>
       <div id="hl-ded-body"></div>
     `;
@@ -31835,6 +32117,48 @@ render();
       </div>`;
     }
     _dedRenderFeeds().catch(e => console.error('[deductions] feed strip failed:', e));
+
+    // CLEARED BEFORE ANY VIEW RUNS. Each branch registers its own repaint; a
+    // stale closure from the tab just left would repaint a table that is no
+    // longer on the page.
+    _dedSearchRepaint = null;
+
+    const qEl = document.getElementById('hl-ded-q');
+    if (qEl) {
+      // The rebuild that brought us here came from typing, so put the caret
+      // back where it was rather than at the start of the value.
+      if (_dedQFocus) {
+        _dedQFocus = false;
+        try { qEl.focus(); qEl.setSelectionRange(qEl.value.length, qEl.value.length); } catch (e) {}
+      }
+      let qt = null;
+      qEl.oninput = () => {
+        clearTimeout(qt);
+        qt = setTimeout(() => {
+          _dedQ = qEl.value;
+          // A view that registered a repaint filters in place and keeps the
+          // caret. A view that did not leaves the query parked until Enter.
+          if (_dedSearchRepaint) _dedSearchRepaint();
+        }, 180);
+      };
+      qEl.onkeydown = (ev) => {
+        if (ev.key !== 'Enter') return;
+        _dedQ = qEl.value;
+        if (_dedSearchRepaint) { _dedSearchRepaint(); return; }
+        // Nothing on this tab consumes the query, so take it somewhere that
+        // does rather than let the box sit there doing nothing.
+        _dedQFocus = true;
+        _dedView = 'lines';
+        try { localStorage.setItem('keel_ded_view', _dedView); } catch (e) {}
+        renderDeductions(hostEl, filtersEl, year);
+      };
+    }
+    const qClr = document.getElementById('hl-ded-q-clear');
+    if (qClr) qClr.onclick = () => {
+      _dedQ = '';
+      _dedLinesLimit = 25;
+      renderDeductions(hostEl, filtersEl, year);
+    };
 
     hostEl.querySelectorAll('.hl-ded-view').forEach(b => b.onclick = () => {
       if (b.dataset.v === _dedView) return;
@@ -32195,6 +32519,29 @@ render();
     // so this tab and the Deductions summary cannot disagree. Filters change what
     // is LISTED and are shown as their own subtotal — the register total stays on
     // screen next to it, so a filter can never look like money going missing.
+    // ── EDLP ───────────────────────────────────────────────────────────────
+    // The one tab that reads a SQL function rather than a table: the three
+    // columns need a five-way join across the plan, the product list, the WFM
+    // scan feed and the deduction detail, and deduction_detail alone is ~367k
+    // rows. Doing that in the browser would mean shipping the whole detail
+    // table to the client to aggregate it away again.
+    if (_dedView === 'edlp') {
+      const ekey = String(year);
+      if ((!_dedEdlp || _dedEdlp.key !== ekey) && !_dedEdlpErr) {
+        body.innerHTML = '<div class="hl-loading">Loading EDLP\u2026</div>';
+        try {
+          const { data, error } = await sb.rpc('edlp_actuals', { p_brand: brandId, p_year: Number(year) });
+          if (error) throw error;
+          _dedEdlp = { key: ekey, rows: data || [] };
+        } catch (e) { _dedEdlpErr = String(e && (e.message || e.hint) || e); }
+      }
+      await _dedRenderEdlp(body, (_dedEdlp && _dedEdlp.rows) || [], _dedEdlpErr, {
+        esc, money, th, td, yr, year,
+        rerender: () => renderDeductions(hostEl, filtersEl, year),
+      });
+      return;
+    }
+
     // ── PROMOTIONS ─────────────────────────────────────────────────────────
     // Its own tab now rather than a grain toggle inside Deductions: two ways to
     // reach one view is one more than is useful, and the register and the promo
@@ -32287,13 +32634,27 @@ render();
           if (!best || s < best) best = s;
         }
         if (best) return best.slice(0, 7);
+        // THE PERIOD THE PROGRAMME RAN BEATS THE DATE IT WAS TAKEN. doc_date is
+        // the month UNFI pulled the money, which for these fees is always the
+        // month after the one being charged for — so a December programme read
+        // as January and sat in the wrong month chip. Where the deduction
+        // number names its own period, that wins.
+        const pr = _dedPeriodFromRef(l.invoice_no) || _dedPeriodFromRef(l.reference_no);
+        if (pr) return pr;
         const dd = String(l.doc_date || '');
         return (dd && dd >= _VF) ? dd.slice(0, 7) : '';
       };
-      // Whether the month came from the document or from the register line —
-      // worth showing, because a derived month is a weaker claim than a stated
-      // one and the reader should be able to tell them apart.
-      const monthIsDerived = (l) => !l.doc_date && !!monthOf(l);
+      // WHERE THE MONTH CAME FROM. A month read off a document, parsed out of a
+      // reference, or stated by the register line are three different strengths
+      // of claim, and the reader should be able to tell which one they have.
+      const monthSrc = (l) => {
+        for (const d of (detBy.get(l.id) || [])) {
+          const s2 = String(d.reference_date || d.date_from || '');
+          if (s2 && s2 >= _VF) return 'doc';
+        }
+        if (_dedPeriodFromRef(l.invoice_no) || _dedPeriodFromRef(l.reference_no)) return 'ran';
+        return 'line';
+      };
       const allMonths = [...new Set(L.map(monthOf).filter(Boolean))].sort();
       const undatedN = L.filter(l => !monthOf(l)).length;
 
@@ -32361,8 +32722,6 @@ render();
 
       body.innerHTML = `
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 14px;">
-          <input id="hl-dl-q" type="search" placeholder="Search invoice, code, DC or remarks\u2026" value="${esc(_dedLinesQ)}"
-            style="flex:1 1 300px;min-width:220px;font-family:var(--mono);font-size:12px;padding:9px 12px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);">
           <div style="position:relative;">
             <button id="hl-dl-mon-toggle" type="button"
               style="font-family:var(--mono);font-size:12px;padding:9px 14px;border:1px solid ${_dedLinesMonths.size ? 'var(--ink)' : 'var(--rule)'};border-radius:6px;background:var(--paper);cursor:pointer;display:flex;align-items:center;gap:10px;">
@@ -32379,7 +32738,7 @@ render();
               </div>
             </div>
           </div>
-          ${(_dedLinesQ.trim() || _dedLinesMonths.size) ? `<button id="hl-dl-clear" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear filters</button>` : ''}
+          ${(_dedQ.trim() || _dedLinesMonths.size) ? `<button id="hl-dl-clear" style="font-family:var(--mono);font-size:11px;padding:9px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear filters</button>` : ''}
         </div>
 
         <div id="hl-dl-results"></div>`;
@@ -32397,7 +32756,7 @@ render();
         // FILTERING HAPPENS HERE, not once at page build. It used to sit above
         // body.innerHTML, so repainting this container alone would have shown
         // the results of whatever was typed the LAST time the page rebuilt.
-      const terms = _dedLinesQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const terms = _dedQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
       const hay = (l) => [l.invoice_no, l.reason_code, l.dc_name, l.remarks, catOf(l),
                           (custFull(l) || {}).name,
                           ...(_dedPromoRefs.get(String(l.id)) || [])]
@@ -32506,7 +32865,16 @@ render();
                     + `<span style="font-family:var(--mono);font-size:11px;">${esc(l.invoice_no || '(no invoice no.)')}</span>` + tag);
                 })()}
                 ${td(monthOf(l)
-                     ? mLbl(monthOf(l)) + (monthIsDerived(l) ? '<span title="from the backup\u2019s own date; the register line carries none" style="color:var(--ink-3);opacity:.65;"> \u00b7 doc</span>' : '')
+                     ? mLbl(monthOf(l)) + (() => {
+                         const sc = monthSrc(l);
+                         if (sc === 'doc') return '<span title="from the backup\u2019s own date; the register line carries none" style="color:var(--ink-3);opacity:.65;"> \u00b7 doc</span>';
+                         if (sc === 'ran') {
+                           const dd = String(l.doc_date || '').slice(0, 7);
+                           return '<span title="the period the programme ran, named by the deduction number'
+                             + (dd ? ' \u2014 taken in ' + mLbl(dd) : '') + '" style="color:var(--ink-3);opacity:.65;"> \u00b7 ran</span>';
+                         }
+                         return '';
+                       })()
                      : '<span style="color:var(--lost);">no date</span>', true, 'color:var(--ink-3);')}
                 ${(() => {
                   const c = custFull(l);
@@ -32607,7 +32975,7 @@ render();
               return out;
             }).join('')}
             ${!shown.length ? `<tr><td colspan="9" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
-              No deduction matches ${terms.length ? '\u201c' + esc(_dedLinesQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
+              No deduction matches ${terms.length ? '\u201c' + esc(_dedQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
             ${filtered.length > _dedLinesLimit ? `<tr><td colspan="9" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
               <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
               <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
@@ -32656,22 +33024,11 @@ render();
       }
 
       // ── handlers ──
-      const q = document.getElementById('hl-dl-q');
-      if (q) {
-        // THE INPUT IS NEVER DESTROYED NOW, so there is no caret to restore and
-        // no scroll to put back -- only the table below it changes. Debounce
-        // stays because filtering 1,945 lines and repainting 25 rows is real
-        // work, just no longer work that eats the thing you are typing into.
-        let t = null;
-        q.oninput = () => {
-          clearTimeout(t);
-          t = setTimeout(() => {
-            _dedLinesQ = q.value;
-            _dedLinesLimit = 25;
-            paintResults();
-          }, 180);
-        };
-      }
+      // THE INPUT LIVES IN THE PAGE HEADER and is never destroyed by this
+      // repaint, so there is no caret to restore and no scroll to put back --
+      // only the table below changes. The debounce stays in the header handler
+      // because filtering ~1,900 lines and repainting 25 rows is real work.
+      _dedSearchRepaint = () => { _dedLinesLimit = 25; paintResults(); };
       const mt = document.getElementById('hl-dl-mon-toggle');
       const mm = document.getElementById('hl-dl-mon-menu');
       if (mt && mm) {
@@ -33208,7 +33565,7 @@ render();
       const clr = document.getElementById('hl-dl-clear');
       // Clear DOES rebuild: the Clear button itself only exists when a filter
       // is set, so the bar above has to be redrawn without it.
-      if (clr) clr.onclick = () => { _dedLinesQ = ''; _dedLinesMonths = new Set(); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
+      if (clr) clr.onclick = () => { _dedQ = ''; _dedLinesMonths = new Set(); _dedLinesLimit = 25; renderDeductions(hostEl, filtersEl, year); };
       // Paging lives in wireRows -- those buttons are inside the results
       // container and are recreated on every repaint.
       await paintResults();
