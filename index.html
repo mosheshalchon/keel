@@ -30408,11 +30408,12 @@ render();
 
       <p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:12px;line-height:1.6;max-width:80ch;">
         The footer's earned and variance cover only the ${withUnits.length} customer${withUnits.length === 1 ? '' : 's'} with a unit feed;
-        planned and deducted cover all ${custList.length}. A deduction is identified as EDLP when its per-unit charge equals that
-        customer's agreed rate for that product group \u2014 customer first, rate second, because $0.52 belongs to more than one
-        Giant. Lines billed at one unit are excluded: a lump sum stored with quantity 1 presents its whole charge as a rate.
-        A customer reading <strong>$0 deducted</strong> against a real plan has no PARSED detail carrying a per-unit rate \u2014
-        a documentation gap, not a finding that they took nothing.
+        planned and deducted cover all ${custList.length}. Deducted is found two ways. Where parsed detail exists, a row is EDLP when its
+        per-unit charge equals that customer's agreed rate for that product group \u2014 customer first, rate second, because $0.52
+        belongs to more than one Giant; lines billed at one unit are excluded, since a lump sum stored with quantity 1 presents its
+        whole charge as a rate. Where a line's own reason code already says EDLP but no detail was ever parsed, the line counts at the
+        only grain it has and lands under <strong>(no item detail)</strong> \u2014 real money, no product and no rate, so earned stays
+        blank against it. A line is read one way or the other, never both.
       </p>`;
 
     body.querySelectorAll('.hl-edlp-row, .hl-edlp-mrow').forEach(b => b.onclick = (ev) => {
