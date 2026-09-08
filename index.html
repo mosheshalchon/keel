@@ -31280,6 +31280,220 @@ render();
     };
   }
 
+  // ── ANY GRID WITH A HEADER ROW ───────────────────────────────────────────
+  // The general spreadsheet reader. Every bespoke layout above it is a grid
+  // with a header row, and writing one per vendor does not scale past the
+  // vendors we happen to have seen.
+  //
+  // It works by NAME, then proves itself by ARITHMETIC. Column names are
+  // matched against a small vocabulary — upc, description, quantity, rate,
+  // amount — which finds candidates but cannot choose between them: the NCG
+  // file has three columns called 'Sum of Rebate', one per region, and picking
+  // the wrong one reports a third of the money with no outward sign of error.
+  //
+  // So the choice is made by testing the identity every deduction row obeys:
+  //
+  //     quantity  x  rate  =  amount
+  //
+  // Every candidate triple is scored on the fraction of rows where that holds.
+  // The winner must satisfy it on at least 90% of rows. Three identical column
+  // names stop being ambiguous the moment you ask which one multiplies out.
+  //
+  // WHY THIS IS SAFE TO GUESS WITH. A guessed layout writes nothing on its own:
+  // the import already refuses unless the rows sum to the document's own stated
+  // total. Name matching proposes, arithmetic narrows, and the document itself
+  // decides. A wrong guess fails loudly at the last gate rather than quietly at
+  // the first.
+  //
+  // It runs LAST, after the hand-written layouts, so a known document keeps its
+  // known reading and this only ever sees what nothing else claimed.
+  const _DED_COLV = {
+    upc:  [/\b(?:12|13)?\s*-?\s*digit\s*upc\b/, /\bupc\b/, /barcode/, /\bgtin\b/, /scan\s*code/, /item\s*(?:code|number|#)/, /article/],
+    desc: [/description/, /item\s*name/, /product\s*(?:name|description)/, /^item$/, /^product$/, /^brand$/],
+    qty:  [/selling\s*units/, /total\s*sum\s*of\s*cases/, /\bunits?\b/, /\bqty\b/, /quantity/, /\bcases?\s*(?:purchased|shipped|sold)?\b/, /ship\s*qty/],
+    rate: [/rebate\s*per\s*unit/, /rate\s*per/, /per\s*unit/, /per\s*case/, /\brate\b/, /allowance/, /scan\s*\$/, /unit\s*charge/, /deduction\s*per/],
+    amt:  [/total\s*sum\s*of\s*rebate/, /extended/, /\bamount\b/, /total\s*(?:rebate|spend|deduction|charge)/, /\bspend\b/, /sum\s*of\s*rebate/, /net\s*(?:amount|\$)/, /\btotal\b/],
+  };
+
+  function _dedParseGrid(rows) {
+    const R = (rows || []).map(r => (r || []).map(c => (c == null ? '' : String(c))));
+    if (R.length < 3) return { error: 'grid: too few rows', rows: [] };
+    const norm = (v) => String(v).replace(/\s+/g, ' ').trim().toLowerCase();
+    const num = (v) => {
+      const t = String(v).replace(/[$,\s]/g, '').replace(/^\((.*)\)$/, '-$1');
+      const n = Number(t);
+      return isFinite(n) && t !== '' ? n : null;
+    };
+
+    // ── the header row: the one naming the most roles ──────────────────────
+    let hi = -1, hbest = 0;
+    for (let i = 0; i < Math.min(R.length, 25); i++) {
+      const cells = R[i].map(norm).filter(Boolean);
+      if (cells.length < 3) continue;
+      let hit = 0;
+      for (const role of Object.keys(_DED_COLV))
+        if (cells.some(c => _DED_COLV[role].some(re => re.test(c)))) hit++;
+      if (hit > hbest) { hbest = hit; hi = i; }
+    }
+    // Without a quantity, a rate and an amount there is nothing to verify
+    // against, and an unverifiable layout is exactly what must not be guessed.
+    if (hi < 0 || hbest < 3) return { error: 'grid: no header row naming enough columns', rows: [] };
+
+    const H = R[hi].map(norm);
+    const cand = (role) => {
+      const out = [];
+      H.forEach((c, i) => { if (c && _DED_COLV[role].some(re => re.test(c))) out.push(i); });
+      return out;
+    };
+    const cUpcs = cand('upc'), cDescs = cand('desc');
+    const qs = cand('qty'), rs = cand('rate'), as = cand('amt');
+    // ── NO EXTENDED-AMOUNT COLUMN: DERIVE IT ────────────────────────────────
+    // Plenty of scanback sheets print a rate and a quantity and never the
+    // product — the Natural Grocers file is one, 'Scan $' and 'Qty' with no
+    // extended column anywhere.
+    //
+    // I first refused these, reasoning that deriving the amount removes the
+    // per-row identity the reader verifies itself against. That was wrong, and
+    // backwards: the check that actually protects the import is the DOCUMENT'S
+    // OWN STATED TOTAL, and a derived column is tested against it just as a
+    // read one is. If Scan $ x Qty summed over every row equals the total the
+    // document prints at its foot, the derivation is confirmed by the document
+    // rather than assumed — which is stronger evidence than a per-row identity,
+    // not weaker.
+    // So derivation is allowed, and the tie is made MANDATORY for it: a read
+    // amount may pass with no stated total to check, a derived one may not.
+    const derive = !as.length;
+    if (derive && !(qs.length && rs.length))
+      return { error: 'grid: no amount column, and no quantity x rate to derive one', rows: [] };
+
+    const body = R.slice(hi + 1);
+    // ── the triple whose arithmetic actually holds ─────────────────────────
+    // When deriving, a === -1 and every (q, r) pair scores 1: there is nothing
+    // to disagree with. The pair is then chosen on COVERAGE — how many rows it
+    // produces a number for — and the document's total is the only judge.
+    let best = null;
+    for (const a of (derive ? [-1] : as)) for (const q of qs.length ? qs : [-1]) for (const r of rs.length ? rs : [-1]) {
+      if (q < 0 || r < 0) continue;
+      if (a < 0) {
+        let seen2 = 0;
+        for (const row of body) {
+          const Q = num(row[q]), Rt = num(row[r]);
+          if (Q == null || Rt == null || Q * Rt === 0) continue;
+          seen2++;
+        }
+        if (seen2 < 3) continue;
+        const unitish2 = /unit/.test(H[r]) && !/per\s*case/.test(H[r]) ? 1 : 0;
+        if (!best || seen2 > best.seen || (seen2 === best.seen && unitish2 > best.unitish))
+          best = { a, q, r, score: 1, seen: seen2, unitish: unitish2, derived: true };
+        continue;
+      }
+      let ok = 0, seen = 0;
+      for (const row of body) {
+        const A = num(row[a]), Q = num(row[q]), Rt = num(row[r]);
+        if (A == null || Q == null || Rt == null || A === 0) continue;
+        seen++;
+        if (Math.abs(Q * Rt - A) <= Math.max(0.02, Math.abs(A) * 0.001)) ok++;
+      }
+      if (seen < 3) continue;
+      const score = ok / seen;
+      // TIE-BREAK TOWARD A PER-UNIT RATE. The NCG file satisfies the identity
+      // twice over — cases x rate-per-case and units x rate-per-unit both come
+      // out at 100% — and the two are equally true. Per-unit is the one that is
+      // useful downstream: EDLP identifies a deduction by matching a per-unit
+      // charge against the customer's agreed rate, and a per-case rate would
+      // tie here and mean nothing there.
+      const unitish = /unit/.test(H[r]) && !/per\s*case/.test(H[r]) ? 1 : 0;
+      if (!best
+          || score > best.score
+          || (score === best.score && unitish > best.unitish)
+          || (score === best.score && unitish === best.unitish && seen > best.seen))
+        best = { a, q, r, score, seen, unitish };
+    }
+    if (!best || best.score < 0.9) {
+      return { error: best
+        ? 'grid: no quantity x rate = amount reading (best ' + Math.round(best.score * 100) + '% of ' + best.seen + ' rows)'
+        : 'grid: no quantity/rate columns to verify against', rows: [] };
+    }
+
+    const cUpc = cUpcs[0] != null ? cUpcs[0] : -1;
+    const cDesc = cDescs[0] != null ? cDescs[0] : -1;
+    const out = [];
+    let stated = null;
+    for (const row of body) {
+      // ── FOOT ROWS FIRST, BEFORE ANY GUARD CAN SKIP THEM ─────────────────
+      // A total row has a label and a number and usually NO quantity, so the
+      // 'no amount, move on' guard below discarded it before it was ever
+      // examined. The derivation then came out to the cent and was refused for
+      // want of anything to confirm it — the worst of both outcomes.
+      //
+      // Two shapes, because a blank identifier is not the only way a foot row
+      // announces itself. The Natural Grocers sheet writes
+      //     10/1/25 - 10/31/25 | $ Total | 241.94 | 241.94
+      // so its total lands IN the barcode column and reads as a product.
+      //
+      // A LABELLED total is taken from the first number after its label, never
+      // the last: that sheet runs on into 170 per-store columns and the last
+      // number in the row is one store's share.
+      //
+      // The label must name MONEY. 'Qty Total' sits directly above '$ Total' in
+      // the same file and would otherwise be summed into the same figure.
+      let footAmt = null;
+      for (let ci = 0; ci < row.length; ci++) {
+        const lab = norm(row[ci]);
+        if (!lab || !/total/.test(lab)) continue;
+        if (!/[$]|amount|rebate|spend|value|deduction/.test(lab)) continue;
+        for (let cj = ci + 1; cj < row.length; cj++) {
+          const v = num(row[cj]);
+          if (v != null && v !== 0) { footAmt = v; break; }
+        }
+        if (footAmt != null) break;
+      }
+      if (footAmt != null) { stated = Math.round(((stated || 0) + footAmt) * 100) / 100; continue; }
+
+      const Qv = num(row[best.q]), Rv = num(row[best.r]);
+      const A = best.derived
+        ? ((Qv == null || Rv == null) ? null : Math.round(Qv * Rv * 100) / 100)
+        : num(row[best.a]);
+      if (A == null || A === 0) continue;
+      const upc = cUpc >= 0 ? String(row[cUpc]).replace(/\D/g, '') : '';
+      // The other shape: an amount with no identifier beside it.
+      if (cUpc >= 0 && !upc) { stated = Math.round(((stated || 0) + A) * 100) / 100; continue; }
+      const Q = Qv, Rt = Rv;
+      out.push({
+        upc: upc || null,
+        item_desc: cDesc >= 0 ? String(row[cDesc]).trim() : '',
+        reference_no: null, ship_date: null, date_to: null,
+        customer_name: null, customer_no: null, store_no: null,
+        ship_qty: Q, unit_chargeback: Rt,
+        unit_cost: null, discount_pct: null,
+        bill_amount: Math.abs(A),
+      });
+    }
+    if (!out.length) return { error: 'grid: no data rows', rows: [] };
+
+    const lineTotal = Math.round(out.reduce((n, r) => n + r.bill_amount, 0) * 100) / 100;
+    const ties = stated != null && Math.abs(lineTotal - stated) < 0.02;
+    // A DERIVED AMOUNT THAT THE DOCUMENT DOES NOT CONFIRM IS A GUESS, and this
+    // is where a guess has to stop. Refusing here rather than returning rows
+    // means it can never reach the import at all.
+    if (best.derived && !ties) {
+      return { error: 'grid: derived ' + H[best.q] + ' \u00d7 ' + H[best.r] + ' = ' + money(lineTotal)
+                      + ', but the document states ' + (stated == null ? 'no total to confirm it' : money(stated)),
+               rows: [] };
+    }
+    return {
+      head: { invoice_no: null, total: stated,
+              type: 'spreadsheet (' + (best.derived ? H[best.q] + ' \u00d7 ' + H[best.r] : H[best.a]) + ')' },
+      rows: out, line_total: lineTotal, ties,
+      note: best.derived
+        ? 'no extended-amount column \u2014 derived ' + H[best.q] + ' \u00d7 ' + H[best.r]
+          + ' and confirmed against the total the document states'
+        : 'columns read by name and verified by arithmetic: '
+          + H[best.q] + ' \u00d7 ' + H[best.r] + ' = ' + H[best.a]
+          + ' on ' + Math.round(best.score * 100) + '% of rows',
+    };
+  }
+
   function _dedParseNgScanback(rows) {
     const U = (v) => String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9%$]/g, '');
     const N = (v) => { if (v == null || String(v).trim() === '') return null;
@@ -33560,7 +33774,27 @@ render();
               const grid = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],
                                                     { header: 1, defval: '', raw: false });
               const rows = grid.map(r => (r || []).map(c => String(c == null ? '' : c)));
-              p = _dedParseNgScanback(rows);
+              // Each layout is tried in turn; the first that yields rows wins.
+              const sheetTried = [];
+              // Hand-written layouts first, the general reader last: a known
+              // document keeps its known reading, and the general one only ever
+              // sees what nothing else claimed.
+              for (const [nm, fn] of [['Natural Grocers scanback', _dedParseNgScanback],
+                                      ['any grid', _dedParseGrid]]) {
+                const got = fn(rows);
+                if (got && !got.error && got.rows && got.rows.length) { p = got; break; }
+                sheetTried.push(nm + ': ' + ((got && got.error) || 'no rows'));
+                p = got;
+              }
+              // WHEN THE GENERAL READER WINS, SAY WHAT IT DECIDED. It guessed
+              // the columns, so the guess has to be visible and checkable
+              // before anyone presses Import — naming the three columns and
+              // the hit rate is what makes it auditable rather than magic.
+              if (p && !p.error && p.note) {
+                out.insertAdjacentHTML('beforeend',
+                  '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:8px;line-height:1.55;">'
+                  + esc(p.note) + '</div>');
+              }
               if (p && p.error) {
                 // NAME THE COLUMNS WHEN NOTHING FITS. "Layout not recognised"
                 // is true and useless; the header row is what lets the next
@@ -33574,6 +33808,7 @@ render();
                   + '<div style="color:var(--ink-3);margin-top:8px;">Widest header row (' + n + ' columns):</div>'
                   + '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-2);margin-top:4px;word-break:break-word;">'
                   + esc(best.slice(0, 30).join(' | ')) + (best.length > 30 ? ' \u2026' : '') + '</div>'
+                  + '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:8px;">Layouts tried \u2014 ' + esc(sheetTried.join(' \u00b7 ')) + '</div>'
                   + '<div style="color:var(--ink-3);margin-top:8px;">Send those column names on and the layout can be added.</div>';
                 return;
               }
