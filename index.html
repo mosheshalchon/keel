@@ -31025,7 +31025,7 @@ render();
   // failures look identical in the UI today and could not be more different.
   function _dedDocProfile(bytes, text) {
     const p = { pages: null, fonts: null, filters: [], textChars: 0, rowLines: 0,
-                sample: null, verdict: 'unknown' };
+                moneyTokens: 0, dateTokens: 0, sample: null, verdict: 'unknown' };
     try {
       const t = String(text || '');
       p.textChars = t.replace(/\s/g, '').length;
@@ -31038,6 +31038,16 @@ render();
       // vendor's address qualifies — '22 BROWNE COURT SUITE 119 SUITE 1' is
       // six tokens and three numbers — and the sample shown to the reader is
       // a letterhead rather than the table.
+      // TOKENS, NOT LINES, ARE THE RELIABLE SIGNAL. The two readers in play
+      // disagree completely about lines: pdftotext puts a row on one line,
+      // Keel's own reader puts every FIELD on its own. Counting money and date
+      // tokens is true of both, and a document with hundreds of amounts is
+      // itemised whatever the whitespace looks like.
+      const tok = t.split(/\s+/);
+      for (const w of tok) {
+        if (/^\$[\d,]*\.?\d+$/.test(w) || /^[\d,]+\.\d{2}$/.test(w)) p.moneyTokens++;
+        else if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(w)) p.dateTokens++;
+      }
       const shapes = new Map();          // token count -> [n, first line]
       for (const ln of t.split('\n')) {
         const w = ln.trim().split(/\s+/);
@@ -31057,6 +31067,14 @@ render();
       let best = null;
       for (const [, e] of shapes) if (!best || e[0] > best[0]) best = e;
       p.sample = best ? best[1].slice(0, 120) : null;
+      // When the reader gives one field per line there IS no row-shaped line,
+      // so show the window around the first amount instead. Seeing the fields
+      // is the whole value of the sample; which side of a newline they fell on
+      // is not.
+      if (!p.sample && p.moneyTokens) {
+        const at = tok.findIndex(w => /^\$[\d,]*\.?\d+$/.test(w));
+        if (at > 0) p.sample = tok.slice(Math.max(0, at - 6), at + 4).join(' ').slice(0, 120);
+      }
 
       // The PDF structure, read as bytes. Crude on purpose — an exact count is
       // not the point, "are there any" is.
@@ -31079,7 +31097,7 @@ render();
 
       // THE VERDICT IS THE POINT. Each one implies a different next action, and
       // saying which is the difference between a diagnosis and a shrug.
-      if (p.rowLines >= 5)                      p.verdict = 'table';      // write a parser
+      if (p.rowLines >= 5 || p.moneyTokens >= 10) p.verdict = 'table';    // write a parser
       else if (p.textChars >= 200)              p.verdict = 'prose';      // text, but no table in it
       else if (p.fonts === 0)                   p.verdict = 'scan';       // OCR is the only route
       else if (p.fonts > 0)                     p.verdict = 'thin';       // fonts but nothing extracted
@@ -31107,6 +31125,8 @@ render();
     if (p.pages != null) bits.push(p.pages + ' page' + (p.pages === 1 ? '' : 's'));
     if (p.fonts != null) bits.push(p.fonts + ' font' + (p.fonts === 1 ? '' : 's'));
     bits.push(p.textChars.toLocaleString() + ' chars of text');
+    bits.push(p.moneyTokens.toLocaleString() + ' amount' + (p.moneyTokens === 1 ? '' : 's'));
+    if (p.dateTokens) bits.push(p.dateTokens.toLocaleString() + ' date' + (p.dateTokens === 1 ? '' : 's'));
     bits.push(p.rowLines.toLocaleString() + ' row-shaped line' + (p.rowLines === 1 ? '' : 's'));
     if (p.filters.length) bits.push('filters: ' + p.filters.join(', '));
     return `<div style="margin-top:12px;padding:11px 13px;border:1px solid var(--rule);border-left-width:3px;border-radius:5px;">
@@ -31152,7 +31172,13 @@ render();
     const re = new RegExp(
       '([A-Z0-9][A-Z0-9-]{2,})\\s+' +        // contract, e.g. BM441752
       '(\\d{11,14})\\s+' +                    // UPC
-      '(.+?)\\s+' +                          // vendor + item description
+      // [\\s\\S], NOT '.': Keel's own PDF reader emits ONE FIELD PER LINE —
+      // every Td operator becomes a newline — so the description sits across
+      // two lines and '.' cannot cross one. pdftotext -layout puts a whole row
+      // on one line and hides this completely, which is exactly how a parser
+      // passes every test and then finds nothing in the product.
+      // Bounded at 80 so a malformed row cannot swallow the rest of the file.
+      '([\\s\\S]{1,80}?)\\s+' +               // vendor + item description
       '(UNITS|CASES?|LBS?|EACH)\\s+' +       // basis
       '\\$([\\d,]*\\.?\\d+)\\s+' +             // rate — '$.45' has no leading zero
       '(' + D + ')\\s+(' + D + ')\\s+' +     // period start, period end
@@ -33199,8 +33225,8 @@ render();
                   const G = itRows.groups || [];
                   const tot = G.reduce((n, r) => n + r.amt, 0);
                   const totU = G.reduce((n, r) => n + r.units, 0);
-                  out += `<tr><td colspan="9" style="padding:0;border-bottom:1px solid var(--rule-soft);background:var(--rule-softer);">
-                    <table style="width:100%;border-collapse:collapse;margin:2px 0 6px 32px;">
+                  out += `<tr><td colspan="9" style="padding:0 0 0 32px;border-bottom:1px solid var(--rule-soft);background:var(--rule-softer);">
+                    <table style="width:100%;border-collapse:collapse;margin:2px 0 6px;table-layout:auto;">
                       <thead><tr>${['Product line', 'Items included', 'Promos', 'Units', 'Rate', 'Spend', '% of line'].map((h, i) =>
                         `<th style="text-align:${i > 2 ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
                       <tbody>${G.map(g => `<tr>
@@ -33215,9 +33241,9 @@ render();
                           return P.length <= 4 ? P.map(esc).join(' ') : esc(P.slice(0, 3).join(' ')) + ' +' + (P.length - 3);
                         })()}</td>
                         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${g.units ? g.units.toLocaleString() : '\u2014'}</td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014'}</td>
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);">${g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014'}</td>
                         <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${money(g.amt)}</td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--ink-3);">${tot ? (g.amt / tot * 100).toFixed(1) + '%' : ''}</td></tr>`).join('')}
+                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);">${tot ? (g.amt / tot * 100).toFixed(1) + '%' : ''}</td></tr>`).join('')}
                       </tbody>
                       <tfoot><tr>
                         <td style="padding:7px 10px;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>Total</strong></td>
@@ -33227,9 +33253,9 @@ render();
                           return all.size ? all.size + ' promo' + (all.size === 1 ? '' : 's') : '';
                         })()}</td>
                         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${totU.toLocaleString()}</strong></td>
-                        <td style="border-top:1px solid var(--rule);"></td>
+                        <td style="padding:7px 10px;border-top:1px solid var(--rule);"></td>
                         <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${money(tot)}</strong></td>
-                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">100%</td>
+                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);border-top:1px solid var(--rule);">100%</td>
                       </tr></tfoot></table></td></tr>`;
                 }
               }
