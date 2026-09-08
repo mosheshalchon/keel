@@ -30865,7 +30865,7 @@ render();
         <div id="hl-ded-drop" style="border:1.5px dashed var(--rule);border-radius:8px;padding:26px 18px;text-align:center;cursor:pointer;background:transparent;transition:background .15s;">
           <div style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">Drop PDFs here, or click to choose</div>
           <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">Multiple files are fine. Large scans take a few seconds each.</div>
-          <input type="file" id="hl-ded-file" accept=".pdf,application/pdf" multiple style="display:none;">
+          <input type="file" id="hl-ded-file" accept=".pdf,.xlsx,.xls,.csv,.txt" multiple style="display:none;">
         </div>
       </div>
       <div id="hl-ded-up-list"></div>`;
@@ -30886,29 +30886,66 @@ render();
     const listEl = document.getElementById('hl-ded-up-list');
 
     async function handle(files) {
-      const pdfs = files.filter(f => /\.pdf$/i.test(f.name));
-      if (!pdfs.length) return;
-      for (const f of pdfs) {
+      // SPREADSHEETS TOO. A third of the deduction folder is xlsx and this tab
+      // took none of it -- the Natural Grocers scanbacks, the WFM ISE files and
+      // the UNFI CSV layouts all arrived here and were silently ignored,
+      // because a filter that drops a file without saying so looks identical to
+      // a file that nobody uploaded.
+      const usable = files.filter(f => /\.(pdf|xlsx|xls|csv|txt)$/i.test(f.name));
+      if (!usable.length) return;
+      for (const f of usable) {
         const entry = { file: f, status: 'reading', note: 'reading…', head: null, rows: [],
                         line: null, existing: null, chosen: false };
         _dedUploadState.push(entry);
         paint();
         try {
           const buf = await f.arrayBuffer();
-          const text = await _dedPdfText(buf, (n) => { entry.note = 'reading… ' + n + ' streams'; paint(); });
-          if (text.replace(/\s+/g, '').length < 40) {
-            entry.status = 'fail'; entry.note = 'no text layer — this is an image-only scan, nothing to read';
-            paint(); continue;
+          let p = null;
+
+          if (/\.(xlsx|xls|csv|txt)$/i.test(f.name)) {
+            const wb = XLSX.read(buf, { type: 'array' });
+            const grid = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],
+                                                  { header: 1, defval: '', raw: false });
+            const rows = grid.map(r => (r || []).map(c => String(c == null ? '' : c)));
+            p = _dedParseNgScanback(rows);
+            if (!p || p.error) {
+              // Name the columns rather than the failure. "Layout not
+              // recognised" is true and useless; the header row is what lets
+              // the next layout be written without opening the file by hand.
+              let best = [], n = -1;
+              for (const r of rows.slice(0, 15)) {
+                const filled = r.filter(c => c.trim() !== '');
+                if (filled.length > n) { n = filled.length; best = filled; }
+              }
+              entry.status = 'fail';
+              entry.note = 'no spreadsheet layout recognised — widest header (' + n + ' cols): '
+                         + best.slice(0, 12).join(' | ') + (best.length > 12 ? ' …' : '');
+              paint(); continue;
+            }
+          } else {
+            const text = await _dedPdfText(buf, (n) => { entry.note = 'reading… ' + n + ' streams'; paint(); });
+            if (text.replace(/\s+/g, '').length < 40) {
+              entry.status = 'fail';
+              entry.note = 'no text layer — this is an image-only scan. Use the FILE button on its register line to send it to the OCR pass.';
+              paint(); continue;
+            }
+            // EVERY LAYOUT IS TRIED and the one that TIES wins. The Distributor
+            // Charge layout used to be refused here and pointed at mode=detail
+            // -- which cannot read it, because those documents are scans. It
+            // parses perfectly when the text is there.
+            for (const fn of [_dedParseDistCharge, _dedParseKsolve]) {
+              let r = null;
+              try { r = fn(text); } catch (e) { continue; }
+              if (!r || !r.rows || !r.rows.length) continue;
+              if (r.ties) { p = r; break; }
+              if (!p) p = r;                       // keep the best near-miss to report
+            }
+            if (!p) {
+              entry.status = 'fail';
+              entry.note = 'read the file but no layout fitted — head: ' + text.replace(/\s+/g, ' ').slice(0, 90);
+              paint(); continue;
+            }
           }
-          // Routed on what the document calls itself. Only the K-Solve family is
-          // handled here; the Distributor Charge and Vendor Chargeback layouts
-          // parse fine server-side and have no reason to come through the browser.
-          if (/DISTRIBUTOR CHARGE/i.test(text) || /VENDOR CHARGEBACK/i.test(text)) {
-            entry.status = 'fail';
-            entry.note = 'this is a Distributor Charge / Vendor Chargeback layout — run sync-deductions mode=detail instead';
-            paint(); continue;
-          }
-          const p = _dedParseKsolve(text);
           entry.head = p.head; entry.rows = p.rows; entry.parsed_total = p.line_total; entry.ties = p.ties;
           if (!p.rows.length) {
             entry.status = 'fail';
@@ -30916,7 +30953,15 @@ render();
             paint(); continue;
           }
           if (!p.head.invoice_no) {
-            entry.status = 'fail'; entry.note = 'no invoice number on the cover — cannot attach to a register line';
+            // A scanback spreadsheet names its CONTRACT, not an invoice, so it
+            // cannot find its own register line. On the per-line FILE button
+            // the line is already chosen and this never arises -- which is why
+            // that is the better route for these.
+            entry.status = 'fail';
+            entry.note = /\.(xlsx|xls|csv|txt)$/i.test(f.name)
+              ? 'read ' + p.rows.length + ' rows totalling ' + money(p.line_total)
+                + ' — but a scanback carries no invoice number, so use the FILE button on the register line instead'
+              : 'no invoice number on the cover — cannot attach to a register line';
             paint(); continue;
           }
           if (!p.ties) {
