@@ -32675,30 +32675,45 @@ render();
         go.onclick = async () => {
           if (!parsed) return;
           arm(false); go.textContent = 'Importing\u2026';
+          // NAME THE STEP. "Importing..." forever tells you nothing about which
+          // of four round trips is hanging, and a request that never returns
+          // raises no error to catch -- so the only diagnostic is saying out
+          // loud what is being attempted.
+          const step = (t) => { out.innerHTML = '<span style="color:var(--ink-3);">' + t + '\u2026</span>'; };
+          // A call that never resolves would otherwise hang the button for
+          // ever; 30s is far beyond a healthy round trip.
+          const guard = (pr, label) => Promise.race([pr,
+            new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' did not respond within 30s')), 30000))]);
           try {
+            step('Reading the banner map');
             const bmap = new Map();
             try {
-              const { data } = await sb.from('deduction_banner_map').select('banner_raw,banner').eq('brand_id', brandId);
+              const { data } = await guard(sb.from('deduction_banner_map').select('banner_raw,banner').eq('brand_id', brandId), 'banner map');
               for (const b of (data || [])) if (b.banner) bmap.set(b.banner_raw, b.banner);
             } catch (e3) { /* an unmapped banner is survivable; a failed import is not */ }
             // DELETE FIRST, so re-uploading the same file replaces its rows
             // rather than adding a second copy. Idempotent by construction, not
             // by trusting detail_parsed.
-            const { error: dErr } = await sb.from('deduction_detail').delete().eq('line_id', l.id);
+            step('Clearing any existing rows on this line');
+            const { error: dErr } = await guard(
+              sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', l.id), 'delete');
             if (dErr) throw new Error('clearing existing rows: ' + dErr.message);
             const rows = parsed.rows.map(r => {
               const cand = _dedBannerCandidate(r.customer_name);
               return _dedDetailRow(r, brandId, l.id, (cand && bmap.get(cand)) || cand);
             });
             for (let k = 0; k < rows.length; k += 500) {
-              const { error } = await sb.from('deduction_detail').insert(rows.slice(k, k + 500));
+              step('Writing rows ' + (k + 1) + '-' + Math.min(k + 500, rows.length) + ' of ' + rows.length);
+              const { error } = await guard(
+                sb.from('deduction_detail').insert(rows.slice(k, k + 500)), 'insert');
               if (error) throw new Error(error.message);
             }
-            const { error: uErr } = await sb.from('deduction_lines').update({
+            step('Updating the register line');
+            const { error: uErr } = await guard(sb.from('deduction_lines').update({
               detail_parsed: true,
               detail_line_total: parsed.line_total,
               detail_variance: Math.round((amt - parsed.line_total) * 100) / 100,
-            }).eq('id', l.id);
+            }).eq('id', l.id), 'line update');
             if (uErr) throw new Error('updating the register line: ' + uErr.message);
             out.innerHTML = '<span style="color:var(--won);">Imported ' + rows.length.toLocaleString() + ' rows.</span>'
               + '<div style="color:var(--ink-3);margin-top:6px;">The store views read a stored snapshot \u2014 run '
@@ -32708,7 +32723,15 @@ render();
             _dedRaw = null;
             setTimeout(() => { wrap.remove(); renderDeductions(hostEl, filtersEl, year); }, 1400);
           } catch (err) {
-            out.innerHTML = '<span style="color:var(--lost);">Import failed: ' + esc(String(err && err.message || err)) + '</span>';
+            const m = String(err && err.message || err);
+            out.innerHTML = '<span style="color:var(--lost);">Import failed: ' + esc(m) + '</span>'
+              // A rejected column is the commonest cause and the message names
+              // it -- printing the row shape beside it saves a round trip.
+              + (/column|schema cache/i.test(m) && parsed.rows[0]
+                 ? '<div style="color:var(--ink-3);margin-top:8px;font-size:10.5px;">First row sent: '
+                   + esc(Object.keys(_dedDetailRow(parsed.rows[0], brandId, l.id, null)).join(', ')) + '</div>'
+                 : '');
+            console.error('[deductions] import failed', err);
             arm(true); go.textContent = 'Import';
           }
         };
