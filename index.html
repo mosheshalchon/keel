@@ -29341,20 +29341,14 @@ render();
     'Fees & penalties': 'Charges on top of merchandise: freight, processing fees, late-delivery fines. Mostly absent from Vividly.',
     'Unclassified': 'No category mapped yet. Ranked by dollars — mapping the top few moves most of this.',
   };
+  // LANDS ON 'exec' — the panel page, now labelled Executive summary. No
+  // one-time override is needed: that has always been the default, so every
+  // saved view already points somewhere sensible and nobody gets moved off the
+  // tab they chose.
   let _dedView = (() => {
-    try {
-      // ONE-TIME LANDING, THEN THE SAVED PREFERENCE RULES AGAIN FOR GOOD. Every
-      // existing user has a view saved from before the Executive summary
-      // existed, so without this nobody would ever see it unless they went
-      // looking for it by name — which defeats the point of a landing page.
-      // Shown once per browser, never forced again.
-      if (!localStorage.getItem('keel_ded_xs_seen')) {
-        localStorage.setItem('keel_ded_xs_seen', '1');
-        return 'execsum';
-      }
-      const v = DED_VIEW_MOVED[localStorage.getItem('keel_ded_view')] || localStorage.getItem('keel_ded_view');
-      return DED_VIEWS.includes(v) ? v : 'execsum';
-    } catch (e) { return 'execsum'; }
+    try { const v = DED_VIEW_MOVED[localStorage.getItem('keel_ded_view')] || localStorage.getItem('keel_ded_view');
+          return DED_VIEWS.includes(v) ? v : 'exec'; }
+    catch (e) { return 'exec'; }
   })();
   let _dedDetail = null;          // cached store-level detail for the Customer tab
   let _dedOpen = new Set();       // which customers are expanded
@@ -31496,8 +31490,8 @@ render();
     // rows both saying Customer taught the reader nothing; this way the screen
     // states the payer-vs-retailer split the whole deduction book runs on.
     const VIEW_LABELS = {
-      execsum:    'Executive summary',
-      exec:       'Summary',
+      exec:       'Executive summary',
+      execsum:    'To-dos',
       customer:   'Retailer',
       summary:    'Category',
       reconcile:  'Reconcile vs. plan',
@@ -31513,7 +31507,7 @@ render();
     // Row 2 answers "how much, and from whom". Row 3 is everything that
     // supports that answer — the rows themselves, the documents, the plumbing.
     const VIEW_ROWS = [
-      ['Deduction overview', ['execsum', 'exec', 'customer', 'summary', 'reconcile']],
+      ['Deduction overview', ['exec', 'customer', 'summary', 'reconcile', 'execsum']],
       ['Support',            ['lines', 'promos', 'checks', 'support', 'exceptions', 'callouts', 'upload', 'catalogue']],
     ];
     // NOTES CARRIED OVER FROM THE FLAT LIST THIS REPLACED, because the reasons
@@ -33223,22 +33217,26 @@ render();
     // holding the whole screen hostage — this view is the landing page now, and
     // a landing page that blocks for several seconds is worse than no landing
     // page at all.
-    // ── EXECUTIVE SUMMARY ────────────────────────────────────────────────────
-    // THE LANDING VIEW. Everything else on this page is a way of interrogating
-    // the book; this is the one screen that states where it stands without
-    // being asked a question first. Four bands, in the order the questions
-    // actually arrive:
+    // ── TO-DOS ───────────────────────────────────────────────────────────────
+    // THE WORKLIST. Sits to the right of Reconcile vs. plan because that is the
+    // order the questions arrive in: what was taken, who took it, how it splits,
+    // whether it matches the plan — and then, given all that, what to go and do.
     //
-    //   1 what was taken, and is it in line with the plan
+    //   1 where the book stands, so the worklist has a denominator
     //   2 where the variance comes from
     //   3 what needs doing, in dollar order
     //   4 whether any of it is current
     //
     // Deliberately NOT here: line counts, check counts, fee totals, unmapped
-    // code counts. Every one is on the Summary tab a click away, and a summary
-    // that lists nine numbers is not a summary. Band 4 is small type but it is
-    // not optional — the whole postmortem history of this module is feeds
-    // dying quietly while the screen looked fine, so "as of" earns its place.
+    // code counts. Every one is a click away and none of them is an action.
+    // Band 4 is small type but it is not optional — the whole postmortem
+    // history of this module is feeds dying quietly while the screen looked
+    // fine, so "as of" earns its place.
+    //
+    // Bands 1 and 2 restate figures the Executive summary also shows. That is
+    // the same deliberate duplication as the big-ticket block below: same
+    // helpers, same inputs, no second copy of the maths, so either can be cut
+    // to a single line once Moshe decides which page keeps them.
     if (_dedView === 'execsum') {
       const fig = (lbl, val, sub, tone) => `
         <div class="ded-xs-fig">
