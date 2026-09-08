@@ -30414,6 +30414,8 @@ render();
         whole charge as a rate. Where a line's own reason code already says EDLP but no detail was ever parsed, the line counts at the
         only grain it has and lands under <strong>(no item detail)</strong> \u2014 real money, no product and no rate, so earned stays
         blank against it. A line is read one way or the other, never both.
+        Corrections made with <strong>SET</strong> on the Deductions tab \u2014 customer, and the promo date that decides the month \u2014
+        are read here too, so a fact is stated in one place and every tab follows. That is why this tab has no edit of its own.
       </p>`;
 
     body.querySelectorAll('.hl-edlp-row, .hl-edlp-mrow').forEach(b => b.onclick = (ev) => {
