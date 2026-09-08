@@ -30971,6 +30971,12 @@ render();
       reference_date: _dedIsoDate(r.ship_date),
       ship_qty: isFinite(r.ship_qty) ? r.ship_qty : null,
       discount_pct: isFinite(r.discount_pct) ? r.discount_pct : null,
+      // THE PER-UNIT RATE, WHEN THE DOCUMENT STATES ONE. Dropping it was
+      // invisible until EDLP needed it: that tab identifies a deduction as EDLP
+      // by matching this against the customer's agreed rate, so a parser that
+      // read '$.45' off every row and then threw it away meant the deduction
+      // could never be recognised as the thing it plainly is.
+      unit_chargeback: isFinite(r.unit_chargeback) ? r.unit_chargeback : null,
       bill_amount: Math.abs(r.bill_amount),
     };
   }
@@ -31002,6 +31008,205 @@ render();
   // Self-verifying twice: Qty equals the sum of the row's store cells, and
   // Qty x Scan $ equals the contract's stated total. Verified against the real
   // files at $41,420.53 (August) and $36,974.08 (October).
+  // ── WHAT IS ACTUALLY IN THIS DOCUMENT ────────────────────────────────────
+  // Six numbers, computed from bytes already in memory, costing nothing.
+  //
+  // THIS EXISTS BECAUSE "I CANNOT READ THIS" WAS NEVER ONCE CHECKED. SN was
+  // parked as OCR-only — "every page is an inline bitmap" — and has a full
+  // Times-Roman text layer on all 64 pages. The ImageIt family was routed to
+  // OCR because the stream reader only tried two decompressors and their
+  // streams are not compressed at all. The OCR queue skipped 250 documents
+  // because none matched a profile, and reported success throughout.
+  //
+  // Every one of those was a claim about a document that nobody tested, and
+  // each cost hours or real money. A profile turns "no layout fitted" from a
+  // dead end into evidence: 64 pages, 64 fonts, 1,414 row-shaped lines means
+  // WRITE A PARSER. 64 pages, 0 fonts, 0 row-shaped lines means OCR. The two
+  // failures look identical in the UI today and could not be more different.
+  function _dedDocProfile(bytes, text) {
+    const p = { pages: null, fonts: null, filters: [], textChars: 0, rowLines: 0,
+                sample: null, verdict: 'unknown' };
+    try {
+      const t = String(text || '');
+      p.textChars = t.replace(/\s/g, '').length;
+
+      // A ROW-SHAPED LINE is the signal that matters: enough fields, at least
+      // two of them numeric, at least one money-ish. Prose and headers do not
+      // qualify; a table of any layout does. This is what separates "there is
+      // text" from "there is a table" — a cover sheet has plenty of the first.
+      // A row needs MONEY OR A DATE, not merely digits. Without that test the
+      // vendor's address qualifies — '22 BROWNE COURT SUITE 119 SUITE 1' is
+      // six tokens and three numbers — and the sample shown to the reader is
+      // a letterhead rather than the table.
+      const shapes = new Map();          // token count -> [n, first line]
+      for (const ln of t.split('\n')) {
+        const w = ln.trim().split(/\s+/);
+        if (w.length < 5) continue;
+        const nums = w.filter(x => /^[\$(]?[\d,]*\.?\d+[)%]?$/.test(x)).length;
+        if (nums < 2) continue;
+        const money = w.some(x => /^\$/.test(x) || /^[\d,]+\.\d{2}$/.test(x));
+        const date  = w.some(x => /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(x));
+        if (!money && !date) continue;
+        p.rowLines++;
+        const clean = ln.trim().replace(/\s+/g, ' ');
+        const e = shapes.get(w.length) || [0, clean];
+        e[0]++; shapes.set(w.length, e);
+      }
+      // The sample comes from the MOST COMMON shape, so it represents the
+      // table rather than whichever oddity happened to appear first.
+      let best = null;
+      for (const [, e] of shapes) if (!best || e[0] > best[0]) best = e;
+      p.sample = best ? best[1].slice(0, 120) : null;
+
+      // The PDF structure, read as bytes. Crude on purpose — an exact count is
+      // not the point, "are there any" is.
+      if (bytes && bytes.byteLength) {
+        const u = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        // latin1 so byte offsets and string offsets agree; the tokens we look
+        // for are all ASCII.
+        let head = '';
+        const CH = 65536;
+        for (let i = 0; i < u.length; i += CH) {
+          head += String.fromCharCode.apply(null, u.subarray(i, Math.min(i + CH, u.length)));
+        }
+        p.pages  = (head.match(/\/Type\s*\/Page[^s]/g) || []).length || null;
+        p.fonts  = (head.match(/\/BaseFont/g) || []).length;
+        const f = new Set();
+        for (const m of head.match(/\/Filter\s*\/?\[?\s*\/(\w+)/g) || []) f.add(m.replace(/.*\//, ''));
+        p.filters = [...f];
+        if (/\bBI\b[\s\S]{0,200}?\bID\b/.test(head) && p.fonts === 0) p.filters.push('inline images');
+      }
+
+      // THE VERDICT IS THE POINT. Each one implies a different next action, and
+      // saying which is the difference between a diagnosis and a shrug.
+      if (p.rowLines >= 5)                      p.verdict = 'table';      // write a parser
+      else if (p.textChars >= 200)              p.verdict = 'prose';      // text, but no table in it
+      else if (p.fonts === 0)                   p.verdict = 'scan';       // OCR is the only route
+      else if (p.fonts > 0)                     p.verdict = 'thin';       // fonts but nothing extracted
+      // fonts === null means the bytes were never seen, so nothing is known.
+      // Guessing 'scan' here would recreate the exact error this function
+      // exists to prevent: an unexamined claim that a file cannot be read.
+    } catch (e) { console.warn('[deductions] document profile failed:', e); }
+    return p;
+  }
+
+  // One line the reader can act on, plus the numbers behind it.
+  function _dedProfileHtml(p, esc) {
+    const say = {
+      table: ['var(--lost)', 'There IS a table here and no parser matched it.',
+              'The rows are readable text. This needs a layout, not OCR \u2014 send the file on.'],
+      prose: ['var(--ink-3)', 'Readable text, but nothing table-shaped in it.',
+              'Often a cover sheet whose detail is a separate file. Check what else is in the folder.'],
+      scan:  ['var(--ink-3)', 'No embedded fonts \u2014 this really is a picture.',
+              'OCR is the only route. Nothing in the browser can read it.'],
+      thin:  ['var(--lost)', 'Fonts are present but almost no text came out.',
+              'The reader, not the document, is likely at fault \u2014 worth reporting.'],
+      unknown: ['var(--ink-3)', 'Could not profile the document.', ''],
+    }[p.verdict] || ['var(--ink-3)', '', ''];
+    const bits = [];
+    if (p.pages != null) bits.push(p.pages + ' page' + (p.pages === 1 ? '' : 's'));
+    if (p.fonts != null) bits.push(p.fonts + ' font' + (p.fonts === 1 ? '' : 's'));
+    bits.push(p.textChars.toLocaleString() + ' chars of text');
+    bits.push(p.rowLines.toLocaleString() + ' row-shaped line' + (p.rowLines === 1 ? '' : 's'));
+    if (p.filters.length) bits.push('filters: ' + p.filters.join(', '));
+    return `<div style="margin-top:12px;padding:11px 13px;border:1px solid var(--rule);border-left-width:3px;border-radius:5px;">
+      <div style="font-family:var(--serif);font-size:14px;color:${say[0]};">${esc(say[1])}</div>
+      ${say[2] ? `<div style="font-family:var(--serif);font-size:13px;color:var(--ink-3);margin-top:4px;line-height:1.55;">${esc(say[2])}</div>` : ''}
+      <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:8px;">${esc(bits.join(' \u00b7 '))}</div>
+      ${p.sample ? `<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-2);margin-top:7px;white-space:pre-wrap;word-break:break-all;">${esc(p.sample)}</div>` : ''}
+    </div>`;
+  }
+
+  // ── KeHE SCAN DEDUCTION (PDF) ────────────────────────────────────────────
+  // The layout behind every SN line — Sprouts scans billed through KeHE. One
+  // row per STORE per item, 1,414 of them across 64 pages in the file that
+  // prompted this, and every field EDLP needs is printed in plain text:
+  // contract, UPC, item, basis, RATE, period start, period end, store, units,
+  // amount.
+  //
+  // The postmortem lists SN as "the one genuinely hard problem left" because
+  // twelve of these were believed to be inline bitmaps needing page-at-a-time
+  // OCR. This file has a full Times-Roman text layer on all 64 pages. Either
+  // the family is mixed or that diagnosis was made on a different vintage —
+  // either way, TRY THE TEXT FIRST. Nothing else in this module has ever been
+  // improved by assuming a document could not be read.
+  //
+  // TWO TOTALS, AND ONLY ONE OF THEM TIES. The document ends with
+  //     Total                                   $10,123.20   <- the scans
+  //     KeHE EP Fee                                $700.00
+  //     Total For: AGAINST THE GRAIN GOURMET   $10,823.20    <- the register line
+  // The rows sum to the FIRST. Tying against the second would fail by exactly
+  // the fee on every file forever, so head.total is the scan total and the fee
+  // is reported separately; the register line legitimately exceeds the detail,
+  // which is what the existing feeOk gap check already allows for.
+  //
+  // NO RETAILER IS NAMED ANYWHERE IN THE DOCUMENT. It prints the vendor and the
+  // broker (Presence Marketing) and identifies stores by number alone. So
+  // customer_name is left null rather than guessed at from the store numbers —
+  // the line already knows it is Sprouts, and the importer fills it from there.
+  function _dedParseKeheScan(text) {
+    const t = String(text || '');
+    // Spacing cannot be trusted: pdftotext -layout gives columns, the browser's
+    // own stream reader gives single spaces. Every field is matched by SHAPE.
+    const D = '\\d{1,2}\\/\\d{1,2}\\/(?:\\d{2}|\\d{4})';
+    const re = new RegExp(
+      '([A-Z0-9][A-Z0-9-]{2,})\\s+' +        // contract, e.g. BM441752
+      '(\\d{11,14})\\s+' +                    // UPC
+      '(.+?)\\s+' +                          // vendor + item description
+      '(UNITS|CASES?|LBS?|EACH)\\s+' +       // basis
+      '\\$([\\d,]*\\.?\\d+)\\s+' +             // rate — '$.45' has no leading zero
+      '(' + D + ')\\s+(' + D + ')\\s+' +     // period start, period end
+      '(\\S+)\\s+' +                          // store
+      '([\\d,]+)\\s+' +                       // units
+      '\\$([\\d,]*\\.\\d{2})',                 // extended amount
+      'g');
+
+    const rows = [];
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      // GROUPS, COUNTED ONCE AND WRITTEN DOWN, because getting this wrong is
+      // silent: reading the quantity as the amount still produces 1,414 tidy
+      // rows and a total that simply is not the document's.
+      //   1 contract  2 upc  3 description  4 basis  5 rate
+      //   6 period from  7 period to  8 store  9 units  10 amount
+      const rate = Number(String(m[5]).replace(/,/g, ''));
+      const qty  = Number(String(m[9]).replace(/,/g, ''));
+      const amt  = Number(String(m[10]).replace(/,/g, ''));
+      if (!isFinite(amt)) continue;
+      // The description holds the vendor name and the item; where the spacing
+      // survived, the item is the second half.
+      const mid = m[3].trim();
+      const parts = mid.split(/\s{2,}/);
+      rows.push({
+        upc: m[2], item_desc: (parts.length > 1 ? parts[parts.length - 1] : mid).trim(),
+        reference_no: m[1], ship_date: m[6], date_to: m[7],
+        customer_name: null, customer_no: null,
+        store_no: String(m[8]), ship_qty: qty,
+        unit_chargeback: isFinite(rate) ? rate : null,
+        unit_cost: null, discount_pct: null, bill_amount: amt,
+      });
+    }
+    if (!rows.length) return { error: 'kehe scan: no rows', rows: [] };
+
+    // 'Total For:' is the grand total INCLUDING the fee. Exclude it explicitly
+    // rather than relying on which one appears first.
+    let stated = null;
+    const tre = /Total(\s+For:[^$\n]*)?\s+\$([\d,]+\.\d{2})/g;
+    let tm;
+    while ((tm = tre.exec(t)) !== null) if (!tm[1]) stated = Number(tm[2].replace(/,/g, ''));
+    const feeM = t.match(/EP\s*Fee\s+\$([\d,]+\.\d{2})/i);
+    const invM = t.match(/\bSN\d{6,}\b/);
+
+    const lineTotal = Math.round(rows.reduce((n, r) => n + r.bill_amount, 0) * 100) / 100;
+    return {
+      head: { invoice_no: invM ? invM[0] : null, total: stated,
+              type: 'KeHE scan deduction', dc: rows[0].reference_no,
+              fee: feeM ? Number(feeM[1].replace(/,/g, '')) : null },
+      rows, line_total: lineTotal,
+      ties: stated != null && Math.abs(lineTotal - stated) < 0.01,
+    };
+  }
+
   function _dedParseNgScanback(rows) {
     const U = (v) => String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9%$]/g, '');
     const N = (v) => { if (v == null || String(v).trim() === '') return null;
@@ -33255,7 +33460,8 @@ render();
                 return;
               }
             } else {
-              const text = await _dedPdfText(await f.arrayBuffer(),
+              const _buf = await f.arrayBuffer();
+              const text = await _dedPdfText(_buf,
                 (n) => { out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026 ' + n + ' streams</span>'; });
               if (!text || text.replace(/\s/g, '').length < 40) {
                 // ── NO TEXT LAYER: OFFER THE ROUTE THAT DOES WORK ──────────
@@ -33263,9 +33469,13 @@ render();
                 // a database administrator. The OCR pass reads the copy in
                 // Dropbox, so all that is needed is to put this line's file
                 // back in its queue and fire one call.
-                out.innerHTML = '<span style="color:var(--lost);">No text layer \u2014 this is a scan.</span>'
-                  + '<div style="color:var(--ink-3);margin-top:8px;">Nothing in the browser can read a picture of a table. '
-                  + 'The OCR pass can, working from the copy already in Dropbox.</div>'
+                // PROVE IT BEFORE SENDING ANYONE TO OCR. This branch is exactly
+                // where SN was misdiagnosed and parked for weeks. If the profile
+                // says fonts are present, the reader is the suspect, not the file.
+                const _pf = _dedDocProfile(_buf, text);
+                out.innerHTML = '<span style="color:var(--lost);">No text came out of this file.</span>'
+                  + _dedProfileHtml(_pf, esc)
+                  + '<div style="color:var(--ink-3);margin-top:8px;">The OCR pass reads the copy already in Dropbox.</div>'
                   + '<button id="hl-up-ocr" style="margin-top:12px;font-family:var(--mono);font-size:12px;padding:9px 18px;border-radius:6px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Read it with OCR</button>';
                 const ob = document.getElementById('hl-up-ocr');
                 if (ob) ob.onclick = async () => {
@@ -33293,7 +33503,7 @@ render();
               // scale, and a document that ties is better evidence of its own
               // layout than a phrase somewhere in its text.
               const tried = [];
-              for (const [nm, fn] of [['Distributor Charge', _dedParseDistCharge], ['K-Solve', _dedParseKsolve]]) {
+              for (const [nm, fn] of [['Distributor Charge', _dedParseDistCharge], ['K-Solve', _dedParseKsolve], ['KeHE scan', _dedParseKeheScan]]) {
                 let r = null;
                 try { r = fn(text); } catch (e6) { tried.push(nm + ': threw'); continue; }
                 if (!r || !r.rows || !r.rows.length) { tried.push(nm + ': no rows'); continue; }
@@ -33303,8 +33513,13 @@ render();
                 if (!p) p = r;                        // keep the best near-miss to report
               }
               if (!p) {
+                // "No layout fitted" is a fact about KEEL, not about the file.
+                // Saying only that is what made a perfectly readable 64-page
+                // table look like a dead end for weeks.
                 out.innerHTML = '<span style="color:var(--lost);">Read the file but no layout fitted.</span>'
-                  + '<div style="color:var(--ink-3);margin-top:6px;">' + esc(tried.join(' \u00b7 ')) + '</div>';
+                  + _dedProfileHtml(_dedDocProfile(_buf, text), esc)
+                  + '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:8px;">Layouts tried \u2014 '
+                  + esc(tried.join(' \u00b7 ')) + '</div>';
                 return;
               }
             }
@@ -33373,8 +33588,16 @@ render();
             const { error: dErr } = await guard(
               sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', l.id), 'delete');
             if (dErr) throw new Error('clearing existing rows: ' + dErr.message);
+            // A DOCUMENT THAT NAMES NO RETAILER INHERITS THE LINE'S. The KeHE
+            // scan files identify stores by number and never print the banner,
+            // so the parser correctly reports null rather than guessing. But the
+            // line already knows — it is attributed to Sprouts by its reason
+            // code — and a detail row with no banner reaches no rollup at all.
+            // The line's own attribution is the fallback, never an override:
+            // where the document does name a customer, the document wins.
+            const lineCust = (custFull(l) || {}).name || null;
             const rows = parsed.rows.map(r => {
-              const cand = _dedBannerCandidate(r.customer_name);
+              const cand = _dedBannerCandidate(r.customer_name || lineCust);
               return _dedDetailRow(r, brandId, l.id, (cand && bmap.get(cand)) || cand);
             });
             for (let k = 0; k < rows.length; k += 500) {
