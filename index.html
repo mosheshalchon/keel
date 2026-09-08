@@ -31008,6 +31008,49 @@ render();
   // Self-verifying twice: Qty equals the sum of the row's store cells, and
   // Qty x Scan $ equals the contract's stated total. Verified against the real
   // files at $41,420.53 (August) and $36,974.08 (October).
+  // ── THE GAP BETWEEN THE DETAIL AND THE LINE ──────────────────────────────
+  // Every deduction has the same shape: some of it is itemised, some is not.
+  // This states the unitemised part as a figure and a percentage, and stops
+  // there. It names nothing.
+  //
+  // AN EARLIER VERSION TRIED TO NAME IT, and that was the mistake. It carried
+  // two tables of fee percentages — a 3% retailer administrative fee, a 15%
+  // distributor processing fee capped at $750 — and decomposed the gap when the
+  // arithmetic landed on the line to the penny. It was correct for Natural
+  // Grocers billed through UNFI and it was a one-time solve: a customer at 12%,
+  // or a month where the 60-day clock never tripped, and it explains nothing.
+  // Worse, a COINCIDENTAL fit reads exactly like a real one, and a confident
+  // wrong explanation is more dangerous than a blank.
+  //
+  // The percentage does the work instead. 5% and you know it is fees. 15% and
+  // you know which fee. 43% and you know rows are missing. Keel does not have
+  // to name it; it has to show it clearly enough that Moshe can, and above all
+  // to stop hiding it.
+  //
+  // THRESHOLD: shown unless the gap is under $1 AND under 0.1%. The asymmetry
+  // is deliberate — clutter is cheap, a hidden gap is the exact failure this
+  // page exists to prevent. A flat dollar floor alone would be wrong anyway:
+  // the KeHE scan files carry genuine rows of $0.45.
+  //
+  // NEGATIVE IS A DIFFERENT ANIMAL and gets different words. Detail exceeding
+  // its line is not unexplained money, it is a contradiction — a double count,
+  // a wrong line match, or a document imported against the wrong invoice. Note
+  // it is a different grain from the over-claim finding on the To-dos list:
+  // that compares a CHECK to its lines, this compares a LINE to its detail.
+  function _dedLineGap(detail, line) {
+    const d = Number(detail), L = Number(line);
+    if (!isFinite(d) || !isFinite(L) || L === 0) return null;
+    const gap = Math.round((L - d) * 100) / 100;
+    if (gap === 0) return null;
+    const pct = Math.abs(gap / L * 100);
+    if (Math.abs(gap) < 1 && pct < 0.1) return null;   // rounding, not a finding
+    return {
+      gap, pct,
+      over: gap < 0,
+      label: gap < 0 ? 'Detail exceeds the line' : 'Not itemised',
+    };
+  }
+
   // ── WHAT IS ACTUALLY IN THIS DOCUMENT ────────────────────────────────────
   // Six numbers, computed from bytes already in memory, costing nothing.
   //
@@ -31201,8 +31244,12 @@ render();
       if (!isFinite(amt)) continue;
       // The description holds the vendor name and the item; where the spacing
       // survived, the item is the second half.
+      // The vendor name and the item are two separate cells. Keel's reader
+      // separates them with a NEWLINE, pdftotext with a run of spaces — split
+      // on either, or the description reads 'AGAINST THE GRA AGAINST
+      // POPPERS-PIZZA-UNC' with the vendor stuck to the front of every item.
       const mid = m[3].trim();
-      const parts = mid.split(/\s{2,}/);
+      const parts = mid.split(/\n|\s{2,}/).map(x => x.trim()).filter(Boolean);
       rows.push({
         upc: m[2], item_desc: (parts.length > 1 ? parts[parts.length - 1] : mid).trim(),
         reference_no: m[1], ship_date: m[6], date_to: m[7],
@@ -33225,38 +33272,76 @@ render();
                   const G = itRows.groups || [];
                   const tot = G.reduce((n, r) => n + r.amt, 0);
                   const totU = G.reduce((n, r) => n + r.units, 0);
-                  out += `<tr><td colspan="9" style="padding:0 0 0 32px;border-bottom:1px solid var(--rule-soft);background:var(--rule-softer);">
-                    <table style="width:100%;border-collapse:collapse;margin:2px 0 6px;table-layout:auto;">
-                      <thead><tr>${['Product line', 'Items included', 'Promos', 'Units', 'Rate', 'Spend', '% of line'].map((h, i) =>
-                        `<th style="text-align:${i > 2 ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
-                      <tbody>${G.map(g => `<tr>
-                        <td style="padding:6px 10px;font-family:var(--mono);font-size:11.5px;color:${g.mapped ? 'var(--ink)' : 'var(--lost)'};">${esc(g.line)}</td>
-                        <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.45;">${esc(g.descs.slice(0, 4).join(', '))}${g.descs.length > 4 ? ' +' + (g.descs.length - 4) : ''}</td>
-                        <td style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.45;" title="${esc([...g.promos].join(' '))}">${(() => {
-                          const P = [...g.promos];
-                          if (!P.length) return '\u2014';
-                          // Legible at this grain where it was not at line grain:
-                          // a bundled chargeback splits across product lines, so a
-                          // group usually carries a handful rather than forty.
-                          return P.length <= 4 ? P.map(esc).join(' ') : esc(P.slice(0, 3).join(' ')) + ' +' + (P.length - 3);
-                        })()}</td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${g.units ? g.units.toLocaleString() : '\u2014'}</td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);">${g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014'}</td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;">${money(g.amt)}</td>
-                        <td style="padding:6px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);">${tot ? (g.amt / tot * 100).toFixed(1) + '%' : ''}</td></tr>`).join('')}
-                      </tbody>
-                      <tfoot><tr>
-                        <td style="padding:7px 10px;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>Total</strong></td>
-                        <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">${itRows.items.length} item${itRows.items.length === 1 ? '' : 's'} \u00b7 ${itRows.rows.toLocaleString()} detail rows</td>
-                        <td style="padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);border-top:1px solid var(--rule);">${(() => {
-                          const all = new Set(); for (const g of G) for (const pr of g.promos) all.add(pr);
-                          return all.size ? all.size + ' promo' + (all.size === 1 ? '' : 's') : '';
-                        })()}</td>
-                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${totU.toLocaleString()}</strong></td>
-                        <td style="padding:7px 10px;border-top:1px solid var(--rule);"></td>
-                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;border-top:1px solid var(--rule);"><strong>${money(tot)}</strong></td>
-                        <td style="padding:7px 10px;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);border-top:1px solid var(--rule);">100%</td>
-                      </tr></tfoot></table></td></tr>`;
+                  // ── REAL ROWS IN THE SAME TABLE, NOT A NESTED ONE ─────────
+                  // A nested table inside a colspan cell sizes its own columns,
+                  // so Spend never landed under Deducted and % of line never
+                  // under Share — the reader had to check which table a number
+                  // belonged to before reading it. This is the same lesson the
+                  // Sales Pacing customer expander learned in August: to line up
+                  // with a column you must BE in that column.
+                  //
+                  // The nine outer columns are
+                  //   Invoice · Month · Customer · Category · Code · Backup ·
+                  //   Deducted · Share · (actions)
+                  // so the arithmetic reads left to right across the last four —
+                  // Units x Rate = Spend, then its share — and Spend and % of
+                  // line inherit the alignment of the money columns above and
+                  // below them, which is the point.
+                  const eTh = (t, right) => `<td style="text-align:${right ? 'right' : 'left'};padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">${t}</td>`;
+                  const eTd = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:11.5px;background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
+                  out += `<tr>${eTh('Product line')}${eTh('')}<td colspan="2" style="padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">Items included</td>${eTh('Units', true)}${eTh('Rate', true)}${eTh('Spend', true)}${eTh('% of line', true)}${eTh('')}</tr>`;
+                  out += G.map(g => {
+                    const P = [...g.promos];
+                    const pTxt = !P.length ? '' : (P.length <= 4 ? P.map(esc).join(' ') : esc(P.slice(0, 3).join(' ')) + ' +' + (P.length - 3));
+                    return `<tr>
+                      ${eTd('<span style="padding-left:18px;">' + esc(g.line) + '</span>', false, 'color:' + (g.mapped ? 'var(--ink)' : 'var(--lost)') + ';')}
+                      ${eTd('')}
+                      <td colspan="2" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.45;background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">${esc(g.descs.slice(0, 4).join(', '))}${g.descs.length > 4 ? ' +' + (g.descs.length - 4) : ''}${pTxt ? '<div style="margin-top:2px;opacity:.75;" title="' + esc(P.join(' ')) + '">' + pTxt + '</div>' : ''}</td>
+                      ${eTd(g.units ? g.units.toLocaleString() : '\u2014', true)}
+                      ${eTd(g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014', true, 'color:var(--ink-3);')}
+                      ${eTd(money(g.amt), true)}
+                      ${eTd(tot ? (g.amt / tot * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
+                      ${eTd('')}
+                    </tr>`;
+                  }).join('');
+                  const allP = new Set(); for (const g of G) for (const pr of g.promos) allP.add(pr);
+                  out += `<tr>
+                    ${eTd('<span style="padding-left:18px;"><strong>Total</strong></span>', false, 'border-top:1px solid var(--rule);')}
+                    ${eTd('', false, 'border-top:1px solid var(--rule);')}
+                    <td colspan="2" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);background:var(--rule-softer);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule-soft);">${itRows.items.length} item${itRows.items.length === 1 ? '' : 's'} \u00b7 ${itRows.rows.toLocaleString()} detail rows${allP.size ? ' \u00b7 ' + allP.size + ' promo' + (allP.size === 1 ? '' : 's') : ''}</td>
+                    ${eTd('<strong>' + totU.toLocaleString() + '</strong>', true, 'border-top:1px solid var(--rule);')}
+                    ${eTd('', true, 'border-top:1px solid var(--rule);')}
+                    ${eTd('<strong>' + money(tot) + '</strong>', true, 'border-top:1px solid var(--rule);')}
+                    ${eTd('100%', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
+                    ${eTd('', false, 'border-top:1px solid var(--rule);')}
+                  </tr>`;
+                  // THE UNITEMISED REMAINDER, ON EVERY LINE THAT HAS ONE.
+                  // Without it the reader sees a detail total below the line
+                  // and no arithmetic connecting them, which looks exactly like
+                  // missing rows — sometimes it is, and that is the point.
+                  const _gap = _dedLineGap(tot, Math.abs(Number(l.amount) || 0));
+                  if (_gap) {
+                    const gc = _gap.over ? 'var(--lost)' : 'var(--ink-3)';
+                    out += `<tr>
+                      ${eTd('<span style="padding-left:18px;color:' + gc + ';">' + (_gap.over ? '' : '+ ') + esc(_gap.label) + '</span>')}
+                      ${eTd('')}
+                      <td colspan="2" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">${_gap.over
+                        ? 'the detail sums to more than the line itself \u2014 a double count, or the wrong line'
+                        : 'fees, or rows the document does not carry'}</td>
+                      ${eTd('', true)}${eTd('', true)}
+                      ${eTd('<span style="color:' + gc + ';">' + money(_gap.gap) + '</span>', true)}
+                      ${eTd('<span style="color:' + gc + ';">' + _gap.pct.toFixed(1) + '%</span>', true)}
+                      ${eTd('')}
+                    </tr>
+                    <tr>
+                      ${eTd('<span style="padding-left:18px;"><strong>Line</strong></span>', false, 'border-top:1px solid var(--rule);')}
+                      ${eTd('', false, 'border-top:1px solid var(--rule);')}
+                      <td colspan="2" style="background:var(--rule-softer);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule-soft);"></td>
+                      ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', true, 'border-top:1px solid var(--rule);')}
+                      ${eTd('<strong>' + money(Math.abs(Number(l.amount) || 0)) + '</strong>', true, 'border-top:1px solid var(--rule);')}
+                      ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', false, 'border-top:1px solid var(--rule);')}
+                    </tr>`;
+                  }
                 }
               }
               return out;
