@@ -29131,6 +29131,48 @@ render();
   // comes from it rather than from anything typed here before.
   let _dedPickLists = null;
 
+  // ITEM DETAIL, SHAPED ONCE. Both callers -- the page prefetch below and the
+  // click fallback -- must produce the SAME object, or a row's units would read
+  // one way when the page painted it and another way after a click. So the
+  // grouping lives here rather than in either of them.
+  //   items  one per UPC (or description where there is none)
+  //   groups one per Brand Library product_line, unmatched UPCs kept separate
+  //   units/amt totals, which is what the collapsed Units and Rate columns read
+  function _dedBuildItems(line, rows) {
+    const by = new Map();
+    for (const r of rows) {
+      const key = (r.upc || '') || (r.item_desc || '\u2014');
+      const cur = by.get(key) || { upc: r.upc || null, desc: r.item_desc || null, units: 0, amt: 0, promos: new Set() };
+      if (!cur.desc && r.item_desc) cur.desc = r.item_desc;
+      cur.units += Number(r.ship_qty || 0);
+      cur.amt += Math.abs(Number(r.bill_amount || 0));
+      const pr = String(r.reference_no || '').trim();
+      if (/^[0-9]{6,10}$/.test(pr) && !String(line.invoice_no || '').includes(pr)) cur.promos.add(pr);
+      by.set(key, cur);
+    }
+    const items = [...by.values()].sort((a, b) => b.amt - a.amt);
+    const gm = new Map();
+    for (const it of items) {
+      const hit = _dedProdMap && _dedProdMap.get(_dedUpc11(it.upc));
+      const key = (hit && hit.line) || '\u2014 not in Brand Library';
+      const g = gm.get(key) || { line: key, units: 0, amt: 0, descs: [], promos: new Set(), mapped: !!(hit && hit.line) };
+      g.units += it.units; g.amt += it.amt;
+      if (it.desc) g.descs.push(it.desc);
+      for (const pr of it.promos) g.promos.add(pr);
+      gm.set(key, g);
+    }
+    const groups = [...gm.values()].sort((a, b) => b.amt - a.amt);
+    return {
+      items, groups, rows: rows.length,
+      units: groups.reduce((n, g) => n + g.units, 0),
+      amt:   groups.reduce((n, g) => n + g.amt, 0)
+    };
+  }
+  // The weighted rate, everywhere it is shown. Total spend over total units --
+  // NOT the mean of the per-item rates, which would weight a 138-unit product
+  // the same as a 21,754-unit one and read materially low on every mixed line.
+  const _dedWtRate = (amt, units) => (units > 0 ? amt / units : null);
+
   // UPC NORMALISATION, because the same item is spelled three ways across the
   // sources: products.unit_upc carries the check digit (892453001242), the
   // deduction detail sometimes zero-pads to 13 (0089245300174), and some feeds
@@ -33338,59 +33380,106 @@ render();
       const shown = filtered.slice(0, _dedLinesLimit);
       const isFiltered = terms.length > 0 || _dedLinesMonths.size > 0;
 
-      // Only the ids not already known, so paging further down costs one small
-      // query rather than re-reading everything above it.
-      const needRefs = shown.filter(l => l.detail_parsed && !_dedPromoRefs.has(String(l.id))).map(l => l.id);
-      if (needRefs.length) {
+      // ── DETAIL FOR THE ROWS ON SCREEN, IN ONE PASS ───────────────────────
+      // This used to fetch reference_no only, and the expansion then fetched the
+      // SAME rows again per click -- which is what put "Reading the detail..."
+      // in front of every open, and why the collapsed row could show no units.
+      // One keyed fetch now serves both: the Units and Rate columns below, and
+      // an expansion that paints from cache with no wait at all.
+      //
+      // Scoped to the rows actually shown, as before. Pulling detail for all
+      // 1,945 lines to serve 25 visible ones would still be absurd; what changed
+      // is that the rows we do pull are kept rather than thrown away.
+      const needDet = shown.filter(l => l.detail_parsed && !_dedItemCache.has(String(l.id))).map(l => l.id);
+      if (needDet.length) {
         try {
-          const seen = new Map();
-          for (let from = 0; ; from += 1000) {
-            const { data, error } = await sb.from('deduction_detail')
-              .select('line_id,reference_no').eq('brand_id', brandId)
-              .in('line_id', needRefs).not('reference_no', 'is', null)
-              .order('line_id', { ascending: true }).range(from, from + 999);
-            if (error) throw error;
-            const byId = new Map(shown.map(x => [String(x.id), x]));
-            for (const r of (data || [])) {
-              const k = String(r.line_id);
-              const l0 = byId.get(k) || {};
-              // A promo number is 6-10 digits. reference_no ALSO holds dates,
-              // invoice ids, 'See attached' and a bare 0 -- the same filter
-              // deduction_promo_rollup uses, for the same reason.
-              const v = String(r.reference_no || '').trim();
-              // DIGITS ONLY. Allowing letter-led values put WFMDEC2515930ISEGR
-              // beside invoice WFMDEC2515930ISEGR -- on the WFM ISE layout
-              // reference_no simply repeats the invoice, so the column echoed
-              // the cell next to it. This is the same filter
-              // deduction_promo_rollup uses, for the same reason: that column
-              // also holds dates, invoice ids, 'See attached' and a bare 0.
-              if (!/^[0-9]{6,10}$/.test(v)) continue;
-              // And never a number that IS the invoice -- repeating it teaches
-              // the reader nothing and hides the lines that carry a real one.
-              if (String(l0.invoice_no || '').includes(v)) continue;
-              if (!seen.has(k)) seen.set(k, new Set());
-              seen.get(k).add(v);
+          // The Brand Library mapping, once per session -- groups the items by
+          // ATG's own product_line, the vocabulary the plan uses.
+          if (!_dedProdMap) {
+            _dedProdMap = new Map();
+            const { data: prods } = await sb.from('products')
+              .select('unit_upc,product_line,item_description').eq('brand_id', brandId);
+            for (const pr of (prods || [])) {
+              const key = _dedUpc11(pr.unit_upc);
+              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null });
             }
-            if (!data || data.length < 1000) break;
           }
-          for (const id of needRefs) _dedPromoRefs.set(String(id), [...(seen.get(String(id)) || [])]);
+          // Chunked, because a single KeHE chargeback runs to thousands of store
+          // rows and 25 of them at once is a large response. Paged within each
+          // chunk, because PostgREST caps a select at 1,000 WITHOUT an error --
+          // which is exactly how a units total quietly comes back short.
+          const byLine = new Map();
+          const CH = 5;
+          for (let i = 0; i < needDet.length; i += CH) {
+            const chunk = needDet.slice(i, i + CH);
+            for (let from = 0; ; from += 1000) {
+              const { data, error } = await sb.from('deduction_detail')
+                .select('line_id,upc,item_desc,ship_qty,bill_amount,reference_no')
+                .eq('brand_id', brandId).in('line_id', chunk)
+                .order('line_id', { ascending: true }).order('id', { ascending: true })
+                .range(from, from + 999);
+              if (error) throw new Error(error.message);
+              for (const r of (data || [])) {
+                if (!byLine.has(r.line_id)) byLine.set(r.line_id, []);
+                byLine.get(r.line_id).push(r);
+              }
+              if (!data || data.length < 1000) break;
+            }
+          }
+          const byId = new Map(shown.map(x => [x.id, x]));
+          for (const id of needDet) {
+            const line = byId.get(id) || {};
+            const built = _dedBuildItems(line, byLine.get(id) || []);
+            _dedItemCache.set(String(id), built);
+            // Promo numbers fall out of the same rows. A promo number is 6-10
+            // DIGITS: reference_no also holds dates, invoice ids, 'See attached'
+            // and a bare 0, and allowing letter-led values put
+            // WFMDEC2515930ISEGR beside invoice WFMDEC2515930ISEGR -- on the WFM
+            // ISE layout that column simply repeats the invoice, so the cell
+            // echoed the one next to it. Same filter deduction_promo_rollup
+            // uses, for the same reason.
+            const refs = new Set();
+            for (const g of built.groups) for (const pr of g.promos) refs.add(pr);
+            _dedPromoRefs.set(String(id), [...refs]);
+          }
         } catch (e) {
-          // A promo number is a nicety; the register is not. Mark them read so a
-          // failure does not re-query on every keystroke.
-          for (const id of needRefs) _dedPromoRefs.set(String(id), []);
+          // The register is not optional; its detail is. Mark them read so a
+          // failure does not re-query on every keystroke, and let the row say so
+          // when it is opened.
+          for (const id of needDet) {
+            if (!_dedItemCache.has(String(id)))
+              _dedItemCache.set(String(id), { items: [], groups: [], rows: 0, units: 0, amt: 0,
+                                              err: 'Could not read the detail: ' + (e && e.message || e) });
+            if (!_dedPromoRefs.has(String(id))) _dedPromoRefs.set(String(id), []);
+          }
         }
       }
         filteredLen = filtered.length;
+        // ── UNITS AND THE WEIGHTED RATE, ACROSS THE ROWS ON SCREEN ──────────
+        // Detail is fetched for the rows shown, so these total exactly those
+        // rows and say so. Totalling units over the whole register would need
+        // every line's detail, and a units figure that silently covered a
+        // quarter of the money would be worse than none -- the same mistake as
+        // a filter that makes money look like it went missing.
+        let _shownUnits = 0, _shownAmt = 0, _shownWith = 0;
+        for (const l of shown) {
+          const it = _dedItemCache.get(String(l.id));
+          if (!it || it.err || !it.units) continue;
+          _shownUnits += it.units; _shownAmt += it.amt; _shownWith++;
+        }
         host.innerHTML = `
         <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:0 0 10px;">
           ${isFiltered
             ? `${filtered.length.toLocaleString()} of ${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(filteredAmt)}</strong> of ${money(registerAmt)}`
             : `${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(registerAmt)}</strong>`}
+          ${_shownUnits ? `<span style="margin-left:10px;" title="totalled across the ${_shownWith} row${_shownWith === 1 ? '' : 's'} on screen that carry itemised detail, over ${money(_shownAmt)} of itemised spend \u2014 not the whole register">
+            \u00b7 ${_shownUnits.toLocaleString()} units \u00b7 <strong style="color:var(--ink);">$${_dedWtRate(_shownAmt, _shownUnits).toFixed(2)}</strong> weighted rate
+            <span style="opacity:.7;">(${_shownWith} itemised row${_shownWith === 1 ? '' : 's'} shown)</span></span>` : ''}
         </div>
 
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Deducted', true)}${th('Share', true)}${th('')}
+            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Units', true)}${th('Rate', true)}${th('Deducted', true)}${th('Share', true)}${th('')}
           </tr></thead>
           <tbody>
             ${shown.map(l => {
@@ -33462,6 +33551,31 @@ render();
                   if (be === false) return td('<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="no document exists, e.g. a flat fee \u2014 complete, not a gap">no doc exists</span>');
                   return td('<span style="color:var(--lost);font-family:var(--mono);font-size:10px;">none</span>');
                 })()}
+                ${(() => {
+                  // UNITS AND RATE ON THE COLLAPSED ROW, from the same cached
+                  // detail the expansion uses -- so the two can never disagree.
+                  // A line with no itemisation gets an em dash, NOT a zero: zero
+                  // units is a claim the document does not make, and it would
+                  // drag every average that touched it.
+                  const it = _dedItemCache.get(String(l.id));
+                  if (!it || it.err || !it.units)
+                    return td('<span style="color:var(--ink-3);">\u2014</span>', true)
+                         + td('<span style="color:var(--ink-3);">\u2014</span>', true);
+                  const r = _dedWtRate(it.amt, it.units);
+                  // The rate is the line's WEIGHTED rate, and it is only the
+                  // whole line's rate when the detail covers the whole line --
+                  // the unitemised remainder (fees, rows the document omits) is
+                  // named in the expansion and flagged here rather than folded
+                  // in silently.
+                  const gap = Math.abs(Number(l.amount || 0)) - it.amt;
+                  const part = Math.abs(gap) > 0.005;
+                  return td(it.units.toLocaleString(), true)
+                       + td('<span title="' + (part
+                             ? 'weighted across ' + money(it.amt) + ' of itemised detail; ' + money(Math.abs(gap)) + ' of this line is not itemised'
+                             : 'total spend over total units on this line') + '">$' + r.toFixed(2)
+                           + (part ? '<span style="color:var(--ink-3);opacity:.7;"> *</span>' : '') + '</span>',
+                           true, 'color:var(--ink-3);');
+                })()}
                 ${td('<strong>' + money(Math.abs(Number(l.amount || 0))) + '</strong>', true)}
                 ${td(registerAmt ? (Math.abs(Number(l.amount || 0)) / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
                 ${td(`<button class="hl-dl-ovr" data-l="${esc(String(l.id))}" title="Set who was charged, and whether a document exists"
@@ -33481,13 +33595,13 @@ render();
               // detail, not of the register, so they always sum to 100.
               if (itOpen) {
                 if (!itRows) {
-                  out += `<tr><td colspan="9" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="11" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">Reading the detail\u2026</td></tr>`;
                 } else if (itRows.err) {
-                  out += `<tr><td colspan="9" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="11" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--lost);background:var(--rule-softer);">${esc(itRows.err)}</td></tr>`;
                 } else if (!itRows.items.length) {
-                  out += `<tr><td colspan="9" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="11" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">No item detail under this line.</td></tr>`;
                 } else {
                   const G = itRows.groups || [];
@@ -33501,16 +33615,17 @@ render();
                   // Sales Pacing customer expander learned in August: to line up
                   // with a column you must BE in that column.
                   //
-                  // The nine outer columns are
+                  // The eleven outer columns are
                   //   Invoice · Month · Customer · Category · Code · Backup ·
-                  //   Deducted · Share · (actions)
-                  // so the arithmetic reads left to right across the last four —
-                  // Units x Rate = Spend, then its share — and Spend and % of
-                  // line inherit the alignment of the money columns above and
-                  // below them, which is the point.
+                  //   Units · Rate · Deducted · Share · (actions)
+                  // so every number sits under its own heading: the expansion's
+                  // Units and Rate under the collapsed row's Units and Rate,
+                  // Spend under Deducted, % of line under Share. The arithmetic
+                  // still reads left to right — Units x Rate = Spend — and a
+                  // reader never has to work out which table a figure is in.
                   const eTh = (t, right) => `<td style="text-align:${right ? 'right' : 'left'};padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">${t}</td>`;
                   const eTd = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:11.5px;background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
-                  out += `<tr>${eTh('Product line')}${eTh('')}<td colspan="2" style="padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">Items included</td>${eTh('Units', true)}${eTh('Rate', true)}${eTh('Spend', true)}${eTh('% of line', true)}${eTh('')}</tr>`;
+                  out += `<tr>${eTh('Product line')}${eTh('')}<td colspan="2" style="padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">Items included</td>${eTh('')}${eTh('')}${eTh('Units', true)}${eTh('Rate', true)}${eTh('Spend', true)}${eTh('% of line', true)}${eTh('')}</tr>`;
                   out += G.map(g => {
                     const P = [...g.promos];
                     const pTxt = !P.length ? '' : (P.length <= 4 ? P.map(esc).join(' ') : esc(P.slice(0, 3).join(' ')) + ' +' + (P.length - 3));
@@ -33518,6 +33633,7 @@ render();
                       ${eTd('<span style="padding-left:18px;">' + esc(g.line) + '</span>', false, 'color:' + (g.mapped ? 'var(--ink)' : 'var(--lost)') + ';')}
                       ${eTd('')}
                       <td colspan="2" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.45;background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">${esc(g.descs.slice(0, 4).join(', '))}${g.descs.length > 4 ? ' +' + (g.descs.length - 4) : ''}${pTxt ? '<div style="margin-top:2px;opacity:.75;" title="' + esc(P.join(' ')) + '">' + pTxt + '</div>' : ''}</td>
+                      ${eTd('')}${eTd('')}
                       ${eTd(g.units ? g.units.toLocaleString() : '\u2014', true)}
                       ${eTd(g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014', true, 'color:var(--ink-3);')}
                       ${eTd(money(g.amt), true)}
@@ -33530,8 +33646,9 @@ render();
                     ${eTd('<span style="padding-left:18px;"><strong>Total</strong></span>', false, 'border-top:1px solid var(--rule);')}
                     ${eTd('', false, 'border-top:1px solid var(--rule);')}
                     <td colspan="2" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);background:var(--rule-softer);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule-soft);">${itRows.items.length} item${itRows.items.length === 1 ? '' : 's'} \u00b7 ${itRows.rows.toLocaleString()} detail rows${allP.size ? ' \u00b7 ' + allP.size + ' promo' + (allP.size === 1 ? '' : 's') : ''}</td>
+                    ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', true, 'border-top:1px solid var(--rule);')}
                     ${eTd('<strong>' + totU.toLocaleString() + '</strong>', true, 'border-top:1px solid var(--rule);')}
-                    ${eTd('', true, 'border-top:1px solid var(--rule);')}
+                    ${eTd(totU ? '<strong>$' + (tot / totU).toFixed(2) + '</strong>' : '', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
                     ${eTd('<strong>' + money(tot) + '</strong>', true, 'border-top:1px solid var(--rule);')}
                     ${eTd('100%', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
                     ${eTd('', false, 'border-top:1px solid var(--rule);')}
@@ -33549,7 +33666,7 @@ render();
                       <td colspan="2" style="padding:6px 10px;font-family:var(--mono);font-size:10px;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">${_gap.over
                         ? 'the detail sums to more than the line itself \u2014 a double count, or the wrong line'
                         : 'fees, or rows the document does not carry'}</td>
-                      ${eTd('', true)}${eTd('', true)}
+                      ${eTd('', true)}${eTd('', true)}${eTd('', true)}${eTd('', true)}
                       ${eTd('<span style="color:' + gc + ';">' + money(_gap.gap) + '</span>', true)}
                       ${eTd('<span style="color:' + gc + ';">' + _gap.pct.toFixed(1) + '%</span>', true)}
                       ${eTd('')}
@@ -33558,6 +33675,7 @@ render();
                       ${eTd('<span style="padding-left:18px;"><strong>Line</strong></span>', false, 'border-top:1px solid var(--rule);')}
                       ${eTd('', false, 'border-top:1px solid var(--rule);')}
                       <td colspan="2" style="background:var(--rule-softer);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule-soft);"></td>
+                      ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', true, 'border-top:1px solid var(--rule);')}
                       ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', true, 'border-top:1px solid var(--rule);')}
                       ${eTd('<strong>' + money(Math.abs(Number(l.amount) || 0)) + '</strong>', true, 'border-top:1px solid var(--rule);')}
                       ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', false, 'border-top:1px solid var(--rule);')}
@@ -33568,9 +33686,9 @@ render();
               return out;
               return out;
             }).join('')}
-            ${!shown.length ? `<tr><td colspan="9" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
+            ${!shown.length ? `<tr><td colspan="11" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
               No deduction matches ${terms.length ? '\u201c' + esc(_dedQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
-            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="9" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="11" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
               <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
               <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
               <span style="margin-left:10px;">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
@@ -33582,6 +33700,8 @@ render();
               ${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
               ${td('', false, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
               ${td('', false, 'border-top:2px solid var(--ink);')}
+              ${_shownUnits ? td('<strong>' + _shownUnits.toLocaleString() + '</strong>', true, 'border-top:2px solid var(--ink);') : td('', true, 'border-top:2px solid var(--ink);')}
+              ${_shownUnits ? td('<strong>$' + _dedWtRate(_shownAmt, _shownUnits).toFixed(2) + '</strong>', true, 'border-top:2px solid var(--ink);color:var(--ink-3);') : td('', true, 'border-top:2px solid var(--ink);')}
               ${td('<strong>' + money(filteredAmt) + '</strong>', true, 'border-top:2px solid var(--ink);')}
               ${td(registerAmt ? (filteredAmt / registerAmt * 100).toFixed(1) + '%' : '', true, 'border-top:2px solid var(--ink);color:var(--ink-3);')}
               ${td('', true, 'border-top:2px solid var(--ink);')}
@@ -33593,6 +33713,7 @@ render();
             <tr>
               ${td('<strong>All deductions ' + esc(yr) + (_dedDist === 'all' ? '' : ' \u00b7 ' + esc(_dedDist)) + '</strong>', false, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
               ${td('', true)}${td('')}${td('')}${td('')}${td('')}
+              ${td('', true)}${td('', true)}
               ${td('<strong>' + money(registerAmt) + '</strong>', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
               ${td('100%', true, 'color:var(--ink-3);' + (isFiltered ? '' : 'border-top:2px solid var(--ink);'))}
               ${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
@@ -33645,9 +33766,23 @@ render();
         if (!line || !line.detail_parsed) return;
         if (_dedItemOpen.has(k)) { _dedItemOpen.delete(k); await paintResults(); return; }
         _dedItemOpen.add(k);
+        // THE COMMON PATH IS NOW A NO-OP. The page prefetches the detail for the
+        // rows it shows, so an open paints from cache with no fetch and no
+        // "Reading the detail..." at all. What follows is the fallback for the
+        // case the prefetch could not cover -- a row whose detail arrived after
+        // the paint, or one invalidated by an upload.
         if (_dedItemCache.has(k)) { await paintResults(); return; }
-        await paintResults();                               // paint "Reading…" first
+        await paintResults();
         try {
+          if (!_dedProdMap) {
+            _dedProdMap = new Map();
+            const { data: prods } = await sb.from('products')
+              .select('unit_upc,product_line,item_description').eq('brand_id', brandId);
+            for (const pr of (prods || [])) {
+              const key = _dedUpc11(pr.unit_upc);
+              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null });
+            }
+          }
           // Paged: a single KeHE chargeback runs to thousands of store rows and
           // PostgREST caps a select at 1,000 with no error, which is exactly how
           // a total quietly comes back short.
@@ -33661,49 +33796,10 @@ render();
             rows.push(...(data || []));
             if (!data || data.length < 1000) break;
           }
-          // Grouped on the UPC where there is one, else the description -- two
-          // spellings of the same item would otherwise show as two products.
-          const by = new Map();
-          for (const r of rows) {
-            const key = (r.upc || '') || (r.item_desc || '\u2014');
-            const cur = by.get(key) || { upc: r.upc || null, desc: r.item_desc || null, units: 0, amt: 0, promos: new Set() };
-            if (!cur.desc && r.item_desc) cur.desc = r.item_desc;
-            cur.units += Number(r.ship_qty || 0);
-            cur.amt += Math.abs(Number(r.bill_amount || 0));
-            const pr = String(r.reference_no || '').trim();
-            if (/^[0-9]{6,10}$/.test(pr) && !String(line.invoice_no || '').includes(pr)) cur.promos.add(pr);
-            by.set(key, cur);
-          }
-          // The Brand Library mapping, fetched once per session. `product_line`
-          // is ATG's own grouping -- the same names the plan uses -- so the
-          // rollup below is the plan's vocabulary rather than a guess made from
-          // the description text.
-          if (!_dedProdMap) {
-            _dedProdMap = new Map();
-            const { data: prods } = await sb.from('products')
-              .select('unit_upc,product_line,item_description').eq('brand_id', brandId);
-            for (const pr of (prods || [])) {
-              const key = _dedUpc11(pr.unit_upc);
-              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null });
-            }
-          }
-          const items = [...by.values()].sort((a, b) => b.amt - a.amt);
-          // GROUPED BY PRODUCT LINE, with every item that fed it named. An
-          // unmatched UPC gets its own row rather than being folded into a
-          // neighbouring group -- a mapping gap should be visible, not absorbed.
-          const gm = new Map();
-          for (const it of items) {
-            const hit = _dedProdMap.get(_dedUpc11(it.upc));
-            const key = (hit && hit.line) || '\u2014 not in Brand Library';
-            const g = gm.get(key) || { line: key, units: 0, amt: 0, descs: [], promos: new Set(), mapped: !!(hit && hit.line) };
-            g.units += it.units; g.amt += it.amt;
-            if (it.desc) g.descs.push(it.desc);
-            for (const pr of it.promos) g.promos.add(pr);
-            gm.set(key, g);
-          }
-          _dedItemCache.set(k, { items, groups: [...gm.values()].sort((a, b) => b.amt - a.amt), rows: rows.length });
+          _dedItemCache.set(k, _dedBuildItems(line, rows));
         } catch (err) {
-          _dedItemCache.set(k, { items: [], rows: 0, err: 'Could not read the detail: ' + (err && err.message || err) });
+          _dedItemCache.set(k, { items: [], groups: [], rows: 0, units: 0, amt: 0,
+                                 err: 'Could not read the detail: ' + (err && err.message || err) });
         }
         renderDeductions(hostEl, filtersEl, year);
       }
