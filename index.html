@@ -33733,17 +33733,16 @@ render();
           <input id="hl-up-file" type="file" accept=".pdf,.xlsx,.xls,.csv,.txt"
             style="font-family:var(--mono);font-size:12px;padding:14px;border:1px dashed var(--rule);border-radius:6px;width:100%;background:var(--paper);color:var(--ink);cursor:pointer;">
           <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:7px;">PDF, xlsx, xls, csv or txt. A scanned PDF has no text to read \u2014 it will offer the OCR route instead.</div>
-          <!-- ONE LINE, SEVERAL DOCUMENTS. Replace is the default and the right
-               one: re-uploading a corrected file must not double the money,
-               which is why the import clears the line first. But a deduction
-               that arrives as two flyer periods, or as a scanback plus its
-               invoice, needs both — and until now the second upload silently
-               deleted the first. -->
-          <label style="display:flex;align-items:center;gap:8px;margin:12px 0 0;font-family:var(--mono);font-size:11px;color:var(--ink-2);cursor:pointer;">
+          <!-- ONLY WHEN THERE IS SOMETHING TO ADD TO. On a line with no backup
+               yet, "add to what is already there" is a choice between nothing
+               and nothing — it invited a wrong answer to a question that did
+               not apply. It appears once the line carries detail, which is the
+               only moment it means anything, and by then the words explain
+               themselves. -->
+          ${(detBy.get(l.id) || []).length ? `<label style="display:flex;align-items:center;gap:8px;margin:12px 0 0;font-family:var(--mono);font-size:11px;color:var(--ink-2);cursor:pointer;">
             <input type="checkbox" id="hl-up-append" style="margin:0;cursor:pointer;">
-            <span>Add to what is already on this line, rather than replacing it</span>
-          </label>
-          <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin:5px 0 0 24px;line-height:1.55;">For a deduction that arrives as more than one document \u2014 period A and period B, or a scanback and its invoice. Each file still has to tie to its own total, and a file already on this line is refused rather than counted twice.</div>
+            <span>Add another file</span>
+          </label>` : ''}
           <div id="hl-up-out" style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin-top:16px;line-height:1.6;"></div>
           <div style="display:flex;gap:9px;margin-top:22px;align-items:center;">
             <button id="hl-up-go" disabled style="font-family:var(--mono);font-size:12.5px;padding:11px 26px;border-radius:6px;border:1px solid var(--rule-soft);background:transparent;color:var(--rule);cursor:default;">Import</button>
