@@ -33902,23 +33902,53 @@ render();
             const invOk = !inv || !dInv || inv === dInv || inv.endsWith(dInv) || dInv.endsWith(inv);
             // Rows exclude KeHE's fee; the register line includes it.
             const gap = Math.round((amt - p.line_total) * 100) / 100;
-            const feeOk = p.line_total <= amt + 0.01 && (amt <= 0 || gap / amt <= 0.15);
+            const gapPct = amt > 0 ? gap / amt : 0;
+            // ── A SHORTFALL IS NOT A FAULT ANY MORE ───────────────────────────
+            // This used to refuse anything more than 15% below the line, on the
+            // reasoning that the only legitimate gap was a processing fee. Two
+            // things have changed since, and together they make the refusal
+            // wrong:
+            //
+            //   · a line can carry SEVERAL documents now. NCG period A is
+            //     $16,320 of a $22,067 deduction — 26% short and completely
+            //     correct, with period B still to come. Refusing it blocks the
+            //     first upload of exactly the workflow the Add-to box exists for.
+            //   · the shortfall is no longer invisible. The expansion states it
+            //     as a figure and a percentage on every line, which is the job
+            //     this threshold was doing badly.
+            //
+            // What still refuses: detail EXCEEDING its line. That is not a
+            // partial document, it is a contradiction — the wrong file, or the
+            // same money twice — and no second upload makes it right.
+            const overLine = p.line_total > amt + 0.01;
             const cust = {};
             for (const r of p.rows) if (r.customer_name) cust[r.customer_name] = (cust[r.customer_name] || 0) + Math.abs(r.bill_amount);
             const top = Object.entries(cust).sort((a, b) => b[1] - a[1]);
             out.innerHTML = `
               <div>${p.rows.length.toLocaleString()} rows \u00b7 <strong>${money(p.line_total)}</strong>${p.head.total_fee != null ? ' + ' + money(p.head.total_fee) + ' fee' : ''}
-                ${gap ? ' \u00b7 <span style="color:var(--ink-3);">' + money(gap) + ' short of the line, consistent with the fee</span>' : ''}</div>
+                ${gap > 0 ? ' \u00b7 <span style="color:var(--ink-3);">' + money(gap) + ' short of the ' + money(amt) + ' line'
+                    + (gapPct <= 0.15 ? ', consistent with a fee' : ' \u2014 ' + Math.round(gapPct * 100) + '%, so another document is likely outstanding')
+                    + '</span>' : ''}</div>
               <div style="color:var(--ink-3);margin-top:4px;">document invoice ${esc(dInv || '\u2014')}${invOk ? '' : ' \u2014 <span style="color:var(--lost);">does not match this line</span>'}
                 ${p.head.dc ? ' \u00b7 ' + esc(p.head.dc) : ''}</div>
               <div style="margin-top:10px;">${top.slice(0, 5).map(([k, v]) =>
                   `<div style="display:flex;justify-content:space-between;gap:14px;"><span>${esc(k)}</span><span style="color:var(--ink-3);">${money(v)}</span></div>`).join('')}
                 ${top.length > 5 ? `<div style="color:var(--ink-3);margin-top:3px;">+ ${top.length - 5} more</div>` : ''}</div>`;
             if (!invOk) { out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 this document belongs to a different invoice.</div>'; return; }
-            if (!feeOk) {
+            if (overLine) {
               out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 ' + money(p.line_total)
-                + ' against a ' + money(amt) + ' deduction is too far apart to be the processing fee.</div>';
+                + ' of detail against a ' + money(amt) + ' line. Detail cannot exceed the deduction it explains;'
+                + ' this is the wrong document, or the same money twice.</div>';
               return;
+            }
+            // A large shortfall is worth saying out loud without standing in the
+            // way: the person uploading knows whether a second document exists,
+            // and the residual row will keep asking until it arrives.
+            if (gapPct > 0.15) {
+              out.innerHTML += '<div style="color:var(--ink-3);margin-top:10px;line-height:1.55;">This document covers '
+                + Math.round((1 - gapPct) * 100) + '% of the line. If that is all of it, the rest will show as'
+                + ' <strong>Not itemised</strong>; if another period or invoice is outstanding, import this one and'
+                + ' tick <strong>Add to</strong> for the next.</div>';
             }
             parsed = p; arm(true);
           } catch (err) {
