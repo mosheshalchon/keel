@@ -29173,6 +29173,71 @@ render();
   // the same as a 21,754-unit one and read materially low on every mixed line.
   const _dedWtRate = (amt, units) => (units > 0 ? amt / units : null);
 
+  // ── TRADE RATE AS A % OF THE CASE PRICE ──────────────────────────────────
+  // (per-unit trade rate x units per case) / case price -- what share of the
+  // invoice is being given back on that product.
+  //
+  // A case price belongs to a BILL-TO ACCOUNT, not a retailer: the same 12"
+  // pizza is $40.44 to PFG and $74.37 to Reinhart. So the account comes from the
+  // line's own check, via _lineDist, and never from the retailer the promo ran
+  // at -- a Natural Grocers scan billed through UNFI is priced at UNFI's rate,
+  // because UNFI is who ATG invoiced.
+  let _dedCasePrices = null;      // 'account|upc' -> price, or null where the sheet disagrees with itself
+  const _DED_PRICE_ACCT = {
+    'UNFI':          ['UNFI - EAST (ATG)', 'UNFI - WEST (ATG)'],
+    'KeHE':          ['KeHE Distributors'],
+    'Kroger':        ['Kroger Co, The'],
+    'Harris Teeter': ['Harris Teeter'],
+    'C&S':           ['C&S Wholesale Grocers']
+  };
+  // UNFI is TWO accounts and they disagree on three items. Where the reference
+  // names the region (ER.../WR..., and VTBR = Western Region) that settles it;
+  // where it does not and the two prices differ, the answer is NO price rather
+  // than a coin-flip that reads like a fact.
+  const _dedPriceAccts = (line) => {
+    const d = (typeof _lineDist === 'function' && _lineDist(line)) || '';
+    const list = _DED_PRICE_ACCT[d];
+    if (!list) return [];
+    if (d !== 'UNFI') return list;
+    const ref = String(line.invoice_no || '').toUpperCase();
+    if (/^ER/.test(ref)) return ['UNFI - EAST (ATG)'];
+    if (/^WR/.test(ref) || /VTBR/.test(ref)) return ['UNFI - WEST (ATG)'];
+    return list;
+  };
+  const _dedCasePrice = (accts, upcKey) => {
+    if (!_dedCasePrices || !upcKey) return null;
+    const seen = new Set();
+    for (const a of accts) {
+      const v = _dedCasePrices.get(a.toLowerCase() + '|' + upcKey);
+      if (v == null) continue;      // null means the sheet holds two prices for it
+      seen.add(Number(v));
+    }
+    if (seen.size !== 1) return null;   // nothing found, or the accounts disagree
+    return [...seen][0];
+  };
+  // Weighted by SPEND across the items that price, so a product with no case
+  // price or no units-per-case is excluded from the percentage rather than
+  // counted as zero -- and `covered` says how much of the line it speaks for.
+  const _dedTradePct = (items, line) => {
+    if (!items || !items.length) return null;
+    const accts = _dedPriceAccts(line);
+    if (!accts.length) return null;
+    let num = 0, cov = 0, all = 0;
+    for (const it of items) {
+      all += it.amt;
+      if (!it.units) continue;
+      const hit = _dedProdMap && _dedProdMap.get(_dedUpc11(it.upc));
+      const per = hit && hit.upc;
+      if (!per) continue;
+      const price = _dedCasePrice(accts, _dedUpc11(it.upc));
+      if (!price) continue;
+      const pct = (it.amt / it.units) * per / price;
+      num += pct * it.amt; cov += it.amt;
+    }
+    if (!cov) return null;
+    return { pct: num / cov, covered: cov, all, part: cov < all - 0.005 };
+  };
+
   // UPC NORMALISATION, because the same item is spelled three ways across the
   // sources: products.unit_upc carries the check digit (892453001242), the
   // deduction detail sometimes zero-pads to 13 (0089245300174), and some feeds
@@ -33390,6 +33455,22 @@ render();
       // Scoped to the rows actually shown, as before. Pulling detail for all
       // 1,945 lines to serve 25 visible ones would still be absurd; what changed
       // is that the rows we do pull are kept rather than thrown away.
+      // The case-price sheet, once per session -- 331 rows, one query. A UPC an
+      // account prices twice is stored as null, so it reads as NO price rather
+      // than whichever row happened to load last.
+      if (!_dedCasePrices) {
+        _dedCasePrices = new Map();
+        try {
+          const { data: cp } = await sb.from('customer_case_prices')
+            .select('customer,upc,case_price').eq('brand_id', brandId).not('upc', 'is', null);
+          for (const r of (cp || [])) {
+            const k = String(r.customer || '').toLowerCase() + '|' + _dedUpc11(r.upc);
+            const v = Number(r.case_price);
+            if (!_dedCasePrices.has(k)) _dedCasePrices.set(k, v);
+            else if (_dedCasePrices.get(k) !== v) _dedCasePrices.set(k, null);
+          }
+        } catch (e) { /* the register does not depend on it */ }
+      }
       const needDet = shown.filter(l => l.detail_parsed && !_dedItemCache.has(String(l.id))).map(l => l.id);
       if (needDet.length) {
         try {
@@ -33398,10 +33479,10 @@ render();
           if (!_dedProdMap) {
             _dedProdMap = new Map();
             const { data: prods } = await sb.from('products')
-              .select('unit_upc,product_line,item_description').eq('brand_id', brandId);
+              .select('unit_upc,product_line,item_description,units_per_case').eq('brand_id', brandId);
             for (const pr of (prods || [])) {
               const key = _dedUpc11(pr.unit_upc);
-              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null });
+              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null, upc: Number(pr.units_per_case) || null });
             }
           }
           // Chunked, because a single KeHE chargeback runs to thousands of store
@@ -33479,7 +33560,7 @@ render();
 
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Units', true)}${th('Rate', true)}${th('Deducted', true)}${th('Share', true)}${th('')}
+            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Units', true)}${th('Rate', true)}${th('Deducted', true)}${th('Share', true)}${th('% trade rate', true)}${th('')}
           </tr></thead>
           <tbody>
             ${shown.map(l => {
@@ -33578,6 +33659,20 @@ render();
                 })()}
                 ${td('<strong>' + money(Math.abs(Number(l.amount || 0))) + '</strong>', true)}
                 ${td(registerAmt ? (Math.abs(Number(l.amount || 0)) / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
+                ${(() => {
+                  const it = _dedItemCache.get(String(l.id));
+                  const tp = it && !it.err ? _dedTradePct(it.items, l) : null;
+                  if (!tp) return td('<span style="color:var(--ink-3);">\u2014</span>', true);
+                  // Over 100% would mean giving back more than the case is sold
+                  // for. That happens, and when it does it is the finding -- so
+                  // it is coloured rather than clipped.
+                  const hot = tp.pct >= 0.5;
+                  return td('<span style="color:' + (hot ? 'var(--lost)' : 'var(--ink-2)') + ';" title="'
+                    + (tp.part ? 'weighted across ' + money(tp.covered) + ' of ' + money(tp.all) + ' itemised \u2014 the rest has no case price or no units-per-case on file'
+                               : 'trade rate x units per case, over the case price for the account invoiced')
+                    + '">' + (tp.pct * 100).toFixed(1) + '%'
+                    + (tp.part ? '<span style="color:var(--ink-3);opacity:.7;"> *</span>' : '') + '</span>', true);
+                })()}
                 ${td(`<button class="hl-dl-ovr" data-l="${esc(String(l.id))}" title="Set who was charged, and whether a document exists"
                       style="font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;
                              border:1px solid var(--rule-soft);border-radius:3px;background:transparent;color:var(--ink-3);cursor:pointer;"
@@ -33595,13 +33690,13 @@ render();
               // detail, not of the register, so they always sum to 100.
               if (itOpen) {
                 if (!itRows) {
-                  out += `<tr><td colspan="11" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="12" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">Reading the detail\u2026</td></tr>`;
                 } else if (itRows.err) {
-                  out += `<tr><td colspan="11" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="12" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--lost);background:var(--rule-softer);">${esc(itRows.err)}</td></tr>`;
                 } else if (!itRows.items.length) {
-                  out += `<tr><td colspan="11" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="12" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">No item detail under this line.</td></tr>`;
                 } else {
                   const G = itRows.groups || [];
@@ -33615,9 +33710,9 @@ render();
                   // Sales Pacing customer expander learned in August: to line up
                   // with a column you must BE in that column.
                   //
-                  // The eleven outer columns are
+                  // The twelve outer columns are
                   //   Invoice · Month · Customer · Category · Code · Backup ·
-                  //   Units · Rate · Deducted · Share · (actions)
+                  //   Units · Rate · Deducted · Share · % trade rate · (actions)
                   // so every number sits under its own heading: the expansion's
                   // Units and Rate under the collapsed row's Units and Rate,
                   // Spend under Deducted, % of line under Share. The arithmetic
@@ -33625,7 +33720,7 @@ render();
                   // reader never has to work out which table a figure is in.
                   const eTh = (t, right) => `<td style="text-align:${right ? 'right' : 'left'};padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">${t}</td>`;
                   const eTd = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:6px 10px;font-family:var(--mono);font-size:11.5px;background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
-                  out += `<tr>${eTh('Product line')}${eTh('')}<td colspan="2" style="padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">Items included</td>${eTh('')}${eTh('')}${eTh('Units', true)}${eTh('Rate', true)}${eTh('Spend', true)}${eTh('% of line', true)}${eTh('')}</tr>`;
+                  out += `<tr>${eTh('Product line')}${eTh('')}<td colspan="2" style="padding:7px 10px;font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);background:var(--rule-softer);border-bottom:1px solid var(--rule-soft);">Items included</td>${eTh('')}${eTh('')}${eTh('Units', true)}${eTh('Rate', true)}${eTh('Spend', true)}${eTh('% of line', true)}${eTh('% trade rate', true)}${eTh('')}</tr>`;
                   out += G.map(g => {
                     const P = [...g.promos];
                     const pTxt = !P.length ? '' : (P.length <= 4 ? P.map(esc).join(' ') : esc(P.slice(0, 3).join(' ')) + ' +' + (P.length - 3));
@@ -33638,6 +33733,19 @@ render();
                       ${eTd(g.units ? '$' + (g.amt / g.units).toFixed(2) : '\u2014', true, 'color:var(--ink-3);')}
                       ${eTd(money(g.amt), true)}
                       ${eTd(tot ? (g.amt / tot * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
+                      ${(() => {
+                        // Per product line, from the items that fed it -- the
+                        // grain where a case price actually applies, since one
+                        // product line can span UPCs priced differently.
+                        const gi = (itRows.items || []).filter(x => {
+                          const h = _dedProdMap && _dedProdMap.get(_dedUpc11(x.upc));
+                          return ((h && h.line) || '\u2014 not in Brand Library') === g.line;
+                        });
+                        const tp = _dedTradePct(gi, l);
+                        if (!tp) return eTd('<span style="color:var(--ink-3);">\u2014</span>', true);
+                        return eTd('<span style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
+                          + (tp.pct * 100).toFixed(1) + '%' + (tp.part ? ' *' : '') + '</span>', true);
+                      })()}
                       ${eTd('')}
                     </tr>`;
                   }).join('');
@@ -33651,6 +33759,12 @@ render();
                     ${eTd(totU ? '<strong>$' + (tot / totU).toFixed(2) + '</strong>' : '', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
                     ${eTd('<strong>' + money(tot) + '</strong>', true, 'border-top:1px solid var(--rule);')}
                     ${eTd('100%', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
+                    ${(() => {
+                      const tp = _dedTradePct(itRows.items, l);
+                      return eTd(tp ? '<strong style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
+                        + (tp.pct * 100).toFixed(1) + '%' + (tp.part ? ' *' : '') + '</strong>' : '',
+                        true, 'border-top:1px solid var(--rule);');
+                    })()}
                     ${eTd('', false, 'border-top:1px solid var(--rule);')}
                   </tr>`;
                   // THE UNITEMISED REMAINDER, ON EVERY LINE THAT HAS ONE.
@@ -33669,7 +33783,7 @@ render();
                       ${eTd('', true)}${eTd('', true)}${eTd('', true)}${eTd('', true)}
                       ${eTd('<span style="color:' + gc + ';">' + money(_gap.gap) + '</span>', true)}
                       ${eTd('<span style="color:' + gc + ';">' + _gap.pct.toFixed(1) + '%</span>', true)}
-                      ${eTd('')}
+                      ${eTd('')}${eTd('')}
                     </tr>
                     <tr>
                       ${eTd('<span style="padding-left:18px;"><strong>Line</strong></span>', false, 'border-top:1px solid var(--rule);')}
@@ -33678,7 +33792,7 @@ render();
                       ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', true, 'border-top:1px solid var(--rule);')}
                       ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', true, 'border-top:1px solid var(--rule);')}
                       ${eTd('<strong>' + money(Math.abs(Number(l.amount) || 0)) + '</strong>', true, 'border-top:1px solid var(--rule);')}
-                      ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', false, 'border-top:1px solid var(--rule);')}
+                      ${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', true, 'border-top:1px solid var(--rule);')}${eTd('', false, 'border-top:1px solid var(--rule);')}
                     </tr>`;
                   }
                 }
@@ -33686,9 +33800,9 @@ render();
               return out;
               return out;
             }).join('')}
-            ${!shown.length ? `<tr><td colspan="11" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
+            ${!shown.length ? `<tr><td colspan="12" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
               No deduction matches ${terms.length ? '\u201c' + esc(_dedQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
-            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="11" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="12" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
               <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
               <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
               <span style="margin-left:10px;">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
@@ -33704,7 +33818,7 @@ render();
               ${_shownUnits ? td('<strong>$' + _dedWtRate(_shownAmt, _shownUnits).toFixed(2) + '</strong>', true, 'border-top:2px solid var(--ink);color:var(--ink-3);') : td('', true, 'border-top:2px solid var(--ink);')}
               ${td('<strong>' + money(filteredAmt) + '</strong>', true, 'border-top:2px solid var(--ink);')}
               ${td(registerAmt ? (filteredAmt / registerAmt * 100).toFixed(1) + '%' : '', true, 'border-top:2px solid var(--ink);color:var(--ink-3);')}
-              ${td('', true, 'border-top:2px solid var(--ink);')}
+              ${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}
             </tr>` : ''}
             <!-- THE REGISTER TOTAL STAYS ON SCREEN WHATEVER IS FILTERED. It sums
                  the same line array the page headline sums, so this tab cannot
@@ -33716,7 +33830,7 @@ render();
               ${td('', true)}${td('', true)}
               ${td('<strong>' + money(registerAmt) + '</strong>', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
               ${td('100%', true, 'color:var(--ink-3);' + (isFiltered ? '' : 'border-top:2px solid var(--ink);'))}
-              ${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
+              ${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
             </tr>
           </tfoot>
         </table>
@@ -33777,10 +33891,10 @@ render();
           if (!_dedProdMap) {
             _dedProdMap = new Map();
             const { data: prods } = await sb.from('products')
-              .select('unit_upc,product_line,item_description').eq('brand_id', brandId);
+              .select('unit_upc,product_line,item_description,units_per_case').eq('brand_id', brandId);
             for (const pr of (prods || [])) {
               const key = _dedUpc11(pr.unit_upc);
-              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null });
+              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null, upc: Number(pr.units_per_case) || null });
             }
           }
           // Paged: a single KeHE chargeback runs to thousands of store rows and
@@ -57391,7 +57505,112 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
           `;
         }).join('')}
       </div>
+
+      <!-- ── CUSTOMER PRICING, BELOW THE IMAGES ────────────────────────────
+           Case price by product, by ACCOUNT. These are ATG's bill-to accounts,
+           not retailers -- the same 12" pizza is $40.44 to PFG and $74.37 to
+           Reinhart -- so the spread across a row is the point of the table, and
+           the low and high are called out for that reason. Loaded from
+           customer_case_prices; the panel simply does not appear for a brand
+           that has none. -->
+      <div id="hl-price-list" style="margin-top:34px;"></div>
     `;
+
+    // Painted after the grid so a slow or missing price table can never hold
+    // up the images, which are what this page is for.
+    (async () => {
+      const host2 = document.getElementById('hl-price-list');
+      if (!host2) return;
+      let rows = [];
+      try {
+        // The products query above carries no brand filter either -- the page
+        // leans on the session's own scoping. Read the brand id if it is there
+        // and filter when it is, rather than throwing and leaving the panel
+        // silently blank if the helper is not mounted on this route.
+        const bId = (window.BrandLibrary && typeof window.BrandLibrary.getSession === 'function'
+                     && (window.BrandLibrary.getSession() || {}).brandId) || null;
+        for (let from = 0; ; from += 1000) {
+          let qy = sb.from('customer_case_prices')
+            .select('customer,upc,product_name,case_price');
+          if (bId) qy = qy.eq('brand_id', bId);
+          const { data, error } = await qy
+            .order('product_name', { ascending: true }).order('customer', { ascending: true })
+            .range(from, from + 999);
+          if (error) throw error;
+          rows.push(...(data || []));
+          if (!data || data.length < 1000) break;
+        }
+      } catch (e) { return; }
+      if (!rows.length) return;
+
+      // Grouped by product, because that is the question being asked -- what do
+      // we charge for this, and to whom. A product with two prices for one
+      // account is shown as both, not reconciled here: the sheet disagrees with
+      // itself on four of them and hiding that would make it permanent.
+      const byProd = new Map();
+      for (const r of rows) {
+        const key = (r.upc || '') + '|' + String(r.product_name || '').toLowerCase();
+        const g = byProd.get(key) || { name: r.product_name, upc: r.upc || null, prices: [] };
+        g.prices.push({ customer: r.customer, price: Number(r.case_price) });
+        byProd.set(key, g);
+      }
+      const prods = [...byProd.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+      const accts = new Set(rows.map(r => r.customer));
+      const fmt = (n) => '$' + n.toFixed(2);
+
+      host2.innerHTML = `
+        <h3 style="font-family:var(--serif);font-size:17px;color:var(--ink);margin:0 0 4px;">Customer pricing</h3>
+        <p style="font-family:var(--serif);font-style:italic;font-size:13px;color:var(--ink-3);margin:0 0 14px;">
+          Case price by product and account \u2014 ${prods.length} product${prods.length === 1 ? '' : 's'} across
+          ${accts.size} account${accts.size === 1 ? '' : 's'}. These are bill-to accounts, not retailers, so the
+          spread within a row is real: it is what each buyer pays for the same case.
+        </p>
+        <input id="hl-price-search" type="text" placeholder="Search product, UPC, or account\u2026"
+               style="width:100%;max-width:420px;padding:9px 12px;font-family:var(--sans);font-size:13.5px;
+                      border:1px solid var(--rule-soft);border-radius:6px;background:var(--paper);margin-bottom:12px;" />
+        <div style="max-height:560px;overflow:auto;border:1px solid var(--rule-soft);border-radius:8px;">
+          <table style="width:100%;border-collapse:collapse;font-family:var(--sans);font-size:13px;">
+            <tbody>
+              ${prods.map(pr => {
+                const sorted = pr.prices.slice().sort((a, b) => a.price - b.price);
+                const lo = sorted[0], hi = sorted[sorted.length - 1];
+                const hay = (pr.name + ' ' + (pr.upc || '') + ' ' + pr.prices.map(x => x.customer).join(' ')).toLowerCase();
+                return `
+                  <tr class="hl-price-prod" data-search="${esc(hay)}">
+                    <td style="padding:12px 14px 4px;border-top:1px solid var(--rule-soft);">
+                      <div style="font-family:var(--serif);font-size:14px;color:var(--ink);">${esc(pr.name)}</div>
+                      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:2px;">
+                        ${pr.upc ? esc(pr.upc) : '<span style="color:var(--lost);">no UPC on the price sheet</span>'}
+                        \u00b7 ${pr.prices.length} account${pr.prices.length === 1 ? '' : 's'}
+                        ${lo.price !== hi.price ? '\u00b7 ' + fmt(lo.price) + ' \u2013 ' + fmt(hi.price)
+                          + ' <span style="opacity:.7;">(' + (((hi.price - lo.price) / lo.price) * 100).toFixed(0) + '% spread)</span>' : '\u00b7 ' + fmt(lo.price)}
+                      </div>
+                    </td>
+                  </tr>
+                  <tr class="hl-price-prod" data-search="${esc(hay)}">
+                    <td style="padding:0 14px 14px;">
+                      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:2px 18px;">
+                        ${sorted.map(x => `
+                          <div style="display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-size:12.5px;">
+                            <span style="color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(x.customer)}</span>
+                            <span style="font-family:var(--mono);font-size:11.5px;color:${x.price === lo.price && lo.price !== hi.price ? 'var(--won)' : (x.price === hi.price && lo.price !== hi.price ? 'var(--lost)' : 'var(--ink-2)')};">${fmt(x.price)}</span>
+                          </div>`).join('')}
+                      </div>
+                    </td>
+                  </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>`;
+
+      const sb2 = document.getElementById('hl-price-search');
+      if (sb2) sb2.oninput = () => {
+        const q = sb2.value.trim().toLowerCase();
+        host2.querySelectorAll('.hl-price-prod').forEach(tr => {
+          tr.style.display = (!q || tr.dataset.search.includes(q)) ? '' : 'none';
+        });
+      };
+    })();
 
     // Wire upload button (present in both empty and populated states)
     document.getElementById('hl-upload-product-images-btn').addEventListener('click', () => {
