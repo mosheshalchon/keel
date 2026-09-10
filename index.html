@@ -29183,6 +29183,7 @@ render();
   // at -- a Natural Grocers scan billed through UNFI is priced at UNFI's rate,
   // because UNFI is who ATG invoiced.
   let _dedCasePrices = null;      // 'account|upc' -> price, or null where the sheet disagrees with itself
+  let _dedPriceErr = null;        // set when the price fetch itself failed, so blank cells can say why
   const _DED_PRICE_ACCT = {
     'UNFI':          ['UNFI - EAST (ATG)', 'UNFI - WEST (ATG)'],
     'KeHE':          ['KeHE Distributors'],
@@ -29194,8 +29195,12 @@ render();
   // names the region (ER.../WR..., and VTBR = Western Region) that settles it;
   // where it does not and the two prices differ, the answer is NO price rather
   // than a coin-flip that reads like a fact.
-  const _dedPriceAccts = (line) => {
-    const d = (typeof _lineDist === 'function' && _lineDist(line)) || '';
+  // dist is PASSED IN, not looked up. _lineDist is declared inside the
+  // deductions render, so a module-level helper cannot see it -- and the
+  // typeof guard that was here turned that scoping mistake into an empty
+  // column rather than an error, which is the worst of both.
+  const _dedPriceAccts = (line, dist) => {
+    const d = dist || '';
     const list = _DED_PRICE_ACCT[d];
     if (!list) return [];
     if (d !== 'UNFI') return list;
@@ -29218,23 +29223,33 @@ render();
   // Weighted by SPEND across the items that price, so a product with no case
   // price or no units-per-case is excluded from the percentage rather than
   // counted as zero -- and `covered` says how much of the line it speaks for.
-  const _dedTradePct = (items, line) => {
-    if (!items || !items.length) return null;
-    const accts = _dedPriceAccts(line);
-    if (!accts.length) return null;
-    let num = 0, cov = 0, all = 0;
+  // Returns { pct, covered, all, part } or { why } -- NEVER a bare null. A blank
+  // cell that cannot say why it is blank is indistinguishable from a rate of
+  // nothing, and three separate causes here look identical on screen: no account
+  // mapped, no case pack on the product, no price for that account. The reason
+  // rides along and lands in the cell's tooltip.
+  const _dedTradePct = (items, line, dist) => {
+    if (!items || !items.length) return { why: 'no itemised detail on this line' };
+    if (!_dedProdMap || !_dedProdMap.size) return { why: 'Brand Library products not loaded' };
+    if (!_dedCasePrices || !_dedCasePrices.size)
+      return { why: _dedPriceErr ? 'case prices failed to load: ' + _dedPriceErr : 'no case prices loaded' };
+    const accts = _dedPriceAccts(line, dist);
+    if (!accts.length) return { why: 'no price account mapped for ' + (dist || 'unknown distributor') };
+    let num = 0, cov = 0, all = 0, noPer = 0, noPrice = 0, noUnits = 0;
     for (const it of items) {
       all += it.amt;
-      if (!it.units) continue;
-      const hit = _dedProdMap && _dedProdMap.get(_dedUpc11(it.upc));
+      if (!it.units) { noUnits++; continue; }
+      const hit = _dedProdMap.get(_dedUpc11(it.upc));
       const per = hit && hit.upc;
-      if (!per) continue;
+      if (!per) { noPer++; continue; }
       const price = _dedCasePrice(accts, _dedUpc11(it.upc));
-      if (!price) continue;
-      const pct = (it.amt / it.units) * per / price;
-      num += pct * it.amt; cov += it.amt;
+      if (!price) { noPrice++; continue; }
+      num += ((it.amt / it.units) * per / price) * it.amt; cov += it.amt;
     }
-    if (!cov) return null;
+    if (!cov) return { why: 'priced against ' + accts.join(' / ') + ' \u2014 '
+      + [noPrice ? noPrice + ' item(s) with no case price for that account' : '',
+         noPer   ? noPer + ' with no units-per-case in Brand Library' : '',
+         noUnits ? noUnits + ' with no quantity' : ''].filter(Boolean).join(', ') };
     return { pct: num / cov, covered: cov, all, part: cov < all - 0.005 };
   };
 
@@ -33469,7 +33484,12 @@ render();
             if (!_dedCasePrices.has(k)) _dedCasePrices.set(k, v);
             else if (_dedCasePrices.get(k) !== v) _dedCasePrices.set(k, null);
           }
-        } catch (e) { /* the register does not depend on it */ }
+        } catch (e) {
+          // NOT swallowed. A silent empty here reads exactly like "no price on
+          // file" and there is no way to tell the two apart from the screen --
+          // which is the failure mode this project keeps getting caught by.
+          _dedPriceErr = (e && e.message) || String(e);
+        }
       }
       const needDet = shown.filter(l => l.detail_parsed && !_dedItemCache.has(String(l.id))).map(l => l.id);
       if (needDet.length) {
@@ -33661,8 +33681,9 @@ render();
                 ${td(registerAmt ? (Math.abs(Number(l.amount || 0)) / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
                 ${(() => {
                   const it = _dedItemCache.get(String(l.id));
-                  const tp = it && !it.err ? _dedTradePct(it.items, l) : null;
-                  if (!tp) return td('<span style="color:var(--ink-3);">\u2014</span>', true);
+                  const tp = it && !it.err ? _dedTradePct(it.items, l, _lineDist(l)) : null;
+                  if (!tp || tp.why) return td('<span style="color:var(--ink-3);" title="'
+                    + esc((tp && tp.why) || 'not calculated') + '">\u2014</span>', true);
                   // Over 100% would mean giving back more than the case is sold
                   // for. That happens, and when it does it is the finding -- so
                   // it is coloured rather than clipped.
@@ -33741,8 +33762,9 @@ render();
                           const h = _dedProdMap && _dedProdMap.get(_dedUpc11(x.upc));
                           return ((h && h.line) || '\u2014 not in Brand Library') === g.line;
                         });
-                        const tp = _dedTradePct(gi, l);
-                        if (!tp) return eTd('<span style="color:var(--ink-3);">\u2014</span>', true);
+                        const tp = _dedTradePct(gi, l, _lineDist(l));
+                        if (!tp || tp.why) return eTd('<span style="color:var(--ink-3);" title="'
+                          + esc(tp && tp.why || '') + '">\u2014</span>', true);
                         return eTd('<span style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
                           + (tp.pct * 100).toFixed(1) + '%' + (tp.part ? ' *' : '') + '</span>', true);
                       })()}
@@ -33760,8 +33782,10 @@ render();
                     ${eTd('<strong>' + money(tot) + '</strong>', true, 'border-top:1px solid var(--rule);')}
                     ${eTd('100%', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
                     ${(() => {
-                      const tp = _dedTradePct(itRows.items, l);
-                      return eTd(tp ? '<strong style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
+                      const tp = _dedTradePct(itRows.items, l, _lineDist(l));
+                      if (tp && tp.why) return eTd('<span style="color:var(--ink-3);" title="' + esc(tp.why)
+                        + '">\u2014</span>', true, 'border-top:1px solid var(--rule);');
+                      return eTd(tp && tp.pct != null ? '<strong style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
                         + (tp.pct * 100).toFixed(1) + '%' + (tp.part ? ' *' : '') + '</strong>' : '',
                         true, 'border-top:1px solid var(--rule);');
                     })()}
@@ -33835,7 +33859,9 @@ render();
           </tfoot>
         </table>
         ${!DL ? `<p style="font-family:var(--mono);font-size:10px;color:var(--lost);margin-top:10px;line-height:1.55;">
-          Store-level detail could not be loaded, so rows cannot be expanded and months fall back to the register line's own date.</p>` : ''}`;
+          Store-level detail could not be loaded, so rows cannot be expanded and months fall back to the register line's own date.</p>` : ''}
+        ${_dedPriceErr ? `<p style="font-family:var(--mono);font-size:10px;color:var(--lost);margin-top:10px;line-height:1.55;">
+          Case prices could not be read, so % trade rate is blank on every row \u2014 that is a load failure, not an absence of prices: ${esc(_dedPriceErr)}</p>` : ''}`;
         wireRows(host);
       };
       // ── ROW HANDLERS, RE-ATTACHABLE ──────────────────────────────────────
