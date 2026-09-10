@@ -29239,7 +29239,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-6 late-fee-net';
+  const _DED_BUILD = 'tr-7 asm-crosswalk';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31744,6 +31744,91 @@ render();
     };
   }
 
+  // ── UNFI ASM / ALL-SALES DETAIL ──────────────────────────────────────────
+  // The layout the 01ASM / WE / MCB chargeback exports use. 20 columns:
+  //   Date Invoice "Period End" "Remit #" Vendor "Pay Code" "Prod #" Brand
+  //   Pack/Size Description Type Ref Whse WhslPrice PurAlw MCB% OI% QtyS
+  //   SaleAmt ChgBckAmt
+  //
+  // This file STATES the rate rather than implying it, which no other layout
+  // does: MCB% is the agreed percentage, WhslPrice is the case price it applies
+  // to, and the arithmetic ties -- 74.37 x 2 = 148.74, x 10% = 14.87 against a
+  // billed 14.88 (UNFI rounds each row). So unit_chargeback is taken as the
+  // chargeback PER CASE actually billed, not as a percentage: the percentage is
+  // of UNFI's own wholesale price to the store, and mixing that into a column
+  // read as dollars-per-unit is how a rate silently becomes a different number.
+  //
+  // NOTE there is no UPC in this file at all -- only UNFI's Prod # and a
+  // truncated description ('PZZA,3CHS,GF,12IN,GRN FRE'). Rows therefore land
+  // with upc: null and group under 'not in Brand Library' until a Prod # to UPC
+  // crosswalk exists. That is a known gap, not a parse failure, and it is why
+  // these lines carry units and a rate but no trade rate.
+  // Prod # -> UPC, from distributor_item_map. Loaded when the upload dialog
+  // opens, so the parser stays a pure function of the grid.
+  let _dedDistItemMap = null;
+  function _dedParseUnfiAsm(rows) {
+    const norm = (t) => String(t == null ? '' : t).trim().toLowerCase().replace(/[^a-z0-9%#]/g, '');
+    let h = -1, C = null;
+    for (let i = 0; i < Math.min(rows.length, 15); i++) {
+      const m = {};
+      (rows[i] || []).forEach((c, n) => { const k = norm(c); if (k && !(k in m)) m[k] = n; });
+      // Demanded together so a file that merely happens to have a 'Description'
+      // cannot claim this layout.
+      if (m.qtys != null && m.chgbckamt != null && m.whslprice != null && m.description != null) { h = i; C = m; break; }
+    }
+    if (h < 0) return { error: 'unfi asm: no header row with QtyS, ChgBckAmt, WhslPrice and Description', rows: [] };
+
+    const num = (v) => {
+      const t = String(v == null ? '' : v).replace(/[$,\s]/g, '').replace(/^\((.*)\)$/, '-$1');
+      const n = Number(t);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const out = [];
+    let tie = 0, off = 0, mapHit = 0;
+    const mapMiss = new Set();
+    for (let i = h + 1; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const desc = String(r[C.description] == null ? '' : r[C.description]).trim();
+      const q = num(r[C.qtys]);
+      const amt = Math.abs(num(r[C.chgbckamt]));
+      if (!desc || !q || !amt) continue;                      // totals and blank rows
+      const wp = num(r[C.whslprice]);
+      const pct = C['mcb%'] != null ? num(r[C['mcb%']]) : 0;
+      // Does the row's own arithmetic hold? Counted, not enforced -- a file that
+      // does not tie is still worth importing, but the note has to say so.
+      if (wp && pct) { (Math.abs(wp * q * pct / 100 - amt) <= 0.05 ? tie++ : off++); }
+      const prodNo = C['prod#'] != null && r[C['prod#']] ? String(r[C['prod#']]).trim() : null;
+      const mapped = prodNo && _dedDistItemMap ? _dedDistItemMap.get(prodNo) : null;
+      if (prodNo) { mapped ? mapHit++ : mapMiss.add(prodNo); }
+      out.push({
+        // The file has no UPC; this comes from the Prod # crosswalk. Where the
+        // Prod # is not mapped the row still imports, with upc null -- it keeps
+        // its store, units and dollars and simply groups under 'not in Brand
+        // Library', which is visible. Guessing a UPC from the truncated
+        // description would not be.
+        upc: mapped || null,
+        item_desc: desc + (C.packsize != null && r[C.packsize] ? ' (' + String(r[C.packsize]).trim() + ')' : ''),
+        reference_no: prodNo,
+        ship_date: null, date_to: null,
+        customer_name: C.whse != null && r[C.whse] ? String(r[C.whse]).trim() : null,
+        customer_no: null, store_no: C.whse != null && r[C.whse] ? String(r[C.whse]).trim() : null,
+        ship_qty: q,
+        unit_chargeback: q ? amt / q : null,                  // per CASE, as billed
+        unit_cost: wp || null,
+        discount_pct: pct || null,
+        bill_amount: amt,
+      });
+    }
+    if (!out.length) return { error: 'unfi asm: header found but no priced rows', rows: [] };
+    return { rows: out,
+             note: 'UNFI ASM layout \u2014 ' + out.length + ' rows. '
+                 + (tie + off ? tie + ' of ' + (tie + off) + ' tie to WhslPrice x QtyS x MCB%. ' : '')
+                 + (_dedDistItemMap
+                     ? mapHit + ' rows matched a UPC via the UNFI Prod # crosswalk'
+                       + (mapMiss.size ? '; UNMAPPED Prod #: ' + [...mapMiss].join(', ') + ' \u2014 those rows import without a UPC.' : '.')
+                     : 'The UNFI Prod # crosswalk did not load, so rows import without a UPC.') };
+  }
+
   function _dedParseNgScanback(rows) {
     const U = (v) => String(v == null ? '' : v).toUpperCase().replace(/[^A-Z0-9%$]/g, '');
     const N = (v) => { if (v == null || String(v).trim() === '') return null;
@@ -34184,6 +34269,14 @@ render();
           parsed = null; arm(false);
           out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026</span>';
           try {
+            if (!_dedDistItemMap) {
+              _dedDistItemMap = new Map();
+              try {
+                const { data: xw } = await sb.from('distributor_item_map')
+                  .select('item_no,upc').eq('brand_id', brandId).eq('distributor', 'UNFI');
+                for (const row of (xw || [])) _dedDistItemMap.set(String(row.item_no).trim(), String(row.upc).trim());
+              } catch (e) { /* the note below says when it did not load */ }
+            }
             const name = String(f.name || '').toLowerCase();
             const isSheet = /\.(xlsx|xls|csv|txt)$/.test(name);
             let p = null;
@@ -34205,6 +34298,7 @@ render();
               // document keeps its known reading, and the general one only ever
               // sees what nothing else claimed.
               for (const [nm, fn] of [['Natural Grocers scanback', _dedParseNgScanback],
+                                      ['UNFI ASM / all sales', _dedParseUnfiAsm],
                                       ['any grid', _dedParseGrid]]) {
                 const got = fn(rows);
                 if (got && !got.error && got.rows && got.rows.length) { p = got; break; }
