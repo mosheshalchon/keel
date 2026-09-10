@@ -29173,6 +29173,26 @@ render();
   // the same as a 21,754-unit one and read materially low on every mixed line.
   const _dedWtRate = (amt, units) => (units > 0 ? amt / units : null);
 
+  // ── HOW MUCH OF THE MONEY IS ON SCREEN ───────────────────────────────────
+  // Every paged list in the app says how many rows are hidden. None of them
+  // said how much MONEY is on screen, which is the question actually being
+  // asked -- twenty-five rows out of 4,839 sounds like nothing and is in fact
+  // a quarter of the register, because the list is sorted by size.
+  //
+  // Cumulative by construction: these lists grow with "Show 25 more" rather
+  // than replacing a page, so the rows on screen ARE the running total. Page
+  // two reads 950 of 2,600, not 300 of 2,600.
+  //
+  // money() is passed in because each caller has its own formatter in scope.
+  function _hlShownSoFar(nShown, nAll, amtShown, amtAll, money) {
+    if (!(amtAll > 0) || nShown >= nAll) return '';
+    return '<span style="margin-left:10px;color:var(--ink-2);">'
+      + '<strong>' + money(amtShown) + '</strong> of ' + money(amtAll)
+      + ' shown \u00b7 <strong>' + (amtShown / amtAll * 100).toFixed(1) + '%</strong>'
+      + ' <span style="color:var(--ink-3);">(' + nShown.toLocaleString() + ' of '
+      + nAll.toLocaleString() + ' rows)</span></span>';
+  }
+
   // ── TRADE RATE AS A % OF THE CASE PRICE ──────────────────────────────────
   // (per-unit trade rate x units per case) / case price -- what share of the
   // invoice is being given back on that product.
@@ -29246,11 +29266,18 @@ render();
   // rate per retail unit -- so those do multiply by the case pack. Moshe
   // confirmed this for the 12 inch pizza: $2.54 x 6 / $49.74.
   const _DED_QTY_IS_CASES = new Set(['UNFI-ALLSALES', 'UNFI-ASMCB', 'UNFI-MCB']);
+  // ── FLAT FEES HAVE NO RATE ───────────────────────────────────────────────
+  // An ad fee, a slotting fee or a growth incentive is a lump sum. It is trade
+  // spend, but it is not paid per unit, so a share of case price is meaningless
+  // for it. These bill against a quantity of 1, which makes bill/qty the ENTIRE
+  // charge -- a $15,000 ad fee came out at 417,827% of a case.
+  const _DED_FLAT_FEE_CATS = new Set(['Ads', 'Ads / Merchandising', 'Slotting',
+                                      'Growth Incentive', 'Free fill']);
   // Visible build marker. Three separate fixes have now been reported as "still
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-10 no-uplift';
+  const _DED_BUILD = 'tr-12 shown-so-far';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -29349,10 +29376,12 @@ render();
   // spoilage allowance, a freight charge, an ad fee or a late-delivery penalty:
   // none of them is a rate paid per unit sold, so the column stays blank rather
   // than printing a number that invites the wrong comparison.
-  const _dedTradePct = (items, line, dist, isTrade) => {
+  const _dedTradePct = (items, line, dist, isTrade, cat) => {
+    if (_DED_FLAT_FEE_CATS.has(cat))
+      return { na: true, why: 'flat fee \u2014 not paid per unit, so a share of case price does not apply' };
     const uplift = _DED_FEE_UPLIFT[line && line.reason_code] || 1;
     const byCase = _DED_QTY_IS_CASES.has(line && line.reason_code);
-    if (isTrade === false) return { why: 'not trade spend \u2014 a share of case price does not apply to this charge' };
+    if (isTrade === false) return { na: true, why: 'not trade spend \u2014 a share of case price does not apply to this charge' };
     if (!items || !items.length) return { why: 'no itemised detail on this line' };
     if (!_dedProdMap || !_dedProdMap.size) return { why: 'Brand Library products not loaded' };
     if (!_dedCasePrices || !_dedCasePrices.size)
@@ -29384,6 +29413,12 @@ render();
       if (!price) { noPrice++; row.skip = 'no case price for this account'; work.push(row); continue; }
       row.price = price;
       row.pct = row.rate * per / price;
+      // Above 100% the charge exceeds what the case sells for, so it is not a
+      // rate at all -- almost always a lump sum billed against a quantity of 1.
+      // Excluded from the weighting and shown as its own reason, never printed
+      // as a percentage: 417,827% reads like a bug, and a smaller wrong number
+      // would read like a fact.
+      if (row.pct > 1) { row.skip = 'charge exceeds the case price \u2014 looks like a lump sum, not a rate'; work.push(row); noPrice++; continue; }
       work.push(row);
       num += row.pct * it.amt; cov += it.amt;
     }
@@ -33940,9 +33975,13 @@ render();
                 ${td(registerAmt ? (Math.abs(Number(l.amount || 0)) / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
                 ${(() => {
                   const it = _dedItemCache.get(String(l.id));
-                  const tp = it && !it.err ? _dedTradePct(it.items, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend') : null;
+                  const tp = it && !it.err ? _dedTradePct(it.items, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend', (rmapBy[l.reason_code] || {}).keel_category) : null;
+                  // n/a where the measure does not apply (flat fee, not trade
+                  // spend); an em dash where it applies but the data is missing.
+                  // Two different facts, so two different marks.
                   if (!tp || tp.why) return td('<span style="color:var(--ink-3);" title="'
-                    + esc((tp && tp.why) || 'not calculated') + '">\u2014</span>', true);
+                    + esc((tp && tp.why) || 'not calculated') + '">'
+                    + (tp && tp.na ? 'n/a' : '\u2014') + '</span>', true);
                   // Over 100% would mean giving back more than the case is sold
                   // for. That happens, and when it does it is the finding -- so
                   // it is coloured rather than clipped.
@@ -34021,9 +34060,9 @@ render();
                           const h = _dedProdMap && _dedProdMap.get(_dedUpc11(x.upc));
                           return ((h && h.line) || '\u2014 not in Brand Library') === g.line;
                         });
-                        const tp = _dedTradePct(gi, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend');
+                        const tp = _dedTradePct(gi, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend', (rmapBy[l.reason_code] || {}).keel_category);
                         if (!tp || tp.why) return eTd('<span style="color:var(--ink-3);" title="'
-                          + esc(tp && tp.why || '') + '">\u2014</span>', true);
+                          + esc(tp && tp.why || '') + '">' + (tp && tp.na ? 'n/a' : '\u2014') + '</span>', true);
                         return eTd('<span style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
                           + (tp.pct * 100).toFixed(1) + '%' + (tp.part ? ' *' : '') + '</span>', true);
                       })()}
@@ -34041,9 +34080,9 @@ render();
                     ${eTd('<strong>' + money(tot) + '</strong>', true, 'border-top:1px solid var(--rule);')}
                     ${eTd('100%', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
                     ${(() => {
-                      const tp = _dedTradePct(itRows.items, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend');
+                      const tp = _dedTradePct(itRows.items, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend', (rmapBy[l.reason_code] || {}).keel_category);
                       if (tp && tp.why) return eTd('<span style="color:var(--ink-3);" title="' + esc(tp.why)
-                        + '">\u2014</span>', true, 'border-top:1px solid var(--rule);');
+                        + '">' + (tp.na ? 'n/a' : '\u2014') + '</span>', true, 'border-top:1px solid var(--rule);');
                       return eTd(tp && tp.pct != null ? '<strong class="hl-dl-tr" data-id="' + l.id
                         + '" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px;color:'
                         + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
@@ -34090,7 +34129,10 @@ render();
             ${filtered.length > _dedLinesLimit ? `<tr><td colspan="12" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
               <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
               <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
-              <span style="margin-left:10px;">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
+              ${_hlShownSoFar(Math.min(_dedLinesLimit, filtered.length), filtered.length,
+                  filtered.slice(0, _dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0),
+                  filteredAmt, money)}
+              <span style="margin-left:10px;color:var(--ink-3);">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
             </td></tr>` : ''}
           </tbody>
           <tfoot>
@@ -34129,7 +34171,7 @@ render();
             const ln = (shown.find(x => String(x.id) === el.dataset.id));
             if (!ln) return;
             const c = _dedItemCache.get(String(ln.id));
-            const tp = c && !c.err ? _dedTradePct(c.items, ln, _lineDist(ln), _dedBucketOf(rmapBy[ln.reason_code]) === 'Trade spend') : null;
+            const tp = c && !c.err ? _dedTradePct(c.items, ln, _lineDist(ln), _dedBucketOf(rmapBy[ln.reason_code]) === 'Trade spend', (rmapBy[ln.reason_code] || {}).keel_category) : null;
             if (tp && tp.pct != null) _dedTradeModal(ln, tp);
           };
         });
@@ -36397,7 +36439,10 @@ ${(() => {
               ${shown.length > _dedCustLimit ? `<tr><td colspan="${MS.length + 2}" style="padding:11px 10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
                 <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, shown.length - _dedCustLimit)} more</button>
                 <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${shown.length}</button>
-                <span style="margin-left:10px;">${shown.length - _dedCustLimit} smaller customers hidden \u00b7 the row below still counts them</span>
+                ${_hlShownSoFar(Math.min(_dedCustLimit, shown.length), shown.length,
+                    list.slice(0, _dedCustLimit).reduce((n, b) => n + Math.abs(Number(b.amt || 0)), 0),
+                    list.reduce((n, b) => n + Math.abs(Number(b.amt || 0)), 0), money)}
+                <span style="margin-left:10px;color:var(--ink-3);">${shown.length - _dedCustLimit} smaller customers hidden \u00b7 the row below still counts them</span>
               </td></tr>` : ''}
               <!-- FOOT TO THE REGISTER. This tab used to end at "Traced to a store"
                    and push the remainder into a footnote, so it read $411,569
@@ -36536,7 +36581,10 @@ ${(() => {
               ${shown.length > _dedCustLimit ? `<tr><td colspan="6" style="padding:11px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
                 <button class="hl-cust-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, shown.length - _dedCustLimit)} more</button>
                 <button class="hl-cust-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${shown.length}</button>
-                <span style="margin-left:10px;">${shown.length - _dedCustLimit} smaller customers hidden \u00b7 ${money(shown.slice(_dedCustLimit).reduce((n, b) => n + b.amt, 0))} \u2014 the total below still counts them</span>
+                ${_hlShownSoFar(Math.min(_dedCustLimit, shown.length), shown.length,
+                    shown.slice(0, _dedCustLimit).reduce((n, b) => n + Math.abs(Number(b.amt || 0)), 0),
+                    shown.reduce((n, b) => n + Math.abs(Number(b.amt || 0)), 0), money)}
+                <span style="margin-left:10px;color:var(--ink-3);">${shown.length - _dedCustLimit} smaller customers hidden \u00b7 ${money(shown.slice(_dedCustLimit).reduce((n, b) => n + b.amt, 0))} \u2014 the total below still counts them</span>
               </td></tr>` : ''}
               ${unattributed ? `<tr>${td('<span style="color:var(--ink-3);">Store detail with no customer name</span>')}${td('', true)}${td('', true)}${td('')}${td(money(unattributed), true)}${td((unattributed / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}</tr>` : ''}
               ${chargeRows.length ? `<tr><td colspan="6" style="padding:16px 10px 6px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule);">Other deductions \u00b7 not customer-specific \u00b7 ${money(chargeAmt)}</td></tr>` : ''}
@@ -36546,7 +36594,10 @@ ${(() => {
               ${gapList.length > _dedGapLimit ? `<tr><td colspan="6" style="padding:11px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
                 <button class="hl-gap-more" style="font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, gapList.length - _dedGapLimit)} more</button>
                 <button class="hl-gap-all" style="margin-left:7px;font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${gapList.length}</button>
-                <span style="margin-left:10px;">${gapList.length - _dedGapLimit} smaller categories hidden \u00b7 ${money(gapList.slice(_dedGapLimit).reduce((n, g) => n + g.amt, 0))}</span>
+                ${_hlShownSoFar(Math.min(_dedGapLimit, gapList.length), gapList.length,
+                    gapList.slice(0, _dedGapLimit).reduce((n, g) => n + Math.abs(Number(g.amt || 0)), 0),
+                    gapList.reduce((n, g) => n + Math.abs(Number(g.amt || 0)), 0), money)}
+                <span style="margin-left:10px;color:var(--ink-3);">${gapList.length - _dedGapLimit} smaller categories hidden \u00b7 ${money(gapList.slice(_dedGapLimit).reduce((n, g) => n + g.amt, 0))}</span>
               </td></tr>` : ''}
               ${priorExcluded ? `<tr>${td('<span style="color:var(--ink-3);">Promos that ran before ' + esc(_dedMon(_yStart)) + ' \u2014 excluded from this view</span>')}${td('', true)}${td('', true)}${td('')}${td('<span style="color:var(--ink-3);">' + money(priorExcluded) + '</span>', true)}${td('', true)}</tr>` : ''}
               <tr>${td('<strong>All deductions ' + esc(yr) + '</strong>', false, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}${td('<strong>' + money(grand) + '</strong>', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}</tr>
