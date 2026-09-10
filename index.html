@@ -29277,7 +29277,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-14 na-always';
+  const _DED_BUILD = 'tr-15 backup-stamp';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -33874,7 +33874,7 @@ render();
 
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Units', true)}${th('Rate', true)}${th('Deducted', true)}${th('Share', true)}${th('% trade rate', true)}${th('')}
+            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Units', true)}${th('Rate', true)}${th('Deducted', true)}${th('Share', true)}${th('% trade rate', true)}${th('')}${th('Backup added')}
           </tr></thead>
           <tbody>
             ${shown.map(l => {
@@ -34008,7 +34008,23 @@ render();
                       style="margin-left:5px;font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;
                              border:1px solid var(--rule-soft);border-radius:3px;background:transparent;color:var(--ink-3);cursor:pointer;"
                       >file</button>`, true)}
-              </tr>`;
+              
+                ${(() => {
+                  // Surname and a short local timestamp -- "Gregory 9/10 11:11 AM".
+                  // The full name, the email and the exact time are on hover:
+                  // the column is for noticing that something arrived, not for
+                  // auditing, and a full datetime in every row would crowd out
+                  // the numbers this table exists to show.
+                  if (!l.backup_at) return td('');
+                  const d = new Date(l.backup_at);
+                  const nm = String(l.backup_by || '').trim();
+                  const surname = nm ? nm.split(/\s+/).slice(-1)[0] : (l.backup_by_email || '\u2014');
+                  const when = (d.getMonth() + 1) + '/' + d.getDate() + ' '
+                    + d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                  return td('<span title="' + esc((nm || '') + (l.backup_by_email ? ' \u00b7 ' + l.backup_by_email : '')
+                      + ' \u00b7 ' + d.toLocaleString()) + '" style="color:var(--ink-3);">'
+                      + esc(surname) + ' ' + esc(when) + '</span>', false, 'white-space:nowrap;');
+                })()}</tr>`;
               // ── WHAT WAS ACTUALLY BOUGHT ────────────────────────────────
               // Item grain, from the document's own UPCs and descriptions --
               // not a product GROUP, which would mean guessing which of ATG's
@@ -34017,13 +34033,13 @@ render();
               // detail, not of the register, so they always sum to 100.
               if (itOpen) {
                 if (!itRows) {
-                  out += `<tr><td colspan="12" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="13" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">Reading the detail\u2026</td></tr>`;
                 } else if (itRows.err) {
-                  out += `<tr><td colspan="12" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="13" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--lost);background:var(--rule-softer);">${esc(itRows.err)}</td></tr>`;
                 } else if (!itRows.items.length) {
-                  out += `<tr><td colspan="12" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
+                  out += `<tr><td colspan="13" style="padding:10px 10px 10px 32px;border-bottom:1px solid var(--rule-soft);
                     font-family:var(--mono);font-size:10.5px;color:var(--ink-3);background:var(--rule-softer);">No item detail under this line.</td></tr>`;
                 } else {
                   const G = itRows.groups || [];
@@ -34132,7 +34148,7 @@ render();
               return out;
               return out;
             }).join('')}
-            ${!shown.length ? `<tr><td colspan="12" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
+            ${!shown.length ? `<tr><td colspan="13" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
               No deduction matches ${terms.length ? '\u201c' + esc(_dedQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
             ${filtered.length > _dedLinesLimit ? `<tr>
               <td colspan="8" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
@@ -34150,7 +34166,7 @@ render();
                 const cell = (h, extra) => `<td style="padding:12px 10px;text-align:right;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;${extra || ''}">${h}</td>`;
                 return cell('<strong>' + money(amt) + '</strong>')
                      + cell(filteredAmt ? (amt / filteredAmt * 100).toFixed(1) + '%' : '', 'color:var(--ink-3);')
-                     + cell('') + cell('');
+                     + cell('') + cell('') + cell('');
               })()}
             </tr>` : ''}
           </tbody>
@@ -34164,7 +34180,7 @@ render();
               ${_shownUnits ? td('<strong>$' + _dedWtRate(_shownAmt, _shownUnits).toFixed(2) + '</strong>', true, 'border-top:2px solid var(--ink);color:var(--ink-3);') : td('', true, 'border-top:2px solid var(--ink);')}
               ${td('<strong>' + money(filteredAmt) + '</strong>', true, 'border-top:2px solid var(--ink);')}
               ${td(registerAmt ? (filteredAmt / registerAmt * 100).toFixed(1) + '%' : '', true, 'border-top:2px solid var(--ink);color:var(--ink-3);')}
-              ${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}
+              ${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}${td('', true, 'border-top:2px solid var(--ink);')}
             </tr>` : ''}
             <!-- THE REGISTER TOTAL STAYS ON SCREEN WHATEVER IS FILTERED. It sums
                  the same line array the page headline sums, so this tab cannot
@@ -34176,7 +34192,7 @@ render();
               ${td('', true)}${td('', true)}
               ${td('<strong>' + money(registerAmt) + '</strong>', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
               ${td('100%', true, 'color:var(--ink-3);' + (isFiltered ? '' : 'border-top:2px solid var(--ink);'))}
-              ${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
+              ${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}${td('', true, isFiltered ? '' : 'border-top:2px solid var(--ink);')}
             </tr>
           </tfoot>
         </table>
@@ -34621,10 +34637,17 @@ render();
               if (error) throw new Error(error.message);
             }
             step('Updating the register line');
+            // WHO AND WHEN, stamped at the moment the import commits -- not at
+            // the moment the dialog opened, and not from the file's own dates,
+            // which are the document's dates and not the act of uploading it.
+            const _sess = (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
             const { error: uErr } = await guard(sb.from('deduction_lines').update({
               detail_parsed: true,
               detail_line_total: parsed.line_total,
               detail_variance: Math.round((amt - parsed.line_total) * 100) / 100,
+              backup_by: _sess.name || _sess.email || null,
+              backup_by_email: _sess.email || null,
+              backup_at: new Date().toISOString(),
             }).eq('id', l.id), 'line update');
             if (uErr) throw new Error('updating the register line: ' + uErr.message);
             out.innerHTML = '<span style="color:var(--won);">Imported ' + rows.length.toLocaleString() + ' rows.</span>'
