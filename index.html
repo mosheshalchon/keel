@@ -29277,7 +29277,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-15 backup-stamp';
+  const _DED_BUILD = 'tr-16 stamp-fetch';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -32500,7 +32500,7 @@ render();
       } else {
         [checks, lines, rmap, lineRates, overrides] = await Promise.all([
           paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
-          paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
+          paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks,backup_by,backup_by_email,backup_at').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
           paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
           // PER-LINE UNIT RATES. The rollup that feeds the detail does not carry
           // ship_qty or unit_chargeback, and the RATE is the only thing that
