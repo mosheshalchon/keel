@@ -29222,19 +29222,17 @@ render();
     if (/^WR/.test(ref) || /VTBR/.test(ref)) return ['UNFI - WEST (ATG)'];
     return list;
   };
-  // ── FEE UPLIFT INSIDE THE DETAIL ─────────────────────────────────────────
-  // UNFI's NCG charge is principal x 1.2 -- a 20% liquidated-damages fee for a
-  // late AP response -- and the uplift is applied to EVERY detail row, not added
-  // as a separate line. Verified on NCG042611996315930VTBR:
-  //   line $65,666      -> principal $54,721.67 + fee $10,944.33
-  //   itemised $57,790  / 1.2 = $48,158.33
-  //   unitemised $7,876 / 1.2 =  $6,563.33
-  //   48,158.33 + 6,563.33     = $54,721.67 exactly
-  // So the rate a row implies is 20% higher than the rate actually agreed, and
-  // leaving it in overstates the trade rate on every NCG line. The fee is a
-  // penalty, not trade spend -- it belongs in the deduction total, not in a
-  // percentage meant to describe what a promotion cost.
-  const _DED_FEE_UPLIFT = { 'UNFI-NCG': 1.2 };
+  // ── NO FEE UPLIFT IS APPLIED ─────────────────────────────────────────────
+  // An earlier build divided every UNFI-NCG rate by 1.2, on the belief that the
+  // 20% late-payment fee was applied to each detail row. It is not: UNFI books
+  // that fee as its OWN code, UNFI-NCG-LATEFEE, $25,225 in 2026, bucketed as a
+  // fee and correctly excluded from trade spend. NCG detail is principal.
+  //
+  // The arithmetic offered as proof was circular -- itemised/1.2 plus
+  // unitemised/1.2 equals the line/1.2 for ANY number, so it confirmed nothing.
+  // If a fee is ever found genuinely embedded in a row, it needs evidence from
+  // the document, not a ratio that holds by construction.
+  const _DED_FEE_UPLIFT = {};
   // ── WHAT THE QUANTITY COUNTS ─────────────────────────────────────────────
   // Not the same across sources, and getting it wrong is invisible -- it yields
   // a plausible number, not an error.
@@ -29252,7 +29250,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-9 case-basis';
+  const _DED_BUILD = 'tr-10 no-uplift';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -29298,10 +29296,7 @@ render();
           ${tp.byCase
             ? 'rate per CASE &divide; case price, weighted by spend &mdash; this document bills cases, so no case pack is applied'
             : 'rate per unit &times; units per case &divide; case price, weighted by spend'}
-          ${tp.uplift && tp.uplift !== 1 ? `<div style="margin-top:6px;color:var(--lost);">
-            Rates shown are NET of the ${Math.round((tp.uplift - 1) * 100)}% late-payment fee this code carries.
-            The document bills principal &times; ${tp.uplift} on every row; the fee is a penalty, not trade spend,
-            so it is divided back out before the percentage.</div>` : ''}
+
         </div>
 
         <div style="margin-top:14px;overflow-x:auto;">
