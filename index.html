@@ -29277,7 +29277,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-12 shown-so-far';
+  const _DED_BUILD = 'tr-14 na-always';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -33974,8 +33974,16 @@ render();
                 ${td('<strong>' + money(Math.abs(Number(l.amount || 0))) + '</strong>', true)}
                 ${td(registerAmt ? (Math.abs(Number(l.amount || 0)) / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
                 ${(() => {
+                  // ALWAYS ASKED, even with no detail. Whether a charge HAS a
+                  // trade rate is a property of the charge, not of whether its
+                  // backup was ever read: an ad fee is n/a with or without
+                  // store detail. Bailing out first made every undocumented
+                  // flat fee and every fee-and-penalty line read as a missing
+                  // number instead of an inapplicable one.
                   const it = _dedItemCache.get(String(l.id));
-                  const tp = it && !it.err ? _dedTradePct(it.items, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend', (rmapBy[l.reason_code] || {}).keel_category) : null;
+                  const tp = _dedTradePct((it && !it.err && it.items) || [], l, _lineDist(l),
+                    _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend',
+                    (rmapBy[l.reason_code] || {}).keel_category);
                   // n/a where the measure does not apply (flat fee, not trade
                   // spend); an em dash where it applies but the data is missing.
                   // Two different facts, so two different marks.
@@ -34126,14 +34134,25 @@ render();
             }).join('')}
             ${!shown.length ? `<tr><td colspan="12" style="padding:26px 10px;font-family:var(--serif);font-size:13.5px;color:var(--ink-3);">
               No deduction matches ${terms.length ? '\u201c' + esc(_dedQ) + '\u201d' : 'this filter'}.</td></tr>` : ''}
-            ${filtered.length > _dedLinesLimit ? `<tr><td colspan="12" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
+            ${filtered.length > _dedLinesLimit ? `<tr>
+              <td colspan="8" style="padding:12px 10px;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">
               <button id="hl-dl-more" style="font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show ${Math.min(DED_PAGE, filtered.length - _dedLinesLimit)} more</button>
               <button id="hl-dl-all" style="margin-left:7px;font-family:var(--mono);font-size:10.5px;padding:6px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">Show all ${filtered.length.toLocaleString()}</button>
-              ${_hlShownSoFar(Math.min(_dedLinesLimit, filtered.length), filtered.length,
-                  filtered.slice(0, _dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0),
-                  filteredAmt, money)}
-              <span style="margin-left:10px;color:var(--ink-3);">${(filtered.length - _dedLinesLimit).toLocaleString()} smaller lines hidden \u00b7 ${money(filtered.slice(_dedLinesLimit).reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0))} \u2014 the total below still counts them</span>
-            </td></tr>` : ''}
+              </td>
+              ${(() => {
+                // The running total sits IN the Deducted and Share columns,
+                // directly above the register total, so the two read as one
+                // stack: this much shown, that much in all. No prose -- the
+                // column headings already say what the numbers are, and the
+                // sentence that used to live here said it a third time.
+                const amt = filtered.slice(0, _dedLinesLimit)
+                  .reduce((n, l) => n + Math.abs(Number(l.amount || 0)), 0);
+                const cell = (h, extra) => `<td style="padding:12px 10px;text-align:right;border-bottom:1px solid var(--rule-soft);font-family:var(--mono);font-size:10.5px;${extra || ''}">${h}</td>`;
+                return cell('<strong>' + money(amt) + '</strong>')
+                     + cell(filteredAmt ? (amt / filteredAmt * 100).toFixed(1) + '%' : '', 'color:var(--ink-3);')
+                     + cell('') + cell('');
+              })()}
+            </tr>` : ''}
           </tbody>
           <tfoot>
             ${isFiltered ? `<tr>
