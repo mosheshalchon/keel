@@ -29277,7 +29277,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-16 stamp-fetch';
+  const _DED_BUILD = 'tr-17 wfm-scan';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31790,6 +31790,94 @@ render();
           + H[best.q] + ' \u00d7 ' + H[best.r] + ' = ' + H[best.a]
           + ' on ' + Math.round(best.score * 100) + '% of rows',
     };
+  }
+
+  // ── WHOLE FOODS SCANBACK (WHFDSCAN) ──────────────────────────────────────
+  // The TPR scanback export, 41 columns. Verified against WHFDSCAN0826015930:
+  // 11,208 rows summing to $20,047.44 against a $20,047 line, and every row
+  // satisfies Unit_Sales x Dollar_Allowance = Total_Dollar_Allowance.
+  //
+  // This file STATES the per-unit rate in Dollar_Allowance, so unit_chargeback
+  // is the document's own figure rather than a derived bill/qty -- the one case
+  // where the two are guaranteed to agree, and the reason the rate on these
+  // lines can be trusted without the implied-rate caveat.
+  //
+  // Nat_UPC arrives as 13 characters with a leading zero ('0089245300101').
+  // _dedUpc11 strips the zeros and lands on the 11-digit stem, which is what
+  // the product map is keyed on, so these join to Brand Library untouched.
+  //
+  // Event_ID is the promo number and goes in reference_no -- it is the same
+  // 8-digit value the register already shows beside these lines.
+  function _dedParseWfmScan(rows) {
+    const norm = (t) => String(t == null ? '' : t).trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    let h = -1, C = null;
+    for (let i = 0; i < Math.min(rows.length, 15); i++) {
+      const m = {};
+      (rows[i] || []).forEach((c, n) => { const k = norm(c); if (k && !(k in m)) m[k] = n; });
+      if (m.natupc != null && m.unitsales != null && m.itemdescription != null
+          && (m.totaldollarallowance != null || m.totalallowance != null)) { h = i; C = m; break; }
+    }
+    if (h < 0) return { error: 'wfm scanback: no header row with Nat_UPC, Unit_Sales, Item_Description and an allowance total', rows: [] };
+
+    const num = (v) => {
+      const t = String(v == null ? '' : v).replace(/[$,\s]/g, '').replace(/^\((.*)\)$/, '-$1');
+      const n = Number(t);
+      return Number.isFinite(n) ? n : 0;
+    };
+    // Excel dates arrive as strings here (SheetJS raw:false) or as ISO. Anything
+    // unparseable is left null rather than coerced -- a wrong date silently
+    // moves a row into another month.
+    const day = (v) => {
+      if (v == null || v === '') return null;
+      const d = new Date(v);
+      return isNaN(d) ? null : d.toISOString().slice(0, 10);
+    };
+    const out = [];
+    let tie = 0, off = 0, pct = 0;
+    for (let i = h + 1; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const desc = String(r[C.itemdescription] == null ? '' : r[C.itemdescription]).trim();
+      if (!desc) continue;
+      const q = num(r[C.unitsales]);
+      const rate = C.dollarallowance != null ? num(r[C.dollarallowance]) : 0;
+      // Both legs, because a percent-funded event puts its money in the other
+      // column. This file is all dollar-funded, but a file that is not would
+      // otherwise import at zero and tie to nothing.
+      const dol = C.totaldollarallowance != null ? num(r[C.totaldollarallowance]) : 0;
+      const pc  = C.totalpercentallowance != null ? num(r[C.totalpercentallowance]) : 0;
+      // SIGNED, not absolute. The file carries genuine credit rows -- a handful
+      // of negative allowances -- and abs() turned a $20,047.44 document into
+      // $20,061.94, which would have failed the tie-out gate and blocked the
+      // import outright. The sign is the document's, so it is kept.
+      const amt = (dol + pc) || (C.totalallowance != null ? -num(r[C.totalallowance]) : 0);
+      if (!amt) continue;
+      if (pc) pct++;
+      if (q && rate) { (Math.abs(q * rate - dol) <= 0.005 ? tie++ : off++); }
+      out.push({
+        upc: C.natupc != null && r[C.natupc] ? String(r[C.natupc]).trim() : null,
+        item_desc: desc,
+        reference_no: C.eventid != null && r[C.eventid] ? String(r[C.eventid]).trim() : null,
+        ship_date: C.eventstart != null ? day(r[C.eventstart]) : null,
+        date_to:   C.eventend   != null ? day(r[C.eventend])   : null,
+        // The region is the banner the register groups on; the store name is
+        // kept beside it so a row can still be traced to one shop.
+        customer_name: C.storeregion != null && r[C.storeregion] ? String(r[C.storeregion]).trim() : null,
+        customer_no: null,
+        store_no: C.store != null && r[C.store] ? String(r[C.store]).trim() : null,
+        ship_qty: q || null,
+        unit_chargeback: rate || null,      // STATED by the document, not derived
+        unit_cost: null,
+        discount_pct: C.percentallowance != null ? (num(r[C.percentallowance]) || null) : null,
+        bill_amount: amt,
+      });
+    }
+    if (!out.length) return { error: 'wfm scanback: header found but no allowance rows', rows: [] };
+    return { rows: out,
+             note: 'Whole Foods scanback \u2014 ' + out.length.toLocaleString() + ' rows. '
+                 + (tie + off ? tie.toLocaleString() + ' of ' + (tie + off).toLocaleString()
+                    + ' tie to Unit_Sales x Dollar_Allowance. ' : '')
+                 + (pct ? pct.toLocaleString() + ' rows are percent-funded. ' : '')
+                 + 'Rates are the document\'s own Dollar_Allowance, not derived.' };
   }
 
   // ── UNFI ASM / ALL-SALES DETAIL ──────────────────────────────────────────
@@ -34393,6 +34481,7 @@ render();
               // sees what nothing else claimed.
               for (const [nm, fn] of [['Natural Grocers scanback', _dedParseNgScanback],
                                       ['UNFI ASM / all sales', _dedParseUnfiAsm],
+                                      ['Whole Foods scanback', _dedParseWfmScan],
                                       ['any grid', _dedParseGrid]]) {
                 const got = fn(rows);
                 if (got && !got.error && got.rows && got.rows.length) { p = got; break; }
