@@ -29273,6 +29273,7 @@ render();
               <th style="text-align:left;padding:5px 8px;">Item</th>
               <th style="padding:5px 8px;">Units</th><th style="padding:5px 8px;">Spend</th>
               <th style="padding:5px 8px;">Rate</th><th style="padding:5px 8px;">Per case</th>
+              <th style="padding:5px 8px;">$/case</th>
               <th style="padding:5px 8px;">Case price</th><th style="padding:5px 8px;">%</th>
             </tr></thead>
             <tbody>
@@ -29284,13 +29285,14 @@ render();
                   <td style="padding:5px 8px;">${m(r.amt)}</td>
                   <td style="padding:5px 8px;">${r.rate != null ? '$' + r.rate.toFixed(4) : '\u2014'}</td>
                   <td style="padding:5px 8px;" title="${esc2(r.perSrc || '')}">${r.per != null ? r.per : '\u2014'}</td>
+                  <td style="padding:5px 8px;">${(r.rate != null && r.per != null) ? m(r.rate * r.per) : '\u2014'}</td>
                   <td style="padding:5px 8px;">${r.price != null ? m(r.price) : '\u2014'}</td>
                   <td style="padding:5px 8px;${r.pct != null && r.pct >= 0.5 ? 'color:var(--lost);' : ''}">${r.pct != null ? (r.pct * 100).toFixed(1) + '%' : '\u2014'}</td>
                 </tr>`).join('')}
             </tbody>
             <tfoot><tr style="text-align:right;border-top:2px solid var(--ink);font-weight:700;">
               <td style="text-align:left;padding:7px 8px;">Weighted</td>
-              <td colspan="4"></td>
+              <td colspan="5"></td>
               <td style="padding:7px 8px;">${m(tp.covered)}</td>
               <td style="padding:7px 8px;${tp.pct >= 0.5 ? 'color:var(--lost);' : ''}">${(tp.pct * 100).toFixed(1)}%</td>
             </tr></tfoot>
@@ -29309,7 +29311,14 @@ render();
     document.body.appendChild(ov);
   }
 
-  const _dedTradePct = (items, line, dist) => {
+  // isTrade is PASSED IN from _dedBucketOf(rmapBy[code]) -- the same taxonomy the
+  // rest of the page uses, so a code reclassified in deduction_reason_map moves
+  // here too with no code change. A percentage of case price is meaningless on a
+  // spoilage allowance, a freight charge, an ad fee or a late-delivery penalty:
+  // none of them is a rate paid per unit sold, so the column stays blank rather
+  // than printing a number that invites the wrong comparison.
+  const _dedTradePct = (items, line, dist, isTrade) => {
+    if (isTrade === false) return { why: 'not trade spend \u2014 a share of case price does not apply to this charge' };
     if (!items || !items.length) return { why: 'no itemised detail on this line' };
     if (!_dedProdMap || !_dedProdMap.size) return { why: 'Brand Library products not loaded' };
     if (!_dedCasePrices || !_dedCasePrices.size)
@@ -33779,7 +33788,7 @@ render();
                 ${td(registerAmt ? (Math.abs(Number(l.amount || 0)) / registerAmt * 100).toFixed(1) + '%' : '', true, 'color:var(--ink-3);')}
                 ${(() => {
                   const it = _dedItemCache.get(String(l.id));
-                  const tp = it && !it.err ? _dedTradePct(it.items, l, _lineDist(l)) : null;
+                  const tp = it && !it.err ? _dedTradePct(it.items, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend') : null;
                   if (!tp || tp.why) return td('<span style="color:var(--ink-3);" title="'
                     + esc((tp && tp.why) || 'not calculated') + '">\u2014</span>', true);
                   // Over 100% would mean giving back more than the case is sold
@@ -33860,7 +33869,7 @@ render();
                           const h = _dedProdMap && _dedProdMap.get(_dedUpc11(x.upc));
                           return ((h && h.line) || '\u2014 not in Brand Library') === g.line;
                         });
-                        const tp = _dedTradePct(gi, l, _lineDist(l));
+                        const tp = _dedTradePct(gi, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend');
                         if (!tp || tp.why) return eTd('<span style="color:var(--ink-3);" title="'
                           + esc(tp && tp.why || '') + '">\u2014</span>', true);
                         return eTd('<span style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
@@ -33880,7 +33889,7 @@ render();
                     ${eTd('<strong>' + money(tot) + '</strong>', true, 'border-top:1px solid var(--rule);')}
                     ${eTd('100%', true, 'border-top:1px solid var(--rule);color:var(--ink-3);')}
                     ${(() => {
-                      const tp = _dedTradePct(itRows.items, l, _lineDist(l));
+                      const tp = _dedTradePct(itRows.items, l, _lineDist(l), _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend');
                       if (tp && tp.why) return eTd('<span style="color:var(--ink-3);" title="' + esc(tp.why)
                         + '">\u2014</span>', true, 'border-top:1px solid var(--rule);');
                       return eTd(tp && tp.pct != null ? '<strong class="hl-dl-tr" data-id="' + l.id
@@ -33968,7 +33977,7 @@ render();
             const ln = (shown.find(x => String(x.id) === el.dataset.id));
             if (!ln) return;
             const c = _dedItemCache.get(String(ln.id));
-            const tp = c && !c.err ? _dedTradePct(c.items, ln, _lineDist(ln)) : null;
+            const tp = c && !c.err ? _dedTradePct(c.items, ln, _lineDist(ln), _dedBucketOf(rmapBy[ln.reason_code]) === 'Trade spend') : null;
             if (tp && tp.pct != null) _dedTradeModal(ln, tp);
           };
         });
