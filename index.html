@@ -29239,7 +29239,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-7 asm-crosswalk';
+  const _DED_BUILD = 'tr-8 asm-desc';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31807,7 +31807,11 @@ render();
         // Library', which is visible. Guessing a UPC from the truncated
         // description would not be.
         upc: mapped || null,
-        item_desc: desc + (C.packsize != null && r[C.packsize] ? ' (' + String(r[C.packsize]).trim() + ')' : ''),
+        // The description EXACTLY as the file writes it, with no pack appended.
+        // 40,359 rows already in the table carry the bare string, and it is the
+        // only key that joins them to a product -- Prod # was never stored. A
+        // suffix here would fork the same product into two spellings.
+        item_desc: desc,
         reference_no: prodNo,
         ship_date: null, date_to: null,
         customer_name: C.whse != null && r[C.whse] ? String(r[C.whse]).trim() : null,
