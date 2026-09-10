@@ -29228,6 +29228,74 @@ render();
   // nothing, and three separate causes here look identical on screen: no account
   // mapped, no case pack on the product, no price for that account. The reason
   // rides along and lands in the cell's tooltip.
+  // The calculation, opened from the cell. Every input on screen: the rate the
+  // document implies, the case pack, the price it was matched to and which
+  // account supplied it -- so a number like 71.5% can be argued with rather
+  // than just disbelieved.
+  function _dedTradeModal(line, tp) {
+    const esc2 = (t) => String(t ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const m = (n) => '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.42);z-index:200;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;';
+    const rows = (tp.work || []).slice().sort((a, b) => b.amt - a.amt);
+    ov.innerHTML = `
+      <div style="background:var(--paper,#f4efe6);border-radius:10px;max-width:720px;width:100%;padding:24px 26px;box-shadow:0 24px 70px rgba(0,0,0,0.3);">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <div>
+            <div style="font-family:var(--serif);font-size:19px;">How this trade rate was worked out</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">
+              ${esc2(line.invoice_no || '')} &middot; priced against ${esc2((tp.accts || []).join(' / '))}
+            </div>
+          </div>
+          <span id="hl-tr-x" style="cursor:pointer;font-size:20px;line-height:1;color:var(--ink-3);">&times;</span>
+        </div>
+
+        <div style="margin-top:14px;padding:11px 14px;border-radius:7px;background:var(--rule-softer);font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">
+          rate per unit &times; units per case &divide; case price, weighted by spend
+        </div>
+
+        <div style="margin-top:14px;overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;">
+            <thead><tr style="color:var(--ink-3);text-align:right;">
+              <th style="text-align:left;padding:5px 8px;">Item</th>
+              <th style="padding:5px 8px;">Units</th><th style="padding:5px 8px;">Spend</th>
+              <th style="padding:5px 8px;">Rate</th><th style="padding:5px 8px;">Per case</th>
+              <th style="padding:5px 8px;">Case price</th><th style="padding:5px 8px;">%</th>
+            </tr></thead>
+            <tbody>
+              ${rows.map(r => `
+                <tr style="text-align:right;border-top:1px solid var(--rule-soft);${r.skip ? 'color:var(--ink-3);' : ''}">
+                  <td style="text-align:left;padding:5px 8px;">${esc2(r.desc || r.upc || '')}
+                    ${r.skip ? '<div style="color:var(--lost);font-size:10px;">' + esc2(r.skip) + '</div>' : ''}</td>
+                  <td style="padding:5px 8px;">${r.units ? r.units.toLocaleString() : '\u2014'}</td>
+                  <td style="padding:5px 8px;">${m(r.amt)}</td>
+                  <td style="padding:5px 8px;">${r.rate != null ? '$' + r.rate.toFixed(4) : '\u2014'}</td>
+                  <td style="padding:5px 8px;">${r.per != null ? r.per : '\u2014'}</td>
+                  <td style="padding:5px 8px;">${r.price != null ? m(r.price) : '\u2014'}</td>
+                  <td style="padding:5px 8px;${r.pct != null && r.pct >= 0.5 ? 'color:var(--lost);' : ''}">${r.pct != null ? (r.pct * 100).toFixed(1) + '%' : '\u2014'}</td>
+                </tr>`).join('')}
+            </tbody>
+            <tfoot><tr style="text-align:right;border-top:2px solid var(--ink);font-weight:700;">
+              <td style="text-align:left;padding:7px 8px;">Weighted</td>
+              <td colspan="4"></td>
+              <td style="padding:7px 8px;">${m(tp.covered)}</td>
+              <td style="padding:7px 8px;${tp.pct >= 0.5 ? 'color:var(--lost);' : ''}">${(tp.pct * 100).toFixed(1)}%</td>
+            </tr></tfoot>
+          </table>
+        </div>
+
+        ${tp.part ? `<p style="font-family:var(--mono);font-size:10.5px;color:var(--lost);margin-top:12px;line-height:1.55;">
+          The percentage covers ${m(tp.covered)} of ${m(tp.all)} itemised. Rows above without a
+          case price or a case pack are excluded from it rather than counted as zero.</p>` : ''}
+        <p style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:10px;line-height:1.55;">
+          The case price comes from the BILL-TO account, not the retailer. Where a product is sold in
+          more than one pack, the pack matched here is the one whose UPC the document carried -- if
+          that is the wrong pack, the price sheet and the UPC disagree, not the arithmetic.</p>
+      </div>`;
+    ov.onclick = (e) => { if (e.target === ov || e.target.id === 'hl-tr-x') ov.remove(); };
+    document.body.appendChild(ov);
+  }
+
   const _dedTradePct = (items, line, dist) => {
     if (!items || !items.length) return { why: 'no itemised detail on this line' };
     if (!_dedProdMap || !_dedProdMap.size) return { why: 'Brand Library products not loaded' };
@@ -29236,21 +29304,28 @@ render();
     const accts = _dedPriceAccts(line, dist);
     if (!accts.length) return { why: 'no price account mapped for ' + (dist || 'unknown distributor') };
     let num = 0, cov = 0, all = 0, noPer = 0, noPrice = 0, noUnits = 0;
+    const work = [];   // every item's inputs, kept so the popup can show the sum
     for (const it of items) {
       all += it.amt;
-      if (!it.units) { noUnits++; continue; }
+      const row = { desc: it.desc, upc: it.upc, units: it.units, amt: it.amt };
+      if (!it.units) { noUnits++; row.skip = 'no quantity'; work.push(row); continue; }
+      row.rate = it.amt / it.units;
       const hit = _dedProdMap.get(_dedUpc11(it.upc));
       const per = hit && hit.upc;
-      if (!per) { noPer++; continue; }
+      if (!per) { noPer++; row.skip = 'no units-per-case in Brand Library'; work.push(row); continue; }
+      row.per = per;
       const price = _dedCasePrice(accts, _dedUpc11(it.upc));
-      if (!price) { noPrice++; continue; }
-      num += ((it.amt / it.units) * per / price) * it.amt; cov += it.amt;
+      if (!price) { noPrice++; row.skip = 'no case price for this account'; work.push(row); continue; }
+      row.price = price;
+      row.pct = row.rate * per / price;
+      work.push(row);
+      num += row.pct * it.amt; cov += it.amt;
     }
     if (!cov) return { why: 'priced against ' + accts.join(' / ') + ' \u2014 '
       + [noPrice ? noPrice + ' item(s) with no case price for that account' : '',
          noPer   ? noPer + ' with no units-per-case in Brand Library' : '',
          noUnits ? noUnits + ' with no quantity' : ''].filter(Boolean).join(', ') };
-    return { pct: num / cov, covered: cov, all, part: cov < all - 0.005 };
+    return { pct: num / cov, covered: cov, all, part: cov < all - 0.005, work, accts };
   };
 
   // UPC NORMALISATION, because the same item is spelled three ways across the
@@ -33688,7 +33763,7 @@ render();
                   // for. That happens, and when it does it is the finding -- so
                   // it is coloured rather than clipped.
                   const hot = tp.pct >= 0.5;
-                  return td('<span style="color:' + (hot ? 'var(--lost)' : 'var(--ink-2)') + ';" title="'
+                  return td('<span class="hl-dl-tr" data-id="' + l.id + '" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px;color:' + (hot ? 'var(--lost)' : 'var(--ink-2)') + ';" title="'
                     + (tp.part ? 'weighted across ' + money(tp.covered) + ' of ' + money(tp.all) + ' itemised \u2014 the rest has no case price or no units-per-case on file'
                                : 'trade rate x units per case, over the case price for the account invoiced')
                     + '">' + (tp.pct * 100).toFixed(1) + '%'
@@ -33785,7 +33860,9 @@ render();
                       const tp = _dedTradePct(itRows.items, l, _lineDist(l));
                       if (tp && tp.why) return eTd('<span style="color:var(--ink-3);" title="' + esc(tp.why)
                         + '">\u2014</span>', true, 'border-top:1px solid var(--rule);');
-                      return eTd(tp && tp.pct != null ? '<strong style="color:' + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
+                      return eTd(tp && tp.pct != null ? '<strong class="hl-dl-tr" data-id="' + l.id
+                        + '" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px;color:'
+                        + (tp.pct >= 0.5 ? 'var(--lost)' : 'var(--ink-2)') + ';">'
                         + (tp.pct * 100).toFixed(1) + '%' + (tp.part ? ' *' : '') + '</strong>' : '',
                         true, 'border-top:1px solid var(--rule);');
                     })()}
@@ -33862,6 +33939,16 @@ render();
           Store-level detail could not be loaded, so rows cannot be expanded and months fall back to the register line's own date.</p>` : ''}
         ${_dedPriceErr ? `<p style="font-family:var(--mono);font-size:10px;color:var(--lost);margin-top:10px;line-height:1.55;">
           Case prices could not be read, so % trade rate is blank on every row \u2014 that is a load failure, not an absence of prices: ${esc(_dedPriceErr)}</p>` : ''}`;
+        host.querySelectorAll('.hl-dl-tr').forEach(el => {
+          el.onclick = (ev) => {
+            ev.stopPropagation();           // must not toggle the row open/shut
+            const ln = (shown.find(x => String(x.id) === el.dataset.id));
+            if (!ln) return;
+            const c = _dedItemCache.get(String(ln.id));
+            const tp = c && !c.err ? _dedTradePct(c.items, ln, _lineDist(ln)) : null;
+            if (tp && tp.pct != null) _dedTradeModal(ln, tp);
+          };
+        });
         wireRows(host);
       };
       // ── ROW HANDLERS, RE-ATTACHABLE ──────────────────────────────────────
