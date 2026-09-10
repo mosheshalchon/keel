@@ -29222,6 +29222,24 @@ render();
     if (/^WR/.test(ref) || /VTBR/.test(ref)) return ['UNFI - WEST (ATG)'];
     return list;
   };
+  // ── FEE UPLIFT INSIDE THE DETAIL ─────────────────────────────────────────
+  // UNFI's NCG charge is principal x 1.2 -- a 20% liquidated-damages fee for a
+  // late AP response -- and the uplift is applied to EVERY detail row, not added
+  // as a separate line. Verified on NCG042611996315930VTBR:
+  //   line $65,666      -> principal $54,721.67 + fee $10,944.33
+  //   itemised $57,790  / 1.2 = $48,158.33
+  //   unitemised $7,876 / 1.2 =  $6,563.33
+  //   48,158.33 + 6,563.33     = $54,721.67 exactly
+  // So the rate a row implies is 20% higher than the rate actually agreed, and
+  // leaving it in overstates the trade rate on every NCG line. The fee is a
+  // penalty, not trade spend -- it belongs in the deduction total, not in a
+  // percentage meant to describe what a promotion cost.
+  const _DED_FEE_UPLIFT = { 'UNFI-NCG': 1.2 };
+  // Visible build marker. Three separate fixes have now been reported as "still
+  // not working" while the running file predated them, and there was no way to
+  // tell a stale deploy from a broken change. Bump this whenever the trade rate
+  // logic changes; it prints beside the register totals and to the console.
+  const _DED_BUILD = 'tr-6 late-fee-net';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -29265,6 +29283,10 @@ render();
 
         <div style="margin-top:14px;padding:11px 14px;border-radius:7px;background:var(--rule-softer);font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">
           rate per unit &times; units per case &divide; case price, weighted by spend
+          ${tp.uplift && tp.uplift !== 1 ? `<div style="margin-top:6px;color:var(--lost);">
+            Rates shown are NET of the ${Math.round((tp.uplift - 1) * 100)}% late-payment fee this code carries.
+            The document bills principal &times; ${tp.uplift} on every row; the fee is a penalty, not trade spend,
+            so it is divided back out before the percentage.</div>` : ''}
         </div>
 
         <div style="margin-top:14px;overflow-x:auto;">
@@ -29283,7 +29305,7 @@ render();
                     ${r.skip ? '<div style="color:var(--lost);font-size:10px;">' + esc2(r.skip) + '</div>' : ''}</td>
                   <td style="padding:5px 8px;">${r.units ? r.units.toLocaleString() : '\u2014'}</td>
                   <td style="padding:5px 8px;">${m(r.amt)}</td>
-                  <td style="padding:5px 8px;">${r.rate != null ? '$' + r.rate.toFixed(4) : '\u2014'}</td>
+                  <td style="padding:5px 8px;"${r.uplift ? ' title="billed $' + r.gross.toFixed(4) + ' incl. fee"' : ''}>${r.rate != null ? '$' + r.rate.toFixed(4) : '\u2014'}</td>
                   <td style="padding:5px 8px;" title="${esc2(r.perSrc || '')}">${r.per != null ? r.per : '\u2014'}</td>
                   <td style="padding:5px 8px;">${(r.rate != null && r.per != null) ? m(r.rate * r.per) : '\u2014'}</td>
                   <td style="padding:5px 8px;">${r.price != null ? m(r.price) : '\u2014'}</td>
@@ -29318,6 +29340,7 @@ render();
   // none of them is a rate paid per unit sold, so the column stays blank rather
   // than printing a number that invites the wrong comparison.
   const _dedTradePct = (items, line, dist, isTrade) => {
+    const uplift = _DED_FEE_UPLIFT[line && line.reason_code] || 1;
     if (isTrade === false) return { why: 'not trade spend \u2014 a share of case price does not apply to this charge' };
     if (!items || !items.length) return { why: 'no itemised detail on this line' };
     if (!_dedProdMap || !_dedProdMap.size) return { why: 'Brand Library products not loaded' };
@@ -29331,12 +29354,20 @@ render();
       all += it.amt;
       const row = { desc: it.desc, upc: it.upc, units: it.units, amt: it.amt };
       if (!it.units) { noUnits++; row.skip = 'no quantity'; work.push(row); continue; }
-      row.rate = it.amt / it.units;
+      // The rate NET of any fee uplift baked into the row.
+      row.gross = it.amt / it.units;
+      row.rate = row.gross / uplift;
+      if (uplift !== 1) row.uplift = uplift;
       const hit = _dedProdMap.get(_dedUpc11(it.upc));
       const per = hit && hit.upc;
       if (!per) { noPer++; row.skip = 'no units-per-case in Brand Library'; work.push(row); continue; }
       row.per = per; row.perSrc = hit.packSrc;
-      const price = _dedCasePrice(accts, _dedUpcKey(it.upc));
+      // Try the UPC as the document wrote it, then its 11-digit stem -- the
+      // map holds both, so a 12-digit detail row and an 11-digit one land on
+      // the same price without either being padded or guessed at.
+      const uk = _dedUpcKey(it.upc);
+      const price = _dedCasePrice(accts, uk) ||
+                    (uk.length === 12 ? _dedCasePrice(accts, uk.slice(0, 11)) : null);
       if (!price) { noPrice++; row.skip = 'no case price for this account'; work.push(row); continue; }
       row.price = price;
       row.pct = row.rate * per / price;
@@ -29347,7 +29378,7 @@ render();
       + [noPrice ? noPrice + ' item(s) with no case price for that account' : '',
          noPer   ? noPer + ' with no units-per-case in Brand Library' : '',
          noUnits ? noUnits + ' with no quantity' : ''].filter(Boolean).join(', ') };
-    return { pct: num / cov, covered: cov, all, part: cov < all - 0.005, work, accts };
+    return { pct: num / cov, covered: cov, all, part: cov < all - 0.005, work, accts, uplift };
   };
 
   // UPC NORMALISATION, because the same item is spelled three ways across the
@@ -33575,11 +33606,28 @@ render();
         try {
           const { data: cp } = await sb.from('customer_case_prices')
             .select('customer,upc,case_price').eq('brand_id', brandId).not('upc', 'is', null);
-          for (const r of (cp || [])) {
-            const k = String(r.customer || '').toLowerCase() + '|' + _dedUpcKey(r.upc);
-            const v = Number(r.case_price);
+          // Keyed on the full 12 digits AND on the 11-digit stem, because the
+          // detail does not store UPCs at one length: the Natural Grocers and
+          // NCG files carry 12, the Whole Foods scan files carry 11 (no check
+          // digit). Keying only on 12 matched the first and silently missed the
+          // second -- units and a rate but no trade rate, on exactly the lines
+          // whose product lines resolved fine.
+          //
+          // The 11-digit alias is set to null wherever two different 12-digit
+          // UPCs share a stem at different prices, so the five bad-check-digit
+          // rows in the sheet still cannot leak a wrong price onto a real
+          // product. Ambiguity stays ambiguous; only the unambiguous ones alias.
+          const put = (k, v) => {
             if (!_dedCasePrices.has(k)) _dedCasePrices.set(k, v);
             else if (_dedCasePrices.get(k) !== v) _dedCasePrices.set(k, null);
+          };
+          for (const r of (cp || [])) {
+            const acct = String(r.customer || '').toLowerCase();
+            const full = _dedUpcKey(r.upc);
+            const v = Number(r.case_price);
+            if (!full) continue;
+            put(acct + '|' + full, v);
+            if (full.length === 12) put(acct + '|' + full.slice(0, 11), v);
           }
         } catch (e) {
           // NOT swallowed. A silent empty here reads exactly like "no price on
@@ -33588,6 +33636,7 @@ render();
           _dedPriceErr = (e && e.message) || String(e);
         }
       }
+      if (!window.__dedBuildLogged) { window.__dedBuildLogged = 1; console.log('[Keel] trade rate build', _DED_BUILD); }
       const needDet = shown.filter(l => l.detail_parsed && !_dedItemCache.has(String(l.id))).map(l => l.id);
       if (needDet.length) {
         try {
@@ -33680,6 +33729,7 @@ render();
           ${isFiltered
             ? `${filtered.length.toLocaleString()} of ${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(filteredAmt)}</strong> of ${money(registerAmt)}`
             : `${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(registerAmt)}</strong>`}
+          <span style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);opacity:.65;" title="trade-rate build running in this tab">${_DED_BUILD}</span>
           ${_shownUnits ? `<span style="margin-left:10px;" title="totalled across the ${_shownWith} row${_shownWith === 1 ? '' : 's'} on screen that carry itemised detail, over ${money(_shownAmt)} of itemised spend \u2014 not the whole register">
             \u00b7 ${_shownUnits.toLocaleString()} units \u00b7 <strong style="color:var(--ink);">$${_dedWtRate(_shownAmt, _shownUnits).toFixed(2)}</strong> weighted rate
             <span style="opacity:.7;">(${_shownWith} itemised row${_shownWith === 1 ? '' : 's'} shown)</span></span>` : ''}
