@@ -29182,7 +29182,20 @@ render();
   // line's own check, via _lineDist, and never from the retailer the promo ran
   // at -- a Natural Grocers scan billed through UNFI is priced at UNFI's rate,
   // because UNFI is who ATG invoiced.
-  let _dedCasePrices = null;      // 'account|upc' -> price, or null where the sheet disagrees with itself
+  // The price lookup keys on the FULL 12-digit UPC, deliberately NOT _dedUpc11.
+  // That helper drops the 12th digit, which for UPC-A is the check digit -- fine
+  // for matching a product, since no two ATG products share an 11-digit stem.
+  // But the price sheet carries five UPCs whose check digit does not compute
+  // (the 8-pack breads and one food-service shell), and four of those collapse
+  // onto real products once the digit is gone: ROSEMARY ROLLS (8-pack) 892453001271
+  // lands on 10" Three Cheese Thin Crust 892453001273. Keying prices on all 12
+  // keeps them apart. _dedUpc11 is untouched, so product-line grouping in the
+  // expansion behaves exactly as before.
+  const _dedUpcKey = (v) => {
+    const raw = String(v == null ? '' : v).replace(/\D/g, '');
+    return raw.length > 12 ? raw.replace(/^0+/, '').slice(-12) : raw;
+  };
+  let _dedCasePrices = null;      // 'account|upc12' -> price, or null where the sheet disagrees with itself
   let _dedPriceErr = null;        // set when the price fetch itself failed, so blank cells can say why
   const _DED_PRICE_ACCT = {
     'UNFI':          ['UNFI - EAST (ATG)', 'UNFI - WEST (ATG)'],
@@ -29270,7 +29283,7 @@ render();
                   <td style="padding:5px 8px;">${r.units ? r.units.toLocaleString() : '\u2014'}</td>
                   <td style="padding:5px 8px;">${m(r.amt)}</td>
                   <td style="padding:5px 8px;">${r.rate != null ? '$' + r.rate.toFixed(4) : '\u2014'}</td>
-                  <td style="padding:5px 8px;">${r.per != null ? r.per : '\u2014'}</td>
+                  <td style="padding:5px 8px;" title="${esc2(r.perSrc || '')}">${r.per != null ? r.per : '\u2014'}</td>
                   <td style="padding:5px 8px;">${r.price != null ? m(r.price) : '\u2014'}</td>
                   <td style="padding:5px 8px;${r.pct != null && r.pct >= 0.5 ? 'color:var(--lost);' : ''}">${r.pct != null ? (r.pct * 100).toFixed(1) + '%' : '\u2014'}</td>
                 </tr>`).join('')}
@@ -29313,8 +29326,8 @@ render();
       const hit = _dedProdMap.get(_dedUpc11(it.upc));
       const per = hit && hit.upc;
       if (!per) { noPer++; row.skip = 'no units-per-case in Brand Library'; work.push(row); continue; }
-      row.per = per;
-      const price = _dedCasePrice(accts, _dedUpc11(it.upc));
+      row.per = per; row.perSrc = hit.packSrc;
+      const price = _dedCasePrice(accts, _dedUpcKey(it.upc));
       if (!price) { noPrice++; row.skip = 'no case price for this account'; work.push(row); continue; }
       row.price = price;
       row.pct = row.rate * per / price;
@@ -33554,7 +33567,7 @@ render();
           const { data: cp } = await sb.from('customer_case_prices')
             .select('customer,upc,case_price').eq('brand_id', brandId).not('upc', 'is', null);
           for (const r of (cp || [])) {
-            const k = String(r.customer || '').toLowerCase() + '|' + _dedUpc11(r.upc);
+            const k = String(r.customer || '').toLowerCase() + '|' + _dedUpcKey(r.upc);
             const v = Number(r.case_price);
             if (!_dedCasePrices.has(k)) _dedCasePrices.set(k, v);
             else if (_dedCasePrices.get(k) !== v) _dedCasePrices.set(k, null);
@@ -33574,10 +33587,20 @@ render();
           if (!_dedProdMap) {
             _dedProdMap = new Map();
             const { data: prods } = await sb.from('products')
-              .select('unit_upc,product_line,item_description,units_per_case').eq('brand_id', brandId);
+              .select('unit_upc,product_line,item_description,units_per_case,case_pack').eq('brand_id', brandId);
             for (const pr of (prods || [])) {
               const key = _dedUpc11(pr.unit_upc);
-              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null, upc: Number(pr.units_per_case) || null });
+              if (key) _dedProdMap.set(key, {
+                line: pr.product_line || null, desc: pr.item_description || null,
+                // SALEABLE units per case -- case_pack, NOT units_per_case.
+                // Original Rolls is 4ct/12pk and Original Baguettes 2ct/12pk:
+                // units_per_case counts PIECES (48 and 24) while both cases hold
+                // 12 retail units and both sell for $58.44. A scan rate is paid
+                // per retail unit, so multiplying by pieces doubled one and not
+                // the other. units_per_case is the fallback only.
+                upc: Number(pr.case_pack) || Number(pr.units_per_case) || null,
+                packSrc: Number(pr.case_pack) ? 'case pack' : (Number(pr.units_per_case) ? 'units per case (no case pack on file)' : null)
+              });
             }
           }
           // Chunked, because a single KeHE chargeback runs to thousands of store
@@ -34004,10 +34027,20 @@ render();
           if (!_dedProdMap) {
             _dedProdMap = new Map();
             const { data: prods } = await sb.from('products')
-              .select('unit_upc,product_line,item_description,units_per_case').eq('brand_id', brandId);
+              .select('unit_upc,product_line,item_description,units_per_case,case_pack').eq('brand_id', brandId);
             for (const pr of (prods || [])) {
               const key = _dedUpc11(pr.unit_upc);
-              if (key) _dedProdMap.set(key, { line: pr.product_line || null, desc: pr.item_description || null, upc: Number(pr.units_per_case) || null });
+              if (key) _dedProdMap.set(key, {
+                line: pr.product_line || null, desc: pr.item_description || null,
+                // SALEABLE units per case -- case_pack, NOT units_per_case.
+                // Original Rolls is 4ct/12pk and Original Baguettes 2ct/12pk:
+                // units_per_case counts PIECES (48 and 24) while both cases hold
+                // 12 retail units and both sell for $58.44. A scan rate is paid
+                // per retail unit, so multiplying by pieces doubled one and not
+                // the other. units_per_case is the fallback only.
+                upc: Number(pr.case_pack) || Number(pr.units_per_case) || null,
+                packSrc: Number(pr.case_pack) ? 'case pack' : (Number(pr.units_per_case) ? 'units per case (no case pack on file)' : null)
+              });
             }
           }
           // Paged: a single KeHE chargeback runs to thousands of store rows and
