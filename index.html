@@ -29235,11 +29235,24 @@ render();
   // penalty, not trade spend -- it belongs in the deduction total, not in a
   // percentage meant to describe what a promotion cost.
   const _DED_FEE_UPLIFT = { 'UNFI-NCG': 1.2 };
+  // ── WHAT THE QUANTITY COUNTS ─────────────────────────────────────────────
+  // Not the same across sources, and getting it wrong is invisible -- it yields
+  // a plausible number, not an error.
+  //
+  // The ASM / WE / MCB exports bill CASES: QtyS is cases shipped and the row
+  // ties as WhslPrice x QtyS x MCB%, so bill/qty is already a rate PER CASE and
+  // must NOT be multiplied by the case pack again. Every line then lands in a
+  // 24-30% band; multiplying would put them near 170%.
+  //
+  // The scan and third-party layers (NCG, 3PTY, WHFDSCAN, SN) bill EACHES -- a
+  // rate per retail unit -- so those do multiply by the case pack. Moshe
+  // confirmed this for the 12 inch pizza: $2.54 x 6 / $49.74.
+  const _DED_QTY_IS_CASES = new Set(['UNFI-ALLSALES', 'UNFI-ASMCB', 'UNFI-MCB']);
   // Visible build marker. Three separate fixes have now been reported as "still
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-8 asm-desc';
+  const _DED_BUILD = 'tr-9 case-basis';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -29282,7 +29295,9 @@ render();
         </div>
 
         <div style="margin-top:14px;padding:11px 14px;border-radius:7px;background:var(--rule-softer);font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">
-          rate per unit &times; units per case &divide; case price, weighted by spend
+          ${tp.byCase
+            ? 'rate per CASE &divide; case price, weighted by spend &mdash; this document bills cases, so no case pack is applied'
+            : 'rate per unit &times; units per case &divide; case price, weighted by spend'}
           ${tp.uplift && tp.uplift !== 1 ? `<div style="margin-top:6px;color:var(--lost);">
             Rates shown are NET of the ${Math.round((tp.uplift - 1) * 100)}% late-payment fee this code carries.
             The document bills principal &times; ${tp.uplift} on every row; the fee is a penalty, not trade spend,
@@ -29341,6 +29356,7 @@ render();
   // than printing a number that invites the wrong comparison.
   const _dedTradePct = (items, line, dist, isTrade) => {
     const uplift = _DED_FEE_UPLIFT[line && line.reason_code] || 1;
+    const byCase = _DED_QTY_IS_CASES.has(line && line.reason_code);
     if (isTrade === false) return { why: 'not trade spend \u2014 a share of case price does not apply to this charge' };
     if (!items || !items.length) return { why: 'no itemised detail on this line' };
     if (!_dedProdMap || !_dedProdMap.size) return { why: 'Brand Library products not loaded' };
@@ -29359,9 +29375,11 @@ render();
       row.rate = row.gross / uplift;
       if (uplift !== 1) row.uplift = uplift;
       const hit = _dedProdMap.get(_dedUpc11(it.upc));
-      const per = hit && hit.upc;
+      // A case-billed row needs no case pack: its rate is already per case.
+      const per = byCase ? 1 : (hit && hit.upc);
       if (!per) { noPer++; row.skip = 'no units-per-case in Brand Library'; work.push(row); continue; }
-      row.per = per; row.perSrc = hit.packSrc;
+      row.per = per;
+      row.perSrc = byCase ? 'quantity is already cases, so no case pack applies' : (hit && hit.packSrc);
       // Try the UPC as the document wrote it, then its 11-digit stem -- the
       // map holds both, so a 12-digit detail row and an 11-digit one land on
       // the same price without either being padded or guessed at.
@@ -29378,7 +29396,7 @@ render();
       + [noPrice ? noPrice + ' item(s) with no case price for that account' : '',
          noPer   ? noPer + ' with no units-per-case in Brand Library' : '',
          noUnits ? noUnits + ' with no quantity' : ''].filter(Boolean).join(', ') };
-    return { pct: num / cov, covered: cov, all, part: cov < all - 0.005, work, accts, uplift };
+    return { pct: num / cov, covered: cov, all, part: cov < all - 0.005, work, accts, uplift, byCase };
   };
 
   // UPC NORMALISATION, because the same item is spelled three ways across the
