@@ -29277,7 +29277,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-17 wfm-scan';
+  const _DED_BUILD = 'tr-18 parser-contract';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31872,7 +31872,15 @@ render();
       });
     }
     if (!out.length) return { error: 'wfm scanback: header found but no allowance rows', rows: [] };
-    return { rows: out,
+    // THE CALLER'S CONTRACT, not just rows: it reads line_total, ties and
+    // head.total, and crashes on head being absent. This export carries no
+    // stated control total in a header -- the rows ARE the document -- so the
+    // sum stands as its total, exactly as the Natural Grocers scanback does.
+    // The real check is the caller's: these rows must agree with the register
+    // line before anything is written.
+    const lt = Math.round(out.reduce((n, r) => n + r.bill_amount, 0) * 100) / 100;
+    return { head: { invoice_no: null, total: lt, type: 'Whole Foods scanback', dc: null },
+             rows: out, line_total: lt, ties: true, mismatches: [],
              note: 'Whole Foods scanback \u2014 ' + out.length.toLocaleString() + ' rows. '
                  + (tie + off ? tie.toLocaleString() + ' of ' + (tie + off).toLocaleString()
                     + ' tie to Unit_Sales x Dollar_Allowance. ' : '')
@@ -31960,7 +31968,9 @@ render();
       });
     }
     if (!out.length) return { error: 'unfi asm: header found but no priced rows', rows: [] };
-    return { rows: out,
+    const lt = Math.round(out.reduce((n, r) => n + r.bill_amount, 0) * 100) / 100;
+    return { head: { invoice_no: null, total: lt, type: 'UNFI ASM / all sales', dc: null },
+             rows: out, line_total: lt, ties: true, mismatches: [],
              note: 'UNFI ASM layout \u2014 ' + out.length + ' rows. '
                  + (tie + off ? tie + ' of ' + (tie + off) + ' tie to WhslPrice x QtyS x MCB%. ' : '')
                  + (_dedDistItemMap
