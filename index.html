@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-27 import-enable';
+  const _DED_BUILD = 'tr-30 cid-detect';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31110,7 +31110,26 @@ render();
     return out;
   }
 
-  function _dedTextFromContent(content) {
+  function _dedTextFromContent(content, cmap) {
+    // With a ToUnicode map the hex strings are GLYPH IDS, two bytes each, and
+    // must go through the map. Without one they are character codes and the
+    // old byte decoding is right -- so both live side by side and the document
+    // decides which applies.
+    const hexDec = (h) => {
+      if (!cmap || !cmap.size) return _dedDecHex(h);
+      const clean = String(h).replace(/\s+/g, '');
+      let o = '';
+      for (let k = 0; k + 3 < clean.length + 1; k += 4) {
+        const code = parseInt(clean.substr(k, 4), 16);
+        if (!isFinite(code)) continue;
+        const ch = cmap.get(code);
+        // An unmapped glyph is DROPPED rather than guessed at: emitting the raw
+        // code point would put random CJK into an invoice and make a broken
+        // read look like a strange one.
+        if (ch != null) o += ch;
+      }
+      return o;
+    };
     let out = '', pending = '';
     const flush = () => { if (pending) { out += pending; pending = ''; } };
     const RX = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|\[[^\]]*\]|(T[dDmJj*fLwsz]|BT|ET|'|")|(-?[\d.]+)/g;
@@ -31118,14 +31137,14 @@ render();
     while ((m = RX.exec(content))) {
       const tok = m[0];
       if (tok.startsWith('(')) pending += _dedDecLiteral(tok.slice(1, -1));
-      else if (tok.startsWith('<') && !tok.startsWith('<<')) pending += _dedDecHex(tok.slice(1, -1));
+      else if (tok.startsWith('<') && !tok.startsWith('<<')) pending += hexDec(tok.slice(1, -1));
       else if (tok.startsWith('[')) {
         const IRX = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|(-?[\d.]+)/g;
         let im;
         while ((im = IRX.exec(tok.slice(1, -1)))) {
           const t = im[0];
           if (t.startsWith('(')) pending += _dedDecLiteral(t.slice(1, -1));
-          else if (t.startsWith('<')) pending += _dedDecHex(t.slice(1, -1));
+          else if (t.startsWith('<')) pending += hexDec(t.slice(1, -1));
           else if (Number(t) < -120) pending += ' ';   // a big kern is a space
         }
       }
@@ -31154,9 +31173,117 @@ render();
   // with 'stream', so a naive match starts the next read at the wrong offset;
   // and the EOL around the data is not part of it, so including it makes
   // inflate reject the whole stream.
+  // ── CID FONTS: GLYPH IDS ARE NOT CHARACTERS ─────────────────────────────
+  // Natural Grocers invoices (SAP BusinessObjects -> PDFlib) embed Arial as
+  // CID TrueType with Identity-H encoding. The text operators then carry
+  // <0048006500...> -- two-byte GLYPH IDS, not character codes. Decoding those
+  // as bytes yields nulls and control characters, which is why every one of
+  // these files reported "read the file but no layout fitted" with an EMPTY
+  // head preview: text was extracted, and none of it was letters.
+  //
+  // The font carries the answer: a ToUnicode CMap mapping glyph id -> unicode.
+  // pdftotext reads it, so the same document extracts perfectly there, which is
+  // what made this look like a layout problem rather than an encoding one.
+  //
+  // ONE MERGED MAP for the whole document rather than per-font. Correct
+  // per-font handling means parsing the resource dictionary and tracking Tf
+  // operators; these documents carry two fonts of the same family and their
+  // maps agree, so merging is right here and would need revisiting for a
+  // document that mixed genuinely different encodings. First writer wins, so a
+  // collision cannot silently overwrite a mapping already found.
+  async function _dedInflateWhole(raw) {
+    for (const fmt of ['deflate', 'deflate-raw']) {
+      try {
+        const st = new Blob([raw]).stream().pipeThrough(new DecompressionStream(fmt));
+        const parts = []; let total = 0;
+        const rd = st.getReader();
+        for (;;) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          total += value.length;
+          if (total > 4_000_000) { try { await rd.cancel(); } catch (e) {} break; }
+          parts.push(value);
+        }
+        if (!parts.length) continue;
+        const all = new Uint8Array(total);
+        let off = 0; for (const p2 of parts) { all.set(p2, off); off += p2.length; }
+        return new TextDecoder('latin1').decode(all);
+      } catch (e) { /* try the next framing */ }
+    }
+    return '';
+  }
+
+  function _dedParseCMap(txt, map) {
+    const hx = (h) => parseInt(h, 16);
+    // <src> <dst> pairs. dst can be several UTF-16 code units for a ligature.
+    const chars = txt.match(/beginbfchar([\s\S]*?)endbfchar/g) || [];
+    for (const blk of chars) {
+      const rx = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
+      let m;
+      while ((m = rx.exec(blk))) {
+        const src = hx(m[1]);
+        let dst = '';
+        for (let k = 0; k < m[2].length; k += 4) dst += String.fromCharCode(hx(m[2].substr(k, 4)));
+        if (!map.has(src)) map.set(src, dst);
+      }
+    }
+    // <lo> <hi> <dstStart> -- a contiguous run, the common case for a subset.
+    const ranges = txt.match(/beginbfrange([\s\S]*?)endbfrange/g) || [];
+    for (const blk of ranges) {
+      const rx = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
+      let m;
+      while ((m = rx.exec(blk))) {
+        const lo = hx(m[1]), hi = hx(m[2]), base = hx(m[3].slice(-4));
+        // A malformed or enormous range would hang this loop; the cap is a
+        // guard, not a limit any real subset reaches.
+        if (!(hi >= lo) || hi - lo > 65535) continue;
+        for (let c = lo; c <= hi; c++) if (!map.has(c)) map.set(c, String.fromCharCode(base + (c - lo)));
+      }
+    }
+  }
+
   async function _dedPdfText(arrayBuf, onProgress) {
     const buf = new Uint8Array(arrayBuf);
     const view = buf.length > _DED_MAX_SCAN ? buf.subarray(0, _DED_MAX_SCAN) : buf;
+
+    // FIRST PASS: collect every ToUnicode CMap. Only streams whose object
+    // header actually says /ToUnicode are inflated, so an ordinary document
+    // pays for nothing -- the map stays empty and decoding behaves exactly as
+    // it did before.
+    const cmap = new Map();
+    let cmapsFound = 0, scanned = 0;
+    {
+      let p2 = 0;
+      for (;;) {
+        const i2 = _dedFindBytes(view, _DED_B_STREAM, p2);
+        if (i2 < 0) break;
+        p2 = i2 + 6;
+        if (i2 >= 3 && view[i2 - 3] === 0x65 && view[i2 - 2] === 0x6e && view[i2 - 1] === 0x64) continue;
+        // NOT detected by looking for /ToUnicode near the stream. These files
+        // put every font dictionary inside a compressed object stream, so the
+        // string does not appear in the file at all -- grep finds zero
+        // occurrences in a document that demonstrably has two CMaps. The only
+        // reliable test is to inflate and look at the content.
+        //
+        // Cheap in practice: capped at 200KB per stream and 40 streams, and it
+        // stops as soon as two maps are in hand, which is every document of
+        // this shape. A file with no CMaps pays one inflate per small stream
+        // and decodes exactly as it did before.
+        if (cmapsFound >= 2 || scanned > 40) break;
+        let st2 = p2;
+        while (view[st2] === 0x0d || view[st2] === 0x0a) st2++;
+        const en2 = _dedFindBytes(view, _DED_B_ENDSTREAM, st2);
+        if (en2 < 0) break;
+        const rawC = view.subarray(st2, en2);
+        if (rawC.length && rawC.length < 200000) {
+          scanned++;
+          const txt = await _dedInflateWhole(rawC);
+          if (txt && /beginbf(char|range)/.test(txt)) { _dedParseCMap(txt, cmap); cmapsFound++; }
+        }
+        p2 = en2 + 9;
+      }
+    }
+
     let out = '', pos = 0, n = 0;
     for (;;) {
       const i = _dedFindBytes(view, _DED_B_STREAM, pos);
@@ -31176,7 +31303,7 @@ render();
       if (raw.length > _DED_MAX_STREAM) continue;
       const sTxt = await _dedStreamTextOps(raw);
       if (!sTxt) continue;
-      out += _dedTextFromContent(sTxt) + '\n';
+      out += _dedTextFromContent(sTxt, cmap) + '\n';
       if (onProgress && (++n % 10 === 0)) { onProgress(n); await new Promise(r => setTimeout(r, 0)); }
     }
     return out.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
@@ -34739,9 +34866,13 @@ render();
         // ── FILTER CONTROLS ────────────────────────────────────────────────
         // Every one of these repaints this container only. The search box lives
         // outside it and keeps its caret, which is the reason the split exists.
-        host.querySelectorAll('.hl-df-btn').forEach(b => {
+        // .hl-df-h is the class the COLUMN HEADINGS use. This bound
+        // .hl-df-btn, left over from the filter bar the headings replaced, so
+        // no heading had a click handler at all and every dropdown was dead.
+        host.querySelectorAll('.hl-df-h').forEach(b => {
           b.onclick = async () => {
             _dedFacetOpen = (_dedFacetOpen === b.dataset.f) ? null : b.dataset.f;
+            _dedFacetQ = '';        // a new column starts with a clean search
             await paintResults();
           };
         });
