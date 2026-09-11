@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-34 filter-close';
+  const _DED_BUILD = 'tr-36 drop-zone';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -30998,8 +30998,11 @@ render();
   // through this test; building a two-char string per line cost 135s on one
   // file. Every operator contains 'T' (0x54), so one integer comparison rejects
   // the path data that is 99.99% of these streams.
+  // Tf (0x66) is kept too: it names the FONT the following strings are in, and
+  // a document with two CID fonts cannot be decoded without knowing which one
+  // is active. It emits no text, so documents with one font read as before.
   function _dedIsTextOp(a, b) {
-    if (a === 0x54) return b === 0x6a || b === 0x4a || b === 0x64 || b === 0x44 || b === 0x6d || b === 0x2a;
+    if (a === 0x54) return b === 0x6a || b === 0x4a || b === 0x64 || b === 0x44 || b === 0x6d || b === 0x2a || b === 0x66;
     if (b === 0x54) return a === 0x42 || a === 0x45;
     return false;
   }
@@ -31110,8 +31113,17 @@ render();
     return out;
   }
 
-  function _dedTextFromContent(content, cmap) {
-    const maps = Array.isArray(cmap) ? cmap : (cmap && cmap.size ? [cmap] : []);
+  // fontMaps (optional): resource name ('/F1') -> that font's own ToUnicode
+  // map, resolved from the document's font dictionaries by _dedPdfText. When
+  // the active font is known, ONLY its map is used -- scoring maps against each
+  // other cannot work when both are subsets of the same family, because a
+  // wrong map turns glyph ids into different letters, not into gibberish that
+  // scores badly (Arial-Bold decoded with Arial's map read 'Naturl GoceeG').
+  function _dedTextFromContent(content, cmap, fontMaps) {
+    const allMaps = Array.isArray(cmap) ? cmap : (cmap && cmap.size ? [cmap] : []);
+    let curFont = null, lastName = null;
+    const mapsFor = () => (fontMaps && curFont && fontMaps.has(curFont)) ? [fontMaps.get(curFont)] : allMaps;
+    let maps = allMaps;
     // With a ToUnicode map the hex strings are GLYPH IDS, two bytes each, and
     // must go through the map. Without one they are character codes and the
     // old byte decoding is right -- so both live side by side and the document
@@ -31155,10 +31167,14 @@ render();
     };
     let out = '', pending = '';
     const flush = () => { if (pending) { out += pending; pending = ''; } };
-    const RX = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|\[[^\]]*\]|(T[dDmJj*fLwsz]|BT|ET|'|")|(-?[\d.]+)/g;
+    // Names (/F1) are matched only so `Tf` can pick up the one before it; they
+    // emit nothing. Without fontMaps the font is tracked and never consulted.
+    const RX = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|\[[^\]]*\]|(\/[^\s\/\[\]()<>{}%]+)|(T[dDmJj*fLwsz]|BT|ET|'|")|(-?[\d.]+)/g;
     let m;
     while ((m = RX.exec(content))) {
       const tok = m[0];
+      if (tok.startsWith('/')) { lastName = tok; continue; }
+      if (tok === 'Tf') { curFont = lastName; maps = mapsFor(); continue; }
       if (tok.startsWith('(')) pending += litDec(tok.slice(1, -1));
       else if (tok.startsWith('<') && !tok.startsWith('<<')) pending += hexDec(tok.slice(1, -1));
       else if (tok.startsWith('[')) {
@@ -31273,6 +31289,71 @@ render();
     }
   }
 
+  function _dedLatin1(bytes) {
+    let s = '';
+    for (let k = 0; k < bytes.length; k += 8192) s += String.fromCharCode.apply(null, bytes.subarray(k, k + 8192));
+    return s;
+  }
+
+  // An object stream is a header of "objnum offset" pairs followed by the
+  // objects themselves, with no `obj`/`endobj` around them. /First in the
+  // stream's own dictionary says where the first object starts.
+  function _dedSplitObjStm(txt, dict, into) {
+    const first = Number((String(dict).match(/\/First\s+(\d+)/) || [])[1]);
+    if (!isFinite(first) || first <= 0 || first > txt.length) return;
+    const nums = (txt.slice(0, first).match(/\d+/g) || []).map(Number);
+    const pairs = [];
+    for (let k = 0; k + 1 < nums.length; k += 2) pairs.push([nums[k], nums[k + 1]]);
+    pairs.forEach(([num, off], k) => {
+      const end = k + 1 < pairs.length ? pairs[k + 1][1] : txt.length - first;
+      if (!into.has(num)) into.set(num, txt.slice(first + off, first + end));
+    });
+  }
+
+  // Resource name -> ToUnicode map. Page resources say `/Font << /F0 7 0 R >>`;
+  // object 7 says `/ToUnicode 17 0 R`; object 17 is a CMap already parsed. The
+  // dictionaries come from object streams (collected during the CMap scan) and,
+  // for files that do not use them, from the plain file body. A name that
+  // resolves to two different maps is dropped rather than guessed.
+  function _dedResolveFontMaps(view, objText, cmapByObj) {
+    try {
+      const objs = new Map(objText);
+      if (view.length <= 8 * 1024 * 1024) {
+        const body = _dedLatin1(view);
+        const rx = /(\d+)\s+\d+\s+obj\b([\s\S]*?)(?:\bstream\b|\bendobj\b)/g;
+        let m;
+        while ((m = rx.exec(body))) { const n0 = Number(m[1]); if (!objs.has(n0)) objs.set(n0, m[2]); }
+      }
+      const toU = (num) => {
+        const t = objs.get(num);
+        const r = t && t.match(/\/ToUnicode\s+(\d+)\s+\d+\s+R/);
+        return r ? cmapByObj.get(Number(r[1])) || null : null;
+      };
+      const out = new Map(), bad = new Set();
+      const take = (dictBody) => {
+        const rx = /(\/[^\s\/\[\]()<>{}%]+)\s+(\d+)\s+\d+\s+R/g;
+        let m;
+        while ((m = rx.exec(dictBody))) {
+          const mp = toU(Number(m[2]));
+          if (!mp) continue;
+          if (out.has(m[1]) && out.get(m[1]) !== mp) bad.add(m[1]);
+          else out.set(m[1], mp);
+        }
+      };
+      for (const t of objs.values()) {
+        let m;
+        const rxD = /\/Font\s*<<([^<>]*)>>/g;
+        while ((m = rxD.exec(t))) take(m[1]);
+        const rxI = /\/Font\s+(\d+)\s+\d+\s+R/g;
+        while ((m = rxI.exec(t))) { const d = objs.get(Number(m[1])); if (d) take(d); }
+      }
+      for (const b of bad) out.delete(b);
+      return out.size ? out : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   async function _dedPdfText(arrayBuf, onProgress) {
     const buf = new Uint8Array(arrayBuf);
     const view = buf.length > _DED_MAX_SCAN ? buf.subarray(0, _DED_MAX_SCAN) : buf;
@@ -31282,6 +31363,8 @@ render();
     // pays for nothing -- the map stays empty and decoding behaves exactly as
     // it did before.
     const cmap = [];               // one Map per font
+    const cmapByObj = new Map();   // object number -> that CMap
+    const objText = new Map();     // object number -> dictionary text, from object streams
     let cmapsFound = 0, scanned = 0;
     {
       let p2 = 0;
@@ -31300,7 +31383,25 @@ render();
         // stops as soon as two maps are in hand, which is every document of
         // this shape. A file with no CMaps pays one inflate per small stream
         // and decodes exactly as it did before.
-        if (cmapsFound >= 2 || scanned > 40) break;
+        //
+        // ONCE TWO MAPS ARE IN HAND the scan carries on, but inflates only
+        // OBJECT STREAMS -- that is where these files keep the font
+        // dictionaries saying which map belongs to which font, and in the
+        // Natural Grocers invoice it sits after both maps. A document with
+        // fewer than two maps never reaches that branch.
+        if (scanned > 40) break;
+        // The object header in front of the stream: its number (so a map can
+        // be found again by reference) and whether it is an object stream.
+        const hdr = _dedLatin1(view.subarray(Math.max(0, i2 - 512), i2));
+        let objNum = null, dictTail = hdr;
+        { const rxO = /(\d+)\s+\d+\s+obj\b/g; let mo; while ((mo = rxO.exec(hdr))) { objNum = Number(mo[1]); dictTail = hdr.slice(mo.index); } }
+        const isObjStm = /\/Type\s*\/ObjStm\b/.test(dictTail);
+        if (cmapsFound >= 2 && !isObjStm) {
+          const skip = _dedFindBytes(view, _DED_B_ENDSTREAM, p2);
+          if (skip < 0) break;
+          p2 = skip + 9;
+          continue;
+        }
         let st2 = p2;
         while (view[st2] === 0x0d || view[st2] === 0x0a) st2++;
         const en2 = _dedFindBytes(view, _DED_B_ENDSTREAM, st2);
@@ -31319,12 +31420,19 @@ render();
           const txt = await _dedInflateWhole(rawC);
           if (txt && /beginbf(char|range)/.test(txt)) {
             const one = new Map(); _dedParseCMap(txt, one);
-            if (one.size) { cmap.push(one); cmapsFound++; }
+            if (one.size) { cmap.push(one); cmapsFound++; if (objNum != null) cmapByObj.set(objNum, one); }
+          } else if (txt && isObjStm) {
+            _dedSplitObjStm(txt, dictTail, objText);
           }
         }
         p2 = en2 + 9;
       }
     }
+    // WHICH MAP BELONGS TO WHICH FONT, read from the document rather than
+    // guessed. Only attempted with two or more maps; with one there is nothing
+    // to choose. Any step that fails leaves fontMaps empty and decoding falls
+    // back to the old scoring -- never worse than before.
+    const fontMaps = cmap.length >= 2 ? _dedResolveFontMaps(view, objText, cmapByObj) : null;
 
     let out = '', pos = 0, n = 0;
     for (;;) {
@@ -31345,7 +31453,7 @@ render();
       if (raw.length > _DED_MAX_STREAM) continue;
       const sTxt = await _dedStreamTextOps(raw);
       if (!sTxt) continue;
-      out += _dedTextFromContent(sTxt, cmap) + '\n';
+      out += _dedTextFromContent(sTxt, cmap, fontMaps) + '\n';
       if (onProgress && (++n % 10 === 0)) { onProgress(n); await new Promise(r => setTimeout(r, 0)); }
     }
     return out.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
@@ -31497,7 +31605,20 @@ render();
       // could never be recognised as the thing it plainly is.
       unit_chargeback: isFinite(r.unit_chargeback) ? r.unit_chargeback : null,
       bill_amount: Math.abs(r.bill_amount),
+      // OPTIONAL COLUMNS A LAYOUT CAN STATE, passed through only when the
+      // parser supplies them (row.extra). Every older parser omits `extra`, so
+      // its rows are written exactly as before. Whitelisted to columns the MCB
+      // import already writes, so no parser can name a column that is not there.
+      ...(r.extra ? _dedDetailExtra(r.extra) : {}),
+      ...(r.document_id != null ? { document_id: r.document_id } : {}),
     };
+  }
+  function _dedDetailExtra(x) {
+    const o = {};
+    for (const k of ['item_no', 'dc', 'customer_state', 'reference_comment', 'date_from', 'date_to',
+                     'recomputed', 'recompute_basis', 'variance'])
+      if (x[k] !== undefined) o[k] = x[k];
+    return o;
   }
 
   function _dedIsoDate(s) {
@@ -32369,6 +32490,252 @@ render();
              rows: out, line_total: lt, ties: true, mismatches };
   }
 
+  // ── NATURAL GROCERS / VITAMIN COTTAGE CUSTOMER INVOICE (PDF) ─────────────
+  // The cover NG sends for every program it bills ATG: scan backs, ad fees and
+  // the quarterly Retail Execution Program. SAP BusinessObjects -> PDFlib, two
+  // CID fonts (see _dedResolveFontMaps -- without per-font maps the bold labels
+  // and the Total read as nonsense).
+  //
+  // Keel's reader emits ONE FIELD PER LINE; pdftotext -layout puts a whole row
+  // on one line. Both are accepted, matched by shape rather than position.
+  //
+  // IT CARRIES NO ITEMISATION. One row per billed program, identified by its
+  // DEBTOR REFERENCE -- `Against the Grain Gourmet 4/1/26-6/30/26 Frozen`, or a
+  // scan back's contract name. That string is what ties it to the spreadsheet
+  // that does carry the items, and nothing in it names the UNFI deduction
+  // (…3PTYNATGROC) that eventually collects it. So head.invoice_no stays NULL:
+  // the NG document number is not a register invoice, and treating it as one
+  // made the per-line check refuse the right line.
+  //
+  // Verified against invoice 1800109559 (billed 7/8/26, RtlExecPrgm): 1 row,
+  // $3,200.59, ties to the stated Total.
+  function _dedParseNgInvoice(text) {
+    const t = String(text || '').replace(/\r/g, '');
+    if (!/Customer\s+Invoice/i.test(t) || !/Debtor\s+Reference/i.test(t)
+        || !/(Vitamin\s+Cottage|Natural\s+Grocers)/i.test(t))
+      return { error: 'ng invoice: not a Natural Grocers customer invoice', rows: [] };
+    const LN = t.split('\n').map(x => x.trim()).filter(Boolean);
+    const D = /^\d{1,2}\/\d{1,2}\/(?:\d{2}|\d{4})$/;
+    const MONEY = /^-?[\d,]*\.\d{2}$/;
+    const num = (s) => Number(String(s).replace(/,/g, ''));
+    // A label's value is on the same line after the colon, or the next line.
+    const after = (rx, ok) => {
+      for (let i = 0; i < LN.length; i++) {
+        const m = LN[i].match(rx);
+        if (!m) continue;
+        const same = (m[1] || '').trim();
+        if (same && (!ok || ok.test(same))) return same;
+        const nxt = LN[i + 1];
+        if (nxt && (!ok || ok.test(nxt))) return nxt;
+      }
+      return null;
+    };
+    const docNo    = after(/Document\s+Number:\s*(.*)$/i, /^\d{6,}$/);
+    const billDate = after(/Billing\s+Date:\s*(.*)$/i, D);
+    const ref      = after(/(?:^|\s)Reference:\s*(.*)$/i, null);
+    const custNo   = (t.match(/Customer\s+Address:\s*(\d+)/i) || [])[1] || null;
+
+    const rows = [];
+    const push = (doc, type, date, line, dref, amtS) => {
+      // CR is a credit NG issues back: it reduces what is owed.
+      const amt = num(amtS) * (String(type).toUpperCase() === 'CR' ? -1 : 1);
+      if (!isFinite(amt)) return;
+      const w = String(dref).match(/(\d{1,2}\/\d{1,2}\/\d{2,4})\s*-\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/);
+      const from = w ? _dedIsoDate(w[1]) : null, to = w ? _dedIsoDate(w[2]) : null;
+      rows.push({
+        upc: null, item_desc: dref, reference_no: dref,
+        ship_date: w ? w[1] : date,
+        customer_name: 'NATURAL GROCERS', customer_no: null,
+        ship_qty: null, unit_cost: null, discount_pct: null, unit_chargeback: null,
+        bill_amount: amt,
+        extra: { reference_comment: 'NG invoice ' + doc + ' line ' + line + (ref ? ' · ' + ref : ''),
+                 date_from: from, date_to: to },
+      });
+    };
+    for (let i = 0; i < LN.length; i++) {
+      // Flowed: the whole row on one line.
+      let m = LN[i].match(/^(\d{6,})\s+([A-Z]{2})\s+(\d{1,2}\/\d{1,2}\/\d{2,4})\s+(\d{1,3})\s+(.+?)\s+(-?[\d,]*\.\d{2})(?:\s+[A-Z]{3})?$/);
+      if (m) { push(m[1], m[2], m[3], m[4], m[5], m[6]); continue; }
+      // One field per line: doc / type / date / line / debtor reference / amount.
+      if (/^\d{6,}$/.test(LN[i]) && /^[A-Z]{2}$/.test(LN[i + 1] || '') && D.test(LN[i + 2] || '')
+          && /^\d{1,3}$/.test(LN[i + 3] || '') && LN[i + 4] && MONEY.test(LN[i + 5] || '')) {
+        push(LN[i], LN[i + 1], LN[i + 2], LN[i + 3], LN[i + 4], LN[i + 5]);
+        i += 5;
+      }
+    }
+    if (!rows.length) return { error: 'ng invoice: header read but no invoice rows', rows: [] };
+    let stated = null;
+    for (let i = 0; i < LN.length; i++) {
+      const m = LN[i].match(/^Total\b\s*(-?[\d,]*\.\d{2})?/i);
+      if (!m) continue;
+      if (m[1]) { stated = num(m[1]); break; }
+      if (MONEY.test(LN[i + 1] || '')) { stated = num(LN[i + 1]); break; }
+    }
+    const lt = Math.round(rows.reduce((n, r) => n + r.bill_amount, 0) * 100) / 100;
+    const refs = [...new Set(rows.map(r => r.reference_no))];
+    const froms = rows.map(r => r.extra.date_from).filter(Boolean).sort();
+    const tos = rows.map(r => r.extra.date_to).filter(Boolean).sort();
+    return {
+      head: { invoice_no: null, total: stated, type: 'Natural Grocers invoice', dc: ref,
+              ng: { kind: 'invoice', doc_no: docNo, bill_date: _dedIsoDate(billDate), reference: ref,
+                    customer_no: custNo, debtor_refs: refs,
+                    period_from: froms[0] || null, period_to: tos[tos.length - 1] || null } },
+      rows, line_total: lt,
+      ties: stated != null && Math.abs(lt - stated) < 0.01,
+      note: 'Natural Grocers invoice ' + (docNo || '?') + (billDate ? ', billed ' + billDate : '')
+          + (ref ? ' (' + ref + ')' : '') + ' — ' + rows.length + ' row' + (rows.length === 1 ? '' : 's')
+          + '. It states no items; its spreadsheet, if uploaded with it, supplies them.',
+    };
+  }
+
+  // ── NATURAL GROCERS PROGRAM BILLING (xlsx: Summary + Billing Detail) ─────
+  // The spreadsheet behind a program invoice such as the quarterly Retail
+  // Execution Program: NG charges a percentage of what it bought from each
+  // UNFI DC, item by item.
+  //   Summary         Brand | Brand Name | Department | Department Name |
+  //                   Invoice Start Date | Invoice End Date | Invoiced Amount | 0.80% Charge
+  //   Billing Detail  Brand | Brand Name | PO Vendor | PO Vendor Name | Article |
+  //                   Article Name | Department | Dept Name | Invoiced Amount | 0.80% Charge
+  //
+  // THE DETAIL IS ON THE SECOND SHEET, which is why this file used to show
+  // seven columns and no layout: both upload paths read the first sheet only.
+  // This parser takes every sheet.
+  //
+  // Reads RAW cell values (sheet_to_json raw:true). Formatted text would round
+  // the charge to the cell's display format, and the charges carry four
+  // decimals: they sum to $3,200.5871, which is the Summary's $3,200.59 only
+  // before rounding each row.
+  //
+  // Self-verifying twice: detail Invoiced Amount sums to the Summary's, and the
+  // detail charge sums to the Summary's charge. The rate is NOT recomputed into
+  // a tie -- NG's own charge is not exactly invoiced x 0.80% (8,980.14 bills
+  // 71.8446, not 71.8411), so the per-row difference is stored as a variance
+  // rather than used to refuse the file.
+  //
+  // The debtor reference is REBUILT from the Summary exactly as the invoice
+  // prints it -- `Against the Grain Gourmet 4/1/26-6/30/26 Frozen` -- because
+  // that string is the only thing tying this file to its invoice.
+  //
+  // Verified against the Q2 2026 file: 59 rows (6 DCs; Iowa City bills 9 of the 10 articles),
+  // $400,068.43 invoiced, $3,200.59 charged, ties to invoice 1800109559.
+  function _dedParseNgProgram(sheets, itemMap) {
+    const norm = (v) => String(v == null ? '' : v).trim().toLowerCase().replace(/[^a-z0-9%]/g, '');
+    const num = (v) => {
+      if (typeof v === 'number') return v;
+      const s = String(v == null ? '' : v).replace(/[$,\s]/g, '').replace(/^\((.*)\)$/, '-$1');
+      if (s === '') return null;
+      const n = Number(s); return isFinite(n) ? n : null;
+    };
+    const iso = (v) => {
+      if (v == null || v === '') return null;
+      if (v instanceof Date && !isNaN(v)) return v.toISOString().slice(0, 10);
+      if (typeof v === 'number' && v > 20000 && v < 80000)
+        return new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);
+      const s = String(v).trim();
+      return _dedIsoDate(s) || (/^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : null);
+    };
+    const mdy = (isoS) => {
+      if (!isoS) return '';
+      const [y, m, d] = isoS.split('-').map(Number);
+      return m + '/' + d + '/' + String(y).slice(2);
+    };
+    const findHeader = (rows, need) => {
+      for (let i = 0; i < Math.min(rows.length, 15); i++) {
+        const C = {};
+        (rows[i] || []).forEach((c, n) => {
+          const k = norm(c);
+          if (!k) return;
+          if (!(k in C)) C[k] = n;
+          const pm = String(c).match(/(\d+(?:\.\d+)?)\s*%\s*charge/i);
+          if (pm && C.__charge == null) { C.__charge = n; C.__pct = Number(pm[1]); }
+        });
+        if (need.every(k => C[k] != null) && C.__charge != null) return { i, C };
+      }
+      return null;
+    };
+    let sum = null, det = null;
+    for (const sh of (sheets || [])) {
+      const rows = sh.rows || [];
+      if (!sum) {
+        const h = findHeader(rows, ['brandname', 'departmentname', 'invoicestartdate', 'invoiceenddate', 'invoicedamount']);
+        if (h) sum = { sheet: sh.name, rows, ...h };
+      }
+      if (!det) {
+        const h = findHeader(rows, ['povendorname', 'article', 'articlename', 'invoicedamount']);
+        if (h) det = { sheet: sh.name, rows, ...h };
+      }
+    }
+    if (!sum) return { error: 'ng program: no Summary sheet with Brand Name, Department Name, Invoice Start/End Date, Invoiced Amount and a % Charge column', rows: [] };
+    if (!det) return { error: 'ng program: Summary found but no Billing Detail sheet (PO Vendor Name, Article, Article Name, Invoiced Amount, % Charge)', rows: [] };
+
+    // Summary: one row per department billed.
+    const S = sum.C, depts = new Map();
+    let sInv = 0, sChg = 0;
+    for (let i = sum.i + 1; i < sum.rows.length; i++) {
+      const r = sum.rows[i] || [];
+      const inv = num(r[S.invoicedamount]), chg = num(r[S.__charge]);
+      if (inv == null || chg == null) continue;
+      const from = iso(r[S.invoicestartdate]), to = iso(r[S.invoiceenddate]);
+      const brandName = String(r[S.brandname] || '').trim(), deptName = String(r[S.departmentname] || '').trim();
+      const dept = String(r[S.department] == null ? '' : r[S.department]).trim();
+      const dref = [brandName, from && to ? mdy(from) + '-' + mdy(to) : '', deptName].filter(Boolean).join(' ');
+      depts.set(dept || deptName, { dref, from, to, deptName, inv, chg });
+      sInv += inv; sChg += chg;
+    }
+    if (!depts.size) return { error: 'ng program: Summary has a header but no billed rows', rows: [] };
+
+    const D = det.C, pct = D.__pct != null ? D.__pct : S.__pct;
+    const out = [], mismatches = [];
+    let dInv = 0, dChg = 0, mapHit = 0;
+    const deptList = [...depts.values()];
+    for (let i = det.i + 1; i < det.rows.length; i++) {
+      const r = det.rows[i] || [];
+      const inv = num(r[D.invoicedamount]), chg = num(r[D.__charge]);
+      if (inv == null || chg == null) continue;
+      const deptKey = String(r[D.department] == null ? '' : r[D.department]).trim();
+      const dp = depts.get(deptKey) || depts.get(String(r[D.deptname] || '').trim()) || (deptList.length === 1 ? deptList[0] : null);
+      if (!dp) { mismatches.push('row ' + (i + 1) + ': department ' + deptKey + ' is not on the Summary'); continue; }
+      const article = String(r[D.article] == null ? '' : r[D.article]).trim();
+      const upc = itemMap && article ? (itemMap.get(article) || null) : null;
+      if (upc) mapHit++;
+      const rec = Math.round(inv * (pct / 100) * 10000) / 10000;
+      dInv += inv; dChg += chg;
+      out.push({
+        upc, item_desc: String(r[D.articlename] || '').trim() || null,
+        reference_no: dp.dref, ship_date: mdy(dp.from) || null,
+        customer_name: 'NATURAL GROCERS', customer_no: null,
+        ship_qty: null, unit_cost: null, unit_chargeback: null,
+        discount_pct: pct, bill_amount: chg,
+        extra: {
+          item_no: article || null,
+          dc: String(r[D.povendorname] || '').trim() || null,
+          date_from: dp.from, date_to: dp.to,
+          reference_comment: 'NG program ' + pct + '% of $' + inv.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' invoiced',
+          recomputed: rec, recompute_basis: 'invoiced x ' + pct + '%',
+          variance: Math.round((chg - rec) * 10000) / 10000,
+        },
+      });
+    }
+    if (!out.length) return { error: 'ng program: Billing Detail has a header but no rows', rows: [] };
+    const r2 = (n) => Math.round(n * 100) / 100;
+    const invTies = Math.abs(r2(dInv) - r2(sInv)) < 0.01;
+    const chgTies = Math.abs(dChg - sChg) < 0.01;
+    if (!invTies) mismatches.push('detail invoiced ' + r2(dInv) + ' vs Summary ' + r2(sInv));
+    if (!chgTies) mismatches.push('detail charge ' + r2(dChg) + ' vs Summary ' + r2(sChg));
+    const froms = deptList.map(d => d.from).filter(Boolean).sort();
+    const tos = deptList.map(d => d.to).filter(Boolean).sort();
+    return {
+      head: { invoice_no: null, total: r2(sChg), type: 'Natural Grocers program billing', dc: deptList.map(d => d.dref).join(' / '),
+              ng: { kind: 'program', debtor_refs: deptList.map(d => d.dref), pct, invoiced: r2(sInv),
+                    period_from: froms[0] || null, period_to: tos[tos.length - 1] || null } },
+      rows: out, line_total: r2(dChg), ties: invTies && chgTies, mismatches,
+      note: 'Natural Grocers program billing — ' + out.length + ' rows across '
+          + new Set(out.map(o => o.extra.dc)).size + ' DCs, ' + pct + '% of $'
+          + r2(sInv).toLocaleString(undefined, { minimumFractionDigits: 2 }) + ' invoiced'
+          + (itemMap ? '; ' + mapHit + ' of ' + out.length + ' rows matched a UPC by NG article number' : '; no NG article crosswalk loaded, so rows carry no UPC') + '.',
+    };
+  }
+
   // ── THE DISTRIBUTOR CHARGE LAYOUT ────────────────────────────────────────
   // The upload tab REFUSED these and pointed at sync-deductions mode=detail,
   // which cannot read them: every one of these documents is a scan with no text
@@ -32542,295 +32909,777 @@ render();
       </p>`;
   }
 
+  // ══ THE DROP ZONE ═══════════════════════════════════════════════════════════
+  // One place to drop any deduction document, Excel or PDF. For each file:
+  //
+  //   READ    every layout Keel knows, on every sheet of a workbook, and the
+  //           one whose rows agree with the document's own total wins.
+  //   MATCH   strongest evidence first -- the invoice number the document
+  //           states; a register reference in the FILENAME (the loader's rule);
+  //           and only then candidate lines by customer + period + amount,
+  //           which are SUGGESTED and never attached without a person choosing.
+  //   SHOW    units, dollars and rate by product line before anything is
+  //           written, so the value of the document is visible up front.
+  //   GUARD   against duplicates at four levels, because a duplicate is the one
+  //           failure that looks exactly like success:
+  //             1 the same FILE (SHA-256), recorded in deduction_documents and
+  //               unique in the database, so two tabs cannot both import it
+  //             2 the same DOCUMENT from another file (its invoice / NG document
+  //               number / debtor reference), also unique in the database
+  //             3 the same ROWS already on any line in the book
+  //             4 more detail than the line it explains
+  //           and it NEVER creates a register line. Documents that became lines
+  //           are where $247,174 of phantom duplicates came from: the remittance
+  //           arrived later and the money was in the book twice.
+  //   HOLD    a document with no deduction on the register yet is saved as
+  //           WAITING -- rows and all -- and offered its line once the register
+  //           brings one in. (Moshe, 11 Sep 2026.)
+  //
+  // Natural Grocers: an invoice PDF and its spreadsheet dropped together are
+  // PAIRED on the debtor reference and the amount; the spreadsheet's rows land
+  // and the PDF is the check. An invoice already on a line, or waiting, is
+  // superseded when its spreadsheet arrives later.
+
+  const _DED_NG_KEY = (s) => String(s == null ? '' : s).toUpperCase().replace(/\s+/g, ' ').trim();
+  const _dedHex = (buf) => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  // SHA-256 in plain JS, for the rare page that is not a secure context (no
+  // crypto.subtle). The fingerprint is what the duplicate guard stands on, so
+  // it must never be unavailable.
+  function _dedSha256Js(bytes) {
+    const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+    const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+    const n = bytes.length, total = Math.ceil((n + 9) / 64) * 64;
+    const m = new Uint8Array(total); m.set(bytes); m[n] = 0x80;
+    const dv = new DataView(m.buffer);
+    dv.setUint32(total - 8, Math.floor(n / 0x20000000)); dv.setUint32(total - 4, (n << 3) >>> 0);
+    const W = new Uint32Array(64);
+    for (let o = 0; o < total; o += 64) {
+      for (let i = 0; i < 16; i++) W[i] = dv.getUint32(o + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const a = W[i - 15], b = W[i - 2];
+        const s0 = ((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3);
+        const s1 = ((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10);
+        W[i] = (W[i - 16] + s0 + W[i - 7] + s1) >>> 0;
+      }
+      let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+      for (let i = 0; i < 64; i++) {
+        const t1 = (h + (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) + ((e & f) ^ (~e & g)) + K[i] + W[i]) >>> 0;
+        const t2 = ((((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+        h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    const out = new Uint8Array(32), ov = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) ov.setUint32(i * 4, H[i]);
+    return out;
+  }
+  const _dedDigest = async (bytes) => (window.crypto && crypto.subtle)
+    ? new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)) : _dedSha256Js(bytes);
+  async function _dedSha256(buf) { return _dedHex(await _dedDigest(new Uint8Array(buf))); }
+  // Dropbox's content_hash: SHA-256 of each 4MB block, concatenated, hashed
+  // again. Computing it here is what lets a dropped file be recognised as one
+  // the crawler has already catalogued.
+  async function _dedDropboxHash(buf) {
+    const B = 4 * 1024 * 1024, u = new Uint8Array(buf), parts = [];
+    for (let o = 0; o < u.length; o += B) parts.push(await _dedDigest(u.subarray(o, o + B)));
+    const cat = new Uint8Array(parts.length * 32);
+    parts.forEach((p, i) => cat.set(p, i * 32));
+    return _dedHex(await _dedDigest(cat));
+  }
+  // The loader's _dedRefCandidates, ported unchanged in behaviour: every
+  // filename segment that could be a register reference, longest first.
+  function _dedFileRefs(name) {
+    const stem = String(name || '').replace(/\.[^.]+$/, '');
+    const parts = stem.split(/[_\s]+/).map(x => x.trim()).filter(Boolean);
+    const out = [];
+    for (const p of parts) {
+      const c = p.replace(/[^A-Za-z0-9.\-]/g, '');
+      if (c.length >= 6 && /\d/.test(c)) out.push(c);
+    }
+    const ranked = [...new Set(out)].sort((a, b) => b.length - a.length);
+    if (ranked.length) return ranked;
+    const whole = stem.replace(/[^A-Za-z0-9.\-]/g, '');
+    return (whole.length >= 6 && /\d/.test(whole)) ? [whole] : [];
+  }
+  const _dedDropUpc = (u) => { const d = String(u == null ? '' : u).replace(/\D/g, '').replace(/^0+/, ''); return d.length >= 8 ? d : null; };
+  // Customer identity for matching only. Deliberately narrow: an unknown name
+  // returns itself, so it can never be forced onto a neighbouring account.
+  const _dedCustKey = (s) => {
+    const k = String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!k) return null;
+    if (/^(ngvc|natgroc|naturalgrocers|naturalgrocersbyvitamincottage|vitamincottage)/.test(k)) return 'natural grocers';
+    if (/^(wholefoods|wfm|whfd)/.test(k)) return 'whole foods';
+    return k;
+  };
+
+  // A document's own identity, independent of the file it arrived in: the
+  // invoice number it states, NG's document number, NG's debtor reference, or a
+  // scanback's contracts plus its total. Null when a layout carries nothing that
+  // identifies the document -- the file hash is then the only identity.
+  function _dedDocKeyOf(layout, head, rows, total) {
+    const h = head || {}, ng = h.ng || null;
+    const refs = [...new Set((rows || []).map(r => r.reference_no).filter(Boolean).map(String))];
+    const t = Math.round(Number(total) * 100) / 100;
+    if (h.invoice_no) return 'INV:' + String(h.invoice_no).trim().toUpperCase();
+    if (layout === 'ng-invoice' && ng && ng.doc_no) return 'NGINV:' + ng.doc_no;
+    if (layout === 'ng-program' && ng) return 'NGPRG:' + ng.debtor_refs.map(_DED_NG_KEY).sort().join('|');
+    if (layout === 'ng-scanback') return 'NGSCAN:' + refs.map(_DED_NG_KEY).sort().join('|') + ':' + t.toFixed(2);
+    if (layout === 'wfm-scan' && refs.length) return ('WFMSCAN:' + refs.slice().sort().join('|')).slice(0, 400) + ':' + t.toFixed(2);
+    return null;
+  }
+  // ARE THESE ROWS ALREADY IN THE BOOK? Found through their reference numbers
+  // (the one key a document's rows carry that the table can be searched on),
+  // matched on UPC + quantity + amount + reference, one-for-one so a row that
+  // genuinely repeats is not counted twice. Catches money loaded by the Dropbox
+  // loader or before the registry existed, which no file record can.
+  // Returns the line holding most of them, its share of this document's rows,
+  // and the rows already there by line (for the NG invoice check).
+  async function _dedRowsInBook(sb, brandId, rows, excludeLineId) {
+    const refs = [...new Set((rows || []).map(r => r.reference_no).filter(Boolean).map(String))].slice(0, 20);
+    if (!refs.length || !rows.length) return { share: 0 };
+    const ex = [];
+    for (let from = 0; from < 60000; from += 1000) {   // PostgREST caps each read at 1,000
+      const { data, error } = await sb.from('deduction_detail').select('line_id,upc,ship_qty,bill_amount,reference_no')
+        .eq('brand_id', brandId).in('reference_no', refs).order('id').range(from, from + 999);
+      if (error) throw new Error(error.message);
+      ex.push(...(data || []));
+      if (!data || data.length < 1000) break;
+    }
+    const own = ex.filter(r => excludeLineId == null || String(r.line_id) !== String(excludeLineId));
+    const sig = (r) => [_dedDropUpc(r.upc) || '', r.ship_qty == null || r.ship_qty === '' ? '' : Number(r.ship_qty),
+                        Math.abs(Number(r.bill_amount) || 0).toFixed(2), String(r.reference_no || '')].join('|');
+    const bySig = new Map();
+    for (const r of own) {
+      const k = sig(r);
+      if (!bySig.has(k)) bySig.set(k, new Map());
+      const m = bySig.get(k); m.set(r.line_id, (m.get(r.line_id) || 0) + 1);
+    }
+    const hits = new Map();
+    for (const r of rows) {
+      const m = bySig.get(sig(r));
+      if (!m) continue;
+      for (const [lid, n] of m) if (n > 0) { m.set(lid, n - 1); hits.set(lid, (hits.get(lid) || 0) + 1); break; }
+    }
+    const perLine = new Map();
+    for (const r of own) perLine.set(r.line_id, (perLine.get(r.line_id) || 0) + Math.abs(Number(r.bill_amount) || 0));
+    const top = [...hits.entries()].sort((a, b) => b[1] - a[1])[0];
+    let inv = null;
+    if (top) {
+      try { const { data } = await sb.from('deduction_lines').select('invoice_no').eq('id', top[0]).maybeSingle(); inv = data && data.invoice_no; } catch (e) {}
+    }
+    return { lineId: top ? top[0] : null, count: top ? top[1] : 0, share: top ? top[1] / rows.length : 0,
+             inv: inv || (top ? 'line ' + top[0] : null), perLine };
+  }
+
+  // Has this file, or this document in another file, been recorded before?
+  // { missing: true } when the registry table does not exist yet.
+  async function _dedRegistryCheck(sb, brandId, sha, key) {
+    const cols = 'id,status,file_name,line_id,uploaded_by,uploaded_at';
+    const { data: a, error } = await sb.from('deduction_documents').select(cols).eq('brand_id', brandId).eq('file_sha256', sha).limit(1);
+    if (error) return { missing: true };
+    let r = a && a[0], how = 'This exact file';
+    if (!r && key) {
+      const { data: b } = await sb.from('deduction_documents').select(cols).eq('brand_id', brandId).eq('doc_key', key).limit(1);
+      r = b && b[0]; how = 'The same document';
+    }
+    if (!r) return {};
+    let where = r.status === 'waiting' ? 'it is waiting for its deduction on the Upload tab'
+              : r.status === 'superseded' ? 'it was replaced by the document that brought the itemised rows' : r.status;
+    if (r.line_id != null) {
+      let inv = 'line ' + r.line_id;
+      try { const { data: ln } = await sb.from('deduction_lines').select('invoice_no').eq('id', r.line_id).maybeSingle(); if (ln && ln.invoice_no) inv = ln.invoice_no; }
+      catch (e) { /* the line id stands in */ }
+      where = r.status === 'superseded' ? where + ', on ' + inv : 'its rows are on ' + inv;
+    }
+    return { hit: how + ' was uploaded' + (r.file_name && how !== 'This exact file' ? ' as ' + r.file_name : '') + ' by '
+                  + (r.uploaded_by || 'someone') + ' on ' + String(r.uploaded_at || '').slice(0, 10) + ' — ' + where + '.' };
+  }
+
   async function _dedRenderUpload(body, sb, brandId, esc, money, refresh) {
-    const st = (s, c) => `<span style="font-family:var(--mono);font-size:9px;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:${c};color:var(--paper);">${s}</span>`;
+    const st = (s, c) => `<span style="font-family:var(--mono);font-size:9px;letter-spacing:.05em;padding:2px 7px;border-radius:3px;background:${c};color:var(--paper);white-space:nowrap;">${s}</span>`;
+    const money2 = (n) => (n == null || !isFinite(n)) ? '—' : (n < 0 ? '-' : '') + '$' + Math.abs(Number(n)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const r2 = (n) => Math.round(Number(n) * 100) / 100;
+    const sess = () => (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
+    const dt = (s) => s ? String(s).slice(0, 10) : '';
+    const S = () => _dedUploadState;
+    const LINE_COLS = 'id,invoice_no,amount,doc_date,reason_code,dc_name,detail_parsed,detail_line_total';
+    const AMBER = '#8a6d1f';
 
     body.innerHTML = `
       <div style="margin-bottom:20px;">
-        <p style="font-family:var(--serif);font-size:13px;color:var(--ink-3);margin:0 0 14px;line-height:1.55;max-width:760px;">
-          Drop deduction backup here — PDFs, spreadsheets or CSVs, as many as you like. Keel reads each one,
-          works out which register line it belongs to from the invoice number the document states about itself,
-          and checks that its rows add up to that line before offering to import it.
-          <strong>Nothing is written until you press Import</strong>, nothing is written unless the document agrees
-          with the register, and importing the same document twice leaves the same rows as importing it once.
-          Files are read <strong>in this browser</strong> — scanned pages inflate to ~25MB each, which is what
-          defeats the server-side parser, so large scans take a few seconds apiece.
-          A UNFI MCB weekly report feeds several lines at once, one per category, each checked separately.
+        <p style="font-family:var(--serif);font-size:13px;color:var(--ink-3);margin:0 0 14px;line-height:1.55;max-width:780px;">
+          Drop any deduction document here — PDFs, spreadsheets or CSVs, as many as you like. Keel reads each one,
+          finds its register line from the invoice number it states, a reference in its filename, or — when neither
+          exists — suggests lines by customer, period and amount for you to confirm. Before anything is written you see
+          what the document holds by product line.
+          <strong>Nothing is written until you press Import.</strong> A file or document Keel has seen before, or rows
+          already in the book, cannot be imported again. A document whose deduction has not reached the register yet is
+          <strong>held</strong> and offered its line when it arrives — no register line is ever created from a document.
         </p>
+        <div id="hl-ded-reg" style="margin-bottom:12px;"></div>
         <div id="hl-ded-drop" style="border:1.5px dashed var(--rule);border-radius:8px;padding:26px 18px;text-align:center;cursor:pointer;background:transparent;transition:background .15s;">
           <div style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">Drop files here, or click to choose</div>
-          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">PDF, xlsx, xls, csv or txt \u00b7 no limit on how many \u00b7 large scans take a few seconds each</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">PDF, xlsx, xls, csv or txt · every sheet is read · large scans take a few seconds each</div>
           <input type="file" id="hl-ded-file" accept=".pdf,.xlsx,.xls,.csv,.txt" multiple style="display:none;">
         </div>
       </div>
-      <div id="hl-ded-up-list"></div>`;
+      <div id="hl-ded-up-list"></div>
+      <div id="hl-ded-wait" style="margin-top:26px;"></div>`;
 
     const drop = document.getElementById('hl-ded-drop');
     const input = document.getElementById('hl-ded-file');
+    const listEl = document.getElementById('hl-ded-up-list');
+    const waitEl = document.getElementById('hl-ded-wait');
+    const regEl = document.getElementById('hl-ded-reg');
     if (!drop || !input) return;
 
-    drop.onclick = () => input.click();
-    drop.ondragover = (e) => { e.preventDefault(); drop.style.background = 'rgba(0,0,0,0.03)'; };
-    drop.ondragleave = () => { drop.style.background = 'transparent'; };
-    drop.ondrop = (e) => {
-      e.preventDefault(); drop.style.background = 'transparent';
-      handle([...(e.dataTransfer.files || [])]);
-    };
-    input.onchange = () => handle([...(input.files || [])]);
-
-    const listEl = document.getElementById('hl-ded-up-list');
-
-    async function handle(files) {
-      // SPREADSHEETS TOO. A third of the deduction folder is xlsx and this tab
-      // took none of it -- the Natural Grocers scanbacks, the WFM ISE files and
-      // the UNFI CSV layouts all arrived here and were silently ignored,
-      // because a filter that drops a file without saying so looks identical to
-      // a file that nobody uploaded.
-      const usable = files.filter(f => /\.(pdf|xlsx|xls|csv|txt)$/i.test(f.name));
-      if (!usable.length) return;
-      for (const f of usable) {
-        const entry = { file: f, status: 'reading', note: 'reading…', head: null, rows: [],
-                        line: null, existing: null, chosen: false };
-        _dedUploadState.push(entry);
-        paint();
-        try {
-          const buf = await f.arrayBuffer();
-          let p = null;
-
-          if (/\.(xlsx|xls|csv|txt)$/i.test(f.name)) {
-            const wb = XLSX.read(buf, { type: 'array' });
-            const grid = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],
-                                                  { header: 1, defval: '', raw: false });
-            const rows = grid.map(r => (r || []).map(c => String(c == null ? '' : c)));
-            // EVERY SPREADSHEET LAYOUT, not just the scanback. The UNFI ASM
-            // and Whole Foods scan layouts were added to the per-line FILE
-            // dialog and never here, so dropping one of those on this tab
-            // reported "no layout recognised" for a file the app can read
-            // perfectly well two clicks away.
-            p = null;
-            for (const fn of [_dedParseNgScanback, _dedParseUnfiAsm, _dedParseWfmScan]) {
-              let r0 = null;
-              try { r0 = fn(rows); } catch (e) { continue; }
-              if (r0 && r0.rows && r0.rows.length) { p = r0; break; }
-            }
-            if (!p || p.error) {
-              // Name the columns rather than the failure. "Layout not
-              // recognised" is true and useless; the header row is what lets
-              // the next layout be written without opening the file by hand.
-              let best = [], n = -1;
-              for (const r of rows.slice(0, 15)) {
-                const filled = r.filter(c => c.trim() !== '');
-                if (filled.length > n) { n = filled.length; best = filled; }
-              }
-              entry.status = 'fail';
-              entry.note = 'no spreadsheet layout recognised — widest header (' + n + ' cols): '
-                         + best.slice(0, 12).join(' | ') + (best.length > 12 ? ' …' : '');
-              paint(); continue;
-            }
-          } else {
-            const text = await _dedPdfText(buf, (n) => { entry.note = 'reading… ' + n + ' streams'; paint(); });
-            if (text.replace(/\s+/g, '').length < 40) {
-              entry.status = 'fail';
-              entry.note = 'no text layer — this is an image-only scan. Use the FILE button on its register line to send it to the OCR pass.';
-              paint(); continue;
-            }
-            // EVERY LAYOUT IS TRIED and the one that TIES wins. The Distributor
-            // Charge layout used to be refused here and pointed at mode=detail
-            // -- which cannot read it, because those documents are scans. It
-            // parses perfectly when the text is there.
-            // The UNFI MCB weekly report is tried FIRST and separately: it is
-            // the one document here that feeds SEVERAL register lines, one per
-            // category, so it cannot go through the single-line path below.
-            const mcb = (() => { try { return _dedParseMcbCells(text); } catch (e) { return null; } })();
-            if (mcb && mcb.detail && mcb.detail.length && mcb.invoice) {
-              entry.mcb = mcb;
-              entry.status = 'ready';
-              // MUST be set, like every other ready entry. The Import button
-              // counts CHOSEN entries, so without this an MCB report parsed
-              // perfectly, showed READY, and left the button dead -- clicking
-              // it did nothing and said nothing.
-              entry.chosen = true;
-              entry.note = 'UNFI MCB weekly ' + mcb.invoice + ' \u2014 ' + mcb.detail.length.toLocaleString()
-                         + ' rows, ' + money(mcb.sum) + ', ' + new Set(mcb.detail.map(d => d.cat)).size + ' categories';
-              paint(); continue;
-            }
-            for (const fn of [_dedParseDistCharge, _dedParseKsolve]) {
-              let r = null;
-              try { r = fn(text); } catch (e) { continue; }
-              if (!r || !r.rows || !r.rows.length) continue;
-              if (r.ties) { p = r; break; }
-              if (!p) p = r;                       // keep the best near-miss to report
-            }
-            if (!p) {
-              entry.status = 'fail';
-              entry.note = 'read the file but no layout fitted — head: ' + text.replace(/\s+/g, ' ').slice(0, 90);
-              paint(); continue;
-            }
-          }
-          entry.head = p.head; entry.rows = p.rows; entry.parsed_total = p.line_total; entry.ties = p.ties;
-          if (!p.rows.length) {
-            entry.status = 'fail';
-            entry.note = 'read the file but found no detail rows — head: ' + text.replace(/\s+/g, ' ').slice(0, 90);
-            paint(); continue;
-          }
-          if (!p.head.invoice_no) {
-            // A scanback spreadsheet names its CONTRACT, not an invoice, so it
-            // cannot find its own register line. On the per-line FILE button
-            // the line is already chosen and this never arises -- which is why
-            // that is the better route for these.
-            entry.status = 'fail';
-            entry.note = /\.(xlsx|xls|csv|txt)$/i.test(f.name)
-              ? 'read ' + p.rows.length + ' rows totalling ' + money(p.line_total)
-                + ' — but a scanback carries no invoice number, so use the FILE button on the register line instead'
-              : 'no invoice number on the cover — cannot attach to a register line';
-            paint(); continue;
-          }
-          if (!p.ties) {
-            entry.status = 'fail';
-            entry.note = 'rows sum to ' + money(p.line_total) + ' against a stated TOTAL of '
-                       + (p.head.total == null ? 'none found' : money(p.head.total)) + ' — not imported';
-            paint(); continue;
-          }
-          // Reconcile against the register.
-          const { data: lns, error: lErr } = await sb.from('deduction_lines')
-            .select('id,invoice_no,amount,reason_code,detail_parsed,detail_line_total')
-            .eq('brand_id', brandId).eq('invoice_no', p.head.invoice_no).limit(2);
-          if (lErr) { entry.status = 'fail'; entry.note = 'could not read the register: ' + lErr.message; paint(); continue; }
-          if (!lns || !lns.length) {
-            entry.status = 'fail';
-            entry.note = 'invoice ' + p.head.invoice_no + ' is not on the check register — load the register first';
-            paint(); continue;
-          }
-          if (lns.length > 1) {
-            entry.status = 'fail';
-            entry.note = 'invoice ' + p.head.invoice_no + ' matches more than one register line — resolve that first';
-            paint(); continue;
-          }
-          entry.line = lns[0];
-
-          // ── THE INVOICE NUMBER IS NOT SELF-VALIDATING ────────────────────
-          // When the cover labels are graphics the number is read POSITIONALLY:
-          // the first line shaped like [A-Z]{1,6}\d{6,}. A detail row's
-          // reference number ('BM432340') has that exact shape, so a document
-          // whose cover did not extract can key itself off its own body and
-          // then attach these rows to a DIFFERENT invoice's line. Unlike the
-          // Edge path, nothing here matched on filename first, so the number is
-          // the only thing selecting the line — it has to be checked against
-          // the money.
-          //
-          // The document total EXCLUDES KeHE's fee (SN000166756: $5,872.95
-          // document, $469.84 fee, $6,342.79 deducted — a flat 8%, capped at
-          // $700). So the parsed total must not exceed the deduction, and the
-          // shortfall must look like a fee rather than a coincidence.
-          const amt = Math.abs(lns[0].amount);
-          const gap = amt - p.line_total;
-          if (p.line_total > amt + 0.01) {
-            entry.status = 'fail';
-            entry.note = 'the document totals ' + money(p.line_total) + ' but the register line for '
-                       + p.head.invoice_no + ' is only ' + money(amt)
-                       + ' — the invoice number was probably read off a detail row, not the cover. Not imported.';
-            paint(); continue;
-          }
-          if (amt > 0 && gap / amt > 0.15) {
-            entry.status = 'fail';
-            entry.note = 'the document totals ' + money(p.line_total) + ' against a deduction of ' + money(amt)
-                       + ' — a gap of ' + money(gap) + ' (' + (gap / amt * 100).toFixed(1)
-                       + '%) is too large to be the processing fee. Check this is the right invoice before importing.';
-            paint(); continue;
-          }
-          entry.fee_gap = Math.round(gap * 100) / 100;
-          // What is ALREADY under this line, counted rather than assumed. The
-          // detail_parsed flag is reported next to it precisely so a
-          // disagreement between the two is visible instead of silent.
-          const { count, error: cErr } = await sb.from('deduction_detail')
-            .select('*', { count: 'exact', head: true }).eq('line_id', lns[0].id);
-          entry.existing = cErr ? null : (count || 0);
-          entry.status = entry.existing ? 'dupe' : 'ready';
-          entry.chosen = !entry.existing;
-          entry.note = '';
-          paint();
-        } catch (err) {
-          entry.status = 'fail'; entry.note = 'failed to read: ' + (err && err.message || String(err));
-          paint();
-        }
-      }
+    // ── THE REGISTRY MUST EXIST ─────────────────────────────────────────────
+    // Without deduction_documents there is nowhere to remember what has been
+    // imported, so the file and document guards would pass everything. Files are
+    // still read and matched -- that writes nothing -- but Import stays off.
+    let registryOk = false;
+    {
+      const { error } = await sb.from('deduction_documents').select('id', { count: 'exact', head: true }).eq('brand_id', brandId);
+      registryOk = !error;
+      if (!registryOk) regEl.innerHTML = `<div style="font-family:var(--mono);font-size:11px;color:var(--lost);border:1px solid var(--lost);border-radius:6px;padding:10px 12px;line-height:1.55;">
+        Import is off: the document registry is missing. Run <strong>DEDUCTION-DOCUMENTS.sql</strong> once in the SQL editor.
+        Until then files are read and matched here but nothing can be written — the duplicate guard would have nothing to remember with.</div>`;
     }
 
+    // ── LOOKUPS, loaded once per visit ─────────────────────────────────────
+    // Product line by UPC, and distributor item numbers to UPC, scoped by
+    // distributor: a UNFI Prod # and an NG article number are both six digits
+    // and must never be looked up in each other's list.
+    let prodIdx = null, itemMaps = null;
+    const loadLookups = async () => {
+      if (prodIdx) return;
+      prodIdx = { full: new Map(), noCheck: new Map() };
+      itemMaps = new Map();
+      try {
+        const { data } = await sb.from('products').select('unit_upc,product_line,category,item_description').eq('brand_id', brandId);
+        const nc = new Map();
+        for (const p of (data || [])) {
+          const k = _dedDropUpc(p.unit_upc);
+          if (!k) continue;
+          const v = { group: p.product_line || p.category || null, desc: p.item_description || null };
+          prodIdx.full.set(k, v);
+          const k11 = k.slice(0, -1);
+          nc.set(k11, nc.has(k11) ? null : v);   // a collision is dropped, never guessed
+        }
+        for (const [k, v] of nc) if (v) prodIdx.noCheck.set(k, v);
+      } catch (e) { /* the preview says when nothing matched */ }
+      try {
+        const { data } = await sb.from('distributor_item_map').select('distributor,item_no,upc').eq('brand_id', brandId);
+        for (const r of (data || [])) {
+          const d = String(r.distributor || '').toUpperCase();
+          if (!itemMaps.has(d)) itemMaps.set(d, new Map());
+          itemMaps.get(d).set(String(r.item_no).trim(), String(r.upc).trim());
+        }
+      } catch (e) { /* rows simply carry no UPC */ }
+      if (!_dedDistItemMap) _dedDistItemMap = itemMaps.get('UNFI') || new Map();
+    };
+    const prodOf = (upc) => {
+      const k = _dedDropUpc(upc);
+      if (!k || !prodIdx) return null;
+      return prodIdx.full.get(k) || prodIdx.noCheck.get(k) || null;
+    };
+
+    // ── WHAT THE DOCUMENT HOLDS, BY PRODUCT LINE ────────────────────────────
+    // Units and a per-unit rate where the document states quantities; a
+    // percentage where it bills on value (NG's program fee, MCB %); dollars
+    // always. Rows that match no product are grouped by what they say they are,
+    // never forced into a line.
+    const groupsOf = (rows) => {
+      const g = new Map();
+      for (const r of rows) {
+        const p = prodOf(r.upc);
+        const key = p ? (p.group || 'No product line set') : 'Not matched to a product';
+        if (!g.has(key)) g.set(key, { key, rows: 0, amt: 0, units: 0, amtU: 0, pctW: 0, amtP: 0, items: new Set(), matched: !!p });
+        const o = g.get(key), a = Math.abs(Number(r.bill_amount) || 0), q = Number(r.ship_qty);
+        o.rows++; o.amt += a;
+        if (isFinite(q) && q) { o.units += q; o.amtU += a; }
+        else if (r.discount_pct != null && isFinite(Number(r.discount_pct))) { o.pctW += Number(r.discount_pct) * a; o.amtP += a; }
+        o.items.add((p && p.desc) || r.item_desc || '(no description)');
+      }
+      return [...g.values()].sort((a, b) => b.amt - a.amt);
+    };
+    const groupsHtml = (rows) => {
+      if (!rows || !rows.length) return '';
+      const gs = groupsOf(rows), tot = gs.reduce((n, o) => n + o.amt, 0);
+      const matchedAmt = gs.filter(o => o.matched).reduce((n, o) => n + o.amt, 0);
+      const td = 'padding:3px 10px 3px 0;font-family:var(--mono);font-size:10.5px;';
+      return `<table style="border-collapse:collapse;margin-top:8px;">
+        <thead><tr>${['Product line', 'Items', 'Units', 'Dollars', 'Rate', 'Share'].map(h => `<th style="${td}text-align:left;font-size:9px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
+        <tbody>${gs.map(o => `<tr>
+          <td style="${td}color:${o.matched ? 'var(--ink)' : 'var(--ink-3)'};" title="${esc([...o.items].slice(0, 12).join(' · '))}">${esc(o.key)}</td>
+          <td style="${td}">${o.items.size}</td>
+          <td style="${td}">${o.units ? Math.round(o.units).toLocaleString() : '—'}</td>
+          <td style="${td}">${money2(o.amt)}</td>
+          <td style="${td}">${o.units ? money2(o.amtU / o.units) + '/unit' : o.amtP ? (o.pctW / o.amtP).toFixed(2) + '%' : '—'}</td>
+          <td style="${td}color:var(--ink-3);">${tot ? Math.round(o.amt / tot * 100) + '%' : ''}</td></tr>`).join('')}</tbody></table>
+        <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:4px;">${tot ? Math.round(matchedAmt / tot * 100) : 0}% of the dollars matched a product by UPC. Hover a product line for its items.</div>`;
+    };
+
+    // ── READ ────────────────────────────────────────────────────────────────
+    const ok = (p) => p && !p.error && p.rows && p.rows.length;
+    const docOf = (p, layout, sheet) => {
+      const h = p.head || {}, ng = h.ng || null;
+      const rows = p.rows;
+      const refs = [...new Set(rows.map(r => r.reference_no).filter(Boolean).map(String))];
+      const dates = rows.map(r => (r.extra && r.extra.date_from) || _dedIsoDate(r.ship_date) || null).filter(Boolean).sort();
+      const d = {
+        layout, sheet, type: h.type || layout, rows, total: r2(p.line_total), stated: h.total, ties: !!p.ties,
+        invoice_no: h.invoice_no ? String(h.invoice_no).trim() : null, ng, refs,
+        customer: /^ng-/.test(layout) ? 'Natural Grocers' : layout === 'wfm-scan' ? 'Whole Foods' : null,
+        period_from: (ng && ng.period_from) || dates[0] || null,
+        period_to: (ng && ng.period_to) || dates[dates.length - 1] || null,
+        bill_date: (ng && ng.bill_date) || null, doc_no: (ng && ng.doc_no) || null,
+        note: p.note || null, mismatches: p.mismatches || [], fee: h.fee != null ? h.fee : h.total_fee != null ? h.total_fee : null,
+      };
+      d.doc_key = _dedDocKeyOf(layout, h, rows, d.total);   // null: identified by its file hash alone
+      return d;
+    };
+    const readFile = async (e) => {
+      const f = e.file, buf = e.buf;
+      if (/\.(xlsx|xls|csv|txt)$/i.test(f.name)) {
+        const wb = XLSX.read(buf, { type: 'array' });
+        const fmt = wb.SheetNames.map(n => ({ name: n, rows: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '', raw: false }).map(r => (r || []).map(c => String(c == null ? '' : c))) }));
+        const raw = wb.SheetNames.map(n => ({ name: n, rows: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '', raw: true }) }));
+        const tried = [];
+        // Workbook-level layouts first: they need more than one sheet.
+        { let p = null; try { p = _dedParseNgProgram(raw, itemMaps.get('NGVC') || null); } catch (x) { p = { error: 'threw' }; }
+          if (ok(p)) return docOf(p, 'ng-program', null);
+          tried.push('NG program: ' + ((p && p.error) || 'no rows')); }
+        for (const sh of fmt) {
+          for (const [nm, lay, fn] of [['NG scanback', 'ng-scanback', _dedParseNgScanback], ['UNFI ASM', 'unfi-asm', _dedParseUnfiAsm], ['WFM scanback', 'wfm-scan', _dedParseWfmScan]]) {
+            let p = null; try { p = fn(sh.rows); } catch (x) { tried.push(nm + ': threw'); continue; }
+            if (ok(p)) return docOf(p, lay, sh.name);
+            tried.push(nm + (fmt.length > 1 ? ' [' + sh.name + ']' : '') + ': ' + ((p && p.error) || 'no rows'));
+          }
+        }
+        // The general reader last, so a known document keeps its known reading.
+        for (const sh of fmt) {
+          let p = null; try { p = _dedParseGrid(sh.rows); } catch (x) { p = null; }
+          if (ok(p)) return docOf(p, 'grid', sh.name);
+          if (p && p.error) tried.push('any grid' + (fmt.length > 1 ? ' [' + sh.name + ']' : '') + ': ' + p.error);
+        }
+        const heads = fmt.map(sh => {
+          let best = [], n = -1;
+          for (const r of sh.rows.slice(0, 15)) { const fl = r.filter(c => c.trim() !== ''); if (fl.length > n) { n = fl.length; best = fl; } }
+          return (fmt.length > 1 ? '[' + sh.name + '] ' : '') + best.slice(0, 12).join(' | ') + (best.length > 12 ? ' …' : '');
+        });
+        return { fail: 'no layout recognised — widest header: ' + heads.join(' · '), tried };
+      }
+      const text = await _dedPdfText(buf, (n) => { e.note = 'reading… ' + n + ' streams'; paint(); });
+      if (text.replace(/\s+/g, '').length < 40)
+        return { fail: 'no text layer — an image-only scan. Use the FILE button on its register line to send it to the OCR pass.' };
+      const mcb = (() => { try { return _dedParseMcbCells(text); } catch (x) { return null; } })();
+      if (mcb && mcb.detail && mcb.detail.length && mcb.invoice) {
+        const um = itemMaps.get('UNFI');
+        for (const d of mcb.detail) { d.upc = um && d.item != null ? (um.get(String(d.item).trim()) || null) : null; d.bill_amount = Math.abs(d.amt); }
+        return { layout: 'unfi-mcb', type: 'UNFI MCB weekly', mcb, rows: mcb.detail, total: r2(mcb.sum), ties: true,
+                 invoice_no: null, doc_key: 'MCB:' + String(mcb.invoice).toUpperCase(), refs: [], customer: null,
+                 note: mcb.detail.length.toLocaleString() + ' rows, ' + new Set(mcb.detail.map(d => d.cat)).size + ' categories — feeds one register line per category', mismatches: [] };
+      }
+      const tried = [];
+      let near = null;
+      for (const [nm, lay, fn] of [['Distributor Charge', 'dist-charge', _dedParseDistCharge], ['K-Solve', 'ksolve', _dedParseKsolve],
+                                   ['KeHE scan', 'kehe-scan', _dedParseKeheScan], ['NG invoice', 'ng-invoice', _dedParseNgInvoice]]) {
+        let p = null; try { p = fn(text); } catch (x) { tried.push(nm + ': threw'); continue; }
+        if (!ok(p)) { tried.push(nm + ': ' + ((p && p.error) || 'no rows')); continue; }
+        if (p.ties) return docOf(p, lay, null);
+        tried.push(nm + ': rows ' + money2(p.line_total) + ' vs stated ' + (p.head && p.head.total != null ? money2(p.head.total) : 'none'));
+        if (!near) near = docOf(p, lay, null);
+      }
+      if (near) return near;
+      return { fail: 'read the file but no layout fitted — head: ' + text.replace(/\s+/g, ' ').slice(0, 90), tried };
+    };
+
+    // ── MATCH ───────────────────────────────────────────────────────────────
+    const byRef = async (ref) => {
+      const { data: ex } = await sb.from('deduction_lines').select(LINE_COLS).eq('brand_id', brandId).eq('invoice_no', ref).limit(5);
+      if (ex && ex.length) return ex;
+      if (ref.length < 10) return [];
+      // Directional prefix, as the loader does: the LINE's invoice may be a
+      // prefix of the reference (…VTBR vs …VTBRD), never the reverse.
+      const { data: pf } = await sb.from('deduction_lines').select(LINE_COLS).eq('brand_id', brandId)
+        .ilike('invoice_no', ref.slice(0, Math.max(8, ref.length - 2)) + '%').limit(10);
+      return (pf || []).filter(h => h.invoice_no && ref.toUpperCase().startsWith(String(h.invoice_no).toUpperCase()));
+    };
+    const lineCust = (l) => {
+      const c = _dedRefCustomer(l.invoice_no);
+      if (c) return c;
+      // UNFI bills a retailer's AD FEE in the same shape as its 3PTY promotions
+      // -- 03752320ADNATGROC, $32,243.74 -- and the app-wide decoder knows only
+      // 3PTY / SCAN / CPN. Without this a Natural Grocers ad-fee invoice could
+      // never be suggested its own line. Known retailer suffixes only.
+      const ad = String(l.invoice_no || '').toUpperCase().trim().match(/^\d{8}AD([A-Z]+)$/);
+      if (ad && _DED_REF_CUST[ad[1]]) return _DED_REF_CUST[ad[1]];
+      const dc = String(l.dc_name || '').trim();
+      return dc && !/,\s*[A-Z]{2}$/.test(dc) ? dc : null;   // a DC location is not a customer
+    };
+    // d: { invoice_no, total, customer, period_from, bill_date, layout }, name: filename
+    const findLine = async (d, name) => {
+      const res = { line: null, how: null, candidates: [], note: '' };
+      if (d.invoice_no) {
+        const hits = await byRef(d.invoice_no);
+        if (hits.length === 1) { res.line = hits[0]; res.how = 'invoice ' + d.invoice_no; return res; }
+        if (hits.length > 1) { res.candidates = hits; res.how = 'invoice ' + d.invoice_no + ' is on ' + hits.length + ' lines'; return res; }
+      }
+      for (const ref of _dedFileRefs(name).slice(0, 4)) {
+        const hits = await byRef(ref);
+        if (hits.length === 1 && Math.abs(Number(hits[0].amount)) >= d.total - 0.01) { res.line = hits[0]; res.how = 'filename names ' + hits[0].invoice_no; return res; }
+        if (hits.length) { res.candidates = hits; res.how = 'filename names ' + ref; return res; }
+      }
+      if (!(d.total > 0)) { res.note = 'no invoice number, no reference in the filename, and no amount to suggest a line from'; return res; }
+      // SUGGESTIONS: deductions 0-20% above the document (fees ride on top of
+      // what a retailer bills), dated no earlier than 45 days before the
+      // document's own date, for the same customer where both sides name one.
+      const lo = d.total - 0.01, hi = d.total * 1.20 + 0.01;
+      const { data } = await sb.from('deduction_lines').select(LINE_COLS).eq('brand_id', brandId).eq('is_deduction', true)
+        .gte('amount', -hi).lte('amount', -lo).limit(400);
+      const anchor = d.bill_date || d.period_from || null;
+      const floor = anchor ? new Date(new Date(anchor + 'T00:00:00Z').getTime() - 45 * 86400000).toISOString().slice(0, 10) : null;
+      const want = _dedCustKey(d.customer);
+      const scored = [];
+      for (const l of (data || [])) {
+        if (floor && l.doc_date && String(l.doc_date).slice(0, 10) < floor) continue;
+        const lc = _dedCustKey(lineCust(l));
+        const same = want && lc ? lc === want : null;
+        if (same === false) continue;
+        if (want && same === null) continue;       // a named customer only meets lines that name the same one
+        scored.push({ l, rank: (same ? 0 : 1) + Math.abs(Math.abs(Number(l.amount)) - d.total) / d.total });
+      }
+      scored.sort((a, b) => a.rank - b.rank);
+      if (!want && scored.length > 12) {
+        res.note = scored.length + ' lines sit within 0–20% of this amount and the document names no customer — too many to suggest. Use the FILE button on the right line.';
+        return res;
+      }
+      res.candidates = scored.slice(0, 8).map(s => s.l);
+      res.how = res.candidates.length ? 'suggested: ' + (want ? d.customer + ', ' : '') + '0–20% above ' + money2(d.total) + (floor ? ', dated from ' + floor : '') : null;
+      if (!res.candidates.length) res.note = 'no ' + (want ? d.customer + ' ' : '') + 'deduction on the register for ' + money2(lo) + '–' + money2(hi) + (floor ? ' dated from ' + floor : '');
+      return res;
+    };
+
+    // ── GUARDS ──────────────────────────────────────────────────────────────
+    // PostgREST caps a read at 1,000 rows however high .limit() is set, so a
+    // guard that reads one page of an 11,000-row line would count a tenth of it
+    // and pass a duplicate. Every guard read pages to the end.
+    const pageAll = async (mk, cap = 60000) => {
+      const out = [];
+      for (let from = 0; from < cap; from += 1000) {
+        const { data, error } = await mk().range(from, from + 999);
+        if (error) throw new Error(error.message);
+        out.push(...(data || []));
+        if (!data || data.length < 1000) break;
+      }
+      return out;
+    };
+    const who = (r) => (r.uploaded_by || 'someone') + ' on ' + dt(r.uploaded_at);
+    const invOfLine = async (id) => {
+      try { const { data } = await sb.from('deduction_lines').select('invoice_no').eq('id', id).maybeSingle(); return (data && data.invoice_no) || ('line ' + id); }
+      catch (x) { return 'line ' + id; }
+    };
+    const sigOf = (r) => [_dedDropUpc(r.upc) || '', r.ship_qty == null || r.ship_qty === '' ? '' : Number(r.ship_qty),
+                          Math.abs(Number(r.bill_amount) || 0).toFixed(2), String(r.reference_no || '')].join('|');
+    // Levels 1-3, before any line is chosen.
+    const guardDoc = async (e) => {
+      const d = e.doc;
+      e.info = e.info || [];
+      if (registryOk) {
+        const { data: h1 } = await sb.from('deduction_documents').select('id,status,file_name,line_id,uploaded_by,uploaded_at')
+          .eq('brand_id', brandId).eq('file_sha256', e.sha).limit(1);
+        if (h1 && h1.length) {
+          const r = h1[0];
+          e.block = 'This exact file was uploaded by ' + who(r) + ' — '
+            + (r.status === 'waiting' ? 'it is waiting for its deduction, below.' : r.line_id ? 'its rows are on ' + await invOfLine(r.line_id) + '.' : 'already recorded (' + r.status + ').');
+          return;
+        }
+        if (d.doc_key) {
+          const { data: h2 } = await sb.from('deduction_documents').select('id,status,file_name,line_id,uploaded_by,uploaded_at,amount')
+            .eq('brand_id', brandId).eq('doc_key', d.doc_key).limit(1);
+          if (h2 && h2.length) {
+            const r = h2[0];
+            e.block = 'The same document arrived before as ' + (r.file_name || 'another file') + ', uploaded by ' + who(r) + ' — '
+              + (r.status === 'waiting' ? 'waiting for its deduction, below.' : r.line_id ? 'on ' + await invOfLine(r.line_id) + '.' : r.status + '.');
+            return;
+          }
+        }
+        // An NG spreadsheet whose invoice PDF came in an earlier upload: the PDF
+        // is superseded by the spreadsheet rather than counted beside it.
+        if (d.layout === 'ng-program' || d.layout === 'ng-scanback') {
+          const keys = new Set((d.ng ? d.ng.debtor_refs : d.refs).map(_DED_NG_KEY));
+          const { data: cv } = await sb.from('deduction_documents').select('id,status,line_id,amount,note,doc_no,bill_date,file_name')
+            .eq('brand_id', brandId).eq('layout', 'ng-invoice').in('status', ['waiting', 'attached'])
+            .gte('amount', d.total - 0.02).lte('amount', d.total + 0.02).limit(20);
+          const hit = (cv || []).find(c => String(c.note || '').split(' | ').some(k => keys.has(_DED_NG_KEY(k.replace(/^debtor:\s*/i, '')))));
+          if (hit) {
+            e.priorCover = hit;
+            d.doc_no = d.doc_no || hit.doc_no; d.bill_date = d.bill_date || hit.bill_date;
+            e.info.push('Its invoice ' + (hit.doc_no || '') + ' (' + hit.file_name + ') was uploaded earlier and is ' + hit.status
+              + ' — this spreadsheet replaces its single row with the itemised ones.');
+          }
+        }
+      }
+      if (e.dbx) {
+        try {
+          const { data: df } = await sb.from('deduction_files').select('filename,path_lower,status').eq('brand_id', brandId).eq('content_hash', e.dbx).limit(2);
+          if (df && df.length) e.info.push('Also in the Dropbox catalogue: ' + df[0].path_lower + ' (' + df[0].status + ').');
+        } catch (x) { /* catalogue check is informational */ }
+      }
+      // Level 3: these rows anywhere in the book.
+      if (d.refs.length && d.rows.length) {
+        try {
+          const rb = await _dedRowsInBook(sb, brandId, d.rows, null);
+          if (rb.share >= 0.6) { e.block = Math.round(rb.share * 100) + '% of these rows (' + rb.count + ' of ' + d.rows.length + ') are already in Keel on ' + rb.inv + '. Importing again would count that money twice.'; return; }
+          if (rb.share >= 0.05) e.info.push(Math.round(rb.share * 100) + '% of these rows also appear on ' + rb.inv + ' — check this is a different document.');
+          // An NG invoice whose itemised spreadsheet is already on a line adds nothing.
+          if (d.layout === 'ng-invoice' && rb.perLine) {
+            for (const [lid, sum] of rb.perLine) if (Math.abs(sum - d.total) <= 0.02) {
+              e.block = 'Its itemised rows for ' + d.refs.join(', ') + ' are already on ' + await invOfLine(lid) + ' (' + money2(sum) + '). The invoice adds nothing.'; return;
+            }
+          }
+        } catch (x) { e.info.push('Could not check the book for these rows: ' + (x.message || x)); }
+      }
+    };
+    // Level 4, once a line is chosen: what is already on it, and whether this
+    // document would take the detail past the deduction.
+    const guardLine = async (e, docRows, total) => {
+      const l = e.line, amt = Math.abs(Number(l.amount) || 0);
+      e.over = false; e.lineBlock = null;
+      let rows;
+      try {
+        rows = await pageAll(() => sb.from('deduction_detail').select('id,upc,ship_qty,bill_amount,reference_no' + (registryOk ? ',document_id' : ''))
+          .eq('brand_id', brandId).eq('line_id', l.id).order('id'));
+      } catch (err) { e.lineBlock = 'could not read what is already on the line: ' + (err.message || err); return; }
+      let have = 0, removable = 0;
+      const coverId = e.priorCover && e.priorCover.status === 'attached' && String(e.priorCover.line_id) === String(l.id) ? e.priorCover.id : null;
+      for (const r of rows) { const a = Math.abs(Number(r.bill_amount) || 0); have += a; if (coverId != null && String(r.document_id) === String(coverId)) removable += a; }
+      if (rows.length && docRows.length) {
+        const sigs = new Map();
+        for (const r of rows) { const k = sigOf(r); sigs.set(k, (sigs.get(k) || 0) + 1); }
+        let dup = 0;
+        for (const r of docRows) { const k = sigOf(r), n = sigs.get(k) || 0; if (n) { dup++; sigs.set(k, n - 1); } }
+        if (dup / docRows.length >= 0.6) { e.lineBlock = Math.round(dup / docRows.length * 100) + '% of these rows are already on this line — the same document again.'; return; }
+      }
+      e.existing = { n: rows.length, total: r2(have), removable: r2(removable) };
+      const after = have - removable + total;
+      if (total > amt + 0.01) { e.lineBlock = money2(total) + ' of detail against a ' + money2(amt) + ' deduction — a document cannot explain more than the line. Wrong line, or the same money twice.'; return; }
+      if (after > amt + 0.01) e.over = true;   // offered as an explicit REPLACE, never done silently
+    };
+
+    // ── PAIRING (Natural Grocers) ───────────────────────────────────────────
+    const pairNg = () => {
+      const live = S().filter(e => e.doc && !['done', 'held', 'fail', 'blocked'].includes(e.status));
+      for (const pdf of live.filter(e => e.doc.layout === 'ng-invoice' && !e.coverFor)) {
+        const keys = new Set(pdf.doc.ng.debtor_refs.map(_DED_NG_KEY));
+        const mate = live.find(s => (s.doc.layout === 'ng-program' || s.doc.layout === 'ng-scanback') && !s.cover
+          && (s.doc.ng ? s.doc.ng.debtor_refs : s.doc.refs).some(k => keys.has(_DED_NG_KEY(k)))
+          && Math.abs(s.doc.total - pdf.doc.total) <= 0.02);
+        if (!mate) continue;
+        mate.cover = pdf; pdf.coverFor = mate;
+        mate.doc.doc_no = mate.doc.doc_no || pdf.doc.doc_no;
+        mate.doc.bill_date = mate.doc.bill_date || pdf.doc.bill_date;
+        for (const r of mate.doc.rows) if (r.extra && pdf.doc.doc_no && !/NG invoice/.test(r.extra.reference_comment || ''))
+          r.extra.reference_comment = 'NG invoice ' + pdf.doc.doc_no + ' · ' + (r.extra.reference_comment || '');
+        pdf.status = 'paired'; pdf.action = null; pdf.chosen = false; pdf.line = null; pdf.candidates = [];
+        pdf.note = 'the invoice for ' + mate.file.name + ' — ' + money2(pdf.doc.total) + ' agrees; its spreadsheet supplies the rows.';
+        mate.needsMatch = true;
+      }
+    };
+
+    // ── STATE for one entry after reading ───────────────────────────────────
+    const settle = async (e) => {
+      e.block = null; e.lineBlock = null; e.line = null; e.candidates = []; e.how = null; e.over = false; e.replace = false; e.info = [];
+      await guardDoc(e);
+      if (e.block) { e.status = 'blocked'; e.action = null; e.chosen = false; return; }
+      if (!e.doc.ties) {
+        e.status = 'fail'; e.action = null; e.chosen = false;
+        e.note = 'rows sum to ' + money2(e.doc.total) + ' against the document’s stated total of '
+          + (e.doc.stated == null ? 'none found' : money2(e.doc.stated)) + ' — a document that disagrees with itself cannot be imported';
+        return;
+      }
+      if (e.doc.mcb) { e.status = registryOk ? 'ready' : 'noreg'; e.action = 'mcb'; e.chosen = registryOk; return; }
+      // An NG spreadsheet whose invoice is already ON a line goes to that line.
+      if (e.priorCover && e.priorCover.status === 'attached' && e.priorCover.line_id != null) {
+        const { data } = await sb.from('deduction_lines').select(LINE_COLS).eq('id', e.priorCover.line_id).maybeSingle();
+        if (data) { e.line = data; e.how = 'its invoice is already on this line'; }
+      }
+      if (!e.line) {
+        const m = await findLine(e.doc, e.file.name);
+        e.line = m.line; e.candidates = m.candidates; e.how = m.how; if (m.note) e.info.push(m.note);
+      }
+      if (e.line) return choose(e, e.line);
+      if (e.candidates.length) { e.status = 'choose'; e.action = null; e.chosen = false; return; }
+      e.status = registryOk ? 'hold' : 'noreg'; e.action = 'hold'; e.chosen = registryOk;
+    };
+    const choose = async (e, line) => {
+      e.line = line; e.replace = false;
+      await guardLine(e, e.doc.rows, e.doc.total);
+      if (e.lineBlock) { e.status = 'blocked-line'; e.action = null; e.chosen = false; return; }
+      e.action = 'attach';
+      e.status = !registryOk ? 'noreg' : e.over ? 'over' : 'ready';
+      e.chosen = registryOk && !e.over;
+    };
+
+    // ── DROP ────────────────────────────────────────────────────────────────
+    drop.onclick = () => input.click();
+    drop.ondragover = (ev) => { ev.preventDefault(); drop.style.background = 'rgba(0,0,0,0.03)'; };
+    drop.ondragleave = () => { drop.style.background = 'transparent'; };
+    drop.ondrop = (ev) => { ev.preventDefault(); drop.style.background = 'transparent'; handle([...(ev.dataTransfer.files || [])]); };
+    input.onchange = () => { handle([...(input.files || [])]); input.value = ''; };
+
+    async function handle(files) {
+      const usable = files.filter(f => /\.(pdf|xlsx|xls|csv|txt)$/i.test(f.name));
+      if (!usable.length) return;
+      await loadLookups();
+      const fresh = [];
+      // Phase 1: read every file. Pairing needs to see them all at once.
+      for (const f of usable) {
+        const e = { id: Math.random().toString(36).slice(2), file: f, status: 'reading', note: 'reading…', doc: null, line: null,
+                    candidates: [], chosen: false, action: null, info: [], open: false };
+        S().push(e); fresh.push(e); paint();
+        try {
+          e.buf = await f.arrayBuffer();
+          e.sha = await _dedSha256(e.buf);
+          try { e.dbx = await _dedDropboxHash(e.buf); } catch (x) { e.dbx = null; }
+          // The same file twice in one drop never reaches the database check.
+          if (S().some(o => o !== e && o.sha === e.sha && o.status !== 'fail')) {
+            e.status = 'blocked'; e.block = 'the same file is already in this list'; e.note = ''; paint(); continue;
+          }
+          const d = await readFile(e);
+          if (d.fail) { e.status = 'fail'; e.note = d.fail; e.tried = d.tried || []; paint(); continue; }
+          e.doc = d; e.note = '';
+          // Seen before? Decided BEFORE pairing, so a file already imported can
+          // never be paired with something new and look usable.
+          if (registryOk) {
+            const reg = await _dedRegistryCheck(sb, brandId, e.sha, d.doc_key);
+            if (reg.hit) { e.status = 'blocked'; e.block = reg.hit; paint(); continue; }
+          }
+          e.needsMatch = true;
+        } catch (err) {
+          e.status = 'fail'; e.note = 'failed to read: ' + (err && err.message || String(err));
+        }
+        paint();
+      }
+      // Phase 2: pair NG invoices with their spreadsheets, across this drop and
+      // anything still unimported from an earlier one.
+      pairNg();
+      // Phase 3: guard and match.
+      for (const e of S()) {
+        if (!e.needsMatch || e.status === 'paired') continue;
+        e.needsMatch = false;
+        e.status = 'matching'; paint();
+        try { await settle(e); } catch (err) { e.status = 'fail'; e.note = 'matching failed: ' + (err && err.message || String(err)); }
+        e.buf = null;   // the bytes are no longer needed; rows and hashes are kept
+        paint();
+      }
+      for (const e of fresh) e.buf = null;
+      paint();
+    }
+
+    // ── PAINT ───────────────────────────────────────────────────────────────
+    const LABEL = {
+      reading: ['READING', 'var(--ink-3)'], matching: ['MATCHING', 'var(--ink-3)'], fail: ['CANNOT IMPORT', 'var(--lost)'],
+      blocked: ['DUPLICATE', 'var(--lost)'], 'blocked-line': ['REFUSED', 'var(--lost)'], paired: ['PAIRED', 'var(--ink-3)'],
+      choose: ['CHOOSE A LINE', AMBER], over: ['WOULD EXCEED', AMBER], ready: ['READY', 'var(--won)'], hold: ['WILL HOLD', AMBER],
+      noreg: ['READ ONLY', 'var(--ink-3)'], done: ['IMPORTED', 'var(--won)'], held: ['HELD', AMBER],
+    };
     function paint() {
       if (!listEl) return;
-      if (!_dedUploadState.length) { listEl.innerHTML = ''; return; }
-      const ready = _dedUploadState.filter(e => e.chosen && (e.status === 'ready' || e.status === 'dupe'));
+      const rows = S();
+      if (!rows.length) { listEl.innerHTML = ''; return; }
+      const ready = rows.filter(e => e.chosen && (e.action === 'attach' || e.action === 'hold' || e.action === 'mcb')
+                                     && ['ready', 'hold', 'over'].includes(e.status) && (e.status !== 'over' || e.replace));
+      const td = 'padding:6px 8px;border-bottom:1px solid var(--rule-soft);vertical-align:top;';
+      const lineTxt = (l) => esc(l.invoice_no || '(no invoice)') + ' · ' + money2(Math.abs(Number(l.amount))) + (l.doc_date ? ' · ' + dt(l.doc_date) : '')
+        + (Number(l.detail_line_total) ? ' · ' + money2(Number(l.detail_line_total)) + ' itemised' : '');
       listEl.innerHTML = `
         <table style="width:100%;border-collapse:collapse;margin-bottom:14px;">
-          <thead><tr>
-            ${['', 'File', 'Invoice', 'Match', 'Type', 'Rows', 'Parsed total', 'Line amount', 'State'].map(h =>
-              `<th style="text-align:left;padding:5px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}
-          </tr></thead>
-          <tbody>
-          ${_dedUploadState.map((e, i) => {
-            const sev = e.status === 'fail' ? 'var(--lost)' : e.status === 'dupe' ? '#8a6d1f' : e.status === 'ready' ? 'var(--won)' : 'var(--ink-3)';
-            const label = e.status === 'fail' ? 'CANNOT IMPORT' : e.status === 'dupe' ? 'ALREADY IMPORTED' : e.status === 'ready' ? 'READY' : 'READING';
-            const box = (e.status === 'ready' || e.status === 'dupe')
-              ? `<input type="checkbox" class="hl-ded-up-pick" data-i="${i}" ${e.chosen ? 'checked' : ''}>` : '';
+          <thead><tr>${['', 'File', 'Document', 'Register line', 'Rows', 'Document total', 'State'].map(h =>
+            `<th style="text-align:left;padding:5px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
+          <tbody>${rows.map((e, i) => {
+            const [lab, col] = LABEL[e.status] || [String(e.status).toUpperCase(), 'var(--ink-3)'];
+            const pickable = ['ready', 'hold', 'over'].includes(e.status);
+            const d = e.doc;
+            let lineCell = '—';
+            if (e.doc && e.doc.mcb) lineCell = '<span style="color:var(--ink-2);">one line per category (' + new Set(e.doc.mcb.detail.map(x => x.cat)).size + ')</span>';
+            else if (e.candidates && e.candidates.length && ['choose', 'ready', 'over', 'blocked-line', 'hold'].includes(e.status)) {
+              lineCell = `<select class="hl-ded-pick-line" data-i="${i}" style="font-family:var(--mono);font-size:10px;max-width:340px;">
+                <option value="">choose a line (${e.candidates.length})…</option>
+                ${e.candidates.map(c => `<option value="${esc(String(c.id))}" ${e.line && String(e.line.id) === String(c.id) ? 'selected' : ''}>${lineTxt(c)}</option>`).join('')}
+                <option value="__hold" ${e.action === 'hold' ? 'selected' : ''}>none of these — hold until its deduction arrives</option></select>
+                <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-top:3px;">${esc(e.how || '')}</div>`;
+            } else if (e.line) {
+              lineCell = `<span style="color:var(--won);">${lineTxt(e.line)}</span><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-top:2px;">${esc(e.how || '')}</div>`;
+            } else if (e.status === 'hold') {
+              lineCell = '<span style="color:' + AMBER + ';">no deduction on the register yet</span>';
+            }
+            const notes = [];
+            if (e.note) notes.push(esc(e.note));
+            if (e.block) notes.push('<span style="color:var(--lost);">' + esc(e.block) + '</span>');
+            if (e.lineBlock) notes.push('<span style="color:var(--lost);">' + esc(e.lineBlock) + '</span>');
+            if (e.status === 'hold' && d) notes.push('Held with its ' + d.rows.length + ' rows, and offered its line when the register brings one in.'
+              + (d.layout === 'ng-invoice' && d.bill_date ? ' NG billed it ' + d.bill_date + '; UNFI can deduct it from ' + new Date(new Date(d.bill_date + 'T00:00:00Z').getTime() + 60 * 86400000).toISOString().slice(0, 10) + ', with fees on top.' : ''));
+            if (e.status === 'over' && e.existing) notes.push(`<label style="color:${AMBER};cursor:pointer;"><input type="checkbox" class="hl-ded-replace" data-i="${i}" ${e.replace ? 'checked' : ''} style="margin:0 5px 0 0;vertical-align:-2px;">The line already carries ${money2(e.existing.total)} of detail (${e.existing.n} rows); with this document it would exceed the ${money2(Math.abs(Number(e.line.amount)))} deduction. Tick to REPLACE what is there with this document.</label>`);
+            if (e.status === 'ready' && e.line && e.existing && e.existing.n && e.action === 'attach') {
+              const gap = Math.abs(Number(e.line.amount)) - (e.existing.total - e.existing.removable + d.total);
+              notes.push('Adds to the ' + e.existing.n + ' rows already on the line' + (e.existing.removable ? ' (replacing its invoice’s single row)' : '') + '; ' + money2(gap) + ' of the deduction stays unitemised.');
+            } else if (e.status === 'ready' && e.line && d && !d.mcb) {
+              const gap = Math.abs(Number(e.line.amount)) - d.total;
+              if (gap > 0.009) notes.push(money2(gap) + ' (' + (gap / Math.abs(Number(e.line.amount)) * 100).toFixed(1) + '%) of the deduction is not in this document — fees, or another document still to come.');
+            }
+            for (const x of (e.info || [])) notes.push('<span style="color:var(--ink-3);">' + esc(x) + '</span>');
+            const open = e.open && d;
             return `<tr>
-              <td style="padding:5px 8px;border-bottom:1px solid var(--rule-soft);">${box}</td>
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);">${esc(e.file.name)}</td>
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.invoice_no) || (e.mcb && e.mcb.invoice) || '—')}</td>
-              ${(() => {
-                // WHAT THIS FILE WILL DO, before Import is pressed. The list said
-                // whether a document PARSED and never whether it had anywhere to
-                // go, so a file that read perfectly and matched nothing looked
-                // identical to one about to land on a line.
-                const cell = (txt, col, tip) => `<td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);color:${col};"${tip ? ' title="' + esc(tip) + '"' : ''}>${txt}</td>`;
-                if (e.mcb) {
-                  const n = new Set(e.mcb.detail.map(d => d.cat)).size;
-                  return cell(n + ' categor' + (n === 1 ? 'y' : 'ies'), 'var(--ink-2)', 'this report feeds one register line per category');
-                }
-                if (e.line) return cell('matched', 'var(--won)', 'attaches to the register line for ' + e.line.invoice_no);
-                const inv = e.head && e.head.invoice_no;
-                if (inv) return cell('new deduction', '#8a6d1f', 'the document names invoice ' + inv + ' but the register has no such line \u2014 either the register has not been re-imported, or this is a deduction Keel has never seen');
-                return cell('\u2014', 'var(--ink-3)', 'no invoice number could be read, so there is nothing to match against');
-              })()}
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.type) || (e.mcb ? 'UNFI MCB weekly' : '—'))}</td>
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.rows.length || '—'}</td>
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.parsed_total != null ? money(e.parsed_total) : '—'}</td>
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.line ? money(Math.abs(e.line.amount)) : '—'}</td>
-              <td style="padding:5px 8px;border-bottom:1px solid var(--rule-soft);">
-                ${st(label, sev)}
-                ${e.note ? `<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:3px;max-width:420px;line-height:1.45;">${esc(e.note)}</div>` : ''}
-                ${e.status === 'dupe' ? `<div style="font-family:var(--mono);font-size:9.5px;color:#8a6d1f;margin-top:3px;line-height:1.45;">${e.existing} detail row(s) already under this line${e.line && !e.line.detail_parsed ? ' — though the line is NOT flagged as parsed, which is itself worth knowing' : ''}. Importing REPLACES them.</div>` : ''}
-              </td></tr>`;
-          }).join('')}
-          </tbody>
+              <td style="${td}">${pickable ? `<input type="checkbox" class="hl-ded-up-pick" data-i="${i}" ${e.chosen && (e.status !== 'over' || e.replace) ? 'checked' : ''} ${e.status === 'over' && !e.replace ? 'disabled' : ''}>` : ''}</td>
+              <td style="${td}font-family:var(--mono);font-size:10px;">${d ? `<a href="#" class="hl-ded-open" data-i="${i}" style="color:var(--ink);text-decoration:underline dotted;">${esc(e.file.name)}</a>` : esc(e.file.name)}</td>
+              <td style="${td}font-family:var(--mono);font-size:10px;">${d ? esc(d.type) + '<div style="color:var(--ink-3);font-size:9px;margin-top:2px;">' + esc(d.invoice_no || d.doc_no || (d.ng && d.ng.debtor_refs ? d.ng.debtor_refs.join(' / ') : '') || (d.mcb ? d.mcb.invoice : '') || '') + '</div>' : '—'}</td>
+              <td style="${td}font-family:var(--mono);font-size:10px;">${lineCell}</td>
+              <td style="${td}font-family:var(--mono);font-size:10.5px;">${d ? d.rows.length.toLocaleString() : '—'}</td>
+              <td style="${td}font-family:var(--mono);font-size:10.5px;">${d ? money2(d.total) : '—'}</td>
+              <td style="${td}">${st(lab, col)}
+                ${notes.length ? `<div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-2);margin-top:4px;max-width:460px;line-height:1.5;">${notes.join('<br>')}</div>` : ''}</td></tr>
+              ${open ? `<tr><td></td><td colspan="6" style="padding:4px 8px 14px;border-bottom:1px solid var(--rule-soft);">
+                ${d.note ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);line-height:1.5;">${esc(d.note)}</div>` : ''}
+                ${d.mismatches && d.mismatches.length ? `<div style="font-family:var(--mono);font-size:10px;color:${AMBER};margin-top:4px;">${esc(d.mismatches.slice(0, 6).join(' · '))}</div>` : ''}
+                ${d.period_from ? `<div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:4px;">period ${esc(d.period_from)}${d.period_to && d.period_to !== d.period_from ? ' to ' + esc(d.period_to) : ''}</div>` : ''}
+                ${groupsHtml(d.rows)}</td></tr>` : ''}
+              ${e.status === 'fail' && e.open && e.tried && e.tried.length ? `<tr><td></td><td colspan="6" style="padding:4px 8px 12px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">Layouts tried — ${esc(e.tried.join(' · '))}</td></tr>` : ''}`;
+          }).join('')}</tbody>
         </table>
-        <div style="display:flex;gap:10px;align-items:center;">
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
           <button id="hl-ded-up-go" ${ready.length ? '' : 'disabled'}
             style="font-family:var(--mono);font-size:11px;padding:8px 18px;border-radius:5px;cursor:${ready.length ? 'pointer' : 'default'};
-                   border:1px solid ${ready.length ? 'var(--ink)' : 'var(--rule-soft)'};
-                   background:${ready.length ? 'var(--ink)' : 'transparent'};color:${ready.length ? 'var(--paper)' : 'var(--rule)'};">
+                   border:1px solid ${ready.length ? 'var(--ink)' : 'var(--rule-soft)'};background:${ready.length ? 'var(--ink)' : 'transparent'};color:${ready.length ? 'var(--paper)' : 'var(--rule)'};">
             Import ${ready.length || ''} document${ready.length === 1 ? '' : 's'}</button>
-          <button id="hl-ded-up-clear" style="font-family:var(--mono);font-size:11px;padding:8px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear</button>
+          <button id="hl-ded-up-clear" style="font-family:var(--mono);font-size:11px;padding:8px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear list</button>
           <span id="hl-ded-up-msg" style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">${(() => {
-            // A DISABLED BUTTON THAT EXPLAINS ITSELF. Silence here reads as a
-            // broken button: files were read, Import looked available, clicking
-            // did nothing. Files that cannot be imported never blocked the ones
-            // that can -- but nothing on screen said so.
-            if (ready.length) return '';
-            const n = _dedUploadState.length;
-            if (!n) return '';
-            const reading = _dedUploadState.filter(e => e.status === 'reading').length;
-            if (reading) return 'still reading ' + reading + ' file' + (reading === 1 ? '' : 's') + '\u2026';
-            const dupes = _dedUploadState.filter(e => e.status === 'dupe').length;
-            const fails = _dedUploadState.filter(e => e.status === 'fail').length;
-            const unticked = _dedUploadState.filter(e => !e.chosen && (e.status === 'ready' || e.status === 'dupe')).length;
-            if (unticked) return 'tick a file to import it \u2014 ' + unticked + ' ready and unticked';
-            if (dupes && !fails) return 'every file is already imported \u2014 tick one to replace its rows';
-            return 'none of these ' + n + ' file' + (n === 1 ? '' : 's') + ' can be imported \u2014 see the reason on each row';
+            if (ready.length) {
+              const h = ready.filter(e => e.action === 'hold').length;
+              return h ? h + ' will be held until their deduction arrives' : '';
+            }
+            const busy = rows.filter(e => e.status === 'reading' || e.status === 'matching').length;
+            if (busy) return 'still working on ' + busy + ' file' + (busy === 1 ? '' : 's') + '…';
+            const ch = rows.filter(e => e.status === 'choose').length;
+            if (ch) return 'choose a register line for ' + ch + ' file' + (ch === 1 ? '' : 's') + ', or hold ' + (ch === 1 ? 'it' : 'them');
+            if (!registryOk) return 'import is off until DEDUCTION-DOCUMENTS.sql has been run';
+            return 'nothing here can be imported — see the reason on each row';
           })()}</span>
         </div>`;
 
-      listEl.querySelectorAll('.hl-ded-up-pick').forEach(cb => cb.onchange = () => {
-        _dedUploadState[Number(cb.dataset.i)].chosen = cb.checked; paint();
+      listEl.querySelectorAll('.hl-ded-up-pick').forEach(cb => cb.onchange = () => { S()[Number(cb.dataset.i)].chosen = cb.checked; paint(); });
+      listEl.querySelectorAll('.hl-ded-replace').forEach(cb => cb.onchange = () => { const e = S()[Number(cb.dataset.i)]; e.replace = cb.checked; e.chosen = cb.checked; paint(); });
+      listEl.querySelectorAll('.hl-ded-open').forEach(a => a.onclick = (ev) => { ev.preventDefault(); const e = S()[Number(a.dataset.i)]; e.open = !e.open; paint(); });
+      listEl.querySelectorAll('.hl-ded-pick-line').forEach(sel => sel.onchange = async () => {
+        const e = S()[Number(sel.dataset.i)];
+        if (sel.value === '__hold') { e.line = null; e.action = 'hold'; e.status = registryOk ? 'hold' : 'noreg'; e.chosen = registryOk; paint(); return; }
+        if (!sel.value) { e.line = null; e.action = null; e.status = 'choose'; e.chosen = false; paint(); return; }
+        const c = e.candidates.find(x => String(x.id) === sel.value);
+        e.status = 'matching'; paint();
+        try { await choose(e, c); } catch (err) { e.status = 'blocked-line'; e.lineBlock = String(err && err.message || err); }
+        paint();
       });
       const clr = document.getElementById('hl-ded-up-clear');
       if (clr) clr.onclick = () => { _dedUploadState = []; paint(); };
@@ -32838,134 +33687,300 @@ render();
       if (go) go.onclick = doImport;
     }
 
-    async function doImport() {
-      const msg = document.getElementById('hl-ded-up-msg');
-      const go = document.getElementById('hl-ded-up-go');
-      if (go) { go.disabled = true; go.textContent = 'Importing…'; }
-
-      // Banner crosswalk is the authority; the extracted name only seeds what
-      // nobody has mapped yet — same rule as the Edge path.
+    // ── WRITE ───────────────────────────────────────────────────────────────
+    const registryRow = (e, extra) => {
+      const d = e.doc, s = sess();
+      return Object.assign({
+        brand_id: brandId, file_name: e.file.name, file_size: e.file.size, file_sha256: e.sha, dropbox_hash: e.dbx || null,
+        layout: d.layout, doc_type: d.type, doc_key: d.doc_key || null, doc_no: d.doc_no || null, invoice_no: d.invoice_no || null,
+        customer: d.customer || null, amount: d.total, row_count: d.rows.length,
+        period_from: d.period_from || null, period_to: d.period_to || null, bill_date: d.bill_date || null,
+        note: d.layout === 'ng-invoice' && d.ng ? d.ng.debtor_refs.map(k => 'debtor: ' + k).join(' | ') : null,
+        uploaded_by: s.name || s.email || null, uploaded_by_email: s.email || null,
+      }, extra || {});
+    };
+    const insertRegistry = async (row) => {
+      const { data, error } = await sb.from('deduction_documents').insert(row).select('id').single();
+      if (error) throw new Error(/duplicate key|unique/i.test(error.message)
+        ? 'already recorded — the database refused a second copy of this file or document' : 'recording the document: ' + error.message);
+      return data.id;
+    };
+    const stampLine = async (lineId, total, amt) => {
+      const s = sess();
+      const { error } = await sb.from('deduction_lines').update({
+        detail_parsed: true, detail_line_total: r2(total), detail_variance: r2(amt - total),
+        backup_by: s.name || s.email || null, backup_by_email: s.email || null, backup_at: new Date().toISOString(),
+      }).eq('id', lineId);
+      if (error) throw new Error('updating the register line: ' + error.message);
+    };
+    // Rows onto a line, tagged with their document. New rows go in FIRST and
+    // anything being replaced is removed after, so a failure part-way can
+    // never leave the line with less than it had.
+    const writeRows = async (docId, line, rows, bmap, opts) => {
+      const lcust = lineCust(line);
+      const out = rows.map(r => {
+        const cand = _dedBannerCandidate(r.customer_name || lcust);
+        const row = _dedDetailRow(r, brandId, line.id, (cand && bmap.get(cand)) || cand);
+        row.document_id = docId;
+        return row;
+      });
+      for (let k = 0; k < out.length; k += 500) {
+        const { error } = await sb.from('deduction_detail').insert(out.slice(k, k + 500));
+        if (error) throw new Error('writing rows: ' + error.message);
+      }
+      if (opts.replaceAll) {
+        const { error } = await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', line.id)
+          .or('document_id.is.null,document_id.neq.' + docId);
+        if (error) throw new Error('removing the rows being replaced: ' + error.message);
+        await sb.from('deduction_documents').update({ status: 'superseded', superseded_by: docId })
+          .eq('brand_id', brandId).eq('line_id', line.id).eq('status', 'attached').neq('id', docId);
+      } else if (opts.removeDoc != null) {
+        const { error } = await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', line.id).eq('document_id', opts.removeDoc);
+        if (error) throw new Error('removing the invoice row being replaced: ' + error.message);
+      }
+    };
+    const loadBannerMap = async () => {
       const bmap = new Map();
       try {
         const { data } = await sb.from('deduction_banner_map').select('banner_raw,banner').eq('brand_id', brandId);
         for (const b of (data || [])) if (b.banner) bmap.set(b.banner_raw, b.banner);
-      } catch (e) { /* an unmapped banner is survivable; a failed import is not */ }
+      } catch (x) { /* an unmapped banner is survivable */ }
+      return bmap;
+    };
 
-      // ── A REPORT THAT FEEDS SEVERAL LINES ────────────────────────────────
-      // The UNFI MCB weekly is the only document here that is not one file to
-      // one line: it carries up to six categories and the register holds one
-      // line per category, written as MCB20260214-P. Each category is imported
-      // against its OWN line with its OWN tie-out, so a category whose rows
-      // disagree with the register is skipped while the others still land --
-      // the alternative is one bad category blocking a whole report.
-      const importMcb = async (e) => {
-        const cats = new Map();
-        for (const d of e.mcb.detail) {
-          if (!cats.has(d.cat)) cats.set(d.cat, []);
-          cats.get(d.cat).push(d);
+    const attach = async (e, bmap) => {
+      const l = e.line, amt = Math.abs(Number(l.amount) || 0), d = e.doc;
+      // Re-checked at the moment of writing: another tab may have imported since.
+      await guardLine(e, d.rows, d.total);
+      if (e.lineBlock) throw new Error(e.lineBlock);
+      if (e.over && !e.replace) throw new Error('would exceed the line — tick replace to proceed');
+      const docId = await insertRegistry(registryRow(e, { status: 'attached', line_id: l.id, attached_at: new Date().toISOString() }));
+      try {
+        const removeDoc = e.priorCover && e.priorCover.status === 'attached' && String(e.priorCover.line_id) === String(l.id) ? e.priorCover.id : null;
+        await writeRows(docId, l, d.rows, bmap, { replaceAll: !!e.replace, removeDoc });
+        const kept = e.replace ? 0 : (e.existing ? e.existing.total - e.existing.removable : 0);
+        await stampLine(l.id, kept + d.total, amt);
+      } catch (err) {
+        await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('document_id', docId);
+        await sb.from('deduction_documents').delete().eq('id', docId);
+        throw err;
+      }
+      await retireCovers(e, docId, l.id);
+      return docId;
+    };
+    // The PDF that was only the check: recorded so it can never be imported on
+    // its own later, and marked superseded by the document that brought the rows.
+    const retireCovers = async (e, docId, lineId) => {
+      if (e.cover && e.cover.sha) {
+        try {
+          await insertRegistry(Object.assign(registryRow(e.cover, { status: 'superseded', superseded_by: docId, line_id: lineId, row_count: 0 }),
+                                             { note: (registryRow(e.cover).note || '') + ' | cover of ' + e.file.name }));
+          e.cover.status = e.status === 'held' ? 'held' : 'done'; e.cover.note = 'recorded as the invoice for ' + e.file.name;
+        } catch (x) { e.cover.note = 'could not record the invoice: ' + (x.message || x); }
+      }
+      if (e.priorCover) {
+        await sb.from('deduction_documents').update({ status: 'superseded', superseded_by: docId }).eq('id', e.priorCover.id);
+        await sb.from('deduction_document_rows').delete().eq('document_id', e.priorCover.id);
+      }
+    };
+    const hold = async (e) => {
+      const d = e.doc;
+      const docId = await insertRegistry(registryRow(e, { status: 'waiting', line_id: null }));
+      try {
+        const plain = d.rows.map(r => JSON.parse(JSON.stringify(r)));
+        for (let k = 0, c = 0; k < plain.length; k += 500, c++) {
+          const { error } = await sb.from('deduction_document_rows').insert({ brand_id: brandId, document_id: docId, chunk: c, rows: plain.slice(k, k + 500) });
+          if (error) throw new Error('saving the rows: ' + error.message);
         }
-        const { data: lns } = await sb.from('deduction_lines')
-          .select('id,invoice_no,amount,detail_parsed')
-          .eq('brand_id', brandId).like('invoice_no', e.mcb.invoice + '-%');
-        if (!lns || !lns.length) { e.status = 'fail'; e.note = 'no register lines for ' + e.mcb.invoice + ' \u2014 the totals page has not been read yet'; return false; }
-        let wrote = 0, skipped = [];
+      } catch (err) {
+        await sb.from('deduction_documents').delete().eq('id', docId);   // cascades to its rows
+        throw err;
+      }
+      await retireCovers(e, docId, null);
+      return docId;
+    };
+    const importMcb = async (e, bmap) => {
+      const cats = new Map();
+      for (const d of e.doc.mcb.detail) { if (!cats.has(d.cat)) cats.set(d.cat, []); cats.get(d.cat).push(d); }
+      const { data: lns } = await sb.from('deduction_lines').select('id,invoice_no,amount,detail_parsed')
+        .eq('brand_id', brandId).like('invoice_no', e.doc.mcb.invoice + '-%');
+      if (!lns || !lns.length) throw new Error('no register lines for ' + e.doc.mcb.invoice + ' — the totals page has not been read yet');
+      const docId = await insertRegistry(registryRow(e, { status: 'attached', line_id: null, lines_touched: 0, attached_at: new Date().toISOString() }));
+      let wrote = 0; const skipped = [];
+      try {
         for (const l of lns) {
           const cat = String(l.invoice_no).split('-').pop().toUpperCase().slice(0, 1);
           const rows = cats.get(cat) || [];
           if (!rows.length) { skipped.push(cat + ': no rows'); continue; }
-          const sum = Math.round(rows.reduce((n, d) => n + Math.abs(d.amt), 0) * 100) / 100;
-          const want = Math.round(Math.abs(Number(l.amount) || 0) * 100) / 100;
-          if (Math.abs(sum - want) > 0.02) { skipped.push(cat + ': ' + money(sum) + ' vs ' + money(want)); continue; }
-          // Replaced, not appended, so importing the same report twice leaves
-          // the same rows -- the guarantee the rest of this tab already makes.
-          await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', l.id);
+          const sum = r2(rows.reduce((n, d) => n + Math.abs(d.amt), 0));
+          const want = r2(Math.abs(Number(l.amount) || 0));
+          if (Math.abs(sum - want) > 0.02) { skipped.push(cat + ': ' + money2(sum) + ' vs ' + money2(want)); continue; }
           const det = rows.map(d => ({
-            brand_id: brandId, line_id: l.id,
-            upc: null, item_no: d.item, item_desc: d.item_desc,
+            brand_id: brandId, line_id: l.id, document_id: docId,
+            upc: d.upc || null, item_no: d.item, item_desc: d.item_desc,
             customer_no: d.customer_no, customer_name: d.customer_name,
             banner: bmap.get(d.customer_name) || d.banner || null,
             customer_state: d.customer_state, dc: null,
             reference_no: d.reference_no, reference_date: null,
             reference_comment: 'Category ' + cat + (d.national ? ' (national)' : ''),
-            ship_qty: d.ship_qty, unit_cost: d.unit_cost,
-            unit_chargeback: null, discount_pct: d.discount_pct,
-            date_from: null, date_to: null,
-            bill_amount: Math.abs(d.amt),
-            recomputed: d.recomputed, recompute_basis: d.recompute_basis,
-            variance: d.variance, is_credit: false,
+            ship_qty: d.ship_qty, unit_cost: d.unit_cost, unit_chargeback: null, discount_pct: d.discount_pct,
+            date_from: null, date_to: null, bill_amount: Math.abs(d.amt),
+            recomputed: d.recomputed, recompute_basis: d.recompute_basis, variance: d.variance, is_credit: false,
           }));
-          for (let k = 0; k < det.length; k += 500)
-            await sb.from('deduction_detail').insert(det.slice(k, k + 500));
-          const _s = (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
-          await sb.from('deduction_lines').update({
-            detail_parsed: true, detail_line_total: sum,
-            detail_variance: Math.round((want - sum) * 100) / 100,
-            backup_by: _s.name || _s.email || null, backup_by_email: _s.email || null,
-            backup_at: new Date().toISOString(),
-          }).eq('id', l.id);
+          for (let k = 0; k < det.length; k += 500) {
+            const { error } = await sb.from('deduction_detail').insert(det.slice(k, k + 500));
+            if (error) throw new Error('writing category ' + cat + ': ' + error.message);
+          }
+          // Replaced, not appended: the category's older rows go after the new ones are in.
+          await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', l.id).or('document_id.is.null,document_id.neq.' + docId);
+          await stampLine(l.id, sum, want);
           wrote++;
         }
-        e.status = wrote ? 'ready' : 'fail';
-        e.note = wrote + ' of ' + lns.length + ' categories imported'
-               + (skipped.length ? ' \u2014 skipped ' + skipped.join(', ') : '');
-        return wrote > 0;
-      };
+      } catch (err) {
+        await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('document_id', docId);
+        await sb.from('deduction_documents').delete().eq('id', docId);
+        throw err;
+      }
+      if (!wrote) { await sb.from('deduction_documents').delete().eq('id', docId); throw new Error('no category tied — ' + skipped.join(', ')); }
+      await sb.from('deduction_documents').update({ lines_touched: wrote }).eq('id', docId);
+      return wrote + ' of ' + lns.length + ' categories imported' + (skipped.length ? ' — skipped ' + skipped.join(', ') : '');
+    };
 
-      let ok = 0, failed = 0;
-      for (const e of _dedUploadState) {
-        // The selection test comes FIRST. Put the other way round, an MCB
-        // report left unticked imported anyway -- the checkbox would have been
-        // decoration on exactly the document that writes to six lines at once.
-        if (!e.chosen || (e.status !== 'ready' && e.status !== 'dupe')) continue;
-        if (e.mcb) { (await importMcb(e)) ? ok++ : failed++; paint(); continue; }
+    async function doImport() {
+      const msg = document.getElementById('hl-ded-up-msg');
+      const go = document.getElementById('hl-ded-up-go');
+      if (go) { go.disabled = true; go.textContent = 'Importing…'; }
+      const bmap = await loadBannerMap();
+      let attached = 0, held = 0, failed = 0;
+      for (const e of S()) {
+        if (!e.chosen || !['ready', 'hold', 'over'].includes(e.status)) continue;
+        if (e.status === 'over' && !e.replace) continue;
         try {
-          // DELETE FIRST. This is what makes the import idempotent rather than
-          // trusting detail_parsed — re-importing the same file replaces its
-          // rows instead of adding a second copy.
-          const { error: dErr } = await sb.from('deduction_detail').delete().eq('line_id', e.line.id);
-          if (dErr) throw new Error('clearing existing rows: ' + dErr.message);
-
-          const rows = e.rows.map(r => {
-            const cand = _dedBannerCandidate(r.customer_name);
-            return _dedDetailRow(r, brandId, e.line.id, (cand && bmap.get(cand)) || cand);
-          });
-          for (let k = 0; k < rows.length; k += 500) {
-            const { error } = await sb.from('deduction_detail').insert(rows.slice(k, k + 500));
-            if (error) throw new Error(error.message);
-          }
-          const { error: uErr } = await sb.from('deduction_lines').update({
-            detail_parsed: true,
-            detail_line_total: e.parsed_total,
-            detail_variance: Math.round((Math.abs(e.line.amount) - e.parsed_total) * 100) / 100,
-          }).eq('id', e.line.id);
-          if (uErr) throw new Error('updating the register line: ' + uErr.message);
-
-          e.status = 'done'; e.chosen = false;
-          e.note = 'imported ' + rows.length + ' rows';
-          ok++;
+          if (e.action === 'mcb') { e.note = await importMcb(e, bmap); e.status = 'done'; attached++; }
+          else if (e.action === 'attach') { await attach(e, bmap); e.status = 'done'; e.note = 'imported ' + e.doc.rows.length + ' rows onto ' + e.line.invoice_no; attached++; }
+          else if (e.action === 'hold') { await hold(e); e.status = 'held'; e.note = 'held with ' + e.doc.rows.length + ' rows — listed below until its deduction arrives'; held++; }
+          if (e.cover && (e.status === 'done' || e.status === 'held')) e.cover.status = e.status;
         } catch (err) {
-          e.status = 'fail'; e.chosen = false;
-          e.note = 'import failed: ' + (err && err.message || String(err));
-          failed++;
+          e.status = 'fail'; e.note = 'import failed: ' + (err && err.message || String(err)); failed++;
         }
+        e.chosen = false; e.info = []; e.block = null; e.lineBlock = null;
         paint();
       }
-
       if (msg) {
-        // The rollup is a MATERIALIZED view: it stores its result. Anything that
-        // changes deduction_detail outside a sync-deductions run leaves it stale,
-        // and a stale rollup shows up as the tie-out count climbing on the
-        // headline — which is the control that makes this visible rather than
-        // silent. Said plainly here so it is not discovered later.
-        msg.innerHTML = ok
-          ? `<span style="color:var(--won);">Imported ${ok} document${ok === 1 ? '' : 's'}${failed ? ', ' + failed + ' failed' : ''}.</span>
-             <span style="color:var(--ink-3);">Now run <code>refresh materialized view concurrently public.deduction_detail_rollup;</code> alone in a SQL tab — the store-detail views read a stored snapshot, not the table.</span>`
+        msg.innerHTML = (attached || held)
+          ? `<span style="color:var(--won);">${attached ? 'Imported ' + attached : ''}${attached && held ? ', ' : ''}${held ? 'held ' + held : ''}${failed ? ', ' + failed + ' failed' : ''}.</span>
+             ${attached ? `<span style="color:var(--ink-3);">Then run, each alone in a SQL tab: <code>refresh materialized view concurrently public.deduction_detail_rollup;</code> and <code>refresh materialized view public.deduction_line_rates;</code> — both views read stored snapshots.</span>` : ''}`
           : `<span style="color:var(--lost);">Nothing imported.</span>`;
       }
-      if (ok) { try { _dedBust(); } catch (e2) {} }
+      if (attached) { try { _dedBust(); } catch (x) {} }
+      renderWaiting();
+    }
+
+    // ── WAITING FOR THEIR DEDUCTION ─────────────────────────────────────────
+    // Held documents, each re-matched against the register on every visit, so
+    // a deduction that has arrived since shows up as a line to attach to.
+    async function renderWaiting() {
+      if (!waitEl || !registryOk) { if (waitEl) waitEl.innerHTML = ''; return; }
+      const { data: docs, error } = await sb.from('deduction_documents')
+        .select('id,file_name,file_sha256,layout,doc_type,doc_key,doc_no,invoice_no,customer,amount,row_count,period_from,period_to,bill_date,uploaded_by,uploaded_at')
+        .eq('brand_id', brandId).eq('status', 'waiting').order('uploaded_at', { ascending: false }).limit(100);
+      if (error || !docs || !docs.length) { waitEl.innerHTML = ''; return; }
+      const W = docs.map(x => ({ rec: x, line: null, candidates: [], how: null, note: '' }));
+      const draw = () => {
+        const td = 'padding:6px 8px;border-bottom:1px solid var(--rule-soft);vertical-align:top;font-family:var(--mono);font-size:10px;';
+        waitEl.innerHTML = `
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px;">Waiting for their deduction · ${docs.length}</div>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead><tr>${['File', 'Document', 'Amount', 'Held', 'Register line', ''].map(h => `<th style="text-align:left;padding:5px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}</tr></thead>
+            <tbody>${W.map((w, i) => {
+              const x = w.rec, opts = w.line ? [w.line] : w.candidates;
+              return `<tr>
+                <td style="${td}"><a href="#" class="hl-wait-open" data-i="${i}" style="color:var(--ink);text-decoration:underline dotted;">${esc(x.file_name || '')}</a></td>
+                <td style="${td}">${esc(x.doc_type || x.layout || '')}<div style="color:var(--ink-3);font-size:9px;">${esc(x.invoice_no || x.doc_no || x.customer || '')}${x.period_from ? ' · ' + esc(dt(x.period_from)) : ''}</div></td>
+                <td style="${td}">${money2(Number(x.amount))}<div style="color:var(--ink-3);font-size:9px;">${x.row_count || 0} rows</div></td>
+                <td style="${td}">${esc(dt(x.uploaded_at))}<div style="color:var(--ink-3);font-size:9px;">${esc(x.uploaded_by || '')}</div></td>
+                <td style="${td}">${w.searching ? '<span style="color:var(--ink-3);">looking…</span>' : opts.length
+                  ? `<select class="hl-wait-line" data-i="${i}" style="font-family:var(--mono);font-size:10px;max-width:320px;">
+                      ${w.line ? '' : '<option value="">choose a line (' + opts.length + ')…</option>'}
+                      ${opts.map(c => `<option value="${esc(String(c.id))}" ${w.pick && String(w.pick) === String(c.id) ? 'selected' : ''}>${esc(c.invoice_no)} · ${money2(Math.abs(Number(c.amount)))}${c.doc_date ? ' · ' + esc(dt(c.doc_date)) : ''}</option>`).join('')}</select>
+                     <div style="color:var(--ink-3);font-size:9px;margin-top:2px;">${esc(w.how || '')}</div>`
+                  : `<span style="color:var(--ink-3);">${esc(w.note || 'no line yet')}</span>`}
+                  ${w.msg ? `<div style="font-size:9.5px;margin-top:3px;color:${w.msgCol || 'var(--ink-3)'};line-height:1.45;">${esc(w.msg)}</div>` : ''}
+                  ${w.over ? `<label style="display:block;margin-top:3px;font-size:9.5px;color:${AMBER};cursor:pointer;"><input type="checkbox" class="hl-wait-replace" data-i="${i}" ${w.replace ? 'checked' : ''} style="margin:0 4px 0 0;vertical-align:-2px;">replace the detail already on the line</label>` : ''}</td>
+                <td style="${td}white-space:nowrap;">
+                  <button class="hl-wait-attach" data-i="${i}" ${(w.line || w.pick) && !w.busy ? '' : 'disabled'} style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:4px;border:1px solid var(--ink);background:${(w.line || w.pick) ? 'var(--ink)' : 'transparent'};color:${(w.line || w.pick) ? 'var(--paper)' : 'var(--rule)'};cursor:pointer;">Attach</button>
+                  <button class="hl-wait-drop" data-i="${i}" style="font-family:var(--mono);font-size:10px;padding:5px 9px;border-radius:4px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;margin-left:4px;">Discard</button></td></tr>
+                ${w.open ? `<tr><td colspan="6" style="padding:2px 8px 12px;border-bottom:1px solid var(--rule-soft);">${w.rows ? groupsHtml(w.rows) : '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">loading rows…</span>'}</td></tr>` : ''}`;
+            }).join('')}</tbody></table>`;
+        waitEl.querySelectorAll('.hl-wait-open').forEach(a => a.onclick = async (ev) => {
+          ev.preventDefault(); const w = W[Number(a.dataset.i)]; w.open = !w.open; draw();
+          if (w.open && !w.rows) { w.rows = await loadRows(w.rec.id); draw(); }
+        });
+        waitEl.querySelectorAll('.hl-wait-line').forEach(sel => sel.onchange = () => { const w = W[Number(sel.dataset.i)]; w.pick = sel.value || null; w.msg = ''; w.over = false; w.replace = false; draw(); });
+        waitEl.querySelectorAll('.hl-wait-replace').forEach(cb => cb.onchange = () => { W[Number(cb.dataset.i)].replace = cb.checked; draw(); });
+        waitEl.querySelectorAll('.hl-wait-drop').forEach(b => b.onclick = async () => {
+          const w = W[Number(b.dataset.i)];
+          if (!w.confirmDrop) { w.confirmDrop = true; w.msg = 'Press Discard again to delete this held document and its rows.'; w.msgCol = 'var(--lost)'; draw(); return; }
+          const { error: de } = await sb.from('deduction_documents').delete().eq('id', w.rec.id).eq('status', 'waiting');
+          if (de) { w.msg = 'could not discard: ' + de.message; draw(); return; }
+          renderWaiting();
+        });
+        waitEl.querySelectorAll('.hl-wait-attach').forEach(b => b.onclick = async () => {
+          const w = W[Number(b.dataset.i)];
+          const lineId = w.pick || (w.line && w.line.id);
+          const l = (w.line && String(w.line.id) === String(lineId)) ? w.line : w.candidates.find(c => String(c.id) === String(lineId));
+          if (!l) return;
+          w.busy = true; w.msg = 'attaching…'; w.msgCol = 'var(--ink-3)'; draw();
+          try {
+            const rows = w.rows || (w.rows = await loadRows(w.rec.id));
+            const shim = { line: l, doc: { rows, total: Number(w.rec.amount) }, priorCover: null };
+            await guardLine(shim, rows, Number(w.rec.amount));
+            if (shim.lineBlock) throw new Error(shim.lineBlock);
+            if (shim.over && !w.replace) { w.over = true; throw new Error('the line already carries ' + money2(shim.existing.total) + ' of detail; this would exceed the deduction. Tick replace to proceed.'); }
+            const bmap = await loadBannerMap();
+            const { data: claimed, error: ce } = await sb.from('deduction_documents')
+              .update({ status: 'attached', line_id: l.id, attached_at: new Date().toISOString() })
+              .eq('id', w.rec.id).eq('status', 'waiting').select('id');
+            if (ce) throw new Error(ce.message);
+            if (!claimed || !claimed.length) throw new Error('someone else attached or discarded this document a moment ago');
+            try {
+              await writeRows(w.rec.id, l, rows, bmap, { replaceAll: !!(shim.over && w.replace) });
+              const kept = shim.over && w.replace ? 0 : shim.existing.total;
+              await stampLine(l.id, kept + Number(w.rec.amount), Math.abs(Number(l.amount)));
+            } catch (err) {
+              await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('document_id', w.rec.id);
+              await sb.from('deduction_documents').update({ status: 'waiting', line_id: null, attached_at: null }).eq('id', w.rec.id);
+              throw err;
+            }
+            await sb.from('deduction_document_rows').delete().eq('document_id', w.rec.id);
+            try { _dedBust(); } catch (x) {}
+            renderWaiting();
+          } catch (err) {
+            w.busy = false; w.msg = String(err && err.message || err); w.msgCol = 'var(--lost)'; draw();
+          }
+        });
+      };
+      const loadRows = async (id) => {
+        const { data } = await sb.from('deduction_document_rows').select('chunk,rows').eq('document_id', id).order('chunk');
+        return (data || []).flatMap(c => c.rows || []);
+      };
+      draw();
+      await loadLookups();
+      // Re-match, a few at a time. Exact references first; suggestions after.
+      for (const w of W.slice(0, 40)) {
+        w.searching = true; draw();
+        try {
+          const m = await findLine({ invoice_no: w.rec.invoice_no, total: Number(w.rec.amount), customer: w.rec.customer,
+                                     period_from: w.rec.period_from, bill_date: w.rec.bill_date, layout: w.rec.layout }, w.rec.file_name);
+          w.line = m.line; w.candidates = m.candidates; w.how = m.how; w.note = m.note;
+          if (w.line) w.pick = w.line.id;
+        } catch (x) { w.note = 'could not search the register'; }
+        w.searching = false; draw();
+      }
     }
 
     paint();
+    renderWaiting();
   }
 
   async function renderDeductions(hostEl, filtersEl, year) {
@@ -35129,11 +36144,13 @@ render();
           go.style.color = on ? 'var(--paper)' : 'var(--rule)';
         };
         let parsed = null;
+        let upSha = null, upDbx = null, upLayout = null, upKey = null, upFile = null;
 
         document.getElementById('hl-up-file').onchange = async (e2) => {
           const f = e2.target.files && e2.target.files[0];
           if (!f) return;
           parsed = null; arm(false);
+          upSha = null; upDbx = null; upLayout = null; upKey = null; upFile = f;
           out.innerHTML = '<span style="color:var(--ink-3);">Reading\u2026</span>';
           try {
             if (!_dedDistItemMap) {
@@ -35161,15 +36178,30 @@ render();
               const rows = grid.map(r => (r || []).map(c => String(c == null ? '' : c)));
               // Each layout is tried in turn; the first that yields rows wins.
               const sheetTried = [];
+              // WORKBOOK LAYOUTS FIRST: the Natural Grocers program billing keeps
+              // its Summary on sheet 1 and its items on sheet 2, so it is read
+              // from every sheet, in raw values (see _dedParseNgProgram).
+              {
+                const rawSheets = wb.SheetNames.map(n => ({ name: n, rows: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '', raw: true }) }));
+                let ngMap = null;
+                try {
+                  const { data: nm } = await sb.from('distributor_item_map').select('item_no,upc').eq('brand_id', brandId).eq('distributor', 'NGVC');
+                  if (nm && nm.length) ngMap = new Map(nm.map(r => [String(r.item_no).trim(), String(r.upc).trim()]));
+                } catch (e) { /* rows import without a UPC, and the note says so */ }
+                let got = null;
+                try { got = _dedParseNgProgram(rawSheets, ngMap); } catch (e) { got = { error: 'threw' }; }
+                if (got && !got.error && got.rows && got.rows.length) { p = got; upLayout = 'ng-program'; }
+                else sheetTried.push('NG program: ' + ((got && got.error) || 'no rows'));
+              }
               // Hand-written layouts first, the general reader last: a known
               // document keeps its known reading, and the general one only ever
               // sees what nothing else claimed.
-              for (const [nm, fn] of [['Natural Grocers scanback', _dedParseNgScanback],
-                                      ['UNFI ASM / all sales', _dedParseUnfiAsm],
-                                      ['Whole Foods scanback', _dedParseWfmScan],
-                                      ['any grid', _dedParseGrid]]) {
+              if (!p) for (const [nm, fn, lay] of [['Natural Grocers scanback', _dedParseNgScanback, 'ng-scanback'],
+                                      ['UNFI ASM / all sales', _dedParseUnfiAsm, 'unfi-asm'],
+                                      ['Whole Foods scanback', _dedParseWfmScan, 'wfm-scan'],
+                                      ['any grid', _dedParseGrid, 'grid']]) {
                 const got = fn(rows);
-                if (got && !got.error && got.rows && got.rows.length) { p = got; break; }
+                if (got && !got.error && got.rows && got.rows.length) { p = got; upLayout = lay; break; }
                 sheetTried.push(nm + ': ' + ((got && got.error) || 'no rows'));
                 p = got;
               }
@@ -35243,11 +36275,12 @@ render();
               // scale, and a document that ties is better evidence of its own
               // layout than a phrase somewhere in its text.
               const tried = [];
-              for (const [nm, fn] of [['Distributor Charge', _dedParseDistCharge], ['K-Solve', _dedParseKsolve], ['KeHE scan', _dedParseKeheScan]]) {
+              for (const [nm, fn, lay] of [['Distributor Charge', _dedParseDistCharge, 'dist-charge'], ['K-Solve', _dedParseKsolve, 'ksolve'],
+                                           ['KeHE scan', _dedParseKeheScan, 'kehe-scan'], ['Natural Grocers invoice', _dedParseNgInvoice, 'ng-invoice']]) {
                 let r = null;
                 try { r = fn(text); } catch (e6) { tried.push(nm + ': threw'); continue; }
                 if (!r || !r.rows || !r.rows.length) { tried.push(nm + ': no rows'); continue; }
-                if (r.ties) { p = r; break; }
+                if (r.ties) { p = r; upLayout = lay; break; }
                 tried.push(nm + ': ' + r.rows.length + ' rows summing ' + money(r.line_total)
                            + ' vs stated ' + (r.head && r.head.total != null ? money(r.head.total) : 'none'));
                 if (!p) p = r;                        // keep the best near-miss to report
@@ -35317,6 +36350,36 @@ render();
                 + ' this is the wrong document, or the same money twice.</div>';
               return;
             }
+            // ── SEEN BEFORE? ──────────────────────────────────────────────────
+            // The same file, or the same document in another file, recorded by
+            // this dialog or by the Upload tab. Refused outright: a duplicate is
+            // the one failure that looks exactly like success.
+            upSha = await _dedSha256(await f.arrayBuffer());
+            try { upDbx = await _dedDropboxHash(await f.arrayBuffer()); } catch (e7) { upDbx = null; }
+            upKey = _dedDocKeyOf(upLayout, p.head, p.rows, p.line_total);
+            const reg = await _dedRegistryCheck(sb, brandId, upSha, upKey);
+            if (reg.missing) {
+              out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 the document registry is missing. Run DEDUCTION-DOCUMENTS.sql once; without it Keel cannot tell whether this file has been imported before.</div>';
+              return;
+            }
+            if (reg.hit) { out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 ' + esc(reg.hit) + '</div>'; return; }
+            // The same rows on ANOTHER line -- loaded by the Dropbox loader, or
+            // before the registry existed -- which no file record can show.
+            try {
+              const rb = await _dedRowsInBook(sb, brandId, p.rows, l.id);
+              if (rb.share >= 0.6) {
+                out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 ' + Math.round(rb.share * 100) + '% of these rows ('
+                  + rb.count + ' of ' + p.rows.length + ') are already in Keel on ' + esc(rb.inv) + '. Importing them here would count that money twice.</div>';
+                return;
+              }
+              if (rb.share >= 0.05) out.innerHTML += '<div style="color:#8a6d1f;margin-top:10px;">' + Math.round(rb.share * 100) + '% of these rows also appear on ' + esc(rb.inv) + ' \u2014 check this is a different document.</div>';
+            } catch (e8) {
+              out.innerHTML += '<div style="color:var(--lost);margin-top:10px;">Not imported \u2014 could not check the book for these rows: ' + esc(String(e8.message || e8)) + '</div>';
+              return;
+            }
+            if (/^ng-/.test(upLayout || '') && !/NATGROC/i.test(inv)) {
+              out.innerHTML += '<div style="color:#8a6d1f;margin-top:10px;">This is a Natural Grocers document and this line does not name NATGROC \u2014 check it is the right line before importing.</div>';
+            }
             // A large shortfall is worth saying out loud without standing in the
             // way: the person uploading knows whether a second document exists,
             // and the residual row will keep asking until it arrives.
@@ -35351,15 +36414,14 @@ render();
               const { data } = await guard(sb.from('deduction_banner_map').select('banner_raw,banner').eq('brand_id', brandId), 'banner map');
               for (const b of (data || [])) if (b.banner) bmap.set(b.banner_raw, b.banner);
             } catch (e3) { /* an unmapped banner is survivable; a failed import is not */ }
-            // DELETE FIRST, so re-uploading the same file replaces its rows
-            // rather than adding a second copy. Idempotent by construction, not
-            // by trusting detail_parsed.
+            // REPLACE, NOT DELETE-FIRST. The new rows go in first, tagged with
+            // their document, and the line's other rows are removed after -- so
+            // a failure part-way never leaves the line with less than it had.
+            // Re-uploading the same file is refused before this by the registry.
             const appendMode = !!(document.getElementById('hl-up-append') || {}).checked;
+            let keptTotal = 0;
             if (!appendMode) {
-              step('Clearing any existing rows on this line');
-              const { error: dErr } = await guard(
-                sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', l.id), 'delete');
-              if (dErr) throw new Error('clearing existing rows: ' + dErr.message);
+              /* replace: the delete happens after the insert, below */
             } else {
               // ── THE SAME DOCUMENT TWICE IS THE ONLY REAL DANGER HERE ──────
               // Replace mode is idempotent by construction: clear, then write.
@@ -35374,10 +36436,22 @@ render();
               // everything. 60% sits clear of both, and the message says which
               // switch to flip rather than just refusing.
               step('Checking these rows are not already on the line');
-              const { data: existing, error: xErr } = await guard(
-                sb.from('deduction_detail').select('upc,ship_qty,bill_amount')
-                  .eq('brand_id', brandId).eq('line_id', l.id).limit(20000), 'read existing');
-              if (xErr) throw new Error('reading existing rows: ' + xErr.message);
+              // Paged: PostgREST returns 1,000 rows however high the limit, and a
+              // check that reads a tenth of the line passes a duplicate.
+              const existing = [];
+              for (let from = 0; from < 60000; from += 1000) {
+                const { data: pg, error: xErr } = await guard(
+                  sb.from('deduction_detail').select('id,upc,ship_qty,bill_amount')
+                    .eq('brand_id', brandId).eq('line_id', l.id).order('id').range(from, from + 999), 'read existing');
+                if (xErr) throw new Error('reading existing rows: ' + xErr.message);
+                existing.push(...(pg || []));
+                if (!pg || pg.length < 1000) break;
+              }
+              keptTotal = existing.reduce((n, r) => n + Math.abs(Number(r.bill_amount) || 0), 0);
+              if (keptTotal + parsed.line_total > amt + 0.01) {
+                throw new Error('the line already carries $' + keptTotal.toFixed(2) + ' of detail; adding $' + parsed.line_total.toFixed(2)
+                  + ' would exceed the $' + amt.toFixed(2) + ' deduction \u2014 the same money twice, or the wrong line. Untick "Add another file" to replace instead.');
+              }
               const sig = (r) => [String(r.upc || ''),
                                   String(r.ship_qty == null ? '' : r.ship_qty),
                                   Number(r.bill_amount || 0).toFixed(2)].join('|');
@@ -35400,30 +36474,72 @@ render();
             // The line's own attribution is the fallback, never an override:
             // where the document does name a customer, the document wins.
             const lineCust = (custFull(l) || {}).name || null;
+            const _sess = (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
+            // RECORD THE DOCUMENT FIRST. The registry is unique on the file hash
+            // and on the document's identity, so a second tab importing the same
+            // file at the same moment is refused by the database, not by luck.
+            step('Recording the document');
+            const _h = parsed.head || {}, _ng = _h.ng || null;
+            const _dates = parsed.rows.map(r => (r.extra && r.extra.date_from) || _dedIsoDate(r.ship_date)).filter(Boolean).sort();
+            const { data: dRec, error: dRecErr } = await guard(sb.from('deduction_documents').insert({
+              brand_id: brandId, status: 'attached', line_id: l.id, attached_at: new Date().toISOString(),
+              file_name: upFile ? upFile.name : null, file_size: upFile ? upFile.size : null, file_sha256: upSha, dropbox_hash: upDbx,
+              layout: upLayout, doc_type: _h.type || upLayout, doc_key: upKey, doc_no: _ng && _ng.doc_no || null,
+              invoice_no: _h.invoice_no || null, customer: /^ng-/.test(upLayout || '') ? 'Natural Grocers' : upLayout === 'wfm-scan' ? 'Whole Foods' : null,
+              amount: parsed.line_total, row_count: parsed.rows.length,
+              period_from: (_ng && _ng.period_from) || _dates[0] || null, period_to: (_ng && _ng.period_to) || _dates[_dates.length - 1] || null,
+              bill_date: _ng && _ng.bill_date || null,
+              note: upLayout === 'ng-invoice' && _ng ? _ng.debtor_refs.map(k => 'debtor: ' + k).join(' | ') : null,
+              uploaded_by: _sess.name || _sess.email || null, uploaded_by_email: _sess.email || null,
+            }).select('id').single(), 'record document');
+            if (dRecErr) throw new Error(/duplicate key|unique/i.test(dRecErr.message)
+              ? 'this file or document is already recorded \u2014 the database refused a second copy'
+              : 'recording the document: ' + dRecErr.message);
+            const docId = dRec.id;
             const rows = parsed.rows.map(r => {
               const cand = _dedBannerCandidate(r.customer_name || lineCust);
-              return _dedDetailRow(r, brandId, l.id, (cand && bmap.get(cand)) || cand);
+              const row = _dedDetailRow(r, brandId, l.id, (cand && bmap.get(cand)) || cand);
+              row.document_id = docId;
+              return row;
             });
-            for (let k = 0; k < rows.length; k += 500) {
-              step('Writing rows ' + (k + 1) + '-' + Math.min(k + 500, rows.length) + ' of ' + rows.length);
-              const { error } = await guard(
-                sb.from('deduction_detail').insert(rows.slice(k, k + 500)), 'insert');
-              if (error) throw new Error(error.message);
+            try {
+              for (let k = 0; k < rows.length; k += 500) {
+                step('Writing rows ' + (k + 1) + '-' + Math.min(k + 500, rows.length) + ' of ' + rows.length);
+                const { error } = await guard(
+                  sb.from('deduction_detail').insert(rows.slice(k, k + 500)), 'insert');
+                if (error) throw new Error(error.message);
+              }
+              if (!appendMode) {
+                step('Removing the rows this document replaces');
+                const { error: dErr } = await guard(
+                  sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', l.id)
+                    .or('document_id.is.null,document_id.neq.' + docId), 'delete');
+                if (dErr) throw new Error('removing the replaced rows: ' + dErr.message);
+                await sb.from('deduction_documents').update({ status: 'superseded', superseded_by: docId })
+                  .eq('brand_id', brandId).eq('line_id', l.id).eq('status', 'attached').neq('id', docId);
+              }
+              step('Updating the register line');
+              // WHO AND WHEN, stamped at the moment the import commits -- not at
+              // the moment the dialog opened, and not from the file's own dates,
+              // which are the document's dates and not the act of uploading it.
+              // ON ADD, THE LINE'S TOTAL IS CUMULATIVE: it used to be overwritten
+              // with this document alone, understating the line's itemised detail.
+              const lineTotal = Math.round((keptTotal + parsed.line_total) * 100) / 100;
+              const { error: uErr } = await guard(sb.from('deduction_lines').update({
+                detail_parsed: true,
+                detail_line_total: lineTotal,
+                detail_variance: Math.round((amt - lineTotal) * 100) / 100,
+                backup_by: _sess.name || _sess.email || null,
+                backup_by_email: _sess.email || null,
+                backup_at: new Date().toISOString(),
+              }).eq('id', l.id), 'line update');
+              if (uErr) throw new Error('updating the register line: ' + uErr.message);
+            } catch (wErr) {
+              // Take back exactly what this document wrote, and its record.
+              await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('document_id', docId);
+              await sb.from('deduction_documents').delete().eq('id', docId);
+              throw wErr;
             }
-            step('Updating the register line');
-            // WHO AND WHEN, stamped at the moment the import commits -- not at
-            // the moment the dialog opened, and not from the file's own dates,
-            // which are the document's dates and not the act of uploading it.
-            const _sess = (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
-            const { error: uErr } = await guard(sb.from('deduction_lines').update({
-              detail_parsed: true,
-              detail_line_total: parsed.line_total,
-              detail_variance: Math.round((amt - parsed.line_total) * 100) / 100,
-              backup_by: _sess.name || _sess.email || null,
-              backup_by_email: _sess.email || null,
-              backup_at: new Date().toISOString(),
-            }).eq('id', l.id), 'line update');
-            if (uErr) throw new Error('updating the register line: ' + uErr.message);
             out.innerHTML = '<span style="color:var(--won);">Imported ' + rows.length.toLocaleString() + ' rows.</span>'
               + '<div style="color:var(--ink-3);margin-top:6px;">The store views read a stored snapshot \u2014 run '
               + '<code>refresh materialized view concurrently public.deduction_detail_rollup;</code> alone in a SQL tab to see them there.</div>';
