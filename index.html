@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-33 cid-perfont';
+  const _DED_BUILD = 'tr-34 filter-close';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -34942,6 +34942,12 @@ render();
             const set = _dedFacet[cb.dataset.f];
             if (cb.checked) set.add(cb.dataset.v); else set.delete(cb.dataset.v);
             _dedLinesLimit = DED_PAGE;        // a new filter starts at the top
+            // CLOSE ON PICK. The panel covers the rows it is filtering, so
+            // leaving it open hides the result of the click that was just made.
+            // Selecting several values is still possible -- Select all takes
+            // the whole list, and reopening the column keeps what is ticked.
+            _dedFacetOpen = null;
+            _dedFacetQ = '';
             await paintResults();
           };
         });
