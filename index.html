@@ -29221,6 +29221,40 @@ render();
     const raw = String(v == null ? '' : v).replace(/\D/g, '');
     return raw.length > 12 ? raw.replace(/^0+/, '').slice(-12) : raw;
   };
+  // ── COLUMN FILTERS ───────────────────────────────────────────────────────
+  // One Set per column. EMPTY MEANS NO FILTER, which is what makes "select all"
+  // and "clear" the same control: selecting everything is the same answer as
+  // selecting nothing, so clearing empties the Set rather than ticking 800
+  // boxes. Kept out of localStorage on purpose -- a filter you cannot see the
+  // cause of, restored days later, reads as missing data.
+  const _DED_FACETS = [
+    ['customer', 'Customer'], ['month', 'Month'], ['category', 'Category'],
+    ['code', 'Code'], ['backup', 'Backup'], ['trade', '% trade rate'],
+    ['rate', 'Rate'], ['addedby', 'Backup added'],
+  ];
+  let _dedFacet = Object.fromEntries(_DED_FACETS.map(([k]) => [k, new Set()]));
+  let _dedFacetOpen = null;
+
+  // Buckets, not raw values: 4,839 distinct rates is not a filter, it is a
+  // second table. The blank bucket is the point of the trade-rate one -- it is
+  // how you find every line the measure could not be computed for.
+  const _dedRateBucket = (v) => {
+    if (v == null || !isFinite(v)) return 'no rate';
+    if (v < 1) return 'under $1';
+    if (v < 5) return '$1 to $5';
+    if (v < 15) return '$5 to $15';
+    return '$15 and over';
+  };
+  const _dedTradeBucket = (pct) => {
+    if (pct == null || !isFinite(pct)) return 'not calculated';
+    if (pct <= 0) return 'zero';
+    const p = pct * 100;
+    if (p < 10) return 'under 10%';
+    if (p < 20) return '10 to 20%';
+    if (p < 30) return '20 to 30%';
+    return '30% and over';
+  };
+
   let _dedCasePrices = null;      // 'account|upc12' -> price, or null where the sheet disagrees with itself
   let _dedPriceErr = null;        // set when the price fetch itself failed, so blank cells can say why
   const _DED_PRICE_ACCT = {
@@ -29293,7 +29327,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-21 cosmetics';
+  const _DED_BUILD = 'tr-22 filters';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -33817,12 +33851,53 @@ render();
         // FILTERING HAPPENS HERE, not once at page build. It used to sit above
         // body.innerHTML, so repainting this container alone would have shown
         // the results of whatever was typed the LAST time the page rebuilt.
+      // ONE definition per facet, read by both the checkbox list and the filter
+      // test. Two definitions would drift and a box would stop matching its own
+      // rows -- the failure is silent and looks like missing data.
+      const facetOf = (l, key) => {
+        if (key === 'customer') return (custFull(l) || {}).name || '(none)';
+        if (key === 'month')    return monthOf(l) || '(undated)';
+        if (key === 'category') return catOf(l) || '(unmapped)';
+        if (key === 'code')     return l.reason_code || '(none)';
+        if (key === 'addedby')  {
+          const n = String(l.backup_by || '').trim();
+          return n ? n.split(/\s+/).slice(-1)[0] : '(not uploaded)';
+        }
+        if (key === 'backup') {
+          if (l.detail_parsed) {
+            const amt = Math.abs(Number(l.amount) || 0);
+            const got = Math.abs(Number(l.detail_line_total) || 0);
+            return (got > 0.005 && amt - got > 0.005) ? 'partial' : 'yes';
+          }
+          const o = _dedOverrideFor(l, overrides);
+          const be = o ? o.backup_exists : null;
+          if (be === true) return 'in folder, unread';
+          if (be === false) return 'no doc exists';
+          return 'no';
+        }
+        const it = _dedItemCache.get(String(l.id));
+        if (key === 'rate')  return _dedRateBucket(it && !it.err && it.units ? it.amt / it.units : null);
+        if (key === 'trade') {
+          const tp = it && !it.err
+            ? _dedTradePct(it.items, l, _lineDist(l),
+                _dedBucketOf(rmapBy[l.reason_code]) === 'Trade spend',
+                (rmapBy[l.reason_code] || {}).keel_category)
+            : null;
+          return _dedTradeBucket(tp && tp.pct != null ? tp.pct : null);
+        }
+        return '(none)';
+      };
+
       const terms = _dedQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
       const hay = (l) => [l.invoice_no, l.reason_code, l.dc_name, l.remarks, catOf(l),
                           (custFull(l) || {}).name,
                           ...(_dedPromoRefs.get(String(l.id)) || [])]
         .filter(Boolean).join(' ').toLowerCase();
       const matches = (l) => {
+        for (const [k] of _DED_FACETS) {
+          const sel = _dedFacet[k];
+          if (sel && sel.size && !sel.has(facetOf(l, k))) return false;
+        }
         if (_dedLinesMonths.size) {
           const mk = monthOf(l) || '(undated)';
           if (!_dedLinesMonths.has(mk)) return false;
@@ -33837,7 +33912,8 @@ render();
       const filteredAmt = filtered.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
       const registerAmt = L.reduce((s2, l) => s2 + Math.abs(Number(l.amount || 0)), 0);
       const shown = filtered.slice(0, _dedLinesLimit);
-      const isFiltered = terms.length > 0 || _dedLinesMonths.size > 0;
+      const isFiltered = terms.length > 0 || _dedLinesMonths.size > 0
+        || _DED_FACETS.some(([k]) => _dedFacet[k] && _dedFacet[k].size > 0);
 
       // ── DETAIL FOR THE ROWS ON SCREEN, IN ONE PASS ───────────────────────
       // This used to fetch reference_no only, and the expansion then fetched the
@@ -34000,7 +34076,53 @@ render();
           if (!it || it.err || !it.units) continue;
           _shownUnits += it.units; _shownAmt += it.amt; _shownWith++;
         }
-        host.innerHTML = `
+        // ── THE FILTER BAR ───────────────────────────────────────────────────
+      // Counts are computed against the rows that pass EVERY OTHER facet, not
+      // against the whole register: with a customer picked, the Code list
+      // should show that customer's codes and what each would leave. Counting
+      // globally is the usual version of this control and it lies -- it offers
+      // boxes that produce nothing.
+      const facetCounts = (key) => {
+        const m = new Map();
+        for (const l of L) {
+          let ok = true;
+          for (const [k2] of _DED_FACETS) {
+            if (k2 === key) continue;
+            const sel2 = _dedFacet[k2];
+            if (sel2 && sel2.size && !sel2.has(facetOf(l, k2))) { ok = false; break; }
+          }
+          if (!ok) continue;
+          const v = facetOf(l, key);
+          m.set(v, (m.get(v) || 0) + 1);
+        }
+        return [...m.entries()].sort((a, b) => b[1] - a[1]);
+      };
+      const facetBar = `
+        <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 12px;">
+          ${_DED_FACETS.map(([k, label]) => {
+            const n = _dedFacet[k].size, on = n > 0;
+            return `<button class="hl-df-btn" data-f="${k}" style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:5px;cursor:pointer;border:1px solid ${on ? 'var(--ink)' : 'var(--rule)'};background:${on ? 'var(--ink)' : 'transparent'};color:${on ? 'var(--paper)' : 'var(--ink-2)'};">${esc(label)}${on ? ' \u00b7 ' + n : ''}</button>`;
+          }).join('')}
+          ${_DED_FACETS.some(([k]) => _dedFacet[k].size) ? `<button id="hl-df-clearall" style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--lost);cursor:pointer;">clear all</button>` : ''}
+        </div>
+        ${_dedFacetOpen ? (() => {
+          const key = _dedFacetOpen, rowsF = facetCounts(key), sel = _dedFacet[key];
+          return `<div style="border:1px solid var(--rule-soft);border-radius:8px;padding:12px 14px;margin:0 0 12px;background:var(--rule-softer);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+              <span style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);">${esc((_DED_FACETS.find(f => f[0] === key) || [, key])[1])} \u00b7 ${rowsF.length} value${rowsF.length === 1 ? '' : 's'}</span>
+              <span>
+                <button class="hl-df-all" data-f="${key}" style="font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">select all</button>
+                <button class="hl-df-none" data-f="${key}" style="margin-left:5px;font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">clear</button>
+                <button class="hl-df-close" style="margin-left:5px;font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;border:none;background:transparent;color:var(--ink-3);cursor:pointer;">close</button>
+              </span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:2px 16px;max-height:260px;overflow:auto;">
+              ${rowsF.map(([v, n]) => `<label style="display:flex;align-items:center;gap:7px;padding:3px 0;font-family:var(--sans);font-size:12.5px;cursor:pointer;"><input type="checkbox" class="hl-df-box" data-f="${key}" data-v="${esc(v)}" ${sel.has(v) ? 'checked' : ''} /><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(v)}</span><span style="margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${n.toLocaleString()}</span></label>`).join('')}
+            </div>
+          </div>`;
+        })() : ''}`;
+
+      host.innerHTML = facetBar + `
         <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:0 0 10px;">
           ${isFiltered
             ? `${filtered.length.toLocaleString()} of ${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(filteredAmt)}</strong> of ${money(registerAmt)}`
@@ -34360,6 +34482,47 @@ render();
           Store-level detail could not be loaded, so rows cannot be expanded and months fall back to the register line's own date.</p>` : ''}
         ${_dedPriceErr ? `<p style="font-family:var(--mono);font-size:10px;color:var(--lost);margin-top:10px;line-height:1.55;">
           Case prices could not be read, so % trade rate is blank on every row \u2014 that is a load failure, not an absence of prices: ${esc(_dedPriceErr)}</p>` : ''}`;
+        // ── FILTER CONTROLS ────────────────────────────────────────────────
+        // Every one of these repaints this container only. The search box lives
+        // outside it and keeps its caret, which is the reason the split exists.
+        host.querySelectorAll('.hl-df-btn').forEach(b => {
+          b.onclick = async () => {
+            _dedFacetOpen = (_dedFacetOpen === b.dataset.f) ? null : b.dataset.f;
+            await paintResults();
+          };
+        });
+        const closeBtn = host.querySelector('.hl-df-close');
+        if (closeBtn) closeBtn.onclick = async () => { _dedFacetOpen = null; await paintResults(); };
+        host.querySelectorAll('.hl-df-box').forEach(cb => {
+          cb.onchange = async () => {
+            const set = _dedFacet[cb.dataset.f];
+            if (cb.checked) set.add(cb.dataset.v); else set.delete(cb.dataset.v);
+            _dedLinesLimit = DED_PAGE;        // a new filter starts at the top
+            await paintResults();
+          };
+        });
+        host.querySelectorAll('.hl-df-all').forEach(b => {
+          b.onclick = async () => {
+            // "Select all" ticks every value currently OFFERED -- which is the
+            // list narrowed by the other facets, not the whole register. Ticking
+            // values that other filters already exclude would leave a filter
+            // that says 40 selected and changes nothing.
+            const k = b.dataset.f;
+            _dedFacet[k] = new Set(facetCounts(k).map(([v]) => v));
+            _dedLinesLimit = DED_PAGE;
+            await paintResults();
+          };
+        });
+        host.querySelectorAll('.hl-df-none').forEach(b => {
+          b.onclick = async () => { _dedFacet[b.dataset.f].clear(); _dedLinesLimit = DED_PAGE; await paintResults(); };
+        });
+        const clearAll = host.querySelector('#hl-df-clearall');
+        if (clearAll) clearAll.onclick = async () => {
+          for (const [k] of _DED_FACETS) _dedFacet[k].clear();
+          _dedLinesLimit = DED_PAGE;
+          await paintResults();
+        };
+
         host.querySelectorAll('.hl-dl-tr').forEach(el => {
           el.onclick = (ev) => {
             ev.stopPropagation();           // must not toggle the row open/shut
