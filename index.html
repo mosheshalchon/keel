@@ -304,11 +304,13 @@ body::before {
 
 .nav-subs { display: flex; flex-direction: column; margin: 2px 0 6px 4px; }
 .nav-sub {
+  /* Same size and face as the parent nav item -- these are pages, not labels.
+     The indent and the rail are what say they belong to Promos. */
   display: block;
-  padding: 5px 0 5px 22px;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: 0.05em;
+  padding: 7px 0 7px 26px;
+  font-family: var(--sans);
+  font-size: 14px;
+  letter-spacing: 0;
   color: var(--ink-3);
   border-left: 1px solid var(--rule-soft);
   cursor: pointer;
@@ -5320,8 +5322,12 @@ HL.renderSidebar = function(activeId) {
     if (!item) return '';
     const isActive = item.id === activeId;
     const cnt = counts[item.id];
-    const subs = isActive ? ((HL.NAV_SUBTABS || {})[item.id] || null) : null;
-    const curSub = subs ? (HL.SUBTAB_ACTIVE || {})[item.id] : null;
+    // ALWAYS SHOWN, not only while the parent page is open. Plan, Trade
+    // analyzer and Deductions are destinations in their own right -- hiding
+    // them until you are already on Promos means you cannot navigate to them
+    // from anywhere else, which is the opposite of what a sidebar is for.
+    const subs = ((HL.NAV_SUBTABS || {})[item.id] || null);
+    const curSub = (isActive && subs) ? (HL.SUBTAB_ACTIVE || {})[item.id] : null;
     return `
       <a href="${item.href}" class="nav-item ${isActive ? 'active' : ''} ${opts.child ? 'nav-child' : ''}">
         <span class="bullet"></span>
@@ -29287,7 +29293,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-20 prefetch-budget';
+  const _DED_BUILD = 'tr-21 cosmetics';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -34057,18 +34063,39 @@ render();
                   // missing one, and hiding it on resolved lines is how a bad
                   // parse becomes permanent.
                   if (!c.name) return td('<span style="color:var(--lost);">\u2014</span>');
-                  return td(`<span>${esc(c.name)}</span>`
+                  // NAME ONLY. The evidence tier ('store detail', 'reference',
+                  // 'code') is still what decided the name, and it still shows
+                  // on hover -- but printed beside every row it read as part of
+                  // the customer and made the column hard to scan. A conflict
+                  // stays visible: that one is a finding, not provenance.
+                  return td(`<span title="${ev ? 'attributed from ' + ev.label : ''}">${esc(c.name)}</span>`
                     + (c.extra ? `<span style="color:var(--ink-3);font-family:var(--mono);font-size:9.5px;" title="the detail also names ${c.extra} other banner${c.extra === 1 ? '' : 's'}"> +${c.extra}</span>` : '')
-                    + (ev ? `<span style="font-family:var(--mono);font-size:9px;color:${ev.color};margin-left:6px;opacity:.8;">${ev.label}</span>` : '')
+                    + (ev && ev.label === 'manual' ? `<span style="font-family:var(--mono);font-size:9px;color:${ev.color};margin-left:6px;opacity:.8;">manual</span>` : '')
                     + (c.conflict ? `<span style="font-family:var(--mono);font-size:9px;color:var(--lost);margin-left:6px;" title="the documents say ${esc(String(c.was))} \u2014 one of the two is wrong">\u26A0 was ${esc(String(c.was))}</span>` : '')
                     + (c.ovr && c.ovr.promo_ref ? `<span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-left:6px;" title="${esc(c.ovr.promo_name || 'retailer promo reference')}">\u00b7 promo ${esc(c.ovr.promo_ref)}</span>` : ''));
                 })()}
                 ${td(cat ? esc(cat) : '<span style="color:var(--lost);">\u26A0 unmapped</span>')}
                 ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + esc(l.reason_code || '\u2014') + '</span>')}
                 ${(() => {
+                  // YES / PARTIAL / NO, not a row count. The count answered a
+                  // question nobody was asking; what a reader wants is whether
+                  // this line is documented. PARTIAL is the one that earns its
+                  // place: the rows landed but do not add up to the line, which
+                  // means a second document exists and has not been uploaded.
+                  // The row count and the shortfall are on hover.
                   const rows = detBy.get(l.id) || [];
-                  if (l.detail_parsed)
-                    return td('<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px;">' + (rows.length ? rows.length.toLocaleString() + ' rows' : 'parsed') + '</span>');
+                  if (l.detail_parsed) {
+                    const amt = Math.abs(Number(l.amount) || 0);
+                    const got = Math.abs(Number(l.detail_line_total) || 0);
+                    const short = amt - got;
+                    const partial = got > 0.005 && short > 0.005;
+                    const lbl = partial ? 'partial' : 'yes';
+                    const col = partial ? 'var(--accent, #8a6d1f)' : 'var(--ink-3)';
+                    const tip = (rows.length ? rows.length.toLocaleString() + ' rows' : 'parsed')
+                      + (partial ? ' \u2014 covering ' + money(got) + ' of ' + money(amt)
+                                 + ', so ' + money(short) + ' is still undocumented' : '');
+                    return td('<span style="font-family:var(--mono);font-size:10px;color:' + col + ';" title="' + esc(tip) + '">' + lbl + '</span>');
+                  }
                   // "none" has always meant NO PARSER WROTE ROWS, and been read
                   // as NO DOCUMENT EXISTS. Those are different problems and only
                   // a person can tell them apart today, so the assertion gets
@@ -34077,7 +34104,7 @@ render();
                   const be = o ? o.backup_exists : null;
                   if (be === true)  return td('<span style="font-family:var(--mono);font-size:10px;color:var(--accent, #8a6d1f);" title="a document is in the folder and has not been read \u2014 a parsing job, not a missing file">in folder \u00b7 unread</span>');
                   if (be === false) return td('<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="no document exists, e.g. a flat fee \u2014 complete, not a gap">no doc exists</span>');
-                  return td('<span style="color:var(--lost);font-family:var(--mono);font-size:10px;">none</span>');
+                  return td('<span style="color:var(--lost);font-family:var(--mono);font-size:10px;" title="no rows have been written for this line">no</span>');
                 })()}
                 ${(() => {
                   // UNITS AND RATE ON THE COLLAPSED ROW, from the same cached
@@ -37157,8 +37184,12 @@ ${(() => {
     main.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
         <div>
-          <div class="eyebrow">— Promotional planning · ${_viewLabel}</div>
-          <h1 class="page-title">Promos.</h1>
+          <div class="eyebrow">— Promotional planning</div>
+          <!-- The heading names the PAGE, not the section. All three views
+               lived under one title, so Plan, Trade analyzer and Deductions
+               were indistinguishable at a glance and a bookmarked link gave no
+               clue where it landed. -->
+          <h1 class="page-title">${_viewLabel}.</h1>
           <p class="page-meta">${_viewMeta}</p>
         </div>
         <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;${_promoView === 'plan' ? '' : 'display:none;'}">
