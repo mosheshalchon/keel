@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-36 drop-zone';
+  const _DED_BUILD = 'tr-37 scans';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -33091,6 +33091,8 @@ render();
       try { const { data: ln } = await sb.from('deduction_lines').select('invoice_no').eq('id', r.line_id).maybeSingle(); if (ln && ln.invoice_no) inv = ln.invoice_no; }
       catch (e) { /* the line id stands in */ }
       where = r.status === 'superseded' ? where + ', on ' + inv : 'its rows are on ' + inv;
+      return { inv, hit: how + ' was uploaded' + (r.file_name && how !== 'This exact file' ? ' as ' + r.file_name : '') + ' by '
+                    + (r.uploaded_by || 'someone') + ' on ' + String(r.uploaded_at || '').slice(0, 10) + ' — ' + where + '.' };
     }
     return { hit: how + ' was uploaded' + (r.file_name && how !== 'This exact file' ? ' as ' + r.file_name : '') + ' by '
                   + (r.uploaded_by || 'someone') + ' on ' + String(r.uploaded_at || '').slice(0, 10) + ' — ' + where + '.' };
@@ -33112,7 +33114,7 @@ render();
           Drop any deduction document here — PDFs, spreadsheets or CSVs, as many as you like. Keel reads each one,
           finds its register line from the invoice number it states, a reference in its filename, or — when neither
           exists — suggests lines by customer, period and amount for you to confirm. Before anything is written you see
-          what the document holds by product line.
+          what the document holds by product line. Scanned PDFs with no text are read with vision.
           <strong>Nothing is written until you press Import.</strong> A file or document Keel has seen before, or rows
           already in the book, cannot be imported again. A document whose deduction has not reached the register yet is
           <strong>held</strong> and offered its line when it arrives — no register line is ever created from a document.
@@ -33272,8 +33274,7 @@ render();
         return { fail: 'no layout recognised — widest header: ' + heads.join(' · '), tried };
       }
       const text = await _dedPdfText(buf, (n) => { e.note = 'reading… ' + n + ' streams'; paint(); });
-      if (text.replace(/\s+/g, '').length < 40)
-        return { fail: 'no text layer — an image-only scan. Use the FILE button on its register line to send it to the OCR pass.' };
+      if (text.replace(/\s+/g, '').length < 40) return { scan: true };
       const mcb = (() => { try { return _dedParseMcbCells(text); } catch (x) { return null; } })();
       if (mcb && mcb.detail && mcb.detail.length && mcb.invoice) {
         const um = itemMaps.get('UNFI');
@@ -33294,6 +33295,144 @@ render();
       }
       if (near) return near;
       return { fail: 'read the file but no layout fitted — head: ' + text.replace(/\s+/g, ' ').slice(0, 90), tried };
+    };
+
+    // ── SCANS: READ WITH VISION ─────────────────────────────────────────────
+    // A PDF with no text layer is posted to sync-deductions mode=vision, which
+    // reads it with the same Claude call the OCR pass uses and WRITES NOTHING.
+    // Everything that follows -- tie-out, matching, the duplicate guards, the
+    // write -- is the same code every other document goes through here.
+    //
+    // Read automatically up to VISION_AUTO per drop, after the duplicate check,
+    // so a file Keel has seen never costs a call; the rest wait for a click.
+    const VISION_AUTO = 10, VISION_MAX = 12 * 1024 * 1024;
+    const askVision = async (e) => {
+      if (e.file.size > VISION_MAX) throw new Error('the scan is over 12MB — too large to read in one call');
+      const { data: sd } = await sb.auth.getSession();
+      const session = sd && sd.session;
+      if (!session) throw new Error('sign in again to read scans');
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 150000);
+      try {
+        const r = await fetch(sb.supabaseUrl + '/functions/v1/sync-deductions?mode=vision', {
+          method: 'POST', signal: ctl.signal, body: e.buf || await e.file.arrayBuffer(),
+          headers: { Authorization: 'Bearer ' + session.access_token, 'content-type': 'application/pdf',
+                     'x-filename': encodeURIComponent(e.file.name) },
+        });
+        // Status codes are not trusted: the loader answers 200 on every failure.
+        const body = await r.json().catch(() => ({ ok: false, error: 'the loader did not answer with JSON (HTTP ' + r.status + ') — is build vision-1 deployed?' }));
+        if (!body.ok) throw new Error(body.error || 'vision read failed');
+        return body;
+      } catch (err) {
+        if (err && err.name === 'AbortError') throw new Error('vision did not answer within 150s');
+        throw err;
+      } finally { clearTimeout(timer); }
+    };
+    // What vision read, turned into the same document shape every parser
+    // produces. Nothing here is computed from a guess: amounts are the printed
+    // ones, and the one split made -- a retailer's fee out of a re-billed
+    // amount -- is made ONLY when the retailer's own invoice prints the
+    // percentage (DEDUCTION+3%FEE) and agrees with the deduction's Amount.
+    const visionDoc = (v) => {
+      const docs = (v && Array.isArray(v.documents)) ? v.documents : [];
+      if (!docs.length) return { fail: 'vision read the scan but found no document in it' };
+      const txt = (x) => x == null ? '' : String(x).trim();
+      const num = (x) => { if (x == null || x === '') return null; const n = Number(String(x).replace(/[$,\s]/g, '').replace(/^\((.*)\)$/, '-$1')); return isFinite(n) ? n : null; };
+      const mdy = (iso) => { const m = txt(iso).match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? Number(m[2]) + '/' + Number(m[3]) + '/' + m[1] : null; };
+      const isNG = (d) => /natural\s*grocers|vitamin\s*cottage/i.test(txt(d.issuer) + ' ' + txt(d.title) + ' ' + txt(d.customer_name));
+      const sumLines = (d) => (d.lines || []).reduce((n, l) => n + (num(l.amount) || 0), 0);
+      const ded = docs.find(d => d.kind === 'distributor_deduction_invoice' && txt(d.deduction_number));
+      const who = (d) => txt(d.issuer) || 'the distributor';
+
+      if (ded) {
+        const dn = txt(ded.deduction_number).replace(/\s+/g, '');
+        const amount = num(ded.amount), fee = num(ded.fee_amount), total = num(ded.stated_total);
+        if (amount == null || total == null) return { fail: 'vision read deduction ' + dn + ' but not both its Amount and its Total — nothing to tie' };
+        const custInv = txt(ded.customer_invoice_number);
+        const cust = txt(ded.customer_name) || null;
+        const rb = docs.find(d => d !== ded && d.kind === 'retailer_customer_invoice' && (!custInv || txt(d.document_number) === custInv)) || null;
+        let split = null;
+        if (rb) {
+          const pctM = (txt(rb.reference) + ' ' + txt(rb.title)).match(/(\d+(?:\.\d+)?)\s*%\s*FEE/i);
+          const rbTotal = num(rb.stated_total) != null ? num(rb.stated_total) : sumLines(rb);
+          if (pctM && Math.abs(rbTotal - amount) <= 0.02) {
+            const pct = Number(pctM[1]), original = r2(amount / (1 + pct / 100));
+            const nos = (txt(rb.debtor_reference) + ' ' + (rb.lines || []).map(l => txt(l.reference_no) + ' ' + txt(l.item_desc)).join(' '))
+              .match(/\b\d{10}\b/g) || [];
+            split = { pct, original, fee: r2(amount - original), rebillNo: txt(rb.document_number) || custInv,
+                      origNo: nos.find(n => n !== txt(rb.document_number)) || null,
+                      ref: txt(rb.reference), debtor: txt(rb.debtor_reference) };
+          }
+        }
+        const custU = cust ? cust.toUpperCase() : null;
+        const base = { upc: null, customer_name: custU, customer_no: null, ship_date: null, ship_qty: null,
+                       unit_cost: null, unit_chargeback: null, discount_pct: null };
+        const rows = [];
+        if (split) {
+          rows.push({ ...base, _principal: true, bill_amount: split.original,
+            item_desc: (cust || 'Retailer') + ' invoice ' + (split.origNo || '(original)') + ' — principal, re-billed as ' + split.rebillNo,
+            reference_no: split.origNo || split.rebillNo,
+            extra: { recompute_basis: 'document principal', reference_comment: 'Deduction invoice ' + dn + (split.debtor ? ' · ' + split.debtor : '') } });
+          rows.push({ ...base, bill_amount: split.fee,
+            item_desc: (cust || 'Retailer') + ' ' + split.pct + '% fee on re-bill ' + split.rebillNo,
+            reference_no: split.rebillNo,
+            extra: { recompute_basis: 'retailer fee as printed', reference_comment: 'Printed on ' + split.rebillNo + ': ' + split.ref,
+                     recomputed: r2(split.original * split.pct / 100), variance: r2(split.fee - r2(split.original * split.pct / 100)) } });
+        } else {
+          rows.push({ ...base, _principal: true, bill_amount: amount,
+            item_desc: (cust ? cust + ' ' : '') + 'deduction principal' + (custInv ? ' — invoice ' + custInv : ''),
+            reference_no: custInv || dn,
+            extra: { recompute_basis: 'document principal', reference_comment: 'Deduction invoice ' + dn } });
+        }
+        if (fee) rows.push({ ...base, bill_amount: fee,
+            item_desc: who(ded) + ' ' + (txt(ded.fee_label) || 'fee'), reference_no: dn,
+            extra: { recompute_basis: 'distributor fee as printed', reference_comment: txt(ded.fee_rule) || null } });
+        const lt = r2(rows.reduce((n, r) => n + r.bill_amount, 0));
+        const ties = Math.abs(amount + (fee || 0) - total) <= 0.02 && Math.abs(lt - total) <= 0.02;
+        return {
+          layout: 'deduction-invoice-scan', sheet: null, type: who(ded) + ' deduction invoice (scan)', rows, total: lt, stated: total, ties,
+          invoice_no: dn, ng: null, refs: [...new Set(rows.map(r => r.reference_no).filter(Boolean))], customer: cust,
+          period_from: null, period_to: null, bill_date: txt(ded.document_date) || null,
+          doc_no: split ? split.rebillNo : (custInv || null), doc_key: 'DEDINV:' + dn.toUpperCase(), vision: true,
+          note: 'Read by vision. Deduction ' + dn + ': ' + money2(amount) + (fee ? ' + ' + money2(fee) + ' ' + (txt(ded.fee_label) || 'fee') : '') + ' = ' + money2(total) + '.'
+              + (split ? ' ' + (cust || 'The retailer') + ' re-billed invoice ' + (split.origNo || '?') + ' as ' + split.rebillNo + ' with a printed ' + split.pct + '% fee: '
+                         + money2(split.original) + ' + ' + money2(split.fee) + '.' : rb ? ' The retailer invoice in the file does not print a fee percentage, so the amount is not split.' : '')
+              + (txt(ded.fee_rule) ? ' Fee rule as printed: “' + txt(ded.fee_rule) + '”.' : ''),
+          mismatches: ties ? [] : ['Amount ' + money2(amount) + (fee ? ' + fee ' + money2(fee) : '') + ' does not equal the printed Total ' + money2(total)],
+        };
+      }
+      if (docs.length > 1) return { fail: 'vision found ' + docs.length + ' separate documents in this scan and no deduction invoice tying them together — drop them as separate files' };
+      const d = docs[0];
+      if (d.kind === 'remittance') return { fail: 'vision read a remittance advice — those cover a whole check and load through the OCR pass (mode=ocr), not onto one line' };
+      const total = num(d.stated_total) != null ? num(d.stated_total) : null;
+      const lines = (d.lines || []).filter(l => num(l.amount) != null);
+      if (!lines.length) return { fail: 'vision read the scan (' + (txt(d.title) || d.kind) + ') but found no amounts in it' };
+      const rows = lines.map(l => ({
+        upc: txt(l.upc).replace(/\D/g, '') || null, item_desc: txt(l.item_desc) || txt(d.debtor_reference) || null,
+        reference_no: txt(l.reference_no) || txt(d.debtor_reference) || null, ship_date: mdy(l.ship_date),
+        customer_name: txt(l.customer_name) || txt(d.customer_name) || (isNG(d) ? 'NATURAL GROCERS' : null), customer_no: null,
+        ship_qty: num(l.qty), unit_cost: null, unit_chargeback: num(l.rate), discount_pct: null, bill_amount: num(l.amount),
+        extra: { reference_comment: 'Read by vision from ' + (txt(d.title) || d.kind) + (txt(d.document_number) ? ' ' + txt(d.document_number) : '') },
+      }));
+      const lt = r2(rows.reduce((n, r) => n + r.bill_amount, 0));
+      if (d.kind === 'retailer_customer_invoice' && isNG(d)) {
+        const refs = [...new Set(rows.map(r => r.reference_no).filter(Boolean))];
+        const w = refs.join(' ').match(/(\d{1,2}\/\d{1,2}\/\d{2,4})\s*-\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/);
+        return docOf({ head: { invoice_no: null, total, type: 'Natural Grocers invoice (scan)', dc: txt(d.reference),
+                               ng: { kind: 'invoice', doc_no: txt(d.document_number) || null, bill_date: txt(d.document_date) || null,
+                                     reference: txt(d.reference), debtor_refs: refs,
+                                     period_from: w ? _dedIsoDate(w[1]) : null, period_to: w ? _dedIsoDate(w[2]) : null } },
+                       rows, line_total: lt, ties: total != null && Math.abs(lt - total) <= 0.02,
+                       note: 'Read by vision: Natural Grocers invoice ' + txt(d.document_number) + '.' }, 'ng-invoice', null);
+      }
+      const p = { head: { invoice_no: txt(d.deduction_number) || (d.kind === 'chargeback_detail' ? txt(d.document_number) : '') || null,
+                          total, type: (txt(d.title) || d.kind) + ' (scan)' },
+                  rows, line_total: lt, ties: total != null && Math.abs(lt - total) <= 0.02,
+                  note: 'Read by vision: ' + (txt(d.issuer) ? txt(d.issuer) + ', ' : '') + (txt(d.title) || d.kind) + ', ' + rows.length + ' rows.' };
+      const out = docOf(p, 'vision-' + (d.kind || 'other'), null);
+      out.customer = txt(d.customer_name) || (isNG(d) ? 'Natural Grocers' : null);
+      out.vision = true;
+      return out;
     };
 
     // ── MATCH ───────────────────────────────────────────────────────────────
@@ -33322,6 +33461,22 @@ render();
     // d: { invoice_no, total, customer, period_from, bill_date, layout }, name: filename
     const findLine = async (d, name) => {
       const res = { line: null, how: null, candidates: [], note: '' };
+      // EXACT, FROM THE OTHER DIRECTION. A deduction invoice read into a line
+      // records the retailer invoice it collects as its principal row. A
+      // retailer document carrying that number belongs to that line -- no
+      // arithmetic involved.
+      const ownNo = d.doc_no ? String(d.doc_no).trim() : '';
+      if (ownNo && d.layout !== 'deduction-invoice-scan') {
+        try {
+          const { data: pr } = await sb.from('deduction_detail').select('line_id').eq('brand_id', brandId)
+            .eq('reference_no', ownNo).eq('recompute_basis', 'document principal').limit(5);
+          const ids = [...new Set((pr || []).map(x => String(x.line_id)))];
+          if (ids.length === 1) {
+            const { data: ln } = await sb.from('deduction_lines').select(LINE_COLS).eq('id', ids[0]).maybeSingle();
+            if (ln) { res.line = ln; res.how = 'its deduction invoice names invoice ' + ownNo; return res; }
+          }
+        } catch (x) { /* fall through to the other evidence */ }
+      }
       if (d.invoice_no) {
         const hits = await byRef(d.invoice_no);
         if (hits.length === 1) { res.line = hits[0]; res.how = 'invoice ' + d.invoice_no; return res; }
@@ -33432,7 +33587,7 @@ render();
       if (d.refs.length && d.rows.length) {
         try {
           const rb = await _dedRowsInBook(sb, brandId, d.rows, null);
-          if (rb.share >= 0.6) { e.block = Math.round(rb.share * 100) + '% of these rows (' + rb.count + ' of ' + d.rows.length + ') are already in Keel on ' + rb.inv + '. Importing again would count that money twice.'; return; }
+          if (rb.share >= 0.6) { e.dupInv = rb.inv; e.block = Math.round(rb.share * 100) + '% of these rows (' + rb.count + ' of ' + d.rows.length + ') are already in Keel on ' + rb.inv + '. Importing again would count that money twice.'; return; }
           if (rb.share >= 0.05) e.info.push(Math.round(rb.share * 100) + '% of these rows also appear on ' + rb.inv + ' — check this is a different document.');
           // An NG invoice whose itemised spreadsheet is already on a line adds nothing.
           if (d.layout === 'ng-invoice' && rb.perLine) {
@@ -33450,12 +33605,34 @@ render();
       e.over = false; e.lineBlock = null;
       let rows;
       try {
-        rows = await pageAll(() => sb.from('deduction_detail').select('id,upc,ship_qty,bill_amount,reference_no' + (registryOk ? ',document_id' : ''))
+        rows = await pageAll(() => sb.from('deduction_detail').select('id,upc,ship_qty,bill_amount,reference_no,recompute_basis' + (registryOk ? ',document_id' : ''))
           .eq('brand_id', brandId).eq('line_id', l.id).order('id'));
       } catch (err) { e.lineBlock = 'could not read what is already on the line: ' + (err.message || err); return; }
       let have = 0, removable = 0;
       const coverId = e.priorCover && e.priorCover.status === 'attached' && String(e.priorCover.line_id) === String(l.id) ? e.priorCover.id : null;
       for (const r of rows) { const a = Math.abs(Number(r.bill_amount) || 0); have += a; if (coverId != null && String(r.document_id) === String(coverId)) removable += a; }
+      // PRINCIPAL AND ITEMISATION ARE THE SAME MONEY, TWO WAYS. A deduction
+      // invoice read by vision states the principal as one row; the scanback
+      // or program billing behind it states the same money item by item.
+      //   · this document IS that itemisation and the line holds the principal
+      //     row: the row is replaced (removeIds), not counted beside it;
+      //   · this document CARRIES a principal row and the line already holds its
+      //     itemisation: only the fees are written (skipPrincipal).
+      // Both need the two figures to agree within two cents; otherwise the
+      // ordinary exceed check below decides.
+      e.removeIds = []; e.skipPrincipal = false;
+      const docPrincipal = docRows.filter(r => r._principal).reduce((n, r) => n + Math.abs(Number(r.bill_amount) || 0), 0);
+      const lineP = rows.filter(r => r.recompute_basis === 'document principal');
+      const linePAmt = lineP.reduce((n, r) => n + Math.abs(Number(r.bill_amount) || 0), 0);
+      if (!docPrincipal && lineP.length && Math.abs(linePAmt - total) <= 0.02) { removable += linePAmt; e.removeIds = lineP.map(r => r.id); }
+      if (docPrincipal) {
+        const itemised = rows.filter(r => !/as printed$|^document principal$/.test(String(r.recompute_basis || '')))
+          .reduce((n, r) => n + Math.abs(Number(r.bill_amount) || 0), 0);
+        if (itemised && Math.abs(itemised - docPrincipal) <= 0.02) e.skipPrincipal = true;
+      }
+      e.writeRows = e.skipPrincipal ? docRows.filter(r => !r._principal) : docRows;
+      e.writeTotal = r2(e.writeRows.reduce((n, r) => n + Math.abs(Number(r.bill_amount) || 0), 0));
+      total = e.writeTotal;
       if (rows.length && docRows.length) {
         const sigs = new Map();
         for (const r of rows) { const k = sigOf(r); sigs.set(k, (sigs.get(k) || 0) + 1); }
@@ -33530,11 +33707,38 @@ render();
     drop.ondrop = (ev) => { ev.preventDefault(); drop.style.background = 'transparent'; handle([...(ev.dataTransfer.files || [])]); };
     input.onchange = () => { handle([...(input.files || [])]); input.value = ''; };
 
+    const readScan = async (e) => {
+      e.status = 'reading'; e.note = 'a scan — reading it with vision (about 20–60 seconds)…'; paint();
+      try {
+        const body = await askVision(e);
+        const d = visionDoc(body.doc);
+        if (!d.fail) d.note = (d.note || '') + ' [' + (body.model || 'vision') + ', loader ' + (body.build || '?') + ']';
+        return d;
+      } catch (err) {
+        return { fail: 'scan could not be read with vision: ' + (err && err.message || String(err)) };
+      }
+    };
+    // A scan left unread (over the per-drop limit), read on request.
+    const readScanNow = async (e) => {
+      e.buf = null;
+      const d = await readScan(e);
+      if (d.fail) { e.status = 'fail'; e.note = d.fail; paint(); return; }
+      e.doc = d; e.note = '';
+      if (registryOk && d.doc_key) {
+        const reg = await _dedRegistryCheck(sb, brandId, '-', d.doc_key);
+        if (reg.hit) { e.status = 'blocked'; e.block = reg.hit; e.dupInv = reg.inv || null; paint(); return; }
+      }
+      e.status = 'matching'; paint();
+      try { await settle(e); } catch (err) { e.status = 'fail'; e.note = 'matching failed: ' + (err && err.message || String(err)); }
+      paint();
+    };
+
     async function handle(files) {
       const usable = files.filter(f => /\.(pdf|xlsx|xls|csv|txt)$/i.test(f.name));
       if (!usable.length) return;
       await loadLookups();
       const fresh = [];
+      let scansThisDrop = 0;
       // Phase 1: read every file. Pairing needs to see them all at once.
       for (const f of usable) {
         const e = { id: Math.random().toString(36).slice(2), file: f, status: 'reading', note: 'reading…', doc: null, line: null,
@@ -33544,18 +33748,33 @@ render();
           e.buf = await f.arrayBuffer();
           e.sha = await _dedSha256(e.buf);
           try { e.dbx = await _dedDropboxHash(e.buf); } catch (x) { e.dbx = null; }
-          // The same file twice in one drop never reaches the database check.
-          if (S().some(o => o !== e && o.sha === e.sha && o.status !== 'fail')) {
+          // The same file twice in one drop never reaches the database check --
+          // whatever happened to the first copy, including a failed read.
+          if (S().some(o => o !== e && o.sha === e.sha)) {
             e.status = 'blocked'; e.block = 'the same file is already in this list'; e.note = ''; paint(); continue;
           }
-          const d = await readFile(e);
+          // A FILE KEEL HAS SEEN is refused before it is read, so a known scan
+          // never costs a vision call.
+          if (registryOk) {
+            const reg0 = await _dedRegistryCheck(sb, brandId, e.sha, null);
+            if (reg0.hit) { e.status = 'blocked'; e.block = reg0.hit; e.dupInv = reg0.inv || null; e.note = ''; paint(); continue; }
+          }
+          let d = await readFile(e);
+          if (d.scan) {
+            if (scansThisDrop >= VISION_AUTO) {
+              e.status = 'scan'; e.note = 'a scan with no text layer — press Read with vision to read it (' + VISION_AUTO + ' are read automatically per drop).';
+              paint(); continue;
+            }
+            scansThisDrop++;
+            d = await readScan(e);
+          }
           if (d.fail) { e.status = 'fail'; e.note = d.fail; e.tried = d.tried || []; paint(); continue; }
           e.doc = d; e.note = '';
           // Seen before? Decided BEFORE pairing, so a file already imported can
           // never be paired with something new and look usable.
-          if (registryOk) {
-            const reg = await _dedRegistryCheck(sb, brandId, e.sha, d.doc_key);
-            if (reg.hit) { e.status = 'blocked'; e.block = reg.hit; paint(); continue; }
+          if (registryOk && d.doc_key) {
+            const reg = await _dedRegistryCheck(sb, brandId, '-', d.doc_key);
+            if (reg.hit) { e.status = 'blocked'; e.block = reg.hit; e.dupInv = reg.inv || null; paint(); continue; }
           }
           e.needsMatch = true;
         } catch (err) {
@@ -33585,6 +33804,7 @@ render();
       blocked: ['DUPLICATE', 'var(--lost)'], 'blocked-line': ['REFUSED', 'var(--lost)'], paired: ['PAIRED', 'var(--ink-3)'],
       choose: ['CHOOSE A LINE', AMBER], over: ['WOULD EXCEED', AMBER], ready: ['READY', 'var(--won)'], hold: ['WILL HOLD', AMBER],
       noreg: ['READ ONLY', 'var(--ink-3)'], done: ['IMPORTED', 'var(--won)'], held: ['HELD', AMBER],
+      scan: ['SCAN — NOT READ', AMBER],
     };
     function paint() {
       if (!listEl) return;
@@ -33615,16 +33835,20 @@ render();
               lineCell = `<span style="color:var(--won);">${lineTxt(e.line)}</span><div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-top:2px;">${esc(e.how || '')}</div>`;
             } else if (e.status === 'hold') {
               lineCell = '<span style="color:' + AMBER + ';">no deduction on the register yet</span>';
+            } else if (e.status === 'blocked' && e.dupInv) {
+              lineCell = '<span style="color:var(--lost);">already on ' + esc(e.dupInv) + '</span>';
             }
             const notes = [];
             if (e.note) notes.push(esc(e.note));
+            if (e.status === 'scan') notes.push(`<button class="hl-ded-vision" data-i="${i}" style="margin-top:4px;font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;">Read with vision</button>`);
+            if (e.skipPrincipal && e.line && ['ready', 'over'].includes(e.status)) notes.push('The principal is already itemised on this line, so only ' + money2(e.writeTotal) + ' of fees is added.');
             if (e.block) notes.push('<span style="color:var(--lost);">' + esc(e.block) + '</span>');
             if (e.lineBlock) notes.push('<span style="color:var(--lost);">' + esc(e.lineBlock) + '</span>');
             if (e.status === 'hold' && d) notes.push('Held with its ' + d.rows.length + ' rows, and offered its line when the register brings one in.'
               + (d.layout === 'ng-invoice' && d.bill_date ? ' NG billed it ' + d.bill_date + '; UNFI can deduct it from ' + new Date(new Date(d.bill_date + 'T00:00:00Z').getTime() + 60 * 86400000).toISOString().slice(0, 10) + ', with fees on top.' : ''));
             if (e.status === 'over' && e.existing) notes.push(`<label style="color:${AMBER};cursor:pointer;"><input type="checkbox" class="hl-ded-replace" data-i="${i}" ${e.replace ? 'checked' : ''} style="margin:0 5px 0 0;vertical-align:-2px;">The line already carries ${money2(e.existing.total)} of detail (${e.existing.n} rows); with this document it would exceed the ${money2(Math.abs(Number(e.line.amount)))} deduction. Tick to REPLACE what is there with this document.</label>`);
             if (e.status === 'ready' && e.line && e.existing && e.existing.n && e.action === 'attach') {
-              const gap = Math.abs(Number(e.line.amount)) - (e.existing.total - e.existing.removable + d.total);
+              const gap = Math.abs(Number(e.line.amount)) - (e.existing.total - e.existing.removable + (e.writeTotal != null ? e.writeTotal : d.total));
               notes.push('Adds to the ' + e.existing.n + ' rows already on the line' + (e.existing.removable ? ' (replacing its invoice’s single row)' : '') + '; ' + money2(gap) + ' of the deduction stays unitemised.');
             } else if (e.status === 'ready' && e.line && d && !d.mcb) {
               const gap = Math.abs(Number(e.line.amount)) - d.total;
@@ -33671,6 +33895,7 @@ render();
 
       listEl.querySelectorAll('.hl-ded-up-pick').forEach(cb => cb.onchange = () => { S()[Number(cb.dataset.i)].chosen = cb.checked; paint(); });
       listEl.querySelectorAll('.hl-ded-replace').forEach(cb => cb.onchange = () => { const e = S()[Number(cb.dataset.i)]; e.replace = cb.checked; e.chosen = cb.checked; paint(); });
+      listEl.querySelectorAll('.hl-ded-vision').forEach(b => b.onclick = () => { b.disabled = true; readScanNow(S()[Number(b.dataset.i)]); });
       listEl.querySelectorAll('.hl-ded-open').forEach(a => a.onclick = (ev) => { ev.preventDefault(); const e = S()[Number(a.dataset.i)]; e.open = !e.open; paint(); });
       listEl.querySelectorAll('.hl-ded-pick-line').forEach(sel => sel.onchange = async () => {
         const e = S()[Number(sel.dataset.i)];
@@ -33738,6 +33963,14 @@ render();
         const { error } = await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', line.id).eq('document_id', opts.removeDoc);
         if (error) throw new Error('removing the invoice row being replaced: ' + error.message);
       }
+      // A deduction invoice's single principal row, replaced by the itemisation.
+      if (!opts.replaceAll && opts.removeIds && opts.removeIds.length) {
+        for (let k = 0; k < opts.removeIds.length; k += 200) {
+          const { error } = await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', line.id)
+            .in('id', opts.removeIds.slice(k, k + 200));
+          if (error) throw new Error('removing the principal row being replaced: ' + error.message);
+        }
+      }
     };
     const loadBannerMap = async () => {
       const bmap = new Map();
@@ -33757,9 +33990,13 @@ render();
       const docId = await insertRegistry(registryRow(e, { status: 'attached', line_id: l.id, attached_at: new Date().toISOString() }));
       try {
         const removeDoc = e.priorCover && e.priorCover.status === 'attached' && String(e.priorCover.line_id) === String(l.id) ? e.priorCover.id : null;
-        await writeRows(docId, l, d.rows, bmap, { replaceAll: !!e.replace, removeDoc });
+        // Replacing everything writes the whole document; otherwise only what the
+        // line guard decided (a principal already itemised is not written twice).
+        const toWrite = e.replace ? d.rows : (e.writeRows || d.rows);
+        const toTotal = e.replace ? d.total : (e.writeTotal != null ? e.writeTotal : d.total);
+        await writeRows(docId, l, toWrite, bmap, { replaceAll: !!e.replace, removeDoc, removeIds: e.removeIds });
         const kept = e.replace ? 0 : (e.existing ? e.existing.total - e.existing.removable : 0);
-        await stampLine(l.id, kept + d.total, amt);
+        await stampLine(l.id, kept + toTotal, amt);
       } catch (err) {
         await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('document_id', docId);
         await sb.from('deduction_documents').delete().eq('id', docId);
@@ -33944,9 +34181,12 @@ render();
             if (ce) throw new Error(ce.message);
             if (!claimed || !claimed.length) throw new Error('someone else attached or discarded this document a moment ago');
             try {
-              await writeRows(w.rec.id, l, rows, bmap, { replaceAll: !!(shim.over && w.replace) });
-              const kept = shim.over && w.replace ? 0 : shim.existing.total;
-              await stampLine(l.id, kept + Number(w.rec.amount), Math.abs(Number(l.amount)));
+              const repl = !!(shim.over && w.replace);
+              const toWrite = repl ? rows : (shim.writeRows || rows);
+              const toTotal = repl ? Number(w.rec.amount) : (shim.writeTotal != null ? shim.writeTotal : Number(w.rec.amount));
+              await writeRows(w.rec.id, l, toWrite, bmap, { replaceAll: repl, removeIds: shim.removeIds });
+              const kept = repl ? 0 : shim.existing.total - shim.existing.removable;
+              await stampLine(l.id, kept + toTotal, Math.abs(Number(l.amount)));
             } catch (err) {
               await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('document_id', w.rec.id);
               await sb.from('deduction_documents').update({ status: 'waiting', line_id: null, attached_at: null }).eq('id', w.rec.id);
