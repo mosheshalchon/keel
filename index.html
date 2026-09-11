@@ -29327,7 +29327,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-22 filters';
+  const _DED_BUILD = 'tr-23 bulk-upload';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31858,6 +31858,110 @@ render();
   //
   // Event_ID is the promo number and goes in reference_no -- it is the same
   // 8-digit value the register already shows beside these lines.
+  // ── UNFI MCB WEEKLY, FROM THE CELL STREAM ────────────────────────────────
+  // The same parser the loader runs, ported so a report dropped here reads the
+  // same way the crawler reads it. Every cell in this document is its own
+  // Td/Tj operator, so the text arrives ONE VALUE PER LINE and no row-shaped
+  // regex can match it; rows are rebuilt positionally instead.
+  //
+  // THIS DOCUMENT FEEDS SEVERAL REGISTER LINES -- one per category -- which is
+  // why the caller handles it separately from every other layout here.
+  //
+  // Verified on MCB20260214VTBR: 811 rows, $25,227.61, tying to the report's own
+  // stated Total Deduction, all six categories matching page 1.
+  function _dedParseMcbCells(text) {
+  const raw = String(text || '').split('\n').map(s => s.trim()).filter(Boolean);
+
+  // Page furniture repeats mid-row: the report breaks pages between a row's
+  // cells, so these cannot be dropped by line position -- only by shape.
+  const NOISE = [
+    /^Page \d+ of \d+$/i, /^\d{1,2}\/\d{1,2}\/\d{4} \d{1,2}:\d{2}:\d{2} [AP]M$/i,
+    /^Week ending :?$/i, /^\d{2}\/\d{2}\/\d{4}$/, /^\d{5} AGAINST THE GRAIN/i,
+    /^(Brand|Product|Unit|Description|Invoice|Ordered|Shipped|Whlse|WholeSale|MCB%|Total Discount ?%|TotalMCB)$/i,
+    /^\*\*\*/, /^Division:? ?\d*$/i, /Summary\*\*\*$/i,
+  ];
+  const noise = (s) => NOISE.some(rx => rx.test(s));
+  const N = (s) => { const n = Number(String(s).replace(/[$,%]/g, '')); return isFinite(n) ? n : null; };
+  const isMoney = (s) => /^\$?-?[\d,]+\.\d{2}$/.test(s);
+  const isPct = (s) => /^-?[\d.]+%$/.test(s);
+  const isInt = (s) => /^\d+$/.test(s);
+
+  const rows = [];
+  let cat = null, national = false, cust = null, stated = null, invoice = null, weekEnd = null;
+
+  for (let i = 0; i < raw.length; i++) {
+    const l = raw[i];
+
+    if (!invoice) { const m = l.match(/^Invoice #\s*(MCB\d{8})/i); if (m) invoice = m[1]; }
+    if (!weekEnd && /^\d{2}\/\d{2}\/\d{4}$/.test(l) && /week ending/i.test(raw[i - 1] || '')) weekEnd = l;
+    if (stated == null && /^Total Deduction/i.test(l)) {
+      for (let k = i; k < Math.min(i + 4, raw.length); k++) if (isMoney(raw[k])) { stated = Math.abs(N(raw[k])); break; }
+    }
+
+    // 'Category: P ...' introduces the NATIONAL block (no customer);
+    // 'Category C - ...' introduces a customer-attributed block.
+    let m = l.match(/^Category:\s*([A-Z])\b/);
+    if (m) { cat = m[1]; national = true; cust = null; continue; }
+    m = l.match(/^Category\s*:?\s*([A-Z])\s*[-\u2013]/);
+    if (m) { cat = m[1]; national = false; cust = null; continue; }
+    if (/^Category\s*:?[A-Z]?.*Total$/i.test(l)) { cust = null; continue; }
+
+    m = l.match(/^Customer\s*:\s*\[([^\]]+)\]\s*-?\s*(.+?)\s*\(([A-Z]+)\)\s*(.*)$/i);
+    if (m) {
+      const tail = m[4] || '';
+      const st = (tail.match(/,\s*([A-Z]{2})\s*$/) || [])[1] || null;
+      cust = { no: m[1], name: m[2].trim(), banner: m[3], city: tail.replace(/,\s*[A-Z]{2}\s*$/, '').trim() || null, state: st };
+      continue;
+    }
+    if (/^Customer Totals/i.test(l)) { cust = null; continue; }
+
+    // A row starts at the brand token. Cells are then taken in order, stepping
+    // over any page furniture that fell between them.
+    if (!/^[@#]\S+/.test(l) || !cat) continue;
+    const cells = [];
+    let j = i + 1;
+    const need = national ? 8 : 10;
+    while (j < raw.length && cells.length < need) {
+      if (noise(raw[j])) { j++; continue; }
+      if (/^(Customer|Category)\b/i.test(raw[j])) break;   // row ended early
+      cells.push(raw[j]); j++;
+    }
+    if (cells.length < need) { i = j - 1; continue; }
+
+    if (national) {
+      // product, pack, description, shipped, wholesale, discount%, mcb%, $total
+      const [prod, pack, desc, shipped, whls, disc, mcb, tot] = cells;
+      if (!isMoney(tot) || !isPct(mcb)) { i = j - 1; continue; }
+      const amt = Math.abs(N(tot));
+      const qty = N(shipped), price = N(whls), pct = N(mcb);
+      const rec = qty != null && price != null && pct != null ? Math.round(qty * price * (pct / 100) * 100) / 100 : null;
+      rows.push({ cat, national: true, brand: l, item: prod, pack, item_desc: desc,
+        customer_no: null, customer_name: null, banner: null, customer_state: null,
+        reference_no: null, ship_qty: qty, unit_cost: price, discount_pct: pct,
+        amt, bill_amount: amt, recomputed: rec, recompute_basis: rec == null ? null : 'shipped x wholesale x MCB%',
+        variance: rec == null ? null : Math.round((amt - rec) * 100) / 100 });
+    } else {
+      // product, pack, description, invoice, ordered, shipped, whlse, discount%, mcb%, total
+      const [prod, pack, desc, inv, ordered, shipped, whls, disc, mcb, tot] = cells;
+      if (!isMoney(tot) || !isPct(mcb) || !isInt(shipped)) { i = j - 1; continue; }
+      const amt = Math.abs(N(tot));
+      const qty = N(shipped), price = N(whls), pct = N(mcb);
+      const rec = qty != null && price != null && pct != null ? Math.round(qty * price * (pct / 100) * 100) / 100 : null;
+      rows.push({ cat, national: false, brand: l, item: prod, pack, item_desc: desc,
+        customer_no: cust ? cust.no : null, customer_name: cust ? cust.name : null,
+        banner: cust ? cust.banner : null, customer_state: cust ? cust.state : null,
+        reference_no: inv, ship_qty: qty, unit_cost: price, discount_pct: pct,
+        amt, bill_amount: amt, recomputed: rec, recompute_basis: rec == null ? null : 'shipped x wholesale x MCB%',
+        variance: rec == null ? null : Math.round((amt - rec) * 100) / 100 });
+    }
+    i = j - 1;
+  }
+
+  if (!rows.length) return { error: 'no MCB rows found in cell stream' };
+  const sum = Math.round(rows.reduce((n, r) => n + r.amt, 0) * 100) / 100;
+  return { detail: rows, invoice, weekEnd, stated, sum };
+  }
+
   function _dedParseWfmScan(rows) {
     const norm = (t) => String(t == null ? '' : t).trim().toLowerCase().replace(/[^a-z0-9]/g, '');
     let h = -1, C = null;
@@ -32323,7 +32427,17 @@ render();
             const grid = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],
                                                   { header: 1, defval: '', raw: false });
             const rows = grid.map(r => (r || []).map(c => String(c == null ? '' : c)));
-            p = _dedParseNgScanback(rows);
+            // EVERY SPREADSHEET LAYOUT, not just the scanback. The UNFI ASM
+            // and Whole Foods scan layouts were added to the per-line FILE
+            // dialog and never here, so dropping one of those on this tab
+            // reported "no layout recognised" for a file the app can read
+            // perfectly well two clicks away.
+            p = null;
+            for (const fn of [_dedParseNgScanback, _dedParseUnfiAsm, _dedParseWfmScan]) {
+              let r0 = null;
+              try { r0 = fn(rows); } catch (e) { continue; }
+              if (r0 && r0.rows && r0.rows.length) { p = r0; break; }
+            }
             if (!p || p.error) {
               // Name the columns rather than the failure. "Layout not
               // recognised" is true and useless; the header row is what lets
@@ -32349,6 +32463,17 @@ render();
             // Charge layout used to be refused here and pointed at mode=detail
             // -- which cannot read it, because those documents are scans. It
             // parses perfectly when the text is there.
+            // The UNFI MCB weekly report is tried FIRST and separately: it is
+            // the one document here that feeds SEVERAL register lines, one per
+            // category, so it cannot go through the single-line path below.
+            const mcb = (() => { try { return _dedParseMcbCells(text); } catch (e) { return null; } })();
+            if (mcb && mcb.detail && mcb.detail.length && mcb.invoice) {
+              entry.mcb = mcb;
+              entry.status = 'ready';
+              entry.note = 'UNFI MCB weekly ' + mcb.invoice + ' \u2014 ' + mcb.detail.length.toLocaleString()
+                         + ' rows, ' + money(mcb.sum) + ', ' + new Set(mcb.detail.map(d => d.cat)).size + ' categories';
+              paint(); continue;
+            }
             for (const fn of [_dedParseDistCharge, _dedParseKsolve]) {
               let r = null;
               try { r = fn(text); } catch (e) { continue; }
@@ -32515,9 +32640,73 @@ render();
         for (const b of (data || [])) if (b.banner) bmap.set(b.banner_raw, b.banner);
       } catch (e) { /* an unmapped banner is survivable; a failed import is not */ }
 
+      // ── A REPORT THAT FEEDS SEVERAL LINES ────────────────────────────────
+      // The UNFI MCB weekly is the only document here that is not one file to
+      // one line: it carries up to six categories and the register holds one
+      // line per category, written as MCB20260214-P. Each category is imported
+      // against its OWN line with its OWN tie-out, so a category whose rows
+      // disagree with the register is skipped while the others still land --
+      // the alternative is one bad category blocking a whole report.
+      const importMcb = async (e) => {
+        const cats = new Map();
+        for (const d of e.mcb.detail) {
+          if (!cats.has(d.cat)) cats.set(d.cat, []);
+          cats.get(d.cat).push(d);
+        }
+        const { data: lns } = await sb.from('deduction_lines')
+          .select('id,invoice_no,amount,detail_parsed')
+          .eq('brand_id', brandId).like('invoice_no', e.mcb.invoice + '-%');
+        if (!lns || !lns.length) { e.status = 'fail'; e.note = 'no register lines for ' + e.mcb.invoice + ' \u2014 the totals page has not been read yet'; return false; }
+        let wrote = 0, skipped = [];
+        for (const l of lns) {
+          const cat = String(l.invoice_no).split('-').pop().toUpperCase().slice(0, 1);
+          const rows = cats.get(cat) || [];
+          if (!rows.length) { skipped.push(cat + ': no rows'); continue; }
+          const sum = Math.round(rows.reduce((n, d) => n + Math.abs(d.amt), 0) * 100) / 100;
+          const want = Math.round(Math.abs(Number(l.amount) || 0) * 100) / 100;
+          if (Math.abs(sum - want) > 0.02) { skipped.push(cat + ': ' + money(sum) + ' vs ' + money(want)); continue; }
+          // Replaced, not appended, so importing the same report twice leaves
+          // the same rows -- the guarantee the rest of this tab already makes.
+          await sb.from('deduction_detail').delete().eq('brand_id', brandId).eq('line_id', l.id);
+          const det = rows.map(d => ({
+            brand_id: brandId, line_id: l.id,
+            upc: null, item_no: d.item, item_desc: d.item_desc,
+            customer_no: d.customer_no, customer_name: d.customer_name,
+            banner: bmap.get(d.customer_name) || d.banner || null,
+            customer_state: d.customer_state, dc: null,
+            reference_no: d.reference_no, reference_date: null,
+            reference_comment: 'Category ' + cat + (d.national ? ' (national)' : ''),
+            ship_qty: d.ship_qty, unit_cost: d.unit_cost,
+            unit_chargeback: null, discount_pct: d.discount_pct,
+            date_from: null, date_to: null,
+            bill_amount: Math.abs(d.amt),
+            recomputed: d.recomputed, recompute_basis: d.recompute_basis,
+            variance: d.variance, is_credit: false,
+          }));
+          for (let k = 0; k < det.length; k += 500)
+            await sb.from('deduction_detail').insert(det.slice(k, k + 500));
+          const _s = (window.Auth && window.Auth.getSession && window.Auth.getSession()) || {};
+          await sb.from('deduction_lines').update({
+            detail_parsed: true, detail_line_total: sum,
+            detail_variance: Math.round((want - sum) * 100) / 100,
+            backup_by: _s.name || _s.email || null, backup_by_email: _s.email || null,
+            backup_at: new Date().toISOString(),
+          }).eq('id', l.id);
+          wrote++;
+        }
+        e.status = wrote ? 'ready' : 'fail';
+        e.note = wrote + ' of ' + lns.length + ' categories imported'
+               + (skipped.length ? ' \u2014 skipped ' + skipped.join(', ') : '');
+        return wrote > 0;
+      };
+
       let ok = 0, failed = 0;
       for (const e of _dedUploadState) {
+        // The selection test comes FIRST. Put the other way round, an MCB
+        // report left unticked imported anyway -- the checkbox would have been
+        // decoration on exactly the document that writes to six lines at once.
         if (!e.chosen || (e.status !== 'ready' && e.status !== 'dupe')) continue;
+        if (e.mcb) { (await importMcb(e)) ? ok++ : failed++; paint(); continue; }
         try {
           // DELETE FIRST. This is what makes the import idempotent rather than
           // trusting detail_parsed — re-importing the same file replaces its
