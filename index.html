@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-37 scans';
+  const _DED_BUILD = 'tr-38 loader layouts';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31604,7 +31604,13 @@ render();
       // read '$.45' off every row and then threw it away meant the deduction
       // could never be recognised as the thing it plainly is.
       unit_chargeback: isFinite(r.unit_chargeback) ? r.unit_chargeback : null,
-      bill_amount: Math.abs(r.bill_amount),
+      // A CREDIT INSIDE A DOCUMENT stays a credit. KeHE's invoice adjustment
+      // charges the short units and credits back 2% of them; written as two
+      // positives the rows would claim more than the document deducts. Only
+      // rows a parser marks is_credit are signed -- every older parser leaves
+      // it unset and writes exactly as before.
+      bill_amount: r.is_credit === true ? -Math.abs(r.bill_amount) : Math.abs(r.bill_amount),
+      ...(r.is_credit === true ? { is_credit: true } : {}),
       // OPTIONAL COLUMNS A LAYOUT CAN STATE, passed through only when the
       // parser supplies them (row.extra). Every older parser omits `extra`, so
       // its rows are written exactly as before. Whitelisted to columns the MCB
@@ -31616,7 +31622,7 @@ render();
   function _dedDetailExtra(x) {
     const o = {};
     for (const k of ['item_no', 'dc', 'customer_state', 'reference_comment', 'date_from', 'date_to',
-                     'recomputed', 'recompute_basis', 'variance'])
+                     'recomputed', 'recompute_basis', 'variance', 'unit_cost'])
       if (x[k] !== undefined) o[k] = x[k];
     return o;
   }
@@ -33074,7 +33080,7 @@ render();
 
   // Has this file, or this document in another file, been recorded before?
   // { missing: true } when the registry table does not exist yet.
-  async function _dedRegistryCheck(sb, brandId, sha, key) {
+  async function _dedRegistryCheck(sb, brandId, sha, key, dbx) {
     const cols = 'id,status,file_name,line_id,uploaded_by,uploaded_at';
     const { data: a, error } = await sb.from('deduction_documents').select(cols).eq('brand_id', brandId).eq('file_sha256', sha).limit(1);
     if (error) return { missing: true };
@@ -33082,6 +33088,25 @@ render();
     if (!r && key) {
       const { data: b } = await sb.from('deduction_documents').select(cols).eq('brand_id', brandId).eq('doc_key', key).limit(1);
       r = b && b[0]; how = 'The same document';
+    }
+    // THE NIGHTLY LOADER'S FILES, known by their Dropbox content hash (the drop
+    // zone computes the same hash for every dropped file). select('*') so a
+    // registry that predates the source column still answers. A loader record
+    // only refuses the file while its line still shows backup -- a line whose
+    // rows have since been removed must be able to take them again.
+    if (!r && dbx) {
+      const { data: c } = await sb.from('deduction_documents').select('*').eq('brand_id', brandId).eq('dropbox_hash', dbx).limit(5);
+      for (const x of (c || [])) {
+        if (x.source !== 'loader') { r = x; how = 'This exact file'; break; }
+        if (x.line_id == null) continue;
+        let ln = null;
+        try { ({ data: ln } = await sb.from('deduction_lines').select('invoice_no,detail_parsed').eq('id', x.line_id).maybeSingle()); } catch (e) { ln = null; }
+        if (ln && ln.detail_parsed) {
+          return { inv: ln.invoice_no || ('line ' + x.line_id),
+                   hit: 'The nightly loader already read this file from Dropbox' + (x.note ? ' (' + x.note + ')' : '')
+                      + ' — its rows are on ' + (ln.invoice_no || 'line ' + x.line_id) + '.' };
+        }
+      }
     }
     if (!r) return {};
     let where = r.status === 'waiting' ? 'it is waiting for its deduction on the Upload tab'
@@ -33106,6 +33131,11 @@ render();
     const dt = (s) => s ? String(s).slice(0, 10) : '';
     const S = () => _dedUploadState;
     const LINE_COLS = 'id,invoice_no,amount,doc_date,reason_code,dc_name,detail_parsed,detail_line_total';
+    // Signed where a parser marked a credit; every other row is a charge.
+    const amtOf = (r) => (r && r.is_credit === true ? -1 : 1) * Math.abs(Number(r && r.bill_amount) || 0);
+    // Files with no stated total (Kroger promo lines, UNFI feeds) prove
+    // themselves against the register line instead: their rows must equal it.
+    const TIE_TO_LINE = /^(kroger-promo|unfi-feed-)/;
     const AMBER = '#8a6d1f';
 
     body.innerHTML = `
@@ -33118,6 +33148,7 @@ render();
           <strong>Nothing is written until you press Import.</strong> A file or document Keel has seen before, or rows
           already in the book, cannot be imported again. A document whose deduction has not reached the register yet is
           <strong>held</strong> and offered its line when it arrives — no register line is ever created from a document.
+          Payment registers and check exports are recognised, with whether Keel already has each check, and never loaded here.
         </p>
         <div id="hl-ded-reg" style="margin-bottom:12px;"></div>
         <div id="hl-ded-drop" style="border:1.5px dashed var(--rule);border-radius:8px;padding:26px 18px;text-align:center;cursor:pointer;background:transparent;transition:background .15s;">
@@ -33198,7 +33229,7 @@ render();
         const p = prodOf(r.upc);
         const key = p ? (p.group || 'No product line set') : 'Not matched to a product';
         if (!g.has(key)) g.set(key, { key, rows: 0, amt: 0, units: 0, amtU: 0, pctW: 0, amtP: 0, items: new Set(), matched: !!p });
-        const o = g.get(key), a = Math.abs(Number(r.bill_amount) || 0), q = Number(r.ship_qty);
+        const o = g.get(key), a = amtOf(r), q = Number(r.ship_qty);
         o.rows++; o.amt += a;
         if (isFinite(q) && q) { o.units += q; o.amtU += a; }
         else if (r.discount_pct != null && isFinite(Number(r.discount_pct))) { o.pctW += Number(r.discount_pct) * a; o.amtP += a; }
@@ -33242,6 +33273,100 @@ render();
       d.doc_key = _dedDocKeyOf(layout, h, rows, d.total);   // null: identified by its file hash alone
       return d;
     };
+    // ── THE NIGHTLY LOADER'S LAYOUTS ────────────────────────────────────────
+    // Everything the Dropbox passes can read and this page has no reader of its
+    // own for -- KeHE detail workbooks, invoice adjustments, vendor chargebacks,
+    // the United / HEB / Freight K-Solve invoices, UNFI WE / CMQ / ISE /
+    // scanback files, Kroger portal PDFs and promo lines -- is read by POSTing
+    // the file to sync-deductions mode=parse. Same parsers as the loader, so a
+    // document reads the same way on upload as it does at night. Writes nothing.
+    // Payment registers are recognised there and never loaded.
+    const loaderParse = async (e) => {
+      const { data: sd } = await sb.auth.getSession();
+      const session = sd && sd.session;
+      if (!session) return { error: 'sign in again to read this file' };
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 120000);
+      try {
+        const r = await fetch(sb.supabaseUrl + '/functions/v1/sync-deductions?mode=parse', {
+          method: 'POST', signal: ctl.signal, body: e.buf || await e.file.arrayBuffer(),
+          headers: { Authorization: 'Bearer ' + session.access_token, 'content-type': 'application/octet-stream',
+                     'x-filename': encodeURIComponent(e.file.name) },
+        });
+        const body = await r.json().catch(() => ({ ok: false, error: 'the loader did not answer with JSON (HTTP ' + r.status + ') — is build parse-1 deployed?' }));
+        if (!body.ok) return { error: body.error || 'the loader could not read it' };
+        return body;
+      } catch (err) {
+        return { error: err && err.name === 'AbortError' ? 'the loader did not answer within 120s' : String(err && err.message || err) };
+      } finally { clearTimeout(timer); }
+    };
+    // A loader document, in the shape every reader on this page produces. Rows
+    // come back as deduction_detail rows; the sign is normalised so the charges
+    // are positive and anything running the other way is marked a credit.
+    const loaderDoc = (ld, fileName) => {
+      const raw = (ld.rows || []).filter(x => x && isFinite(Number(x.bill_amount)));
+      const pos = raw.reduce((n, x) => n + Math.max(0, Number(x.bill_amount)), 0);
+      const neg = raw.reduce((n, x) => n + Math.max(0, -Number(x.bill_amount)), 0);
+      const chargeSign = pos >= neg ? 1 : -1;
+      const isoMdy = (v) => { const m = String(v || '').match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? Number(m[2]) + '/' + Number(m[3]) + '/' + m[1] : null; };
+      const rows = raw.map(x => {
+        const b = Number(x.bill_amount);
+        const credit = b !== 0 && Math.sign(b) !== chargeSign;
+        return {
+          upc: x.upc ? String(x.upc).replace(/\D/g, '') || null : null,
+          item_desc: x.item_desc || null,
+          customer_name: x.customer_name || x.banner || ld.customer || null,
+          banner: x.banner || null,
+          customer_no: x.customer_no || null,
+          reference_no: x.reference_no != null ? String(x.reference_no) : null,
+          ship_date: isoMdy(x.reference_date),
+          ship_qty: x.ship_qty == null || x.ship_qty === '' ? null : Number(x.ship_qty),
+          unit_chargeback: x.unit_chargeback == null ? null : Number(x.unit_chargeback),
+          discount_pct: x.discount_pct == null ? null : Number(x.discount_pct),
+          bill_amount: Math.abs(b),
+          ...(credit ? { is_credit: true } : {}),
+          extra: { item_no: x.item_no || undefined, dc: x.dc || undefined, customer_state: x.customer_state || undefined,
+                   reference_comment: x.reference_comment || undefined, date_from: x.date_from || undefined, date_to: x.date_to || undefined,
+                   recomputed: x.recomputed == null ? undefined : x.recomputed, recompute_basis: x.recompute_basis || undefined,
+                   variance: x.variance == null ? undefined : x.variance, unit_cost: x.unit_cost == null ? undefined : x.unit_cost },
+        };
+      });
+      const total = r2(rows.reduce((n, x) => n + amtOf(x), 0));
+      const refs = [...new Set(rows.map(x => x.reference_no).filter(Boolean))];
+      const d = {
+        layout: ld.layout, sheet: null, type: ld.type, rows, total, stated: ld.stated, ties: !!ld.ties, tieToLine: !!ld.tie_to_line,
+        invoice_no: ld.invoice_no ? String(ld.invoice_no).trim() : null, ng: null, refs, customer: ld.customer || null,
+        period_from: ld.period_from || null, period_to: ld.period_to || null, bill_date: null, doc_no: null,
+        note: [ld.note, 'Read by the nightly loader\'s parser.'].filter(Boolean).join(' '),
+        mismatches: ld.mismatches ? [ld.mismatches + ' row' + (ld.mismatches === 1 ? '' : 's') + ' do not recompute'] : [],
+        fee: ld.fee || null,
+      };
+      d.doc_key = _dedDocKeyOf(d.layout, { invoice_no: d.invoice_no }, rows, total);
+      return d;
+    };
+    // What mode=parse said, as a readFile result: a document, several (one per
+    // invoice), a register or a document with nothing to attach, or a reason.
+    const fromLoader = (body, fileName) => {
+      if (body.error) return { tried: ['nightly loader: ' + body.error] };
+      if (body.kind === 'scan') return { scan: true };
+      if (body.kind === 'register' && body.register) {
+        const g = body.register, ch = g.checks || [];
+        const known = ch.filter(c => c.in_keel), unknown = ch.filter(c => !c.in_keel);
+        const fmt = (c) => c.check_no + (c.check_date ? ' (' + c.check_date + ')' : '') + ': ' + c.deductions + ' deduction' + (c.deductions === 1 ? '' : 's') + ' ' + money2(c.deduction_total)
+          + (c.in_keel ? ' — in Keel, ' + c.in_keel.lines + ' lines' : ' — NOT in Keel yet');
+        return { register: true, note: g.type + ' with ' + ch.length + ' check' + (ch.length === 1 ? '' : 's') + '. '
+          + (unknown.length ? unknown.length + ' not in Keel yet — the nightly loader brings them in once the file is in Dropbox. ' : 'Keel already has every one. ')
+          + 'Registers are never loaded from here. ' + ch.slice(0, 6).map(fmt).join(' · ') + (ch.length > 6 ? ' · …' : '') };
+      }
+      if (body.kind === 'own-invoice') return { notdoc: true, note: body.note || 'no deduction detail in this document' };
+      if (body.kind === 'documents' && body.documents && body.documents.length) {
+        const docs = body.documents.map(ld => loaderDoc(ld, fileName)).filter(d => d.rows.length);
+        if (!docs.length) return { tried: ['nightly loader: the document has no rows'] };
+        return docs.length === 1 ? docs[0] : { multi: docs };
+      }
+      return { tried: (body.tried || []).map(t => 'nightly loader — ' + t) };
+    };
+
     const readFile = async (e) => {
       const f = e.file, buf = e.buf;
       if (/\.(xlsx|xls|csv|txt)$/i.test(f.name)) {
@@ -33260,6 +33385,10 @@ render();
             tried.push(nm + (fmt.length > 1 ? ' [' + sh.name + ']' : '') + ': ' + ((p && p.error) || 'no rows'));
           }
         }
+        // The nightly loader's spreadsheet layouts, and the registers.
+        { const lp = fromLoader(await loaderParse(e), f.name);
+          if (!lp.tried) return lp;
+          tried.push(...lp.tried); }
         // The general reader last, so a known document keeps its known reading.
         for (const sh of fmt) {
           let p = null; try { p = _dedParseGrid(sh.rows); } catch (x) { p = null; }
@@ -33274,7 +33403,14 @@ render();
         return { fail: 'no layout recognised — widest header: ' + heads.join(' · '), tried };
       }
       const text = await _dedPdfText(buf, (n) => { e.note = 'reading… ' + n + ' streams'; paint(); });
-      if (text.replace(/\s+/g, '').length < 40) return { scan: true };
+      // NO TEXT HERE IS NOT YET A SCAN. Kroger's portal PDFs use a shifted
+      // subset font this page's extractor cannot decode and the loader's can;
+      // asking the loader first costs a second, where a vision read costs a call.
+      if (text.replace(/\s+/g, '').length < 40) {
+        const lp = fromLoader(await loaderParse(e), f.name);
+        if (!lp.tried && !lp.scan) return lp;
+        return { scan: true };
+      }
       const mcb = (() => { try { return _dedParseMcbCells(text); } catch (x) { return null; } })();
       if (mcb && mcb.detail && mcb.detail.length && mcb.invoice) {
         const um = itemMaps.get('UNFI');
@@ -33293,6 +33429,9 @@ render();
         tried.push(nm + ': rows ' + money2(p.line_total) + ' vs stated ' + (p.head && p.head.total != null ? money2(p.head.total) : 'none'));
         if (!near) near = docOf(p, lay, null);
       }
+      { const lp = fromLoader(await loaderParse(e), f.name);
+        if (!lp.tried && !lp.scan) return lp;
+        if (lp.tried) tried.push(...lp.tried); }
       if (near) return near;
       return { fail: 'read the file but no layout fitted — head: ' + text.replace(/\s+/g, ' ').slice(0, 90), tried };
     };
@@ -33631,8 +33770,13 @@ render();
         if (itemised && Math.abs(itemised - docPrincipal) <= 0.02) e.skipPrincipal = true;
       }
       e.writeRows = e.skipPrincipal ? docRows.filter(r => !r._principal) : docRows;
-      e.writeTotal = r2(e.writeRows.reduce((n, r) => n + Math.abs(Number(r.bill_amount) || 0), 0));
+      e.writeTotal = r2(e.writeRows.reduce((n, r) => n + amtOf(r), 0));
       total = e.writeTotal;
+      // No stated total in the file: the register line is the only check there is.
+      if (e.doc && (e.doc.tieToLine || TIE_TO_LINE.test(String(e.doc.layout || ''))) && Math.abs(r2(total) - amt) > 0.02) {
+        e.lineBlock = 'this file states no total of its own, so its rows must equal the deduction — they sum to ' + money2(total) + ' against ' + money2(amt) + ' on ' + (l.invoice_no || 'the line') + '.';
+        return;
+      }
       if (rows.length && docRows.length) {
         const sigs = new Map();
         for (const r of rows) { const k = sigOf(r); sigs.set(k, (sigs.get(k) || 0) + 1); }
@@ -33671,7 +33815,7 @@ render();
       e.block = null; e.lineBlock = null; e.line = null; e.candidates = []; e.how = null; e.over = false; e.replace = false; e.info = [];
       await guardDoc(e);
       if (e.block) { e.status = 'blocked'; e.action = null; e.chosen = false; return; }
-      if (!e.doc.ties) {
+      if (!e.doc.ties && !e.doc.tieToLine) {
         e.status = 'fail'; e.action = null; e.chosen = false;
         e.note = 'rows sum to ' + money2(e.doc.total) + ' against the document’s stated total of '
           + (e.doc.stated == null ? 'none found' : money2(e.doc.stated)) + ' — a document that disagrees with itself cannot be imported';
@@ -33738,6 +33882,7 @@ render();
       if (!usable.length) return;
       await loadLookups();
       const fresh = [];
+      const multiRest = [];
       let scansThisDrop = 0;
       // Phase 1: read every file. Pairing needs to see them all at once.
       for (const f of usable) {
@@ -33756,7 +33901,7 @@ render();
           // A FILE KEEL HAS SEEN is refused before it is read, so a known scan
           // never costs a vision call.
           if (registryOk) {
-            const reg0 = await _dedRegistryCheck(sb, brandId, e.sha, null);
+            const reg0 = await _dedRegistryCheck(sb, brandId, e.sha, null, e.dbx);
             if (reg0.hit) { e.status = 'blocked'; e.block = reg0.hit; e.dupInv = reg0.inv || null; e.note = ''; paint(); continue; }
           }
           let d = await readFile(e);
@@ -33769,6 +33914,23 @@ render();
             d = await readScan(e);
           }
           if (d.fail) { e.status = 'fail'; e.note = d.fail; e.tried = d.tried || []; paint(); continue; }
+          if (d.register) { e.status = 'register'; e.note = d.note; paint(); continue; }
+          if (d.notdoc) { e.status = 'notdoc'; e.note = d.note; paint(); continue; }
+          // ONE FILE, SEVERAL DOCUMENTS (a Kroger promo file covers many
+          // invoices). Each becomes its own row here, matched and guarded on its
+          // own, and recorded under the file's hash plus its invoice -- so every
+          // invoice is refused on its own if it comes round again.
+          if (d.multi) {
+            const [first, ...rest] = d.multi;
+            const baseSha = e.sha;
+            e.sha = baseSha + '#' + (first.invoice_no || 1); e.dbx = null;
+            d = first;
+            rest.forEach((doc, k) => {
+              const s2 = { id: Math.random().toString(36).slice(2), file: f, sha: baseSha + '#' + (doc.invoice_no || k + 2), dbx: null,
+                           status: 'reading', note: '', doc, line: null, candidates: [], chosen: false, action: null, info: [], open: false };
+              S().push(s2); fresh.push(s2); multiRest.push(s2);
+            });
+          }
           e.doc = d; e.note = '';
           // Seen before? Decided BEFORE pairing, so a file already imported can
           // never be paired with something new and look usable.
@@ -33781,6 +33943,15 @@ render();
           e.status = 'fail'; e.note = 'failed to read: ' + (err && err.message || String(err));
         }
         paint();
+      }
+      for (const e of multiRest) {
+        try {
+          if (registryOk && e.doc.doc_key) {
+            const reg = await _dedRegistryCheck(sb, brandId, '-', e.doc.doc_key);
+            if (reg.hit) { e.status = 'blocked'; e.block = reg.hit; e.dupInv = reg.inv || null; continue; }
+          }
+          e.needsMatch = true;
+        } catch (err) { e.status = 'fail'; e.note = 'failed to check: ' + (err && err.message || String(err)); }
       }
       // Phase 2: pair NG invoices with their spreadsheets, across this drop and
       // anything still unimported from an earlier one.
@@ -33805,6 +33976,7 @@ render();
       choose: ['CHOOSE A LINE', AMBER], over: ['WOULD EXCEED', AMBER], ready: ['READY', 'var(--won)'], hold: ['WILL HOLD', AMBER],
       noreg: ['READ ONLY', 'var(--ink-3)'], done: ['IMPORTED', 'var(--won)'], held: ['HELD', AMBER],
       scan: ['SCAN — NOT READ', AMBER],
+      register: ['REGISTER — NOT IMPORTED', 'var(--ink-3)'], notdoc: ['NOTHING TO ATTACH', 'var(--ink-3)'],
     };
     function paint() {
       if (!listEl) return;
@@ -33944,8 +34116,11 @@ render();
     const writeRows = async (docId, line, rows, bmap, opts) => {
       const lcust = lineCust(line);
       const out = rows.map(r => {
-        const cand = _dedBannerCandidate(r.customer_name || lcust);
-        const row = _dedDetailRow(r, brandId, line.id, (cand && bmap.get(cand)) || cand);
+        // A banner the document itself states (Kroger's KMA division) is kept as
+        // stated; only a store or customer NAME goes through the candidate rule,
+        // which would turn '615 - Dillon KMA' into '- DILLON'.
+        const cand = r.banner ? null : _dedBannerCandidate(r.customer_name || lcust);
+        const row = _dedDetailRow(r, brandId, line.id, r.banner ? (bmap.get(r.banner) || r.banner) : ((cand && bmap.get(cand)) || cand));
         row.document_id = docId;
         return row;
       });
@@ -34170,7 +34345,7 @@ render();
           w.busy = true; w.msg = 'attaching…'; w.msgCol = 'var(--ink-3)'; draw();
           try {
             const rows = w.rows || (w.rows = await loadRows(w.rec.id));
-            const shim = { line: l, doc: { rows, total: Number(w.rec.amount) }, priorCover: null };
+            const shim = { line: l, doc: { rows, total: Number(w.rec.amount), layout: w.rec.layout, tieToLine: TIE_TO_LINE.test(String(w.rec.layout || '')) }, priorCover: null };
             await guardLine(shim, rows, Number(w.rec.amount));
             if (shim.lineBlock) throw new Error(shim.lineBlock);
             if (shim.over && !w.replace) { w.over = true; throw new Error('the line already carries ' + money2(shim.existing.total) + ' of detail; this would exceed the deduction. Tick replace to proceed.'); }
