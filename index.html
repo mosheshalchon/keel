@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-39 edlp carve-out';
+  const _DED_BUILD = 'tr-41 edlp rows kehe early pay';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -29810,6 +29810,50 @@ render();
     if (prog === 'EDLP') return true;
     return _dedBucketOf(rm) === 'Trade spend';
   }
+  // ── KeHE EARLY PAY, CALCULATED ──────────────────────────────────────────
+  // KeHE's 2% appears on no KeHE document: its checks tie to invoices minus
+  // deductions with no discount term, and its register has no discount column.
+  // Moshe, 11 Sep 2026 (the accountant's method): 2% of what ATG ships KeHE,
+  // on the gross invoice. So it is computed from NetSuite's billed sales to
+  // KeHE (sales_actuals, customer dimension, Billed + Closed -- shipped, not
+  // open orders), per month, and always labelled as calculated.
+  const DED_KEHE_EARLY_PAY_RATE = 0.02;
+  function _dedKeheEarlyPay(rows, fromMk, toMk) {
+    const byMonth = new Map();
+    let shipped = 0;
+    for (const r of (rows || [])) {
+      if (!/^(billed|closed)$/i.test(String(r.status || '').trim())) continue;
+      const mk = String(r.month || '').slice(0, 7);
+      if (!mk || (fromMk && mk < fromMk) || (toMk && mk > toMk)) continue;
+      const a = Number(r.amount) || 0;
+      shipped += a;
+      byMonth.set(mk, (byMonth.get(mk) || 0) + a);
+    }
+    return { shipped, pay: shipped * DED_KEHE_EARLY_PAY_RATE, byMonth, rate: DED_KEHE_EARLY_PAY_RATE };
+  }
+
+  // A LINE CAN SIT IN TWO BUCKETS. UNFI's weekly MCB chargeback line is part
+  // EDLP (its "A Arranged by Vendor" rows) and part promotion. _dedComputeRecon
+  // returns that share on edlpLines with part:true; every screen that groups
+  // lines by bucket asks for the pieces here, so the two parts always add back
+  // to the line and the table still foots to the register.
+  function _dedLinePieces(l, rm, edlpLines) {
+    const e = edlpLines && l ? edlpLines.get(l.id) : null;
+    if (e && e.part) {
+      const a = Math.abs(Number(l.amount || 0));
+      const eAmt = Math.min(a, Number(e.amt) || 0);
+      const sgn = Number(l.amount) < 0 ? -1 : 1;
+      const share = a ? eAmt / a : 0;
+      const merch = Number(l.detail_line_total || 0);
+      return [
+        { l: Object.assign({}, l, { amount: sgn * eAmt, detail_line_total: merch * share, processing_fee: 0, _part: 'EDLP share' }),
+          bucket: 'EDLP' },
+        { l: Object.assign({}, l, { amount: sgn * (a - eAmt), detail_line_total: merch * (1 - share), _part: 'excluding EDLP share' }),
+          bucket: _dedProgramOf(l, rm) || _dedBucketOf(rm) },
+      ].filter(p => Math.abs(Number(p.l.amount)) > 0.005);
+    }
+    return [{ l, bucket: _dedBucketOfLine(l, rm, edlpLines) }];
+  }
   const DED_BUCKET_ORDER = ['Trade spend', 'EDLP', 'Early pay', 'Allowances & shortages', 'Fees & penalties', 'Unclassified'];
   const DED_BUCKET_NOTE = {
     'Trade spend': 'Promotions — scans, TPRs, MCBs, ads. Reconciles against the promo plan. EDLP and early pay are carved out into their own buckets.',
@@ -30034,7 +30078,7 @@ render();
   // from module state and writes nothing back, so both callers are guaranteed
   // the same answer for the same inputs. Nothing about the arithmetic changed
   // when it moved here — only where it lives.
-  function _dedComputeRecon({ L, rmapBy, D, P, scopedIds, dist, distNames, lineRates, completedOnly, includePartial, year }) {
+  function _dedComputeRecon({ L, rmapBy, D, P, scopedIds, dist, distNames, lineRates, lineEdlp, completedOnly, includePartial, year }) {
       // deduction_detail has no distributor column, so it is fetched whole and
       // narrowed here to the lines in scope — otherwise By customer and the
       // reconciliation would total every distributor's stores under one label.
@@ -30271,11 +30315,30 @@ render();
         const m = raw ? bm.get(raw) : null;
         return (m && m.plan_customer) || _autoMatch(d.customer_name) || _autoMatch(raw) || null;
       };
-      const edlpLines = new Map();       // line_id -> { cust, how: 'document'|'rate', amt }
+      const edlpLines = new Map();       // line_id -> { cust, how: 'document'|'rate'|'category', amt, part }
       const earlyPayLines = new Set();
       const earlyPayBy = new Map();      // category -> amount
       const edlpNoCust = '(customer not identified)';
-      let earlyPayTotal = 0, edlpDocTotal = 0, edlpRateTotal = 0;
+      let earlyPayTotal = 0, edlpDocTotal = 0, edlpRateTotal = 0, edlpCatTotal = 0;
+      // ── EDLP BY ROW: UNFI MCB CATEGORY A ────────────────────────────────
+      // One WE chargeback line per week carries every chain, and within it
+      // "A Arranged by Vendor" rows are EDLP (Wegmans, Giant Carlisle, Thrive,
+      // Wakefern, Giant Landover -- EDLP-NEXT.sql, 11 Sep 2026) while "P Promos"
+      // rows are scans. So the line is SPLIT: the category-A share goes to EDLP
+      // per chain, and the line stays in trade spend at the remainder, with the
+      // store rows of those chains scaled down by the same share so nothing is
+      // counted in both piles. Shares, not dollars, because a line's register
+      // amount and its detail can differ by a fee.
+      const _upB = (b) => String(b || '').trim().toUpperCase();
+      const catEdlp = new Map();         // line_id -> { edlp, lineBill, banners: Map(BANNER -> {edlp, bill}) }
+      for (const r of (lineEdlp || [])) {
+        const lb = Number(r.line_bill) || 0, eb = Number(r.edlp_bill) || 0;
+        if (!(lb > 0) || !(eb > 0)) continue;
+        let c = catEdlp.get(r.line_id);
+        if (!c) catEdlp.set(r.line_id, c = { edlp: 0, lineBill: lb, banners: new Map() });
+        c.edlp += eb;
+        c.banners.set(_upB(r.banner), { edlp: eb, bill: Number(r.banner_bill) || eb });
+      }
       const TL = [];
       let nonTradeTotal = 0;
       const nonTradeBy = new Map();
@@ -30306,6 +30369,20 @@ render();
         edlpLines.set(l.id, { cust, how, amt });
         edlpTotal += amt;
       };
+      // A category share of a line: no line-level rate applies (the line mixes
+      // categories), so the rate columns stay empty for it.
+      const _edlpAddShare = (l, cust, amt) => {
+        const e = edlpBy.get(cust) || { amt: 0, units: 0, agreed: null, charged: null, offRate: 0, offAgreed: 0,
+                                         lines: 0, byDoc: 0, byRate: 0, byCat: 0, agreedSet: new Set(), chargedSet: new Set() };
+        const prev = edlpLines.get(l.id);
+        e.amt += amt; e.byCat = (e.byCat || 0) + amt;
+        if (!prev || !prev.custs || !prev.custs.has(cust)) e.lines++;
+        edlpBy.set(cust, e);
+        edlpCatTotal += amt; edlpDocTotal += amt; edlpTotal += amt;
+        const ent = prev || { cust, how: 'category', amt: 0, part: true, custs: new Set() };
+        ent.amt += amt; ent.custs.add(cust);
+        edlpLines.set(l.id, ent);
+      };
       for (const l of L) {
         const a = Math.abs(Number(l.amount || 0));
         const prog = _dedProgramOf(l, rmapBy[l.reason_code]);
@@ -30328,6 +30405,27 @@ render();
           continue;
         }
         if (isTrade(l)) {
+          const ce = catEdlp.get(l.id);
+          if (ce && a > 0) {
+            const share = Math.min(1, ce.edlp / ce.lineBill);
+            for (const [B, v] of ce.banners) {
+              const part = a * Math.min(1, v.edlp / ce.lineBill);
+              if (part <= 0.005) continue;
+              _edlpAddShare(l, _rowCust({ banner: B, customer_name: null }) || B, part);
+            }
+            const eAmt = (edlpLines.get(l.id) || {}).amt || 0;
+            if (share >= 0.999 || a - eAmt <= 0.005) { const ent = edlpLines.get(l.id); if (ent) ent.part = false; continue; }
+            // The remainder stays trade: a copy of the line at the reduced
+            // amount, and the category-A chains' rows scaled to what is left.
+            TL.push(Object.assign({}, l, { amount: (Number(l.amount) < 0 ? -1 : 1) * (a - eAmt), _edlpShare: eAmt }));
+            detByLine.set(l.id, rows.map(d => {
+              const v = ce.banners.get(_upB(d.banner));
+              if (!v || !(v.bill > 0)) return d;
+              const f = Math.max(0, 1 - v.edlp / v.bill);
+              return f >= 0.9999 ? d : Object.assign({}, d, { bill_amount: Number(d.bill_amount || 0) * f });
+            }).filter(d => Math.abs(Number(d.bill_amount || 0)) > 0.005));
+            continue;
+          }
           let hitCust = null;
           if (lc && _edlpHit(l, lc)) hitCust = lc;
           if (!hitCust && rows.length) {
@@ -30657,7 +30755,7 @@ render();
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
              planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
              planExcludedTypeBy, planExcludedRecvBy, planCarved, planCarvedBy,
-             edlpLines, edlpDocTotal, edlpRateTotal, earlyPayTotal, earlyPayBy, earlyPayLines };
+             edlpLines, edlpDocTotal, edlpRateTotal, edlpCatTotal, earlyPayTotal, earlyPayBy, earlyPayLines };
   }
 
   // ══ PROMOTIONS BY RETAILER PROMO NUMBER ═══════════════════════════════════
@@ -34572,7 +34670,7 @@ render();
     };
 
 
-    let checks = [], lines = [], rmap = [], detAgg = [], lineRates = [], overrides = [];
+    let checks = [], lines = [], rmap = [], detAgg = [], lineRates = [], overrides = [], lineEdlp = [], keheShip = [];
     let _dedDistCounts = { KeHE: 0, UNFI: 0 };
     let _scopedLineIds = new Set();
     let _dedFp = '';
@@ -34624,9 +34722,9 @@ render();
     const rawKey = brandId + '|' + year;
     try {
       if (_dedRaw && _dedRaw.key === rawKey) {
-        ({ checks, lines, rmap, lineRates = [], overrides = [] } = _dedRaw);
+        ({ checks, lines, rmap, lineRates = [], overrides = [], lineEdlp = [], keheShip = [] } = _dedRaw);
       } else {
-        [checks, lines, rmap, lineRates, overrides] = await Promise.all([
+        [checks, lines, rmap, lineRates, overrides, lineEdlp, keheShip] = await Promise.all([
           paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
           paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks,backup_by,backup_by_email,backup_at').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
           paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
@@ -34646,8 +34744,24 @@ render();
           paged(() => sb.from('deduction_overrides')
             .select('id,scope,match_value,customer,promo_type,promo_date,amount,source_note,backup_exists,promo_ref,promo_name,active')
             .eq('brand_id', brandId).eq('active', true).order('id', { ascending: true })).catch(() => []),
+          // EDLP BY ROW (EDLP-ROWS.sql). UNFI's WE chargeback rows carry the
+          // report's MCB Category, and "A Arranged by Vendor" is EDLP -- but those
+          // rows share a weekly line with ordinary promotions, so the carve is a
+          // share of the line, per chain. Caught: a brand without the view gets
+          // no row-level carve, not a broken page.
+          paged(() => sb.from('deduction_line_edlp')
+            .select('line_id,banner,basis,edlp_bill,banner_bill,line_bill')
+            .eq('brand_id', brandId).order('line_id', { ascending: true })).catch(() => []),
+          // KeHE EARLY PAY IS NOT ON ANY KeHE DOCUMENT. Moshe, 11 Sep 2026: it is
+          // 2% of what ATG ships KeHE, on the gross invoice -- so it is computed
+          // from NetSuite's billed sales to KeHE (sales_actuals), never read.
+          paged(() => sb.from('sales_actuals')
+            .select('entity,month,amount,status')
+            .eq('brand_id', brandId).eq('dimension', 'customer').ilike('entity', '%kehe%')
+            .gte('month', year + '-01-01').lte('month', year + '-12-31')
+            .order('month', { ascending: true })).catch(() => []),
         ]);
-        _dedRaw = { key: rawKey, checks, lines, rmap, lineRates, overrides };
+        _dedRaw = { key: rawKey, checks, lines, rmap, lineRates, overrides, lineEdlp, keheShip };
       }
       // Scope applied AFTER caching, so switching distributor is instant and
       // never refetches. A UNFI line can have a null check (their unfiled
@@ -35650,16 +35764,19 @@ render();
         if (!_planStale() && !_detStale()) {
           try {
             carvedLines = _dedComputeRecon({ L, rmapBy, D: _dedDetail || { det: [], bmap: [] }, P: _dedPlan || { lines: [] },
-              scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates,
+              scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates, lineEdlp,
               completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year }).edlpLines;
           } catch (e) { carvedLines = null; }
         }
         for (const l of L) {
           const rm = rmapBy[l.reason_code];
           if (!rm || rm.is_trade_spend !== true) continue;
-          if (_dedProgramOf(l, rm) || (carvedLines && carvedLines.has(l.id))) continue;
-          tradeTotal += Math.abs(Number(l.amount || 0));
-          if (rm.promo_bearing === true) promoBearingTotal += Math.abs(Number(l.amount || 0));
+          const cv = carvedLines && carvedLines.get(l.id);
+          if (_dedProgramOf(l, rm) || (cv && !cv.part)) continue;
+          // A partly-EDLP line (UNFI category A rows) counts at its remainder.
+          const rest = Math.abs(Number(l.amount || 0)) - (cv && cv.part ? Number(cv.amt) || 0 : 0);
+          tradeTotal += rest;
+          if (rm.promo_bearing === true) promoBearingTotal += rest;
         }
       } catch (e) { /* denominator is a nicety; the list still works without it */ }
 
@@ -37481,7 +37598,7 @@ render();
       let R3 = null;
       try {
         R3 = _dedComputeRecon({ L, rmapBy, D: D3, P: P3, scopedIds: _scopedLineIds, dist: _dedDist,
-                                distNames: Object.keys(_dedDistCounts || {}), lineRates,
+                                distNames: Object.keys(_dedDistCounts || {}), lineRates, lineEdlp,
                                 completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       } catch (e) { console.warn('[deductions] executive summary reconciliation failed:', e); }
 
@@ -37834,7 +37951,7 @@ render();
       // ── 4 · versus plan. Same function the Reconcile tab calls, same inputs,
       // so these ten rows cannot disagree with that screen.
       const P2 = _dedPlan || { lines: [], err: null };
-      const R2 = _dedComputeRecon({ L, rmapBy, D: D2, P: P2, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates,
+      const R2 = _dedComputeRecon({ L, rmapBy, D: D2, P: P2, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates, lineEdlp,
                                     completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       // Catch-all and unattributable rows are excluded: a variance there is an
       // artefact of the plan naming no retailer, not a retailer out of line.
@@ -37897,6 +38014,7 @@ render();
       const panelCarve = (() => {
         const yrChecks = checks.filter(ch => String(ch.check_date || '').slice(0, 4) === yr);
         const taken = yrChecks.reduce((n, ch) => n + Math.abs(Number(ch.discount_total || 0)), 0);
+        const kehe = (_dedDist === 'all' || _dedDist === 'KeHE') ? _dedKeheEarlyPay(keheShip) : { shipped: 0, pay: 0 };
         const promo = R2.tradeTotal || 0, edlp = R2.edlpTotal || 0, early = R2.earlyPayTotal || 0;
         const planE = (R2.planCarvedBy && R2.planCarvedBy.get('EDLP')) || 0;
         const planP = (R2.planCarvedBy && R2.planCarvedBy.get('Early pay')) || 0;
@@ -37916,18 +38034,21 @@ render();
           <div style="display:flex;gap:14px;flex-wrap:wrap;">
             ${card('Trade spend \u00b7 promotions', promo, pc(promo) + ' \u00b7 scans, TPRs, MCBs, ads \u00b7 compared to plan')}
             ${card('EDLP', edlp,
-                pc(edlp) + ' \u00b7 by document ' + money(R2.edlpDocTotal || 0) + ' \u00b7 by rate ' + money(R2.edlpRateTotal || 0)
+                pc(edlp) + ' \u00b7 by document ' + money((R2.edlpDocTotal || 0) - (R2.edlpCatTotal || 0))
+                + ((R2.edlpCatTotal || 0) > 0.005 ? ' \u00b7 UNFI category A ' + money(R2.edlpCatTotal) : '')
+                + ' \u00b7 by rate ' + money(R2.edlpRateTotal || 0)
                 + (planE ? '<br>plan ' + money(planE) + ' for the year, for scale' : '')
                 + (topE.length ? '<br>' + topE.map(([c, v]) => esc(_custName(c)) + ' ' + money(v.amt)).join(' \u00b7 ') : ''))}
-            ${card('Early pay', early + taken,
+            ${card('Early pay', early + taken + kehe.pay,
                 (early > 0.005 ? money(early) + ' as deduction lines \u00b7 ' : '')
                 + money(taken) + ' taken off ' + yr + ' payments'
+                + (kehe.pay > 0.005 ? '<br>KeHE ' + money(kehe.pay) + ' calculated: 2% of ' + money(kehe.shipped) + ' shipped' : '')
                 + (planP ? '<br>plan ' + money(planP) : ''))}
           </div>
           ${(P2.err || detailFailed) ? `<p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:10px;line-height:1.55;">
             ${P2.err ? 'The plan did not load, so EDLP found by agreed rate is missing here \u2014 only EDLP the reason code or document names is counted.' : 'Store detail did not load, so EDLP found by rate uses the line\u2019s own customer only.'}</p>` : ''}
           <p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:10px;line-height:1.55;">
-            Early pay taken off payments is the discount column on the checks. It never enters the deduction book, so the Early pay card is the only place it is added in.</p>`, true);
+            Early pay taken off payments is the discount column on the UNFI and Kroger checks; KeHE states no discount anywhere, so its 2% is calculated on what ATG shipped KeHE (NetSuite gross, billed). Neither enters the deduction book, so the Early pay card is the only place they are added in.</p>`, true);
       })();
 
       shell(panelCust, panelCarve + panelRec);
@@ -37960,7 +38081,7 @@ render();
     if (_dedView === 'reconcile') {
       const D = _dedDetail || { det: [], bmap: [] };
       const P = _dedPlan || { lines: [], err: null };
-      const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates,
+      const R = _dedComputeRecon({ L, rmapBy, D, P, scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates, lineEdlp,
                                    completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       const { planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
               planExcludedTypeBy } = R;
@@ -38366,14 +38487,16 @@ ${(() => {
             const v = set && set.size ? [...set].sort((x, y) => x - y) : (one != null ? [one] : []);
             return v.length ? v.map(x => '$' + Number(x).toFixed(2)).join(' \u00b7 ') : '<span style="color:var(--rule);">\u2014</span>';
           };
-          const how = (v) => v.byDoc > 0.005 && v.byRate > 0.005 ? 'document + rate'
-                           : v.byDoc > 0.005 ? 'document' : 'rate';
+          const how = (v) => [(v.byDoc || 0) - (v.byCat || 0) > 0.005 ? 'document' : null,
+                              (v.byCat || 0) > 0.005 ? 'UNFI category A' : null,
+                              (v.byRate || 0) > 0.005 ? 'rate' : null].filter(Boolean).join(' + ') || 'document';
           return `<div style="border:1px solid var(--rule);border-radius:7px;padding:10px 12px;margin:0 0 12px;">
             <div style="font-family:var(--mono);font-size:9.5px;letter-spacing:0.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:2px;">
               EDLP \u00b7 a per-unit rate on everything sold, carved out of trade spend above \u00b7 ${esc(yr)}
             </div>
             <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-bottom:8px;line-height:1.55;">
-              Found two ways. By DOCUMENT: the reason code or reference names the programme \u2014 Whole Foods SPDA (WHFDSPDA\u2026, \u201cSPDA 2026 JUN \u2026 0.33\u201d), UNFI deal type E.
+              Found three ways. By DOCUMENT: the reason code or reference names the programme \u2014 Whole Foods SPDA (WHFDSPDA\u2026, \u201cSPDA 2026 JUN \u2026 0.33\u201d), UNFI deal type E, the Sprouts SN EDLP months.
+              By UNFI CATEGORY: rows on UNFI\u2019s weekly MCB chargeback filed under \u201cA Arranged by Vendor\u201d (Wegmans, Giant Carlisle, Thrive, Wakefern, Giant Landover) \u2014 that share of the line only; the rest of the line stays in trade spend.
               By RATE: KeHE bills EDLP through the scan channel, so a line whose detail sits at one rate that is this customer\u2019s agreed EDLP rate is EDLP (the Sprouts $0.45 scans).
             </div>
             <table style="width:100%;border-collapse:collapse;">
@@ -38393,11 +38516,13 @@ ${(() => {
                        ? '<span style="font-family:var(--mono);font-size:10px;color:var(--lost);">' + money(v.offRate) + ' does not multiply out</span>'
                        : (v.chargedSet && v.chargedSet.size)
                        ? '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">units \u00d7 rate ties</span>'
+                       : (v.byCat || 0) > 0.005
+                       ? '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="UNFI bills these rows as a % of wholesale inside a weekly chargeback, so there is no single per-unit rate to check">billed as MCB % \u00b7 no unit rate</span>'
                        : '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="no single-rate store detail on these lines yet">no detail to check</span>')}
                 </tr>`).join('')}
                 <tr style="border-top:2px solid var(--ink);">
                   ${td('<strong style="font-family:var(--serif);font-size:13px;">Total</strong>')}
-                  ${td('<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">document ' + money(edlpDocTotal || 0) + ' \u00b7 rate ' + money(edlpRateTotal || 0) + '</span>')}
+                  ${td('<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">document ' + money((edlpDocTotal || 0) - (R.edlpCatTotal || 0)) + ' \u00b7 UNFI category A ' + money(R.edlpCatTotal || 0) + ' \u00b7 rate ' + money(edlpRateTotal || 0) + '</span>')}
                   ${td('')}${td('')}
                   ${td('<strong>' + (totU ? Math.round(totU).toLocaleString() : '\u2014') + '</strong>', true)}
                   ${td('<strong>' + money(tot) + '</strong>', true)}
@@ -38435,6 +38560,9 @@ ${(() => {
             return n;
           })();
           const asLines = earlyPayTotal || 0;
+          // KeHE's 2%, calculated on shipments in the same months as Taken.
+          const keheEp = (_dedDist === 'all' || _dedDist === 'KeHE') ? _dedKeheEarlyPay(keheShip, winStart, winEnd) : { shipped: 0, pay: 0 };
+          const keheCalc = keheEp.pay;
           const inWin = (c) => {
             const d = String(c.check_date || '').slice(0, 7);
             return d && (!winStart || d >= winStart) && (!winEnd || d <= winEnd);
@@ -38444,7 +38572,7 @@ ${(() => {
             .reduce((s2, c) => s2 + Math.abs(Number(c.discount_total || 0)), 0);
           const gross = checks.filter(inWin)
             .reduce((s2, c) => s2 + Math.abs(Number(c.invoice_total || 0)), 0);
-          if (!planned && !taken && !asLines) return '';
+          if (!planned && !taken && !asLines && !keheCalc) return '';
           // Never state a rate off zero, and never let a partially-loaded set
           // read as a real shortfall: until every check carries the column, the
           // taken figure is a floor, not a total.
@@ -38457,9 +38585,10 @@ ${(() => {
             <div style="display:flex;gap:26px;flex-wrap:wrap;align-items:baseline;">
               <span style="font-family:var(--serif);font-size:13px;">Planned <strong style="font-family:var(--mono);">${money(planned)}</strong></span>
               <span style="font-family:var(--serif);font-size:13px;">Taken off payments <strong style="font-family:var(--mono);">${money(taken)}</strong></span>
+              ${keheCalc > 0.005 ? `<span style="font-family:var(--serif);font-size:13px;" title="KeHE states no discount on any document; 2% of what ATG shipped KeHE (NetSuite gross, billed) in the same months">KeHE, calculated <strong style="font-family:var(--mono);">${money(keheCalc)}</strong></span>` : ''}
               ${asLines > 0.005 ? `<span style="font-family:var(--serif);font-size:13px;" title="lines coded early pay, the whole year in scope \u2014 carved out in the bridge above">Charged as deduction lines <strong style="font-family:var(--mono);">${money(asLines)}</strong></span>` : ''}
               ${rate ? `<span style="font-family:var(--serif);font-size:13px;color:var(--ink-2);">Effective rate <strong style="font-family:var(--mono);">${rate.toFixed(2)}%</strong> of gross</span>` : ''}
-              ${planned && (taken + asLines) ? `<span style="font-family:var(--mono);font-size:11px;color:${dCol(taken + asLines, planned)};">${(taken + asLines - planned > 0 ? '+' : '') + money(taken + asLines - planned)} vs plan${asLines > 0.005 ? ' (both kinds together)' : ''}</span>` : ''}
+              ${planned && (taken + asLines + keheCalc) ? `<span style="font-family:var(--mono);font-size:11px;color:${dCol(taken + asLines + keheCalc, planned)};">${(taken + asLines + keheCalc - planned > 0 ? '+' : '') + money(taken + asLines + keheCalc - planned)} vs plan${(asLines > 0.005 || keheCalc > 0.005) ? ' (all kinds together)' : ''}</span>` : ''}
             </div>
             <div style="font-family:var(--mono);font-size:9.5px;color:var(--ink-3);margin-top:6px;line-height:1.55;">
               ${covered < 100
@@ -38616,7 +38745,7 @@ ${(() => {
       let Rsum = null;
       try {
         Rsum = _dedComputeRecon({ L, rmapBy, D: _dedDetail || { det: [], bmap: [] }, P: _dedPlan || { lines: [], err: null },
-                                  scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates,
+                                  scopedIds: _scopedLineIds, dist: _dedDist, distNames: Object.keys(_dedDistCounts || {}), lineRates, lineEdlp,
                                   completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
       } catch (e) { console.warn('[deductions] EDLP by rate failed on Category:', e); }
       const sumEdlpLines = Rsum ? Rsum.edlpLines : null;
@@ -38627,28 +38756,35 @@ ${(() => {
       // Early pay taken OFF THE PAYMENT: the discount column on this year's
       // checks. Never a deduction line, so it is printed beside the bucket and
       // never added to it -- this table foots to the register.
+      const epKehe = (_dedDist === 'all' || _dedDist === 'KeHE') ? _dedKeheEarlyPay(keheShip) : { shipped: 0, pay: 0 };
       const epChecks = checks.filter(ch => String(ch.check_date || '').slice(0, 4) === yr);
       const epTaken = epChecks.reduce((n, ch) => n + Math.abs(Number(ch.discount_total || 0)), 0);
       const epTakenN = epChecks.filter(ch => Math.abs(Number(ch.discount_total || 0)) > 0.005).length;
       const epCovered = epChecks.filter(ch => ch.discount_total != null).length;
       const bucketExtra = (name, b) => {
         if (name === 'EDLP' && Rsum) {
-          let doc = 0, rate = 0;
+          let doc = 0, rate = 0, cat = 0;
           for (const l of L) {
             const e = sumEdlpLines && sumEdlpLines.get(l.id);
             if (!e) { if (_dedProgramOf(l, rmapBy[l.reason_code]) === 'EDLP') doc += Math.abs(Number(l.amount || 0)); continue; }
-            if (e.how === 'rate') rate += e.amt; else doc += e.amt;
+            if (e.how === 'rate') rate += e.amt; else if (e.how === 'category') cat += e.amt; else doc += e.amt;
           }
-          return 'Found by reason code or document ' + money(doc) + ' \u00b7 by agreed rate ' + money(rate) + '.'
+          return 'Found by reason code or document ' + money(doc)
+            + (cat > 0.005 ? ' \u00b7 by UNFI category A (share of the weekly MCB lines) ' + money(cat) : '')
+            + ' \u00b7 by agreed rate ' + money(rate) + '.'
             + (edlpLimit ? ' ' + edlpLimit : '');
         }
         if (name === 'EDLP') return edlpLimit;
         if (name === 'Early pay') {
-          return epTaken > 0.005
-            ? 'Taken off payments in ' + yr + ': ' + money(epTaken) + ' on ' + epTakenN + ' check' + (epTakenN === 1 ? '' : 's')
-              + ' \u2014 not in this table\u2019s total.'
-              + (epCovered < epChecks.length ? ' Only ' + epCovered + ' of ' + epChecks.length + ' checks carry a discount figure yet, so that is a floor.' : '')
-            : (epChecks.length && !epCovered ? 'No check this year carries a discount figure yet.' : '');
+          const parts = [];
+          if (epTaken > 0.005)
+            parts.push('Taken off payments in ' + yr + ': ' + money(epTaken) + ' on ' + epTakenN + ' check' + (epTakenN === 1 ? '' : 's')
+              + (epCovered < epChecks.length ? ' (only ' + epCovered + ' of ' + epChecks.length + ' checks carry a discount figure yet, so that is a floor)' : '') + '.');
+          else if (epChecks.length && !epCovered) parts.push('No check this year carries a discount figure yet.');
+          if (epKehe.pay > 0.005)
+            parts.push('KeHE, calculated: 2% of ' + money(epKehe.shipped) + ' shipped to KeHE in ' + yr + ' (NetSuite, billed) = ' + money(epKehe.pay) + '.');
+          if (parts.length) parts.push('Neither is a deduction line, so neither is in this table\u2019s total.');
+          return parts.join(' ');
         }
         return '';
       };
@@ -38656,10 +38792,11 @@ ${(() => {
       const buckets = new Map();
       // An Early pay row with no lines still earns its place when money was
       // taken off payments: it is the one place that figure is shown.
-      if (epTaken > 0.005) buckets.set('Early pay', { name: 'Early pay', lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, cats: new Map(), codes: new Set() });
-      for (const l of L) {
+      if (epTaken > 0.005 || epKehe.pay > 0.005) buckets.set('Early pay', { name: 'Early pay', lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, cats: new Map(), codes: new Set() });
+      for (const piece of L.flatMap(l0 => _dedLinePieces(l0, rmapBy[l0.reason_code], sumEdlpLines))) {
+        const l = piece.l;
         const rm = rmapBy[l.reason_code];
-        const bk = _dedBucketOfLine(l, rm, sumEdlpLines);
+        const bk = piece.bucket;
         const catKey = rm && rm.keel_category ? rm.keel_category : (l.reason_code || 'Unresolved');
         const code = l.reason_code || '(none)';
         const amt = Number(l.amount || 0);
@@ -38711,8 +38848,8 @@ ${(() => {
                 ${td('')}${td(b.lines.toLocaleString(), true)}
                 ${td(b.merch ? money(Math.abs(b.merch)) : dash, true)}
                 ${td(b.fee ? money(Math.abs(b.fee)) : dash, true)}
-                ${td('<strong>' + money(-b.amount) + '</strong>', true)}
-                ${td(pctOf(-b.amount), true, 'color:var(--ink-3);')}
+                ${td(b.lines ? '<strong>' + money(-b.amount) + '</strong>' : dash, true)}
+                ${td(b.lines ? pctOf(-b.amount) : '', true, 'color:var(--ink-3);')}
                 ${td(dPct(b), true, b.docAmt === 0 ? 'color:var(--ink-3);' : '')}
               </tr>
               <tr><td colspan="8" style="padding:0 10px 6px;border-bottom:1px solid var(--rule-soft);">
@@ -38782,7 +38919,7 @@ ${(() => {
                           <th style="text-align:left;padding:4px 8px;color:var(--ink-3);font-weight:400;">Backup</th>
                         </tr></thead>
                         <tbody>${v.rows.slice().sort((a, b2) => a.amount - b2.amount).map(r => `<tr>
-                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);">${esc(r.invoice_no || '')}</td>
+                          <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);">${esc(r.invoice_no || '')}${r._part ? `<span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-left:6px;">${esc(r._part)}</span>` : ''}</td>
                           <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(String(r.doc_date || '').slice(0, 10))}</td>
                           <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(_chkNo.get(r.check_id) || '')}</td>
                           <td style="padding:3px 8px;border-top:1px solid var(--rule-soft);color:var(--ink-3);">${esc(r.po_no || r.remarks || '')}</td>
@@ -38829,14 +38966,16 @@ ${(() => {
                 let a2 = dAgg.get(dn);
                 if (!a2) dAgg.set(dn, a2 = { lines: 0, trade: 0, edlp: 0, early: 0, other: 0 });
                 a2.lines++;
-                const amt = -Number(l.amount) || 0;
-                // The same bucket the tree above put the line in, so the two
+                // The same pieces the tree above put the line in, so the two
                 // tables foot to each other column by column.
-                const bk2 = _dedBucketOfLine(l, rmapBy[l.reason_code], sumEdlpLines);
-                if (bk2 === 'Trade spend') a2.trade += amt;
-                else if (bk2 === 'EDLP') a2.edlp += amt;
-                else if (bk2 === 'Early pay') a2.early += amt;
-                else a2.other += amt;
+                for (const pc of _dedLinePieces(l, rmapBy[l.reason_code], sumEdlpLines)) {
+                  const amt = -Number(pc.l.amount) || 0;
+                  const bk2 = pc.bucket;
+                  if (bk2 === 'Trade spend') a2.trade += amt;
+                  else if (bk2 === 'EDLP') a2.edlp += amt;
+                  else if (bk2 === 'Early pay') a2.early += amt;
+                  else a2.other += amt;
+                }
               }
               const tot = -totalAmt || 1;
               const sumOf = (a2) => a2.trade + a2.edlp + a2.early + a2.other;
@@ -38860,10 +38999,10 @@ ${(() => {
             ${td('<strong>ALL</strong>')}
             ${td('<strong>' + L.length.toLocaleString() + '</strong>', true)}
             ${(() => {
-              const byB = (want) => L.filter(l => {
-                const bk3 = _dedBucketOfLine(l, rmapBy[l.reason_code], sumEdlpLines);
-                return want === 'Other' ? !['Trade spend', 'EDLP', 'Early pay'].includes(bk3) : bk3 === want;
-              }).reduce((n, l) => n + (-Number(l.amount) || 0), 0);
+              const pieces = L.flatMap(l => _dedLinePieces(l, rmapBy[l.reason_code], sumEdlpLines));
+              const byB = (want) => pieces.filter(pc => want === 'Other'
+                  ? !['Trade spend', 'EDLP', 'Early pay'].includes(pc.bucket) : pc.bucket === want)
+                .reduce((n, pc) => n + (-Number(pc.l.amount) || 0), 0);
               return ['Trade spend', 'EDLP', 'Early pay', 'Other'].map(k => td('<strong>' + money(byB(k)) + '</strong>', true)).join('');
             })()}
             ${td('<strong>' + money(-totalAmt) + '</strong>', true)}
