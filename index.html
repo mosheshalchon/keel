@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-30 cid-detect';
+  const _DED_BUILD = 'tr-33 cid-perfont';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31111,24 +31111,47 @@ render();
   }
 
   function _dedTextFromContent(content, cmap) {
+    const maps = Array.isArray(cmap) ? cmap : (cmap && cmap.size ? [cmap] : []);
     // With a ToUnicode map the hex strings are GLYPH IDS, two bytes each, and
     // must go through the map. Without one they are character codes and the
     // old byte decoding is right -- so both live side by side and the document
     // decides which applies.
     const hexDec = (h) => {
-      if (!cmap || !cmap.size) return _dedDecHex(h);
       const clean = String(h).replace(/\s+/g, '');
-      let o = '';
+      if (!maps.length) return _dedDecHex(clean);
+      const codes = [];
       for (let k = 0; k + 3 < clean.length + 1; k += 4) {
         const code = parseInt(clean.substr(k, 4), 16);
-        if (!isFinite(code)) continue;
-        const ch = cmap.get(code);
-        // An unmapped glyph is DROPPED rather than guessed at: emitting the raw
-        // code point would put random CJK into an invoice and make a broken
-        // read look like a strange one.
-        if (ch != null) o += ch;
+        if (isFinite(code)) codes.push(code);
       }
-      return o;
+      // An unmapped glyph is DROPPED rather than guessed at: emitting the raw
+      // code point would put random CJK into an invoice and make a broken read
+      // look merely strange.
+      return viaMaps(codes);
+    };
+    // LITERAL STRINGS CARRY GLYPH IDS TOO. This document writes its CID text as
+    // (\000\001\000\002...) rather than <00010002...>, so mapping only the hex
+    // path left every character untranslated and the output opened with
+    // \u0000\u0001 -- which is exactly what a reader saw as an empty preview.
+    // Both string forms go through the map when one exists.
+    const score = (t) => { let n = 0; for (const c of t) if (/[A-Za-z0-9 ,.\/#$-]/.test(c)) n++; return n; };
+    const viaMaps = (codes) => {
+      let best = '', bestScore = -1;
+      for (const mp of maps) {
+        let o = '';
+        for (const code of codes) { const ch = mp.get(code); if (ch != null) o += ch; }
+        const sc = score(o) - (codes.length - o.length);   // penalise dropped glyphs
+        if (sc > bestScore) { bestScore = sc; best = o; }
+      }
+      return best;
+    };
+    const litDec = (raw) => {
+      const bytes = _dedDecLiteral(raw);
+      if (!maps.length) return bytes;
+      const codes = [];
+      for (let k = 0; k + 1 < bytes.length; k += 2)
+        codes.push((bytes.charCodeAt(k) << 8) | bytes.charCodeAt(k + 1));
+      return viaMaps(codes);
     };
     let out = '', pending = '';
     const flush = () => { if (pending) { out += pending; pending = ''; } };
@@ -31136,14 +31159,14 @@ render();
     let m;
     while ((m = RX.exec(content))) {
       const tok = m[0];
-      if (tok.startsWith('(')) pending += _dedDecLiteral(tok.slice(1, -1));
+      if (tok.startsWith('(')) pending += litDec(tok.slice(1, -1));
       else if (tok.startsWith('<') && !tok.startsWith('<<')) pending += hexDec(tok.slice(1, -1));
       else if (tok.startsWith('[')) {
         const IRX = /\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|(-?[\d.]+)/g;
         let im;
         while ((im = IRX.exec(tok.slice(1, -1)))) {
           const t = im[0];
-          if (t.startsWith('(')) pending += _dedDecLiteral(t.slice(1, -1));
+          if (t.startsWith('(')) pending += litDec(t.slice(1, -1));
           else if (t.startsWith('<')) pending += hexDec(t.slice(1, -1));
           else if (Number(t) < -120) pending += ' ';   // a big kern is a space
         }
@@ -31213,6 +31236,14 @@ render();
     return '';
   }
 
+  // ONE MAP PER FONT, NOT ONE MERGED MAP. Two subset fonts number their glyphs
+  // independently -- Arial and Arial-Bold both start at 1 meaning different
+  // letters -- so merging them makes whichever loaded second decode as
+  // nonsense: real values came out right while bold labels read
+  // 'Naturl GoceeG ttsoVimnm'. Each map is kept separately and a run of text is
+  // decoded with whichever map yields the most letters, which is a cheap stand
+  // in for tracking Tf operators and is correct whenever the fonts disagree --
+  // the only case where it matters.
   function _dedParseCMap(txt, map) {
     const hx = (h) => parseInt(h, 16);
     // <src> <dst> pairs. dst can be several UTF-16 code units for a ligature.
@@ -31250,7 +31281,7 @@ render();
     // header actually says /ToUnicode are inflated, so an ordinary document
     // pays for nothing -- the map stays empty and decoding behaves exactly as
     // it did before.
-    const cmap = new Map();
+    const cmap = [];               // one Map per font
     let cmapsFound = 0, scanned = 0;
     {
       let p2 = 0;
@@ -31274,11 +31305,22 @@ render();
         while (view[st2] === 0x0d || view[st2] === 0x0a) st2++;
         const en2 = _dedFindBytes(view, _DED_B_ENDSTREAM, st2);
         if (en2 < 0) break;
-        const rawC = view.subarray(st2, en2);
+        // TRIM THE TRAILING EOL, exactly as the content pass does. Without it
+        // DecompressionStream rejects the stream outright and the catch
+        // swallows it -- every inflate returned an empty string and the CMap
+        // stayed empty, so the decoder fell back to raw glyph ids and the
+        // document read as control characters. Silent, and indistinguishable
+        // from a document that has no maps at all.
+        let sp2 = en2;
+        while (sp2 > st2 && (view[sp2 - 1] === 0x0a || view[sp2 - 1] === 0x0d)) sp2--;
+        const rawC = view.subarray(st2, sp2);
         if (rawC.length && rawC.length < 200000) {
           scanned++;
           const txt = await _dedInflateWhole(rawC);
-          if (txt && /beginbf(char|range)/.test(txt)) { _dedParseCMap(txt, cmap); cmapsFound++; }
+          if (txt && /beginbf(char|range)/.test(txt)) {
+            const one = new Map(); _dedParseCMap(txt, one);
+            if (one.size) { cmap.push(one); cmapsFound++; }
+          }
         }
         p2 = en2 + 9;
       }
