@@ -29287,7 +29287,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-19 mcb-cases';
+  const _DED_BUILD = 'tr-20 prefetch-budget';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -33882,7 +33882,32 @@ render();
         }
       }
       if (!window.__dedBuildLogged) { window.__dedBuildLogged = 1; console.log('[Keel] trade rate build', _DED_BUILD); }
-      const needDet = shown.filter(l => l.detail_parsed && !_dedItemCache.has(String(l.id))).map(l => l.id);
+      // ── PREFETCH BUDGET ──────────────────────────────────────────────────
+      // This used to prefetch every shown line's detail unconditionally, which
+      // was cheap when a line carried a dozen store rows. It is not any more:
+      // an MCB category line carries 333-811 rows, a Whole Foods scan line
+      // 11,207, and the MCB detail load added tens of thousands more. Twenty-five
+      // such lines is a six-figure row count fetched before the page can paint,
+      // which is why the register became slow to load.
+      //
+      // detBy already holds the per-line rollup row count, fetched in one go, so
+      // the cost of a line is KNOWN before deciding to pull it. Lines are taken
+      // cheapest first up to a total row budget; anything past it keeps working
+      // exactly as it did before today -- an em dash in Units and Rate, and a
+      // fetch on expand. Nothing is lost, it is just not paid for up front.
+      const DET_BUDGET = 4000, DET_PER_LINE = 1200;
+      let _budget = DET_BUDGET;
+      const needDet = shown
+        .filter(l => l.detail_parsed && !_dedItemCache.has(String(l.id)))
+        .map(l => ({ id: l.id, n: (detBy.get(l.id) || []).length || 0 }))
+        .sort((a, b) => a.n - b.n)
+        .filter(x => {
+          if (x.n > DET_PER_LINE) return false;         // too big to prepay for
+          if (x.n > _budget) return false;
+          _budget -= Math.max(x.n, 1);
+          return true;
+        })
+        .map(x => x.id);
       if (needDet.length) {
         try {
           // The Brand Library mapping, once per session -- groups the items by
