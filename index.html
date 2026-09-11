@@ -29265,7 +29265,17 @@ render();
   // The scan and third-party layers (NCG, 3PTY, WHFDSCAN, SN) bill EACHES -- a
   // rate per retail unit -- so those do multiply by the case pack. Moshe
   // confirmed this for the 12 inch pizza: $2.54 x 6 / $49.74.
-  const _DED_QTY_IS_CASES = new Set(['UNFI-ALLSALES', 'UNFI-ASMCB', 'UNFI-MCB']);
+  // The MCB weekly report bills CASES too: its Shipped column is cases and the
+  // row reproduces as shipped x wholesale x MCB%, verified on all 811 rows of
+  // MCB20260214. These are the codes mcbpdf writes from that report, so they
+  // take the same treatment as the ASM family -- without them the rate reads
+  // about six times high, which looks plausible and is not.
+  const _DED_QTY_IS_CASES = new Set([
+    'UNFI-ALLSALES', 'UNFI-ASMCB', 'UNFI-MCB',
+    'UNFI-NATLPROMO', 'UNFI-PRICEPROMO', 'UNFI-SHELF', 'UNFI-EDLP',
+    'UNFI-TURNOVER', 'UNFI-AD', 'UNFI-NEWSTORE', 'UNFI-NEWITEM',
+    'UNFI-CIRCULAR', 'UNFI-SAMPLES', 'UNFI-MISC', 'UNFI-SPDA', 'UNFI-TPR',
+  ]);
   // ── FLAT FEES HAVE NO RATE ───────────────────────────────────────────────
   // An ad fee, a slotting fee or a growth incentive is a lump sum. It is trade
   // spend, but it is not paid per unit, so a share of case price is meaningless
@@ -29277,7 +29287,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-18 parser-contract';
+  const _DED_BUILD = 'tr-19 mcb-cases';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
