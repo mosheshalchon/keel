@@ -29234,6 +29234,8 @@ render();
   ];
   let _dedFacet = Object.fromEntries(_DED_FACETS.map(([k]) => [k, new Set()]));
   let _dedFacetOpen = null;
+  let _dedFacetQ = '';            // search inside the open panel
+  let _dedFacetPanel = () => '';  // set each paint; thf() calls it
 
   // Buckets, not raw values: 4,839 distinct rates is not a filter, it is a
   // second table. The blank bucket is the point of the trade-rate one -- it is
@@ -29327,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-23 bulk-upload';
+  const _DED_BUILD = 'tr-27 import-enable';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -32377,14 +32379,18 @@ render();
     body.innerHTML = `
       <div style="margin-bottom:20px;">
         <p style="font-family:var(--serif);font-size:13px;color:var(--ink-3);margin:0 0 14px;line-height:1.55;max-width:760px;">
-          Drop K-Solve backup PDFs here — the scanned SCAN, spoilage and fee documents. These are read
-          <strong>in this browser</strong>: they are scanned pages redrawn as vectors, ~25MB per page inflated, which is
-          what kills the server-side parser. Nothing is written until you press Import, and importing the same document
-          twice leaves the same rows as importing it once.
+          Drop deduction backup here — PDFs, spreadsheets or CSVs, as many as you like. Keel reads each one,
+          works out which register line it belongs to from the invoice number the document states about itself,
+          and checks that its rows add up to that line before offering to import it.
+          <strong>Nothing is written until you press Import</strong>, nothing is written unless the document agrees
+          with the register, and importing the same document twice leaves the same rows as importing it once.
+          Files are read <strong>in this browser</strong> — scanned pages inflate to ~25MB each, which is what
+          defeats the server-side parser, so large scans take a few seconds apiece.
+          A UNFI MCB weekly report feeds several lines at once, one per category, each checked separately.
         </p>
         <div id="hl-ded-drop" style="border:1.5px dashed var(--rule);border-radius:8px;padding:26px 18px;text-align:center;cursor:pointer;background:transparent;transition:background .15s;">
-          <div style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">Drop PDFs here, or click to choose</div>
-          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">Multiple files are fine. Large scans take a few seconds each.</div>
+          <div style="font-family:var(--mono);font-size:11.5px;color:var(--ink-2);">Drop files here, or click to choose</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:5px;">PDF, xlsx, xls, csv or txt \u00b7 no limit on how many \u00b7 large scans take a few seconds each</div>
           <input type="file" id="hl-ded-file" accept=".pdf,.xlsx,.xls,.csv,.txt" multiple style="display:none;">
         </div>
       </div>
@@ -32470,6 +32476,11 @@ render();
             if (mcb && mcb.detail && mcb.detail.length && mcb.invoice) {
               entry.mcb = mcb;
               entry.status = 'ready';
+              // MUST be set, like every other ready entry. The Import button
+              // counts CHOSEN entries, so without this an MCB report parsed
+              // perfectly, showed READY, and left the button dead -- clicking
+              // it did nothing and said nothing.
+              entry.chosen = true;
               entry.note = 'UNFI MCB weekly ' + mcb.invoice + ' \u2014 ' + mcb.detail.length.toLocaleString()
                          + ' rows, ' + money(mcb.sum) + ', ' + new Set(mcb.detail.map(d => d.cat)).size + ' categories';
               paint(); continue;
@@ -32583,7 +32594,7 @@ render();
       listEl.innerHTML = `
         <table style="width:100%;border-collapse:collapse;margin-bottom:14px;">
           <thead><tr>
-            ${['', 'File', 'Invoice', 'Type', 'Rows', 'Parsed total', 'Line amount', 'State'].map(h =>
+            ${['', 'File', 'Invoice', 'Match', 'Type', 'Rows', 'Parsed total', 'Line amount', 'State'].map(h =>
               `<th style="text-align:left;padding:5px 8px;font-family:var(--mono);font-size:9px;color:var(--ink-3);border-bottom:1px solid var(--rule-soft);">${h}</th>`).join('')}
           </tr></thead>
           <tbody>
@@ -32595,8 +32606,23 @@ render();
             return `<tr>
               <td style="padding:5px 8px;border-bottom:1px solid var(--rule-soft);">${box}</td>
               <td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);">${esc(e.file.name)}</td>
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.invoice_no) || '—')}</td>
-              <td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.type) || '—')}</td>
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.invoice_no) || (e.mcb && e.mcb.invoice) || '—')}</td>
+              ${(() => {
+                // WHAT THIS FILE WILL DO, before Import is pressed. The list said
+                // whether a document PARSED and never whether it had anywhere to
+                // go, so a file that read perfectly and matched nothing looked
+                // identical to one about to land on a line.
+                const cell = (txt, col, tip) => `<td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);color:${col};"${tip ? ' title="' + esc(tip) + '"' : ''}>${txt}</td>`;
+                if (e.mcb) {
+                  const n = new Set(e.mcb.detail.map(d => d.cat)).size;
+                  return cell(n + ' categor' + (n === 1 ? 'y' : 'ies'), 'var(--ink-2)', 'this report feeds one register line per category');
+                }
+                if (e.line) return cell('matched', 'var(--won)', 'attaches to the register line for ' + e.line.invoice_no);
+                const inv = e.head && e.head.invoice_no;
+                if (inv) return cell('new deduction', '#8a6d1f', 'the document names invoice ' + inv + ' but the register has no such line \u2014 either the register has not been re-imported, or this is a deduction Keel has never seen');
+                return cell('\u2014', 'var(--ink-3)', 'no invoice number could be read, so there is nothing to match against');
+              })()}
+              <td style="padding:5px 8px;font-family:var(--mono);font-size:10px;border-bottom:1px solid var(--rule-soft);">${esc((e.head && e.head.type) || (e.mcb ? 'UNFI MCB weekly' : '—'))}</td>
               <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.rows.length || '—'}</td>
               <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.parsed_total != null ? money(e.parsed_total) : '—'}</td>
               <td style="padding:5px 8px;font-family:var(--mono);font-size:10.5px;border-bottom:1px solid var(--rule-soft);">${e.line ? money(Math.abs(e.line.amount)) : '—'}</td>
@@ -32615,7 +32641,23 @@ render();
                    background:${ready.length ? 'var(--ink)' : 'transparent'};color:${ready.length ? 'var(--paper)' : 'var(--rule)'};">
             Import ${ready.length || ''} document${ready.length === 1 ? '' : 's'}</button>
           <button id="hl-ded-up-clear" style="font-family:var(--mono);font-size:11px;padding:8px 14px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--ink-3);cursor:pointer;">Clear</button>
-          <span id="hl-ded-up-msg" style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);"></span>
+          <span id="hl-ded-up-msg" style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">${(() => {
+            // A DISABLED BUTTON THAT EXPLAINS ITSELF. Silence here reads as a
+            // broken button: files were read, Import looked available, clicking
+            // did nothing. Files that cannot be imported never blocked the ones
+            // that can -- but nothing on screen said so.
+            if (ready.length) return '';
+            const n = _dedUploadState.length;
+            if (!n) return '';
+            const reading = _dedUploadState.filter(e => e.status === 'reading').length;
+            if (reading) return 'still reading ' + reading + ' file' + (reading === 1 ? '' : 's') + '\u2026';
+            const dupes = _dedUploadState.filter(e => e.status === 'dupe').length;
+            const fails = _dedUploadState.filter(e => e.status === 'fail').length;
+            const unticked = _dedUploadState.filter(e => !e.chosen && (e.status === 'ready' || e.status === 'dupe')).length;
+            if (unticked) return 'tick a file to import it \u2014 ' + unticked + ' ready and unticked';
+            if (dupes && !fails) return 'every file is already imported \u2014 tick one to replace its rows';
+            return 'none of these ' + n + ' file' + (n === 1 ? '' : 's') + ' can be imported \u2014 see the reason on each row';
+          })()}</span>
         </div>`;
 
       listEl.querySelectorAll('.hl-ded-up-pick').forEach(cb => cb.onchange = () => {
@@ -33780,6 +33822,24 @@ render();
     };
 
     const th = (t, right) => `<th style="text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">${t}</th>`;
+    // ── A FILTERING COLUMN HEADING ───────────────────────────────────────────
+    // The heading IS the control, rather than a separate filter bar above the
+    // table. A bar is a second place to look and it does not say WHICH column
+    // each filter belongs to; putting it on the heading means the question
+    // ("which customers?") is asked where the answer is shown.
+    //
+    // The panel is absolutely positioned inside the th, so it opens over the
+    // table instead of pushing every row down -- reading a filtered list while
+    // the list jumps is the thing this is supposed to make easier.
+    const thf = (t, key, right) => {
+      const n = (_dedFacet[key] || new Set()).size;
+      const open = _dedFacetOpen === key;
+      return `<th style="position:relative;text-align:${right ? 'right' : 'left'};padding:8px 10px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.06em;color:var(--ink-3);text-transform:uppercase;border-bottom:1px solid var(--rule);white-space:nowrap;">
+        <span class="hl-df-h" data-f="${key}" style="cursor:pointer;color:${n ? 'var(--ink)' : 'inherit'};border-bottom:1px dotted ${n ? 'var(--ink)' : 'var(--rule)'};padding-bottom:1px;">
+          ${t}${n ? ' \u00b7 ' + n : ''} \u25be</span>
+        ${open ? _dedFacetPanel(key, right) : ''}
+      </th>`;
+    };
     const td = (t, right, extra) => `<td style="text-align:${right ? 'right' : 'left'};padding:9px 10px;font-family:var(--mono);font-size:11.5px;color:var(--ink);border-bottom:1px solid var(--rule-soft);${extra || ''}">${t}</td>`;
 
     // ── DEDUCTIONS · THE REGISTER AT LINE GRAIN ───────────────────────────────
@@ -34286,32 +34346,37 @@ render();
         }
         return [...m.entries()].sort((a, b) => b[1] - a[1]);
       };
-      const facetBar = `
-        <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 12px;">
-          ${_DED_FACETS.map(([k, label]) => {
-            const n = _dedFacet[k].size, on = n > 0;
-            return `<button class="hl-df-btn" data-f="${k}" style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:5px;cursor:pointer;border:1px solid ${on ? 'var(--ink)' : 'var(--rule)'};background:${on ? 'var(--ink)' : 'transparent'};color:${on ? 'var(--paper)' : 'var(--ink-2)'};">${esc(label)}${on ? ' \u00b7 ' + n : ''}</button>`;
-          }).join('')}
-          ${_DED_FACETS.some(([k]) => _dedFacet[k].size) ? `<button id="hl-df-clearall" style="font-family:var(--mono);font-size:10px;padding:5px 11px;border-radius:5px;border:1px solid var(--rule);background:transparent;color:var(--lost);cursor:pointer;">clear all</button>` : ''}
-        </div>
-        ${_dedFacetOpen ? (() => {
-          const key = _dedFacetOpen, rowsF = facetCounts(key), sel = _dedFacet[key];
-          return `<div style="border:1px solid var(--rule-soft);border-radius:8px;padding:12px 14px;margin:0 0 12px;background:var(--rule-softer);">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-              <span style="font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);">${esc((_DED_FACETS.find(f => f[0] === key) || [, key])[1])} \u00b7 ${rowsF.length} value${rowsF.length === 1 ? '' : 's'}</span>
-              <span>
-                <button class="hl-df-all" data-f="${key}" style="font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">select all</button>
-                <button class="hl-df-none" data-f="${key}" style="margin-left:5px;font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;border:1px solid var(--rule);background:transparent;color:var(--ink-2);cursor:pointer;">clear</button>
-                <button class="hl-df-close" style="margin-left:5px;font-family:var(--mono);font-size:10px;padding:3px 9px;border-radius:4px;border:none;background:transparent;color:var(--ink-3);cursor:pointer;">close</button>
-              </span>
-            </div>
-            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:2px 16px;max-height:260px;overflow:auto;">
-              ${rowsF.map(([v, n]) => `<label style="display:flex;align-items:center;gap:7px;padding:3px 0;font-family:var(--sans);font-size:12.5px;cursor:pointer;"><input type="checkbox" class="hl-df-box" data-f="${key}" data-v="${esc(v)}" ${sel.has(v) ? 'checked' : ''} /><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(v)}</span><span style="margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${n.toLocaleString()}</span></label>`).join('')}
-            </div>
-          </div>`;
-        })() : ''}`;
+      // Built here because it needs facetCounts, which needs the filtered set.
+      // Hung on a holder so thf() -- defined further up with the other table
+      // helpers -- can reach it without either one having to move.
+      _dedFacetPanel = (key, right) => {
+        const rowsF = facetCounts(key);
+        const sel = _dedFacet[key];
+        const q = (_dedFacetQ || '').toLowerCase();
+        const shownVals = q ? rowsF.filter(([v]) => String(v).toLowerCase().includes(q)) : rowsF;
+        return `<div class="hl-df-panel" style="position:absolute;top:100%;${right ? 'right:0;' : 'left:0;'}z-index:40;
+            min-width:260px;max-width:340px;background:var(--paper);border:1px solid var(--rule);
+            border-radius:7px;box-shadow:0 14px 40px rgba(0,0,0,0.16);padding:9px;text-transform:none;letter-spacing:0;">
+          <input class="hl-df-q" type="text" placeholder="Search\u2026" value="${esc(_dedFacetQ || '')}"
+            style="width:100%;box-sizing:border-box;padding:6px 9px;font-family:var(--sans);font-size:12.5px;
+                   border:1px solid var(--rule-soft);border-radius:5px;background:transparent;margin-bottom:7px;" />
+          <div style="display:flex;gap:10px;align-items:center;padding:0 2px 7px;border-bottom:1px solid var(--rule-soft);margin-bottom:6px;">
+            <span class="hl-df-all" data-f="${key}" style="font-family:var(--mono);font-size:10px;color:var(--ink-2);cursor:pointer;">Select all</span>
+            <span class="hl-df-none" data-f="${key}" style="font-family:var(--mono);font-size:10px;color:var(--ink-2);cursor:pointer;">Clear</span>
+            <span style="margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${sel.size ? sel.size + ' selected' : 'no filter'}</span>
+          </div>
+          <div style="max-height:280px;overflow:auto;">
+            ${shownVals.map(([v, n]) => `
+              <label style="display:flex;align-items:center;gap:8px;padding:4px 2px;font-family:var(--sans);font-size:12.5px;cursor:pointer;">
+                <input type="checkbox" class="hl-df-box" data-f="${key}" data-v="${esc(v)}" ${sel.has(v) ? 'checked' : ''} />
+                <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(v)}</span>
+                <span style="margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--ink-3);">${n.toLocaleString()}</span>
+              </label>`).join('') || '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);padding:6px 2px;">nothing matches that</div>'}
+          </div>
+        </div>`;
+      };
 
-      host.innerHTML = facetBar + `
+      host.innerHTML = `
         <div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:0 0 10px;">
           ${isFiltered
             ? `${filtered.length.toLocaleString()} of ${L.length.toLocaleString()} lines \u00b7 <strong style="color:var(--ink);">${money(filteredAmt)}</strong> of ${money(registerAmt)}`
@@ -34324,7 +34389,7 @@ render();
 
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Invoice')}${th('Month', true)}${th('Customer')}${th('Category')}${th('Code')}${th('Backup')}${th('Units', true)}${th('Rate', true)}${th('Deducted', true)}${th('Share', true)}${th('% trade rate', true)}${th('')}${th('Backup added')}
+            ${th('Invoice')}${thf('Month', 'month', true)}${thf('Customer', 'customer')}${thf('Category', 'category')}${thf('Code', 'code')}${thf('Backup', 'backup')}${th('Units', true)}${thf('Rate', 'rate', true)}${th('Deducted', true)}${th('Share', true)}${thf('% trade rate', 'trade', true)}${th('')}${thf('Backup added', 'addedby')}
           </tr></thead>
           <tbody>
             ${shown.map(l => {
@@ -34680,8 +34745,25 @@ render();
             await paintResults();
           };
         });
-        const closeBtn = host.querySelector('.hl-df-close');
-        if (closeBtn) closeBtn.onclick = async () => { _dedFacetOpen = null; await paintResults(); };
+        // The search box must not repaint on every keystroke -- that would
+        // destroy the caret, the same fault the page-level search box was
+        // rebuilt to avoid. It filters the list in place instead.
+        const qBox = host.querySelector('.hl-df-q');
+        if (qBox) {
+          qBox.oninput = () => {
+            _dedFacetQ = qBox.value;
+            const q = _dedFacetQ.toLowerCase();
+            host.querySelectorAll('.hl-df-panel label').forEach(lb => {
+              const v = (lb.querySelector('.hl-df-box') || {}).dataset;
+              lb.style.display = (!q || String(v && v.v || '').toLowerCase().includes(q)) ? '' : 'none';
+            });
+          };
+          qBox.focus();
+        }
+        // Clicking anywhere else closes the panel. Without this the only way out
+        // is the heading you opened it from, which is easy to lose track of once
+        // the panel covers the rows.
+        host.querySelectorAll('.hl-df-panel').forEach(pn => { pn.onclick = (ev) => ev.stopPropagation(); });
         host.querySelectorAll('.hl-df-box').forEach(cb => {
           cb.onchange = async () => {
             const set = _dedFacet[cb.dataset.f];
