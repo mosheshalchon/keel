@@ -28486,9 +28486,17 @@ render();
       // A missing view is a migration that has not been run, not a broken page.
       // Say which file, because "relation does not exist" tells nobody anything.
       const missing = /does not exist|42P01/i.test(_tabErr || '');
+      // A TIMEOUT here means the PLAIN view is still installed. It re-derives
+      // the governing window for every Vividly plan line on every read, which
+      // survives the SQL editor's longer limit and dies at the app's. Naming the
+      // file is the fix; printing "canceling statement" alone tells nobody what
+      // to do about it.
+      const slow = /timeout|canceling statement|57014/i.test(_tabErr || '');
       summaryEl.innerHTML = '<div style="font-family:var(--serif);padding:30px;background:var(--bone-2);border-radius:8px;line-height:1.6;">'
         + (missing
-            ? '<strong>promo_event_link has not been created yet.</strong><br>Run <span style="font-family:var(--mono);font-size:12px;">PROMO-EVENT-LINK.sql</span> and reload. Nothing else on this page depends on it.'
+            ? '<strong>promo_event_link has not been created yet.</strong><br>Run <span style="font-family:var(--mono);font-size:12px;">PROMO-EVENT-LINK-2.sql</span> and reload. Nothing else on this page depends on it.'
+            : slow
+            ? '<strong>promo_event_link timed out, so it is still the plain view.</strong><br>Run <span style="font-family:var(--mono);font-size:12px;">PROMO-EVENT-LINK-2.sql</span>, which materializes it, then reload.'
             : '<strong>Could not read promo_event_link.</strong><br><span style="font-family:var(--mono);font-size:12px;color:#a8381f;">' + esc(_tabErr) + '</span>')
         + '</div>';
       return;
@@ -29750,7 +29758,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-54 analyzer B';
+  const _DED_BUILD = 'tr-55 analyzer B, matview';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
