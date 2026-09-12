@@ -28574,6 +28574,8 @@ render();
       } catch (e) { return { tag: null, lift: null, why: 'could not measure' }; }
     };
 
+    for (const g of byEvent.values()) g.codes.sort((a, b) => (Number(b.actual_spend) || 0) - (Number(a.actual_spend) || 0));
+    for (const u of unclaimed.values()) u.codes.sort((a, b) => (Number(b.actual_spend) || 0) - (Number(a.actual_spend) || 0));
     const evs = [...byEvent.values()].sort((a, b) => b.act - a.act);
     for (const g of evs) g.m = liftFor(g);
     const uns = [...unclaimed.values()].sort((a, b) => b.act - a.act);
@@ -28633,8 +28635,8 @@ render();
         + td('<span style="color:var(--ink-2);">' + esc(g.name || g.key) + '</span>'
              + '<div style="font-size:9.5px;color:var(--ink-3);">' + esc(md(g.ws)) + ' → ' + esc(md(g.we))
              + (g.type ? ' · ' + esc(g.type) : '') + '</div>')
-        + td('<span style="color:var(--ink-2);">' + g.codes.length + '</span>'
-             + (g.units ? '<div style="font-size:9.5px;color:var(--ink-3);">' + num(g.units) + ' u</div>' : ''), true)
+        + td('<span style="font-family:var(--mono);color:var(--ink-2);">' + esc((g.codes[0] || {}).promo_no || '—') + '</span>'
+             + (g.codes.length > 1 ? '<div style="font-size:9.5px;color:var(--ink-3);">+' + (g.codes.length - 1) + ' more</div>' : ''))
         + td(money(g.planned), true)
         + td(money(g.viv), true, 'color:var(--ink-3);')
         + td('<strong>' + money(g.act) + '</strong>', true)
@@ -28655,7 +28657,8 @@ render();
         + td('<strong>' + esc(u.cust) + '</strong>')
         + td('<span style="color:var(--ink-3);">no plan event claims these</span>'
              + '<div style="font-size:9.5px;color:var(--ink-3);">' + esc(md(lo)) + ' → ' + esc(md(hi)) + '</div>')
-        + td(u.codes.length, true)
+        + td('<span style="font-family:var(--mono);color:var(--ink-2);">' + esc((u.codes[0] || {}).promo_no || '—') + '</span>'
+             + (u.codes.length > 1 ? '<div style="font-size:9.5px;color:var(--ink-3);">+' + (u.codes.length - 1) + ' more</div>' : ''))
         + td('', true) + td('', true)
         + td('<strong>' + money(u.act) + '</strong>', true)
         + td('', true)
@@ -28672,11 +28675,18 @@ render();
       + fig(money(totUn), 'billed with no plan', uns.length ? uns.length + ' customer' + (uns.length === 1 ? '' : 's') + ' — Vividly cannot see these' : 'nothing unaccounted for', totUn > 0 ? '#a35a2a' : null)
       + fig(money(totViv), 'Vividly says was deducted', 'against ' + money(totPlanned) + ' planned')
       + '</div>'
+      + '<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin:-10px 0 18px;">'
+      + money(totAct + totUn + undAmt) + ' of deductions in ' + year + ' carry a retailer promo number · '
+      + money(totAct) + ' attached to a plan · ' + money(totUn) + ' unclaimed · '
+      + money(undAmt) + ' carry no dates, so nothing can hold them. '
+      + 'Trade spend without a promo number on it is not in this view at all — that is the Deductions tab.'
+      + '</div>'
       + '<div style="overflow-x:auto;">'
       + '<table style="width:100%;border-collapse:collapse;min-width:900px;">'
       + '<thead><tr style="border-bottom:1.5px solid var(--ink-3);">'
-      + th('Retailer') + th('Plan event') + th('Codes', true) + th('Planned', true)
-      + th('Vividly', true) + th('Billed (Keel)', true) + th('Δ', true)
+      + th('Retailer') + th('Plan event') + th('Promo code') + th('Planned<div style="font-weight:400;text-transform:none;letter-spacing:0;">Vividly</div>', true)
+      + th('Deducted<div style="font-weight:400;text-transform:none;letter-spacing:0;">Vividly says</div>', true)
+      + th('Billed<div style="font-weight:400;text-transform:none;letter-spacing:0;">distributor docs</div>', true) + th('Δ', true)
       + th('Units', true) + th('Rate', true) + th('Lift', true)
       + '</tr></thead><tbody>'
       + (evRows || '<tr><td colspan="10" style="padding:26px;text-align:center;font-family:var(--serif);font-style:italic;color:var(--ink-3);">No actual promotions attached to a ' + year + ' plan event yet.</td></tr>')
@@ -29758,7 +29768,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-55 analyzer B, matview';
+  const _DED_BUILD = 'tr-56 analyzer B labels';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
