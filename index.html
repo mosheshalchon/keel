@@ -4421,6 +4421,74 @@ body.login-mode { display: grid; grid-template-columns: 1fr 1fr; min-height: 100
    synchronously via Auth.getSession().
    ============================================================ */
 
+// ── KeelPerf ─────────────────────────────────────────────────────────────
+// KeelPerf.on()      turn timing on and reload
+// KeelPerf.report()  print what has been measured since the last page load
+// KeelPerf.off()     turn it off and reload
+// Declared before Auth because getClient() consults it on the very first call.
+window.KeelPerf = (function () {
+  let enabled = false;
+  try { enabled = localStorage.getItem('keel_perf') === '1'
+        || /[?&#]perf=1/.test(location.href); } catch (e) {}
+  const rows = [];
+  const nav = [];
+  const page = () => (location.hash || '#').split('?')[0].replace(/^#/, '') || '(root)';
+  const t0 = (window.performance || Date).now();
+  const api = {
+    get enabled() { return enabled; },
+    _rec(table, ms, n, err) {
+      rows.push({ page: page(), table, ms: Math.round(ms), rows: n, error: !!err,
+                  at: Math.round((window.performance || Date).now() - t0) });
+    },
+    mark(label) { nav.push({ label, at: Math.round((window.performance || Date).now() - t0) }); },
+    on()  { try { localStorage.setItem('keel_perf', '1'); } catch (e) {} location.reload(); },
+    off() { try { localStorage.removeItem('keel_perf'); } catch (e) {} location.reload(); },
+    clear() { rows.length = 0; },
+    raw() { return rows.slice(); },
+    report() {
+      if (!enabled) { console.log('KeelPerf is off. Run KeelPerf.on() — the page will reload — then use Keel for a minute and run KeelPerf.report().'); return; }
+      if (!rows.length) { console.log('KeelPerf: nothing recorded yet.'); return; }
+      // BY PAGE FIRST, because the question is "which page is slow".
+      const byPage = new Map();
+      for (const r of rows) {
+        const e = byPage.get(r.page) || { page: r.page, queries: 0, 'total ms': 0, rows: 0, errors: 0, 'slowest query': '', _worst: 0 };
+        e.queries++; e['total ms'] += r.ms; e.rows += r.rows; if (r.error) e.errors++;
+        if (r.ms > e._worst) { e._worst = r.ms; e['slowest query'] = r.table + ' ' + r.ms + 'ms'; }
+        byPage.set(r.page, e);
+      }
+      const pages = [...byPage.values()].sort((a, b) => b['total ms'] - a['total ms'])
+        .map(({ _worst, ...rest }) => rest);
+      console.log('%cKeelPerf \u00b7 by page', 'font-weight:bold');
+      console.table(pages);
+      // THEN BY TABLE, because the answer is usually one query.
+      const byTable = new Map();
+      for (const r of rows) {
+        const k = r.page + ' \u00b7 ' + r.table;
+        const e = byTable.get(k) || { page: r.page, table: r.table, calls: 0, 'total ms': 0, rows: 0, 'max ms': 0 };
+        e.calls++; e['total ms'] += r.ms; e.rows += r.rows; e['max ms'] = Math.max(e['max ms'], r.ms);
+        byTable.set(k, e);
+      }
+      console.log('%cKeelPerf \u00b7 by query, slowest first', 'font-weight:bold');
+      console.table([...byTable.values()].sort((a, b) => b['total ms'] - a['total ms']).slice(0, 30));
+      // REPEATS ARE THE TELL. The same table fetched many times on one page is
+      // either pagination or a render loop, and the two look identical here
+      // until you compare `calls` against `rows`.
+      const rep = [...byTable.values()].filter(x => x.calls >= 4)
+        .sort((a, b) => b.calls - a.calls).slice(0, 10);
+      if (rep.length) {
+        console.log('%cKeelPerf \u00b7 repeated fetches (pagination, or a render running twice)', 'font-weight:bold');
+        console.table(rep);
+      }
+      console.log('KeelPerf: ' + rows.length + ' queries, '
+        + rows.reduce((n, r) => n + r.ms, 0) + 'ms of query time, '
+        + rows.reduce((n, r) => n + r.rows, 0).toLocaleString() + ' rows, since page load.');
+      return pages;
+    },
+  };
+  if (enabled) console.log('%cKeelPerf is ON \u00b7 use Keel, then run KeelPerf.report()', 'color:#7c3aed;font-weight:bold');
+  return api;
+})();
+
 window.Auth = (function() {
 
   // Project credentials. The publishable (anon) key is safe to ship in
@@ -4809,7 +4877,53 @@ window.Auth = (function() {
 
   function getSession() { return _cachedSession; }
   function getBootError() { return _bootError; }
-  function getClient() { return client(); }
+  // ── KeelPerf: OPT-IN QUERY TIMING ───────────────────────────────────────
+  // Every complaint about Keel's speed has so far been answered by guessing at
+  // the code, and twice the guess was wrong. This times EVERY Supabase query
+  // the app makes, tagged with the page that made it, so "which page is slow
+  // and why" is a table rather than an argument.
+  //
+  // OFF BY DEFAULT, and it wraps nothing at all unless it is on -- switched on
+  // with KeelPerf.on() (a reload follows) and off again with KeelPerf.off().
+  // The wrapper is a Proxy that intercepts only `then`, which is where
+  // PostgREST actually issues the request: everything else is passed through
+  // and re-wrapped so a chained .select().eq().order() still behaves exactly
+  // as it did. A measurement tool that changes what it measures is worthless,
+  // and one that can break the app in normal use is worse than none.
+  function getClient() {
+    const c = client();
+    if (!window.KeelPerf || !window.KeelPerf.enabled || c.__keelPerfWrapped) return c;
+    const wrap = (b, table) => new Proxy(b, {
+      get(t, prop, recv) {
+        if (prop === 'then') {
+          return (onOk, onErr) => {
+            const t0 = (window.performance || Date).now();
+            return Reflect.get(t, 'then', t).call(t, (res) => {
+              try {
+                window.KeelPerf._rec(table,
+                  (window.performance || Date).now() - t0,
+                  (res && res.data && res.data.length) || 0,
+                  !!(res && res.error));
+              } catch (e) {}
+              return res;
+            }).then(onOk, onErr);
+          };
+        }
+        const v = Reflect.get(t, prop, recv);
+        if (typeof v !== 'function') return v;
+        return (...args) => {
+          const r = v.apply(t, args);
+          return (r && typeof r === 'object' && typeof r.then === 'function') ? wrap(r, table) : r;
+        };
+      },
+    });
+    const origFrom = c.from.bind(c);
+    c.from = (table) => wrap(origFrom(table), table);
+    const origRpc = c.rpc ? c.rpc.bind(c) : null;
+    if (origRpc) c.rpc = (fn, ...rest) => wrap(origRpc(fn, ...rest), 'rpc:' + fn);
+    c.__keelPerfWrapped = true;
+    return c;
+  }
 
   async function signIn(email, password) {
     const { data, error } = await client().auth.signInWithPassword({
@@ -27398,7 +27512,7 @@ render();
   // Dollars come from Vividly (expected + actual spend); measured sell-through comes from
   // UNFI weekly (cases + $), KeHE weekly ($ only), wfm_sales (units + $) and kroger_sales
   // (units + $, ≈ fiscal-week mapping). SPINS deliberately deferred to v2.
-  const PROMO_VIEWS = [['plan', 'Plan'], ['analyzer', 'Trade analyzer'], ['deductions', 'Deductions']];
+  const PROMO_VIEWS = [['plan', 'Plan'], ['analyzer', 'Trade analyzer'], ['analyzerb', 'Trade analyzer B'], ['deductions', 'Deductions']];
   // The sidebar renders these beneath Promos while the page is open. Fed from
   // PROMO_VIEWS rather than restated there, so a fourth view can never appear in
   // one list and not the other — which is precisely how TAB_DEFS drifted.
@@ -27429,7 +27543,7 @@ render();
   // 2027 is Keel-built promos, which the analyzer has no Vividly lines to
   // measure. Rather than hide the year pill's meaning, each view declares the
   // years it can answer for and an out-of-range year is clamped visibly.
-  const PROMO_YEARS_FOR = (v) => v === 'analyzer' ? [2025, 2026] : [2025, 2026, 2027];
+  const PROMO_YEARS_FOR = (v) => (v === 'analyzer' || v === 'analyzerb') ? [2025, 2026] : [2025, 2026, 2027];
   let _taCompletedOnly = true;
   const _taCache = {};
   const _taLinesCache = {};
@@ -28304,6 +28418,281 @@ render();
     </div>`;
     document.body.appendChild(ov);
     ov.addEventListener('click', (e) => { if (e.target === ov || e.target.id === 'hl-ta-audit-x') ov.remove(); });
+  }
+
+  // ── TRADE ANALYZER B (12 Sep 2026) ──────────────────────────────────────────
+  // A measures the PLAN. B measures the same plan events with the money that was
+  // ACTUALLY BILLED against them, read from promo_event_link: the retailer's own
+  // promo codes attached to the Vividly event whose window contains them.
+  //
+  // THE VIVIDLY EVENT STAYS THE CONTAINER, on Moshe's instruction and for a good
+  // reason — ATG sales reviewed those customers and dates, and they are the plan
+  // of record for 2026 whether or not a code exists. The deduction windows often
+  // are not reviewed at all: 327 of them run 45–90 days, which is a billing range
+  // rather than a promotion. So the code sits inside the plan event, never the
+  // other way round.
+  //
+  // A IS NOT REPLACED. Both views stay, because reading them against each other
+  // is the only way to tell a methodology change from a data change.
+  //
+  // Three things B can say that A cannot:
+  //   * what was billed against a plan event, from the distributor's own
+  //     documents rather than from Vividly's Actual Spend field
+  //   * the retailer's promo numbers behind it, with units and implied rate
+  //   * UNCLAIMED — promos that ran and were billed with no plan behind them.
+  //     That list is the whole point; Vividly cannot produce it.
+  let _tabCache = {}, _tabErr = null;
+  const _tabOpen = new Set();
+
+  async function _tabLoad(year) {
+    if (_tabCache[year]) return _tabCache[year];
+    _tabErr = null;
+    try {
+      const sb = window.Auth.getClient();
+      const brandId = window.BrandLibrary.getSession().brandId;
+      const out = [];
+      // select('*') deliberately. A column list here would be inferred from the
+      // code that consumes it, which is exactly how the Promotions tab broke.
+      for (let p = 0; p < 40; p++) {
+        const { data, error } = await sb.from('promo_event_link')
+          .select('*').eq('brand_id', brandId)
+          .order('promo_no').range(p * 1000, p * 1000 + 999);
+        if (error) throw new Error(error.message);
+        const d = data || [];
+        out.push(...d);
+        if (d.length < 1000) break;
+      }
+      const lo = year + '-01-01', hi = year + '-12-31';
+      _tabCache[year] = {
+        rows: out.filter(r => r.event_start && r.event_start >= lo && r.event_start <= hi),
+        undated: out.filter(r => !r.event_start),
+      };
+      return _tabCache[year];
+    } catch (e) { _tabErr = String(e && e.message || e); return null; }
+  }
+
+  async function renderTradeAnalyzerB(summaryEl, filtersEl, year) {
+    const esc = (x) => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const money = (n) => (n == null || !isFinite(n)) ? '—' : '$' + Math.round(n).toLocaleString();
+    const num = (n) => (n == null || !isFinite(n)) ? '—' : Math.round(n).toLocaleString();
+    const pct = (n) => (n == null || !isFinite(n)) ? '—' : (n > 0 ? '+' : '') + Math.round(n * 100) + '%';
+    const md = (d) => d ? String(d).slice(5).replace('-', '/') : '';
+
+    filtersEl.innerHTML = '';
+    summaryEl.innerHTML = '<div class="hl-loading">Reading the promotions that actually ran…</div>';
+
+    const got = await _tabLoad(year);
+    if (!got) {
+      // A missing view is a migration that has not been run, not a broken page.
+      // Say which file, because "relation does not exist" tells nobody anything.
+      const missing = /does not exist|42P01/i.test(_tabErr || '');
+      summaryEl.innerHTML = '<div style="font-family:var(--serif);padding:30px;background:var(--bone-2);border-radius:8px;line-height:1.6;">'
+        + (missing
+            ? '<strong>promo_event_link has not been created yet.</strong><br>Run <span style="font-family:var(--mono);font-size:12px;">PROMO-EVENT-LINK.sql</span> and reload. Nothing else on this page depends on it.'
+            : '<strong>Could not read promo_event_link.</strong><br><span style="font-family:var(--mono);font-size:12px;color:#a8381f;">' + esc(_tabErr) + '</span>')
+        + '</div>';
+      return;
+    }
+
+    let lines = _taLinesCache[year];
+    if (!lines) {
+      const f = await _vvFetchLines(year);
+      if (!f.error) { _taLinesCache[year] = f.lines; lines = f.lines; } else lines = [];
+    }
+    const src = await _taLoadSales(year);
+
+    // ── group: one row per PLAN EVENT, codes underneath ──────────────────────
+    const byEvent = new Map(), unclaimed = new Map();
+    for (const r of got.rows) {
+      if (r.promotion_key) {
+        let g = byEvent.get(r.promotion_key);
+        if (!g) {
+          g = { key: r.promotion_key, cust: r.plan_customer || r.cust_resolved, name: r.plan_promo_name,
+                type: r.plan_promo_type, ws: r.plan_start, we: r.plan_end,
+                planned: Number(r.planned_spend) || 0, viv: Number(r.vividly_deducted) || 0,
+                act: 0, units: 0, codes: [] };
+          byEvent.set(r.promotion_key, g);
+        }
+        g.act += Number(r.actual_spend) || 0;
+        g.units += Number(r.units) || 0;
+        g.codes.push(r);
+      } else {
+        const k = r.cust_resolved || '(customer not resolved)';
+        if (!unclaimed.has(k)) unclaimed.set(k, { cust: k, act: 0, units: 0, codes: [] });
+        const u = unclaimed.get(k);
+        u.act += Number(r.actual_spend) || 0; u.units += Number(r.units) || 0; u.codes.push(r);
+      }
+    }
+
+    // ── lift, computed with A's OWN helpers on A's OWN window ────────────────
+    // Not a second methodology. The window is the plan window, the baseline is
+    // _taBaseNearest's nearest six off-promo weeks, the ratio is weekly rates —
+    // identical to A by construction, so any difference between the two views is
+    // the MONEY, never the measurement.
+    const linesByKey = new Map();
+    for (const l of lines) {
+      if (!l.promotion_key) continue;
+      if (!linesByKey.has(l.promotion_key)) linesByKey.set(l.promotion_key, []);
+      linesByKey.get(l.promotion_key).push(l);
+    }
+    const exclFor = (cust) => {
+      const out = [];
+      for (const l2 of lines) {
+        if ((l2.customer || '') !== cust) continue;
+        if (/edlp|merch|slotting|fee|admin|freight/i.test(String(l2.promo_type || ''))) continue;
+        const w2 = _taWindow(l2); if (w2) out.push(w2);
+      }
+      return out;
+    };
+    const exclCache = new Map();
+    const liftFor = (g) => {
+      try {
+        const ls = linesByKey.get(g.key) || [];
+        const l = ls.find(x => !_taIsFee(x.promo_type)) || ls[0];
+        if (!l) return null;
+        if (_taAlwaysOn(l.promo_type)) return { tag: 'EDLP', lift: null, why: 'always-on — no off-programme baseline exists' };
+        const series = _taSeriesFor(l, src);
+        if (!series || !series.map) return { tag: null, lift: null, why: 'no sales series for this customer' };
+        const cust = l.customer || '';
+        if (!exclCache.has(cust)) exclCache.set(cust, exclFor(cust));
+        const win = _taSum(series.map, g.ws, g.we);
+        const base = _taBaseNearest(series.map, g.ws, exclCache.get(cust), 6);
+        if (!win || !win.weeks) return { tag: series.tag, lift: null, why: 'no sales weeks inside the plan window' };
+        if (!base || !base.weeks) return { tag: series.tag, lift: null, why: 'no off-promo weeks before it — weekly history starts later' };
+        const useU = series.units && win.u > 0 && base.u > 0;
+        const wr = (useU ? win.u : win.d) / win.weeks, br = (useU ? base.u : base.d) / base.weeks;
+        if (!(br > 0)) return { tag: series.tag, lift: null, why: 'baseline is zero' };
+        return { tag: series.tag, lift: (wr - br) / br, weeks: win.weeks, baseWks: base.weeks, unit: useU };
+      } catch (e) { return { tag: null, lift: null, why: 'could not measure' }; }
+    };
+
+    const evs = [...byEvent.values()].sort((a, b) => b.act - a.act);
+    for (const g of evs) g.m = liftFor(g);
+    const uns = [...unclaimed.values()].sort((a, b) => b.act - a.act);
+
+    const totAct = evs.reduce((s, g) => s + g.act, 0);
+    const totUn = uns.reduce((s, g) => s + g.act, 0);
+    const totPlanned = evs.reduce((s, g) => s + g.planned, 0);
+    const totViv = evs.reduce((s, g) => s + g.viv, 0);
+    const nCodes = evs.reduce((s, g) => s + g.codes.length, 0);
+    const undAmt = got.undated.reduce((s, r) => s + (Number(r.actual_spend) || 0), 0);
+
+    const fig = (v, label, sub, color) =>
+      '<div style="flex:1;min-width:170px;">'
+      + '<div style="font-family:var(--mono);font-size:38px;font-weight:700;letter-spacing:-0.02em;color:' + (color || 'var(--ink)') + ';">' + v + '</div>'
+      + '<div style="font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:var(--ink-3);margin-top:4px;">' + label + '</div>'
+      + (sub ? '<div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:3px;">' + sub + '</div>' : '')
+      + '</div>';
+
+    const th = (t, right) => '<th style="padding:7px 10px;text-align:' + (right ? 'right' : 'left') + ';font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:0.07em;color:var(--ink-3);font-weight:600;white-space:nowrap;">' + t + '</th>';
+    const td = (h, right, extra) => '<td style="padding:7px 10px;text-align:' + (right ? 'right' : 'left') + ';font-family:var(--mono);font-size:11.5px;' + (extra || '') + '">' + h + '</td>';
+
+    const liftCell = (m) => {
+      if (!m) return '<span style="color:var(--ink-3);">—</span>';
+      if (m.lift == null) return '<span style="color:var(--ink-3);" title="' + esc(m.why || '') + '">n/a</span>';
+      const c = m.lift > 0 ? '#2f6b3f' : m.lift < 0 ? '#a8381f' : 'var(--ink-2)';
+      const tip = esc((m.weeks || 0) + ' promo weeks vs ' + (m.baseWks || 0) + ' baseline weeks, measured in ' + (m.unit ? 'units' : 'dollars') + (m.tag ? ' \u00b7 ' + m.tag : ''));
+      return '<span style="color:' + c + ';font-weight:700;" title="' + tip + '">' + pct(m.lift) + '</span>';
+    };
+
+    const codeRows = (codes, cls) => codes
+      .slice()
+      .sort((a, b) => (Number(b.actual_spend) || 0) - (Number(a.actual_spend) || 0))
+      .map(c => {
+        const days = c.event_days == null ? null : Number(c.event_days);
+        const wide = days != null && days > 44;
+        return '<tr class="' + cls + '" style="display:none;background:rgba(63,79,111,0.05);">'
+          + td('<span style="padding-left:20px;color:var(--ink-3);">' + esc(c.reason_code || '') + '</span>')
+          + td('<strong>' + esc(c.promo_no || '') + '</strong>'
+               + '<div style="font-size:9.5px;color:var(--ink-3);">' + esc(md(c.event_start)) + ' → ' + esc(md(c.event_end))
+               + (wide ? ' <span style="color:#a35a2a;">· ' + days + 'd, a billing range</span>' : '')
+               + ' · ' + esc(c.attach_kind || '') + '</div>')
+          + td(c.items != null ? num(c.items) + ' items' : '', true, 'color:var(--ink-3);')
+          + td('', true) + td('', true)
+          + td(money(Number(c.actual_spend) || 0), true)
+          + td('', true)
+          + td(c.units ? num(c.units) + ' u' : '', true, 'color:var(--ink-3);')
+          + td(c.rate_implied != null ? '$' + Number(c.rate_implied).toFixed(2) : '', true, 'color:var(--ink-3);')
+          + td('', true)
+          + '</tr>';
+      }).join('');
+
+    const evRows = evs.map(g => {
+      const d = g.act - g.viv;
+      const cls = 'tabc-' + String(g.key).replace(/[^A-Za-z0-9]/g, '');
+      return '<tr class="tab-ev" data-k="' + esc(cls) + '" style="cursor:pointer;border-top:1px solid var(--rule-soft);">'
+        + td('<strong>' + esc(g.cust || '—') + '</strong>')
+        + td('<span style="color:var(--ink-2);">' + esc(g.name || g.key) + '</span>'
+             + '<div style="font-size:9.5px;color:var(--ink-3);">' + esc(md(g.ws)) + ' → ' + esc(md(g.we))
+             + (g.type ? ' · ' + esc(g.type) : '') + '</div>')
+        + td('<span style="color:var(--ink-2);">' + g.codes.length + '</span>'
+             + (g.units ? '<div style="font-size:9.5px;color:var(--ink-3);">' + num(g.units) + ' u</div>' : ''), true)
+        + td(money(g.planned), true)
+        + td(money(g.viv), true, 'color:var(--ink-3);')
+        + td('<strong>' + money(g.act) + '</strong>', true)
+        + td((Math.abs(d) < 1 ? '—' : (d > 0 ? '+' : '\u2212') + money(Math.abs(d))), true,
+             'color:' + (Math.abs(d) < 1 ? 'var(--ink-3)' : d > 0 ? '#a8381f' : '#2f6b3f') + ';')
+        + td(g.units ? num(g.units) : '', true, 'color:var(--ink-3);')
+        + td(g.units > 0 ? '$' + (g.act / g.units).toFixed(2) : '', true, 'color:var(--ink-3);')
+        + td(liftCell(g.m), true)
+        + '</tr>'
+        + codeRows(g.codes, cls);
+    }).join('');
+
+    const unRows = uns.map(u => {
+      const cls = 'tabu-' + String(u.cust).replace(/[^A-Za-z0-9]/g, '');
+      const lo = u.codes.reduce((m, c) => (!m || c.event_start < m) ? c.event_start : m, null);
+      const hi = u.codes.reduce((m, c) => (!m || c.event_end > m) ? c.event_end : m, null);
+      return '<tr class="tab-ev" data-k="' + esc(cls) + '" style="cursor:pointer;border-top:1px solid var(--rule-soft);">'
+        + td('<strong>' + esc(u.cust) + '</strong>')
+        + td('<span style="color:var(--ink-3);">no plan event claims these</span>'
+             + '<div style="font-size:9.5px;color:var(--ink-3);">' + esc(md(lo)) + ' → ' + esc(md(hi)) + '</div>')
+        + td(u.codes.length, true)
+        + td('', true) + td('', true)
+        + td('<strong>' + money(u.act) + '</strong>', true)
+        + td('', true)
+        + td(u.units ? num(u.units) : '', true, 'color:var(--ink-3);')
+        + td(u.units > 0 ? '$' + (u.act / u.units).toFixed(2) : '', true, 'color:var(--ink-3);')
+        + td('', true)
+        + '</tr>'
+        + codeRows(u.codes, cls);
+    }).join('');
+
+    summaryEl.innerHTML =
+      '<div style="display:flex;gap:34px;flex-wrap:wrap;padding:22px 24px;background:var(--bone-2);border-radius:9px;margin-bottom:20px;">'
+      + fig(money(totAct), 'billed against the plan', nCodes.toLocaleString() + ' retailer promo codes on ' + evs.length + ' plan events')
+      + fig(money(totUn), 'billed with no plan', uns.length ? uns.length + ' customer' + (uns.length === 1 ? '' : 's') + ' — Vividly cannot see these' : 'nothing unaccounted for', totUn > 0 ? '#a35a2a' : null)
+      + fig(money(totViv), 'Vividly says was deducted', 'against ' + money(totPlanned) + ' planned')
+      + '</div>'
+      + '<div style="overflow-x:auto;">'
+      + '<table style="width:100%;border-collapse:collapse;min-width:900px;">'
+      + '<thead><tr style="border-bottom:1.5px solid var(--ink-3);">'
+      + th('Retailer') + th('Plan event') + th('Codes', true) + th('Planned', true)
+      + th('Vividly', true) + th('Billed (Keel)', true) + th('Δ', true)
+      + th('Units', true) + th('Rate', true) + th('Lift', true)
+      + '</tr></thead><tbody>'
+      + (evRows || '<tr><td colspan="10" style="padding:26px;text-align:center;font-family:var(--serif);font-style:italic;color:var(--ink-3);">No actual promotions attached to a ' + year + ' plan event yet.</td></tr>')
+      + (unRows
+          ? '<tr><td colspan="10" style="padding:18px 10px 7px;font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#a35a2a;border-top:2px solid var(--rule-soft);">Ran and was billed — no plan behind it</td></tr>' + unRows
+          : '')
+      + '</tbody></table></div>'
+      + (undAmt > 0
+          ? '<div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:14px;">'
+            + got.undated.length.toLocaleString() + ' further promotions carry ' + money(undAmt)
+            + ' but no dates, so nothing can be attached to them or measured from them.</div>'
+          : '');
+
+    // ONE assignment, never addEventListener — a re-render would stack handlers
+    // and toggle every row twice, which reads as rows that will not open.
+    summaryEl.onclick = (e) => {
+      const tr = e.target.closest && e.target.closest('tr.tab-ev');
+      if (!tr || !summaryEl.contains(tr)) return;
+      const k = tr.dataset.k;
+      if (!k) return;
+      const open = !_tabOpen.has(k);
+      if (open) _tabOpen.add(k); else _tabOpen.delete(k);
+      summaryEl.querySelectorAll('tr.' + k).forEach(r => { r.style.display = open ? '' : 'none'; });
+    };
   }
 
   async function renderTradeAnalyzer(summaryEl, filtersEl, year) {
@@ -29361,7 +29750,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-52 promo fix, analyzer lanes';
+  const _DED_BUILD = 'tr-54 analyzer B';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -40422,6 +40811,8 @@ ${(() => {
     const _viewLabel = (PROMO_VIEWS.find(([v]) => v === _promoView) || [, 'Plan'])[1];
     const _viewMeta = _promoView === 'analyzer'
       ? 'Planned versus deducted, measured against Keel\u2019s own sales.'
+      : _promoView === 'analyzerb'
+      ? 'The same plan events, measured with the money the distributors actually billed.'
       : _promoView === 'deductions'
       ? 'What the distributors actually took, and how it compares to the plan.'
       : 'Annual promo plan by retailer. Expand a retailer to see individual promo lines.';
@@ -40485,6 +40876,7 @@ ${(() => {
     if (_planYear) {
       const sEl = document.getElementById('hl-promo-summary'), fEl = document.getElementById('hl-promo-filters');
       if (_promoView === 'analyzer') await renderTradeAnalyzer(sEl, fEl, _promoYear);
+      else if (_promoView === 'analyzerb') await renderTradeAnalyzerB(sEl, fEl, _promoYear);
       else if (_promoView === 'deductions') await renderDeductions(sEl, fEl, _promoYear);
       else await renderVividlyPlan(sEl, fEl, _promoYear);
       return;
@@ -68084,6 +68476,7 @@ CREATE POLICY "Allow all" ON synonym_mappings FOR ALL USING (true) WITH CHECK (t
 
   function dispatch() {
     const route = getRouteFromHash();
+    try { if (window.KeelPerf && window.KeelPerf.enabled) window.KeelPerf.mark(route); } catch (e) {}
     const session = BrandLibrary.getSession();
 
     // Auth gate — only #login is open without a session
