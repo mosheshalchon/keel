@@ -29330,7 +29330,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-46 eleven tabs';
+  const _DED_BUILD = 'tr-47 units and rates';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -31175,13 +31175,10 @@ render();
               tone(variance))}
       </div>
 
-      <p style="font-family:var(--serif);font-size:14px;color:var(--ink-2);line-height:1.65;max-width:80ch;margin:22px 0 4px;">
-        <strong>Earned</strong> is the agreed rate times the units that actually sold, so it depends on neither the forecast
-        nor the document folder. <strong>Deducted \u2212 earned</strong> is therefore two answers in one: whether the distributor
-        took what it was owed, and what the folder is still missing.
-        ${covPct < 100 ? `Only ${covPct}% of the plan can be measured that way today \u2014 Whole Foods is the only customer with a
-        feed of units sold. The rest show planned and deducted with earned left blank; blank is <em>unknown</em>, not zero.` : ''}
-      </p>
+      <!-- The five-sentence explanation of Earned is gone (Moshe, 12 Sep 2026).
+           What it had to say is on the figures themselves: the Earned tile
+           already reads "N% of the plan has a unit feed", and a customer with
+           no feed shows "no units" in words rather than a zero. -->
 
       <div style="display:flex;gap:6px;align-items:center;margin:18px 0 2px;">
         ${modeBtn('customer', 'By customer')}${modeBtn('month', 'By month')}
@@ -35748,9 +35745,20 @@ render();
     // Tolerance is a cent, for float noise only.
     const _dedTieNote = (tabTotal, registerTotal) => {
       const diff = Math.round((tabTotal - registerTotal) * 100) / 100;
+      // A RED BANNER HAS TO MEAN SOMETHING. $3,758 against a $2.6M register is
+      // 0.14% -- rounding and a handful of edge rows -- and shouting "do not
+      // quote either figure" over it taught the reader to ignore the banner,
+      // which is the one outcome that makes it useless when it matters. Under
+      // 1% the difference is still STATED, just quietly; over 1% it is loud.
+      const share = registerTotal ? Math.abs(diff) / Math.abs(registerTotal) : 1;
       if (Math.abs(diff) < 0.01) {
         return `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;">
           \u2713 ties to the ${money(registerTotal)} register</p>`;
+      }
+      if (share <= 0.01) {
+        return `<p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:10px;">
+          \u2713 ties to the ${money(registerTotal)} register within ${money(Math.abs(diff))}
+          (${(share * 100).toFixed(2)}%)</p>`;
       }
       return `<p style="font-family:var(--mono);font-size:10.5px;color:var(--lost);margin-top:10px;
         border-left:2px solid var(--lost);padding-left:9px;line-height:1.5;">
@@ -38323,7 +38331,11 @@ render();
             Early pay taken off payments is the discount column on the UNFI and Kroger checks; KeHE states no discount anywhere, so its 2% is calculated on what ATG shipped KeHE (NetSuite gross, billed). Neither enters the deduction book, so the Early pay card is the only place they are added in.</p>`, true);
       })();
 
-      shell(panelCust, panelCarve + panelRec);
+      // panelCarve is COMPUTED AND NOT RENDERED (Moshe, 12 Sep 2026): three
+      // cards and two paragraphs restating what the Category tab's own buckets
+      // already say, one click away. The builder is left intact -- its figures
+      // are the same ones Category reads -- so restoring it is one word.
+      shell(panelCust, panelRec);
       return;
     }
 
@@ -39043,22 +39055,26 @@ ${(() => {
             if (!e) { if (_dedProgramOf(l, rmapBy[l.reason_code]) === 'EDLP') doc += Math.abs(Number(l.amount || 0)); continue; }
             if (e.how === 'rate') rate += e.amt; else if (e.how === 'category') cat += e.amt; else doc += e.amt;
           }
-          return 'Found by reason code or document ' + money(doc)
-            + (cat > 0.005 ? ' \u00b7 by UNFI category A (share of the weekly MCB lines) ' + money(cat) : '')
-            + ' \u00b7 by agreed rate ' + money(rate) + '.'
-            + (edlpLimit ? ' ' + edlpLimit : '');
+          // FIGURES, NOT SENTENCES. Same three numbers, no prose around them.
+          return 'document ' + money(doc)
+            + (cat > 0.005 ? ' \u00b7 UNFI category A ' + money(cat) : '')
+            + ' \u00b7 agreed rate ' + money(rate)
+            + (edlpLimit ? ' \u00b7 ' + edlpLimit : '');
         }
         if (name === 'EDLP') return edlpLimit;
         if (name === 'Early pay') {
           const parts = [];
+          // These two figures exist NOWHERE ELSE now that the Executive
+          // summary's carve panel is gone -- early pay is taken off the payment
+          // and never becomes a deduction line -- so they stay. As values.
           if (epTaken > 0.005)
-            parts.push('Taken off payments in ' + yr + ': ' + money(epTaken) + ' on ' + epTakenN + ' check' + (epTakenN === 1 ? '' : 's')
-              + (epCovered < epChecks.length ? ' (only ' + epCovered + ' of ' + epChecks.length + ' checks carry a discount figure yet, so that is a floor)' : '') + '.');
-          else if (epChecks.length && !epCovered) parts.push('No check this year carries a discount figure yet.');
+            parts.push(money(epTaken) + ' off ' + yr + ' payments on ' + epTakenN + ' check' + (epTakenN === 1 ? '' : 's')
+              + (epCovered < epChecks.length ? ' (' + epCovered + ' of ' + epChecks.length + ' checks carry a figure \u2014 a floor)' : ''));
+          else if (epChecks.length && !epCovered) parts.push('no check this year carries a discount figure');
           if (epKehe.pay > 0.005)
-            parts.push('KeHE, calculated: 2% of ' + money(epKehe.shipped) + ' shipped to KeHE in ' + yr + ' (NetSuite, billed) = ' + money(epKehe.pay) + '.');
-          if (parts.length) parts.push('Neither is a deduction line, so neither is in this table\u2019s total.');
-          return parts.join(' ');
+            parts.push('KeHE ' + money(epKehe.pay) + ' calculated \u00b7 2% of ' + money(epKehe.shipped) + ' shipped');
+          if (parts.length) parts.push('not deduction lines \u2014 not in this total');
+          return parts.join(' \u00b7 ');
         }
         return '';
       };
@@ -39139,7 +39155,12 @@ ${(() => {
                 ${td(dPct(b), true, b.docAmt === 0 ? 'color:var(--ink-3);' : '')}
               </tr>
               <tr><td colspan="8" style="padding:0 10px 6px;border-bottom:1px solid var(--rule-soft);">
-                <div style="font-family:var(--serif);font-size:12px;color:var(--ink-3);padding-left:12px;">${esc(DED_BUCKET_NOTE[b.name] || '')}</div>
+                <!-- DED_BUCKET_NOTE is no longer rendered (Moshe, 12 Sep 2026):
+                     a sentence describing what "Trade spend" means, under a row
+                     labelled Trade spend. bucketExtra stays because it carries
+                     FIGURES that appear nowhere else -- how the EDLP bucket was
+                     found, and the early pay that never becomes a deduction
+                     line -- now stated as values, not sentences. -->
                 ${(() => { const x = bucketExtra(b.name, b); return x ? `<div style="font-family:var(--mono);font-size:10.5px;color:var(--ink-2);padding:3px 0 0 12px;">${esc(x)}</div>` : ''; })()}
               </td></tr>`;
 
@@ -39392,12 +39413,25 @@ ${(() => {
           continue;
         }
         let b = banners.get(name);
-        if (!b) banners.set(name, b = { name, amt: 0, rows: 0, plan: (m && m.plan_customer) || null, stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map(), catLines: new Map() });
+        if (!b) banners.set(name, b = { name, amt: 0, rows: 0, units: 0, unitsAmt: 0, rates: new Set(), plan: (m && m.plan_customer) || null, stores: new Map(), cats: new Map(), months: new Map(), catMonths: new Map(), catLines: new Map() });
         b.amt += amt; b.rows++;
         const store = d.customer_name || '(unnamed store)';
         let st = b.stores.get(store);
         if (!st) b.stores.set(store, st = { name: store, state: d.customer_state, amt: 0, rows: 0, items: [] });
         st.amt += amt; st.rows++;
+        // ── UNITS AND RATE ──────────────────────────────────────────────
+        // Dollars alone cannot tell a price change from a volume change, and
+        // for a per-unit programme the rate IS the agreement. Accumulated only
+        // over rows that actually carry a quantity, with their dollars kept
+        // separately: dividing the whole amount by a partial unit count would
+        // overstate the rate on any customer whose detail is mixed.
+        const _q = Number(d.ship_qty) || 0;
+        if (_q > 0) {
+          b.units += _q; b.unitsAmt += amt;
+          st.units = (st.units || 0) + _q; st.unitsAmt = (st.unitsAmt || 0) + amt;
+          const _r = Math.round((amt / _q) * 100) / 100;
+          if (_r > 0) { b.rates.add(_r); st.rates = st.rates || new Set(); st.rates.add(_r); }
+        }
         // The deepest level is the document's own row: item, reference, date,
         // qty, rate. Held by reference, not copied.
         st.items.push(d);
@@ -39552,15 +39586,33 @@ ${(() => {
           </table></div>
           `;
       } else {
+        // One place decides how units and a rate are shown, so the customer row
+        // and the store row under it cannot disagree.
+        const unitsCell = (u) => u > 0
+          ? td(Math.round(u).toLocaleString(), true)
+          : td('<span style="color:var(--ink-3);">\u2014</span>', true);
+        const rateCell = (u, a, rs) => {
+          if (!(u > 0) || !(a > 0)) return td('<span style="color:var(--ink-3);">\u2014</span>', true);
+          const r = a / u;
+          const many = rs && rs.size > 1;
+          return td('$' + r.toFixed(2)
+            + (many ? '<span style="color:var(--ink-3);font-size:9.5px;" title="' + rs.size
+                    + ' different per-unit rates in this customer\u2019s detail \u2014 this is the weighted average"> avg</span>' : ''),
+            true, 'color:var(--ink-2);');
+        };
         body.innerHTML = bar + `
           <table class="ded-hide-c2 ded-hide-c3" style="width:100%;border-collapse:collapse;">
-            <thead><tr>${th('Customer')}${th('Stores', true)}${th('Lines', true)}${th('Plan customer')}${th('Deducted', true)}${th('Share', true)}</tr></thead>
+            <!-- LINES became UNITS. A count of detail rows is an artefact of how
+                 the distributor batched its file; units are what was sold, and
+                 with the rate beside them a change in dollars can be read as
+                 price or volume rather than just "bigger". -->
+            <thead><tr>${th('Customer')}${th('Stores', true)}${th('Units', true)}${th('Rate', true)}${th('Plan customer')}${th('Deducted', true)}${th('Share', true)}</tr></thead>
             <tbody>
               ${shown.slice(0, _dedCustLimit).map(b => {
                 const open = _dedOpen.has(b.name);
                 let out = `<tr class="hl-cust-row" data-b="${esc(b.name)}" style="cursor:pointer;">
                   ${td(`<span style="display:inline-block;width:12px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span>${esc(b.name)}`)}
-                  ${td(b.stores.size, true)}${td(b.rows.toLocaleString(), true)}
+                  ${td(b.stores.size, true)}${unitsCell(b.units)}${rateCell(b.units, b.unitsAmt, b.rates)}
                   ${td(b.plan ? esc(b.plan) : '<span style="color:var(--ink-3);">unlinked</span>')}
                   ${td(money(b.amt), true, 'font-weight:600;')}
                   ${td((b.amt / grand * 100).toFixed(1) + '%', true, 'color:var(--ink-3);')}
@@ -39595,7 +39647,7 @@ ${(() => {
                     // tab opens. A flat chip strip answered "what was charged"
                     // but not "when", which is the question that turns a number
                     // into something you can take to the distributor.
-                    out += `<tr><td colspan="6" style="padding:0;background:var(--rule-softer);">
+                    out += `<tr><td colspan="7" style="padding:0;background:var(--rule-softer);">
                       <div style="padding:8px 10px 4px 34px;font-family:var(--mono);font-size:9.5px;letter-spacing:0.08em;color:var(--ink-3);text-transform:uppercase;">By bucket</div>
                       <table style="width:100%;border-collapse:collapse;">
                         ${b.catList.map(([cat, v]) => {
@@ -39635,7 +39687,7 @@ ${(() => {
                     const sOpen = _dedCustStore.has(sk);
                     let s = `<tr class="hl-cust-store" data-s="${esc(sk)}" style="background:var(--rule-softer);cursor:pointer;">
                       ${td('<span style="padding-left:22px;display:inline-block;width:12px;color:var(--ink-3);">' + (sOpen ? '\u2212' : '+') + '</span>' + esc(st.name) + (st.state ? ' <span style="color:var(--ink-3);">' + esc(st.state) + '</span>' : ''))}
-                      ${td('', true)}${td(st.rows, true)}${td('')}${td(money(st.amt), true)}${td('', true)}</tr>`;
+                      ${td('', true)}${unitsCell(st.units || 0)}${rateCell(st.units || 0, st.unitsAmt || 0, st.rates)}${td('')}${td(money(st.amt), true)}${td('', true)}</tr>`;
                     if (sOpen) {
                       // Largest first — on a 60-store SCAN document the row that
                       // matters is never the one that happens to be printed first.
@@ -39653,11 +39705,19 @@ ${(() => {
                              + (meta ? '<div style="padding-left:52px;font-family:var(--mono);font-size:9.5px;color:var(--ink-3);">' + meta + '</div>' : ''))}
                           ${td('', true)}
                           ${td(it.ship_qty != null ? esc(it.ship_qty) : '', true, 'color:var(--ink-3);')}
-                          ${td('')}
+                          ${td((() => {
+                            // The row's OWN rate, under the Rate column, so the
+                            // customer average above can be checked against the
+                            // items that made it.
+                            const q = Number(it.ship_qty) || 0;
+                            const a = Math.abs(Number(it.bill_amount || 0));
+                            const r = it.unit_chargeback != null ? Number(it.unit_chargeback) : (q > 0 ? a / q : 0);
+                            return r > 0 ? '$' + r.toFixed(2) : '';
+                          })(), true, 'color:var(--ink-3);')}
                           ${td(money(Math.abs(Number(it.bill_amount || 0))), true, 'color:var(--ink-2);')}
                           ${td('', true)}</tr>`;
                       }).join('');
-                      if (items.length > 60) s += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:52px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (items.length - 60).toLocaleString() + ' smaller item rows not shown \u00b7 the store total above still counts them</span>')}${td('', true)}${td('', true)}${td('')}${td('', true)}${td('', true)}</tr>`;
+                      if (items.length > 60) s += `<tr style="background:var(--rule-softer);">${td('<span style="padding-left:52px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">' + (items.length - 60).toLocaleString() + ' smaller item rows not shown \u00b7 the store total above still counts them</span>')}${td('', true)}${td('', true)}${td('', true)}${td('')}${td('', true)}${td('', true)}</tr>`;
                     }
                     return s;
                   }).join('');
