@@ -29113,7 +29113,8 @@ render();
   // one level finer, and Category already expands to the code. Its render branch
   // is left in place — nothing routes to it now, and deleting live code to
   // remove a button is a worse trade than leaving it unreachable.
-  const DED_VIEW_MOVED = { category: 'summary', other: 'summary', code: 'summary' };
+  const DED_VIEW_MOVED = { category: 'summary', other: 'summary', code: 'summary',
+                           catalogue: 'support', exceptions: 'execsum', callouts: 'execsum' };
   let _dedCustStore = new Set();  // By customer: expanded stores -> the item rows
   // Deductions tab: the register at line grain.
   let _dedLinesLimit = 25;        // rows shown; grows by DED_PAGE
@@ -29329,7 +29330,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-44 edlp banners';
+  const _DED_BUILD = 'tr-46 eleven tabs';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -29873,6 +29874,13 @@ render();
     catch (e) { return 'exec'; }
   })();
   let _dedDetail = null;          // cached store-level detail for the Customer tab
+  // THE DOCUMENT CATALOGUE. Filename, status and content hash only -- ~11k rows
+  // -- because "is the missing document missing, or just unread?" cannot be
+  // answered from the register, and it is the difference between a request to
+  // the distributor and a queue that is merely behind. Support gaps used to
+  // state the gap and stop there; the Catalogue tab held the other half of the
+  // answer on a separate screen nobody cross-referenced.
+  let _dedFilesCache = null;
   let _dedOpen = new Set();       // which customers are expanded
   const DED_PAGE = 25;
   let _dedCustLimit = DED_PAGE;   // banners shown before "show more"
@@ -35160,7 +35168,23 @@ render();
     // supports that answer — the rows themselves, the documents, the plumbing.
     const VIEW_ROWS = [
       ['Deduction overview', ['exec', 'customer', 'summary', 'reconcile', 'edlp', 'execsum']],
-      ['Support',            ['lines', 'promos', 'checks', 'support', 'exceptions', 'callouts', 'upload', 'catalogue']],
+      // 'catalogue' left the nav 12 Sep 2026: it answered the second half of
+      // Support gaps' question ("is the document missing, or just unread?") on
+      // a screen nobody cross-referenced, as thirty rows of read-through % with
+      // no dollars on them. That answer is now a COLUMN on the gap itself. The
+      // branch is left in place and unreachable -- deleting live code to remove
+      // a button is the worse trade, and DED_VIEW_MOVED sends saved links on.
+      // 'exceptions' and 'callouts' left the nav 12 Sep 2026. Neither computed
+      // anything of its own: every Exceptions section was a digest of another
+      // tab (its no-backup dollars even DISAGREED with Support gaps', because
+      // one scoped to trade spend and the other did not), and the Callouts code
+      // says outright "Nothing new is computed here" -- its crawl and feed
+      // strips are the same ones To-dos renders. The one thing that was unique
+      // to Callouts, the double-count list, has moved to Checks, which is where
+      // Callouts already told the reader to go. Both branches stay in place and
+      // unreachable; DED_VIEW_MOVED sends saved links to To-dos, which ranks
+      // all of these signals by dollars and links to the proof.
+      ['Support',            ['lines', 'promos', 'checks', 'support', 'upload']],
     ];
     // NOTES CARRIED OVER FROM THE FLAT LIST THIS REPLACED, because the reasons
     // are not obvious from the labels:
@@ -35649,6 +35673,17 @@ render();
       if (r.error) return { lines: [], err: r.error.message };
       _dedIdb.put('plan|' + _planKey, r.lines);
       return { lines: r.lines, err: null };
+    };
+
+    const _dedGetFiles = async () => {
+      if (_dedFilesCache && _dedFilesCache.key === brandId) return _dedFilesCache.rows;
+      let rows = [];
+      try {
+        rows = await paged(() => sb.from('deduction_files')
+          .select('filename,status').eq('brand_id', brandId).order('id', { ascending: true }));
+      } catch (e) { rows = []; }
+      _dedFilesCache = { key: brandId, rows: rows || [] };
+      return _dedFilesCache.rows;
     };
 
     // Warm the caller from cache before it decides to paint a spinner.
@@ -39781,155 +39816,170 @@ ${(() => {
       ];
       const mixTot = dedL.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
 
-      // ── CANDIDATE CHECK ───────────────────────────────────────────────────
-      // Replaces a "period" column that was reading raw digit runs out of the
-      // reference and landing in a different place per layout -- 02072601 from
-      // WE020726…, 2615930 from WFMJAN26…, which is meaningless. doc_date is
-      // already correct on every one of these, so the useful thing to show is
-      // WHICH advice it should have been on: the distributor's checks settling
-      // in the 45 days after the deduction date. This is a SUGGESTION for
-      // accounting to go looking with, never an anchor -- every check already
-      // foots to its own lines, so none of these can simply be attached.
-      const cand = (l) => {
-        const d = l.doc_date ? new Date(l.doc_date + 'T12:00:00') : null;
-        if (!d || isNaN(d)) return '\u2014';
-        const hits = (checks || []).filter(c => {
-          if (!c.check_date) return false;
-          const cd = new Date(String(c.check_date) + 'T12:00:00');
-          if (isNaN(cd)) return false;
-          const days = (cd - d) / 86400000;
-          return days >= 0 && days <= 45;
-        }).sort((a, b) => String(a.check_date).localeCompare(String(b.check_date)));
-        if (!hits.length) return '\u2014';
-        return hits.slice(0, 2).map(c => esc(c.check_no)).join(', ')
-             + (hits.length > 2 ? ` +${hits.length - 2}` : '');
+      // ── IS THE DOCUMENT MISSING, OR JUST UNREAD? ───────────────────────
+      // This replaces the "Possible check" column, which guessed at advices
+      // settling within 45 days and was empty on every row -- and it is the
+      // reason the Catalogue tab no longer exists as its own screen. "No
+      // document" and "the document is sitting in Dropbox unread" look
+      // identical here and need opposite responses: one is a request to the
+      // distributor, the other is a queue that is behind. Stating which turns
+      // this tab from a complaint into a decision.
+      const _files = await _dedGetFiles();
+      const RANK = { parsed: 3, new: 2, failed: 1, unsupported: 1, ignored: 0 };
+      // TWO INDEXES, BECAUSE THE UNDERSCORE MEANS TWO THINGS. In
+      // 038053513PTYNATGROC_Scan Back October 2025.xlsx it separates the
+      // reference from a description; in AGAINSTTHEGRAIN_TPR_260400031_Backup
+      // it is PART of the reference. Cutting at the first underscore reduced
+      // AGAINSTTHEGRAIN_TPR_260400031 and AGAINSTTHEGRAIN_PA_260500031 -- both
+      // live rows on this tab -- to the same key, and whichever file was seen
+      // last would answer for both.
+      //
+      // So: the full stem is the authority, and the head is consulted ONLY for
+      // a reference that has no underscore of its own, which is exactly the
+      // case the head was meant to serve.
+      const _byStem = new Map();    // FULL STEM -> best status
+      const _byHead = new Map();    // first segment -> best status
+      const _best = (m, k, st) => {
+        const prev = m.get(k);
+        if (!prev || (RANK[st] ?? 0) > (RANK[prev] ?? 0)) m.set(k, st);
+      };
+      for (const f of _files) {
+        const stem = String(f.filename || '').replace(/\.[^.]+$/, '').toUpperCase();
+        if (!stem) continue;
+        _best(_byStem, stem, f.status);
+        const head = stem.split('_')[0];
+        if (head && head !== stem) _best(_byHead, head, f.status);
+      }
+      // THE BEST STATUS ACROSS EVERY COPY, not the first one found. A reference
+      // can carry several files -- 038053513PTYNATGROC has a bare PDF that was
+      // never opened and a "_Scan Back October 2025" workbook that was read --
+      // and if ANY copy has been read, the document is read. Returning the
+      // exact-stem match alone reported that one as unread and would have sent
+      // someone to look for a document already in the book.
+      const _statusOf = (ref) => {
+        const k = String(ref || '').toUpperCase();
+        if (!k) return null;
+        let best = _byStem.get(k) || null;
+        if (!k.includes('_')) {
+          const h = _byHead.get(k);
+          if (h && (!best || (RANK[h] ?? 0) > (RANK[best] ?? 0))) best = h;
+        }
+        return best;
+      };
+      const _fileIdx = { get: (k) => _statusOf(k) };
+      const DOC = {
+        parsed:      ['read', 'var(--won)'],
+        'new':       ['in Dropbox, unread', 'var(--lost)'],
+        failed:      ['unreadable', '#8a6d1f'],
+        unsupported: ['unreadable', '#8a6d1f'],
+        ignored:     ['unreadable', '#8a6d1f'],
+      };
+      const docOf = (ref) => {
+        const st = _fileIdx.get(String(ref || '').toUpperCase());
+        return st ? (DOC[st] || ['read', 'var(--won)']) : ['not in Dropbox', 'var(--ink-3)'];
+      };
+      const docCell = (ref) => {
+        const [lbl, col] = docOf(ref);
+        return '<span style="font-family:var(--mono);font-size:10.5px;color:' + col + ';">' + lbl + '</span>';
       };
 
-      const byCode = new Map();
-      for (const l of orphans) {
-        const k = l.reason_code || '(none)';
-        const o = byCode.get(k) || { code: k, lines: 0, amt: 0 };
-        o.lines++; o.amt += Math.abs(Number(l.amount) || 0);
-        byCode.set(k, o);
-      }
-      body.innerHTML = `
-        <div style="margin-bottom:20px;">
-          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;color:var(--ink-2);text-transform:uppercase;margin-bottom:6px;">Support mix — ${esc(_dedDist === 'all' ? 'all distributors' : _dedDist)}</div>
-          <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0 0 9px;line-height:1.5;max-width:860px;">
-            A deduction needs two documents and they fail independently: a remittance advice proving the
-            money was taken, and backup detail proving what for. Switch the distributor above to compare.
-          </p>
-          <table style="width:100%;border-collapse:collapse;">
-            <thead><tr>${th('Status')}${th('Lines', true)}${th('Amount', true)}${th('% of book', true)}</tr></thead>
-            <tbody>${mix.map(([name, rows]) => {
-              const a = rows.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
-              const good = name === 'Fully supported';
-              return `<tr>
-                ${td(`<span style="${good ? 'color:var(--won);' : ''}">${esc(name)}</span>`)}
-                ${td(rows.length.toLocaleString(), true)}
-                ${td(money(-a), true)}
-                ${td(mixTot ? (a / mixTot * 100).toFixed(1) + '%' : '\u2014', true, 'color:var(--ink-3);')}
-              </tr>`;
-            }).join('')}</tbody>
-          </table>
-        </div>
+      // A FIGURE, NOT A TABLE ROW. The support mix used to be a four-column
+      // table that had to be read before it meant anything. These are the same
+      // three numbers at a size someone reads standing up.
+      const fig = (lbl, val, sub, col) => `
+        <div style="min-width:0;">
+          <div style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--ink-3);">${esc(lbl)}</div>
+          <div style="font-family:var(--serif);font-size:38px;line-height:1.1;margin-top:6px;${col ? 'color:' + col + ';' : ''}">${val}</div>
+          ${sub ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:5px;line-height:1.5;">${sub}</div>` : ''}
+        </div>`;
+      const pct = (a) => mixTot ? (a / mixTot * 100).toFixed(0) + '% of the book' : '';
+      const mixAmt = (rows) => rows.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+      const okAmt = mixAmt(mix[0][1]), noDetAmt = mixAmt(mix[1][1]);
 
-        <div style="margin-bottom:16px;">
-          <div style="font-family:var(--serif);font-size:19px;margin-bottom:4px;">
-            ${money(tot)} has no remittance advice.
-          </div>
-          <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0;line-height:1.55;max-width:860px;">
-            These carry full backup detail — stores, rates, amounts — but no payment document showing the
-            money was taken. They are counted in every total on this page because the spend is real and
-            classified. What is missing is the proof. <strong>Possible check</strong> lists advices that
-            settled within 45 days of the deduction date; it is a place to start looking, not a match.
-          </p>
+      // How many of the gap lines have their document sitting unread. This is
+      // the single most useful number on the tab: it is work already paid for.
+      const unreadOf = (rows) => {
+        let n = 0, amt = 0;
+        for (const l of rows) if (_fileIdx.get(String(l.invoice_no || '').toUpperCase()) === 'new') { n++; amt += Math.abs(Number(l.amount) || 0); }
+        return { n, amt };
+      };
+      const gapRows = dedL.filter(l => {
+        if (l.detail_parsed) return false;
+        const rm = rmapBy[l.reason_code];
+        return rm && rm.is_trade_spend;
+      });
+      const unreadAll = unreadOf(dedL.filter(l => !l.detail_parsed || !l.check_id));
+
+      body.innerHTML = `
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:24px;padding:4px 2px 8px;">
+          ${fig('Fully supported', money(okAmt), pct(okAmt) + ' · ' + mix[0][1].length.toLocaleString() + ' lines', 'var(--won)')}
+          ${fig('No backup detail', money(noDetAmt), pct(noDetAmt) + ' · ' + mix[1][1].length.toLocaleString() + ' lines')}
+          ${fig('No remittance advice', money(tot), pct(tot) + ' · ' + orphans.length.toLocaleString() + ' lines')}
         </div>
-        ${byCode.size ? `<table style="width:100%;border-collapse:collapse;margin-bottom:22px;">
-          <thead><tr>${th('Code')}${th('Lines', true)}${th('Amount', true)}</tr></thead>
-          <tbody>${[...byCode.values()].sort((a, b) => b.amt - a.amt).map(o => `<tr>
-            ${td('<strong>' + esc(o.code) + '</strong>')}${td(o.lines, true)}
-            ${td('<span style="color:var(--lost);">' + money(-o.amt) + '</span>', true)}
-          </tr>`).join('')}</tbody></table>` : ''}
-        ${orphans.length ? `<div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+        ${unreadAll.n ? `<div style="font-family:var(--mono);font-size:12px;color:var(--lost);margin:18px 0 4px;">
+          ${unreadAll.n.toLocaleString()} of these carry a document that is in Dropbox and has never been opened
+          · ${money(unreadAll.amt)}. Reading them costs nothing but queue time.</div>` : ''}
+        <p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin:6px 0 26px;">
+          A deduction needs two documents and they fail independently — an advice proving the money moved,
+          backup proving what for. Scoped to ${esc(_dedDist === 'all' ? 'all distributors' : _dedDist)}.</p>
+
+        ${orphans.length ? `<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:var(--ink-2);">No remittance advice · ${money(tot)}</div>
           <button id="hl-ded-support-dl" style="font-family:var(--mono);font-size:11px;padding:6px 13px;border-radius:5px;border:1px solid var(--ink);background:transparent;color:var(--ink);cursor:pointer;">Download CSV</button>
         </div>
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
-            ${th('Reference / source file')}${th('Distributor')}${th('Code')}${th('Retailer')}${th('Date')}${th('Possible check')}${th('Amount', true)}
+            ${th('Reference / source file')}${th('Distributor')}${th('Code')}${th('Date')}${th('Document')}${th('Amount', true)}
           </tr></thead>
           <tbody>${orphans.map(l => `<tr>
             ${td('<span style="font-family:var(--mono);font-size:10.5px;">' + esc(l.invoice_no || '—') + '</span>')}
             ${td(esc(_lineDist(l)))}
             ${td(esc(l.reason_code || '—'))}
-            ${td('<span style="font-size:10.5px;">' + esc(_custName(l.dc_name) || '—') + '</span>')}
             ${td(esc(String(l.doc_date || '—')))}
-            ${td('<span style="font-family:var(--mono);font-size:10.5px;color:var(--ink-3);">' + cand(l) + '</span>')}
+            ${td(docCell(l.invoice_no))}
             ${td(money(-Math.abs(Number(l.amount) || 0)), true)}
           </tr>`).join('')}</tbody></table>`
         : '<div style="font-family:var(--mono);font-size:11px;color:var(--won);">Every deduction sits on a remittance advice.</div>'}
-        <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:14px;line-height:1.55;max-width:860px;">
-          The reference doubles as the source filename — search Dropbox for it to find the backup. Nothing
-          here can be fixed by loading more files: every check already foots to its own lines, so there is
-          no payment for these to attach to. The advice was never filed, or never issued.
-        </p>
+
         ${(() => {
           // ── TRADE SPEND WITH NO ITEMISED BACKUP ────────────────────────────
-          // The SECOND kind of gap, and the one that actually blocks
-          // reconciliation. A missing advice means nobody proved the money left;
-          // this means the money is proven gone, the charge is promotional, and
-          // no document names the stores, rates or promo number it should
-          // reconcile against.
-          //
-          // SCOPED TO TRADE SPEND DELIBERATELY. Most undocumented UNFI money is
-          // freight, reclaim, late fees, growth incentives and compliance
-          // penalties -- none of which HAS a promo to match, so counting them in
-          // a reconciliation gap overstates it. A freight charge has no promo
-          // number because there is no promo. Only trade spend belongs here.
-          const gaps = dedL.filter(l => {
-            if (l.detail_parsed) return false;
-            const rm = rmapBy[l.reason_code];
-            return rm && rm.is_trade_spend;
-          });
-          if (!gaps.length) return '';
-          const gTot = gaps.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
-          const tradeAll = dedL.filter(l => {
-            const rm = rmapBy[l.reason_code];
-            return rm && rm.is_trade_spend;
-          });
-          const tradeTot = tradeAll.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
+          // The second kind of gap, and the one that blocks reconciliation. A
+          // missing advice means nobody proved the money left; this means the
+          // money is proven gone, the charge is promotional, and no document
+          // names the stores, rates or promo number it should reconcile
+          // against. SCOPED TO TRADE SPEND DELIBERATELY: freight, reclaim, late
+          // fees and compliance penalties have no promo to match in the first
+          // place, so counting them here would overstate the gap.
+          if (!gapRows.length) return '';
+          const gTot = gapRows.reduce((n, l) => n + Math.abs(Number(l.amount) || 0), 0);
           const byCat = new Map();
-          for (const l of gaps) {
+          for (const l of gapRows) {
             const rm = rmapBy[l.reason_code];
             const k = (rm && rm.keel_category) || 'Uncategorised';
-            const e = byCat.get(k) || { cat: k, lines: 0, amt: 0, codes: new Set() };
-            e.lines++; e.amt += Math.abs(Number(l.amount) || 0);
-            if (l.reason_code) e.codes.add(l.reason_code);
+            const e = byCat.get(k) || { cat: k, lines: [], amt: 0 };
+            e.lines.push(l); e.amt += Math.abs(Number(l.amount) || 0);
             byCat.set(k, e);
           }
           return `
-          <div style="margin:30px 0 16px;padding-top:22px;border-top:1px solid var(--rule-soft);">
-            <div style="font-family:var(--serif);font-size:19px;margin-bottom:4px;">
-              ${money(-gTot)} of trade spend has no promo-level documentation.
-            </div>
-            <p style="font-family:var(--serif);font-size:12.5px;color:var(--ink-3);margin:0;line-height:1.55;max-width:860px;">
-              ${tradeTot ? (gTot / tradeTot * 100).toFixed(0) : 0}% of ${esc(_dedDist === 'all' ? 'all' : _dedDist)} trade spend.
-              These deductions are proven taken and correctly classified, but no document names the stores,
-              rates or promo number they should reconcile against. Fees, freight, reclaim and penalties are
-              excluded — those have no promotion to match in the first place.
-            </p>
+          <div style="margin:34px 0 10px;padding-top:24px;border-top:1px solid var(--rule-soft);">
+            <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:var(--ink-2);">
+              Trade spend with no promo-level backup · ${money(-gTot)}</div>
           </div>
           <table style="width:100%;border-collapse:collapse;">
-            <thead><tr>${th('Bucket')}${th('Codes')}${th('Lines', true)}${th('Undocumented', true)}</tr></thead>
-            <tbody>${[...byCat.values()].sort((a, b) => b.amt - a.amt).map(e => `<tr>
-              ${td('<strong>' + esc(e.cat) + '</strong>')}
-              ${td('<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">'
-                   + esc([...e.codes].sort().join(' · ')) + '</span>')}
-              ${td(e.lines, true)}
-              ${td('<span style="color:var(--lost);">' + money(-e.amt) + '</span>', true)}
-            </tr>`).join('')}
-            <tr>${td('<strong>Total</strong>', false, 'border-top:2px solid var(--ink);')}${td('', false, 'border-top:2px solid var(--ink);')}
-              ${td('<strong>' + gaps.length + '</strong>', true, 'border-top:2px solid var(--ink);')}
+            <thead><tr>${th('Category')}${th('Lines', true)}${th('Document in Dropbox, unread', true)}${th('Undocumented', true)}</tr></thead>
+            <tbody>${[...byCat.values()].sort((a, b) => b.amt - a.amt).map(e => {
+              const u = unreadOf(e.lines);
+              return `<tr>
+                ${td('<strong>' + esc(e.cat) + '</strong>')}
+                ${td(e.lines.length.toLocaleString(), true)}
+                ${td(u.n ? '<span style="color:var(--lost);">' + u.n.toLocaleString() + ' · ' + money(u.amt) + '</span>'
+                         : '<span style="color:var(--ink-3);">—</span>', true)}
+                ${td('<span style="color:var(--lost);">' + money(-e.amt) + '</span>', true)}
+              </tr>`;
+            }).join('')}
+            <tr>${td('<strong>Total</strong>', false, 'border-top:2px solid var(--ink);')}
+              ${td('<strong>' + gapRows.length.toLocaleString() + '</strong>', true, 'border-top:2px solid var(--ink);')}
+              ${td('', true, 'border-top:2px solid var(--ink);')}
               ${td('<strong>' + money(-gTot) + '</strong>', true, 'border-top:2px solid var(--ink);')}</tr>
             </tbody>
           </table>`;
@@ -39940,11 +39990,9 @@ ${(() => {
       const dl = body.querySelector('#hl-ded-support-dl');
       if (dl) dl.onclick = () => {
         const q = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-        const rows = [['Reference / source file', 'Distributor', 'Code', 'Retailer',
-                       'Date', 'Possible check', 'Amount']];
+        const rows = [['Reference / source file', 'Distributor', 'Code', 'Date', 'Document', 'Amount']];
         for (const l of orphans) rows.push([l.invoice_no || '', _lineDist(l), l.reason_code || '',
-          _custName(l.dc_name) || '', l.doc_date || '',
-          String(cand(l)).replace(/<[^>]*>/g, '').replace(/\u2014/g, ''),
+          l.doc_date || '', docOf(l.invoice_no)[0],
           (-Math.abs(Number(l.amount) || 0)).toFixed(2)]);
         // BOM so Excel reads the £/– and any accented retailer name as UTF-8
         // instead of mojibake.
@@ -39960,14 +40008,53 @@ ${(() => {
     }
 
     if (_dedView === 'checks') {
+      // ── THE DOUBLE COUNT MOVED HERE ────────────────────────────────────
+      // It lived only on Callouts, which told the reader "Open the Checks tab
+      // to see the lines" -- and Checks had no column for it, so the
+      // instruction went nowhere. It belongs on the check register: it IS a
+      // fact about a check. Callouts leaves the nav with this.
+      const _over = new Map(overClaimed.map(x => [x.c.id, x]));
+      const notTiedN = checks.filter(c => !c.ties_out).length;
+      const tieGap = checks.reduce((n, c) => n + (c.ties_out ? 0 : Math.abs(Number(c.tie_variance) || 0)), 0);
+
+      // PROBLEMS FIRST. A register sorted by date buries the four checks worth
+      // looking at under ninety that are fine.
+      const rank = (c) => (_over.has(c.id) ? 0 : c.ties_out ? 2 : 1);
+      const rows = checks.slice().sort((x, y) =>
+        rank(x) - rank(y) || String(y.check_date || '').localeCompare(String(x.check_date || '')));
+
+      const fig = (lbl, val, sub, col) => `
+        <div style="min-width:0;">
+          <div style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.09em;text-transform:uppercase;color:var(--ink-3);">${esc(lbl)}</div>
+          <div style="font-family:var(--serif);font-size:38px;line-height:1.1;margin-top:6px;${col ? 'color:' + col + ';' : ''}">${val}</div>
+          ${sub ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:5px;line-height:1.5;">${sub}</div>` : ''}
+        </div>`;
+
       body.innerHTML = `
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:24px;padding:4px 2px 8px;">
+          ${fig('Checks', checks.length.toLocaleString(), esc(DSHORT) + ' · ' + esc(String(yr)))}
+          ${fig('Do not tie', notTiedN ? money(tieGap) : '—',
+                notTiedN ? notTiedN + ' of ' + checks.length + ' · Keel is missing rows for them'
+                         : 'every check foots to its own lines',
+                notTiedN ? 'var(--lost)' : 'var(--won)')}
+          ${fig('Possible double count', overClaimed.length ? money(-overClaimedTotal) : '—',
+                overClaimed.length ? overClaimed.length + ' check' + (overClaimed.length === 1 ? '' : 's')
+                  + ' carry more in lines than the check states'
+                  : 'no check carries more in lines than it states',
+                overClaimed.length ? 'var(--lost)' : 'var(--won)')}
+        </div>
+        <p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin:14px 0 22px;">
+          A check ties out when its invoices and deductions sum to what ${esc(DNAME)} actually paid.
+          Checks paying invoices dated before the export window will not tie until an earlier register is loaded.</p>
         <table style="width:100%;border-collapse:collapse;">
           <thead><tr>
             ${th('Check #')}${th('Date')}${th('Invoices $', true)}${th('Deductions $', true)}
-            ${th('Net parsed', true)}${th('Check amount', true)}${th('Ties out')}
+            ${th('Net parsed', true)}${th('Check amount', true)}${th('Ties out')}${th('Lines over stated', true)}
           </tr></thead>
           <tbody>
-            ${checks.map(c => `<tr>
+            ${rows.map(c => {
+              const ov = _over.get(c.id);
+              return `<tr>
               ${td(`<strong>${esc(c.check_no)}</strong>`)}
               ${td(esc(String(c.check_date || '—')))}
               ${td(money(c.invoice_total), true)}
@@ -39977,14 +40064,12 @@ ${(() => {
               ${td(c.ties_out
                   ? '<span style="color:var(--won);">✓</span>'
                   : `<span style="color:var(--lost);">✕ off by ${money(Math.abs(c.tie_variance || 0))}</span>`)}
-            </tr>`).join('')}
+              ${td(ov
+                  ? `<span style="color:var(--lost);" title="lines ${money(-ov.lines)} against a stated ${money(-ov.stated)} — usually one charge entered twice, a remittance line and an itemised file line for the same money">${money(-ov.excess)}</span>`
+                  : '<span style="color:var(--ink-3);">—</span>', true)}
+            </tr>`; }).join('')}
           </tbody>
-        </table>
-        <p style="font-family:var(--serif);font-size:12px;color:var(--ink-3);margin-top:12px;line-height:1.55;">
-          A check TIES OUT when the invoices and deductions on it sum to the amount KeHE actually paid. This is the control on the whole module:
-          if a check does not tie, Keel is missing rows for it and any analysis built on it is incomplete. Checks that pay invoices dated before the
-          export window will not tie until an earlier register is loaded.
-        </p>`;
+        </table>`;
       return;
     }
 
