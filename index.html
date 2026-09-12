@@ -27531,17 +27531,35 @@ render();
       if (out.length === 1000) {
         const total = Number(first.count);
         if (isFinite(total) && total > 1000) {
+          // EIGHT AT A TIME, NOT SEVENTY-EIGHT. 78,814 rows is 79 pages, and
+          // firing them all into one Promise.all is not parallelism -- the
+          // browser holds six connections open and queues the rest, so the tail
+          // waits behind the head anyway while the server takes 78 simultaneous
+          // hits. Measured at 11,419ms on the UNFI/KeHE weekly pull.
           const npages = Math.min(Math.ceil(total / 1000), 80);
-          const res = await Promise.all(Array.from({ length: npages - 1 }, (_, i) => mk().range((i + 1) * 1000, (i + 1) * 1000 + 999)));
-          const bad = res.find(r => r.error);
-          if (bad) return { rows: out, error: bad.error };
-          for (const r of res) out = out.concat(r.data || []);
+          const LANES = 8;
+          for (let base = 1; base < npages; base += LANES) {
+            const n = Math.min(LANES, npages - base);
+            const res = await Promise.all(Array.from({ length: n }, (_, i) =>
+              mk().range((base + i) * 1000, (base + i) * 1000 + 999)));
+            const bad = res.find(r => r.error);
+            if (bad) return { rows: out, error: bad.error };
+            for (const r of res) out = out.concat(r.data || []);
+          }
         } else {
-          for (let f = 1000; ; f += 1000) {   // no count came back — fall back to sequential
-            const { data, error } = await mk().range(f, f + 999);
-            if (error) return { rows: out, error };
-            out = out.concat(data || []);
-            if (!data || data.length < 1000 || f > 60000) break;
+          // No count came back. Same waves as the deductions pager rather than
+          // one page per latency hop.
+          for (let base = 1; base < 80; base += 4) {
+            const res = await Promise.all(Array.from({ length: 4 }, (_, i) =>
+              mk().range((base + i) * 1000, (base + i) * 1000 + 999)));
+            let done = false;
+            for (const r of res) {
+              if (r.error) return { rows: out, error: r.error };
+              const d = r.data || [];
+              out = out.concat(d);
+              if (d.length < 1000) { done = true; break; }
+            }
+            if (done) break;
           }
         }
       }
@@ -27557,7 +27575,20 @@ render();
     // Kroger is bounded to the promo year + the prior one (it used to pull all history).
     const tAll = (window.performance || Date).now();
     const [dcs, wf, kr, nsq] = await Promise.all([
-      paged(() => sb.from('distributor_customer_sales').select('distributor, chain_name, week_starting, sales, quantity', { count: 'exact' }).eq('brand_id', brandId).eq('report_type', 'weekly').gte('week_starting', lo).lte('week_starting', hi).order('week_starting').order('distributor').order('chain_name'), 'UNFI/KeHE weekly'),
+      // AGGREGATE ON THE SERVER IF IT IS THERE. This pull is 78,814 raw rows
+      // that the loop below immediately groups by (chain, week) -- work Postgres
+      // does in milliseconds and returns a few thousand rows for. The view
+      // distributor_customer_weekly (ANALYZER-WEEKLY.sql) does exactly that
+      // grouping; when it is absent this falls back to the raw table and
+      // behaves as before, so the page never depends on the migration.
+      (async () => {
+        const view = await paged(() => sb.from('distributor_customer_weekly')
+          .select('distributor, chain_name, week_starting, sales, quantity', { count: 'exact' })
+          .eq('brand_id', brandId).gte('week_starting', lo).lte('week_starting', hi)
+          .order('week_starting').order('distributor').order('chain_name'), 'UNFI/KeHE weekly (rolled up)');
+        if (!view.error) return view;
+        return paged(() => sb.from('distributor_customer_sales').select('distributor, chain_name, week_starting, sales, quantity', { count: 'exact' }).eq('brand_id', brandId).eq('report_type', 'weekly').gte('week_starting', lo).lte('week_starting', hi).order('week_starting').order('distributor').order('chain_name'), 'UNFI/KeHE weekly (raw)');
+      })(),
       paged(() => sb.from('wfm_sales').select('week_end, unit_sales, net_sales, brand, item_desc', { count: 'exact' }).eq('brand_id', brandId).gte('week_end', lo).lte('week_end', hi).order('week_end').order('region').order('scan_code'), 'WFM'),
       paged(() => sb.from('kroger_sales').select('fiscal_year, week, ty_units, ty_revenue', { count: 'exact' }).eq('brand_id', brandId).gte('fiscal_year', year - 1).lte('fiscal_year', year).order('fiscal_year').order('week').order('upc'), 'Kroger'),
       paged(() => sb.from('sales_actuals').select('entity, month, amount, units, status', { count: 'exact' }).eq('brand_id', brandId).eq('dimension', 'customer').gte('month', lo).lte('month', hi).order('month').order('entity').order('status'), 'NetSuite'),
@@ -29330,7 +29361,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-51 one render at a time';
+  const _DED_BUILD = 'tr-52 promo fix, analyzer lanes';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -36157,15 +36188,16 @@ render();
       if (!_dedPromos && !_dedPromosErr) {
         body.innerHTML = '<div class="hl-loading">Loading promotions\u2026</div>';
         try {
-          // NAMED COLUMNS, NOT '*'. The rollup is one row per retailer promo
-          // number and carries more than this screen reads; '*' shipped every
-          // one of them on a tab that renders nineteen.
+          // BACK TO '*', AND STAYING THERE. tr-50 replaced this with the
+          // nineteen column names the screen reads -- derived from `p.<field>`
+          // in the render code, which is NOT the same thing as the view's
+          // columns. At least one of them is computed in JS rather than
+          // selected, PostgREST rejected the whole request with 400, and the
+          // tab's "the promo rollup does not exist yet" branch caught it and
+          // told Moshe to build a view he already has. A column list has to be
+          // read off the view, never inferred from the code that consumes it.
           _dedPromos = await paged(() => sb.from('deduction_promo_rollup')
-            .select('promo_no,promo_name,plan_customer,banner,ref_kind,reason_codes,'
-                  + 'event_start,event_end,first_scan,last_scan,'
-                  + 'items,stores,invoices,units,actual_spend,'
-                  + 'rate_min,rate_max,rate_implied,rate_count')
-            .eq('brand_id', brandId).order('actual_spend', { ascending: false }));
+            .select('*').eq('brand_id', brandId).order('actual_spend', { ascending: false }));
         } catch (e) { _dedPromosErr = String(e && e.message || e); }
       }
       // Trade spend for the year is the denominator this tab has to foot to.
