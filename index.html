@@ -29329,7 +29329,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-41 edlp rows kehe early pay';
+  const _DED_BUILD = 'tr-44 edlp banners';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -30139,6 +30139,22 @@ render();
         // which is a finding, not be forced onto a neighbouring account.
         'giant carlisle': 'Giant Carlisle',
         'giant landover': 'Giant Landover',
+        // ── UNFI'S OWN CHAIN CODES ───────────────────────────────────────
+        // The weekly MCB chargeback names the chain as a three-letter code and
+        // nothing else -- deduction_detail.banner is literally 'WGE' -- while
+        // the plan names the retailer. Nothing bridged the two, so every dollar
+        // of category-A EDLP was attributed to a CODE: the EDLP tab grew a row
+        // called WGE holding $116,654 while the row called Wegmans read $0, and
+        // Reconcile compared the Wegmans plan against nothing at all.
+        // Confirmed chain by chain against Vividly's EDLP actuals
+        // (EDLP-NEXT.sql, 11 Sep 2026). CBS, EST, NTH and MWT -- $546 between
+        // them -- are deliberately NOT here: a guess bridges money onto the
+        // wrong account silently, and an unmatched code is a finding.
+        'wge': 'Wegmans',
+        'gcf': 'Giant Carlisle',
+        'sgf': 'Giant Landover',
+        'trf': 'Thrive',
+        'wfz': 'Wakefern',
       };
       // THE ALIAS LOOKUP WAS DEAD CODE. _PLAN_ALIAS is keyed on lowercase
       // phrases ('natural grocers'), but it was being probed with _dedNorm's
@@ -30154,20 +30170,43 @@ render();
       // '' entry would send every unrecognised retailer to one plan customer.
       const _lite = (s) => String(s || '').toLowerCase()
         .replace(/['\u2019\u02BC]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
-      const _autoMatch = (raw) => {
-        const lk = _lite(raw);
-        const al = lk ? _PLAN_ALIAS[lk] : null;
-        if (al) {
-          const ak = _dedNorm(al);
-          if (_planIdx.has(ak)) return _planIdx.get(ak);
-        }
-        const k = _dedNorm(raw);
+      // Exact, then "the raw name starts with a plan customer's name". One
+      // direction only: a raw string is arbitrary data and letting a SHORT one
+      // claim a longer plan customer would merge retailers.
+      const _planPrefix = (k) => {
         if (!k) return null;
         if (_planIdx.has(k)) return _planIdx.get(k);
         for (const [pk, pc] of _planIdx) {
-          if (pk.length >= 4 && (k.startsWith(pk + ' ') || k === pk)) return pc;
+          if (pk.length >= 4 && k.startsWith(pk + ' ')) return pc;
         }
         return null;
+      };
+      // AN ALIAS MAY MATCH THE OTHER WAY TOO, because it is hand-written and
+      // deliberate. It has to: _dedNorm strips noise words, so plan customer
+      // 'Giant Carlisle - The Giant Company' normalises to GIANT CARLISLE GIANT
+      // and the alias value 'Giant Carlisle' to GIANT CARLISLE -- never equal,
+      // and never a prefix in the permitted direction. Both Giant aliases have
+      // therefore been dead since they were written, which is why Giant
+      // Carlisle reconciled against nothing. Ambiguity is refused rather than
+      // guessed: if two plan customers both begin with the alias, no match.
+      const _planFromAlias = (al) => {
+        const k = _dedNorm(al);
+        const hit = _planPrefix(k);
+        if (hit) return hit;
+        if (!k) return null;
+        let found = null;
+        for (const [pk, pc] of _planIdx) {
+          if (!pk.startsWith(k + ' ')) continue;
+          if (found && found !== pc) return null;
+          found = pc;
+        }
+        return found;
+      };
+      const _autoMatch = (raw) => {
+        const lk = _lite(raw);
+        const al = lk ? _PLAN_ALIAS[lk] : null;
+        if (al) { const hit = _planFromAlias(al); if (hit) return hit; }
+        return _planPrefix(_dedNorm(raw));
       };
 
       // Catch-all plan lines name a distributor or nothing at all. They can
@@ -30316,6 +30355,17 @@ render();
         return (m && m.plan_customer) || _autoMatch(d.customer_name) || _autoMatch(raw) || null;
       };
       const edlpLines = new Map();       // line_id -> { cust, how: 'document'|'rate'|'category', amt, part }
+      // ── THE CARVE, KEPT FLAT ────────────────────────────────────────────
+      // One record per (line, customer, how) with the amount, and the promo
+      // month filled in further down once promoMonthOf exists. The EDLP tab
+      // reads THIS instead of matching rates of its own: before, that tab ran a
+      // second definition of EDLP in SQL (edlp_actuals, a per-unit rate match
+      // on parsed detail) and so reported $149,187 while the EDLP bucket on
+      // Category reported $276,022, with Wegmans -- $98,449 of category-A rows
+      // that carry no per-unit rate until the WE files are re-read -- showing a
+      // flat $0. Two definitions of one programme is one too many. This is the
+      // definition; every screen now sums the same records.
+      const edlpParts = [];              // { id, cust, how, amt, mk }
       const earlyPayLines = new Set();
       const earlyPayBy = new Map();      // category -> amount
       const edlpNoCust = '(customer not identified)';
@@ -30337,7 +30387,11 @@ render();
         let c = catEdlp.get(r.line_id);
         if (!c) catEdlp.set(r.line_id, c = { edlp: 0, lineBill: lb, banners: new Map() });
         c.edlp += eb;
-        c.banners.set(_upB(r.banner), { edlp: eb, bill: Number(r.banner_bill) || eb });
+        // rate_min / rate_max arrive only once the chargeback rows carry a
+        // per-unit rate (loader parse-5); older rows have none and the panel
+        // then says so rather than inventing one.
+        const rates = [Number(r.rate_min), Number(r.rate_max)].filter(v => isFinite(v) && v > 0);
+        c.banners.set(_upB(r.banner), { edlp: eb, bill: Number(r.banner_bill) || eb, rates: [...new Set(rates)] });
       }
       const TL = [];
       let nonTradeTotal = 0;
@@ -30367,21 +30421,39 @@ render();
         if (how === 'rate') { e.byRate += amt; edlpRateTotal += amt; } else { e.byDoc += amt; edlpDocTotal += amt; }
         edlpBy.set(cust, e);
         edlpLines.set(l.id, { cust, how, amt });
+        edlpParts.push({ id: l.id, l, cust, how, amt });
         edlpTotal += amt;
       };
       // A category share of a line: no line-level rate applies (the line mixes
       // categories), so the rate columns stay empty for it.
-      const _edlpAddShare = (l, cust, amt) => {
+      const _edlpAddShare = (l, cust, amt, rates) => {
         const e = edlpBy.get(cust) || { amt: 0, units: 0, agreed: null, charged: null, offRate: 0, offAgreed: 0,
                                          lines: 0, byDoc: 0, byRate: 0, byCat: 0, agreedSet: new Set(), chargedSet: new Set() };
         const prev = edlpLines.get(l.id);
         e.amt += amt; e.byCat = (e.byCat || 0) + amt;
+        // THE PER-UNIT RATE, RECOVERED FROM THE CHARGEBACK. UNFI bills these
+        // rows as a whole PERCENT of case cost; the loader divides by the pack
+        // printed beside the item, so the rate here is what the retailer was
+        // charged per unit and can be held against the agreed rate. The percent
+        // being rounded is worth about 1.5%, so the tolerance is relative, not
+        // the flat half-cent used where a rate is stated outright.
+        const set = edlpRates.get(cust);
+        for (const rv of (rates || [])) {
+          if (!isFinite(rv) || rv <= 0) continue;
+          e.chargedSet.add(Math.round(rv * 10000) / 10000);
+          if (e.charged == null) e.charged = rv;
+          let hit = null;
+          if (set) for (const a of set) if (Math.abs(rv - a) <= Math.max(EDLP_RATE_TOL, a * 0.02)) { hit = a; break; }
+          if (hit != null) { e.agreedSet.add(hit); if (e.agreed == null) e.agreed = hit; }
+          else if (set && set.size) e.offAgreed += amt / (rates.length || 1);
+        }
         if (!prev || !prev.custs || !prev.custs.has(cust)) e.lines++;
         edlpBy.set(cust, e);
         edlpCatTotal += amt; edlpDocTotal += amt; edlpTotal += amt;
         const ent = prev || { cust, how: 'category', amt: 0, part: true, custs: new Set() };
         ent.amt += amt; ent.custs.add(cust);
         edlpLines.set(l.id, ent);
+        edlpParts.push({ id: l.id, l, cust, how: 'category', amt });
       };
       for (const l of L) {
         const a = Math.abs(Number(l.amount || 0));
@@ -30411,7 +30483,7 @@ render();
             for (const [B, v] of ce.banners) {
               const part = a * Math.min(1, v.edlp / ce.lineBill);
               if (part <= 0.005) continue;
-              _edlpAddShare(l, _rowCust({ banner: B, customer_name: null }) || B, part);
+              _edlpAddShare(l, _rowCust({ banner: B, customer_name: null }) || B, part, v.rates);
             }
             const eAmt = (edlpLines.get(l.id) || {}).amt || 0;
             if (share >= 0.999 || a - eAmt <= 0.005) { const ent = edlpLines.get(l.id); if (ent) ent.part = false; continue; }
@@ -30510,6 +30582,13 @@ render();
         // every date-filtered view because nothing ever read it.
         return _dedRefMonth(l.invoice_no);
       };
+
+      // The carve's month, decided by the same rule as everything else on the
+      // page. It is resolved HERE rather than inside the carve because
+      // promoMonthOf is a const declared below it and would be in the temporal
+      // dead zone; the line object is carried on each record for exactly this
+      // and dropped again once it has been used.
+      for (const p of edlpParts) { p.mk = promoMonthOf(p.l) || ''; p.l = null; }
 
       // WHICH RECEIVERS THE PLAN SIDE ADMITS. This used to be the hardcoded
       // pair /kehe|unfi/, written when those were the only two distributors
@@ -30755,7 +30834,8 @@ render();
              winStart, winEnd, partialMonth, monthLines, monthsSorted,
              planExcludedType, planExcludedRecv, planOutOfWindow, planNotClosed, planBookTotal,
              planExcludedTypeBy, planExcludedRecvBy, planCarved, planCarvedBy,
-             edlpLines, edlpDocTotal, edlpRateTotal, edlpCatTotal, earlyPayTotal, earlyPayBy, earlyPayLines };
+             edlpLines, edlpParts, edlpDocTotal, edlpRateTotal, edlpCatTotal,
+             earlyPayTotal, earlyPayBy, earlyPayLines };
   }
 
   // ══ PROMOTIONS BY RETAILER PROMO NUMBER ═══════════════════════════════════
@@ -30828,7 +30908,49 @@ render();
       deducted: num(r.deducted) || 0,
     }));
 
-    if (!R.length) {
+    // ── DEDUCTED IS THE CARVE ──────────────────────────────────────────────
+    // Not edlp_actuals' own deducted column. That column is a per-unit rate
+    // match over parsed detail, which is a SECOND definition of EDLP: on 12 Sep
+    // 2026 it reported $149,187 against the $276,022 in the EDLP bucket on the
+    // Category tab, and showed Wegmans at $0 -- $98,449 of "A Arranged by
+    // Vendor" rows that carry no per-unit rate until the WE chargeback files
+    // are re-read. A programme cannot have two totals. The book's definition
+    // lives in _dedComputeRecon (reason code or document, UNFI category A by
+    // chain, agreed rate) and is what every other screen sums, so this tab sums
+    // it too and the two tabs cannot disagree again.
+    //
+    // edlp_actuals still supplies PLANNED and EARNED, which is what it is for:
+    // the plan, the product list and the WFM unit feed, joined in SQL.
+    const CV = U.carve || null;
+    const HOW_LBL = { document: 'Found by reason code or document',
+                      category: 'UNFI category A — share of the weekly MCB lines',
+                      rate: 'Matched on the agreed rate' };
+    const HOW_ORDER = ['document', 'category', 'rate'];
+    const cvNorm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const cvBy = new Map();             // customer -> { name, amt, months:Map, how:Map }
+    const cvMonth = new Map();          // month number (0 = outside the year) -> amt
+    let cvTotal = 0;
+    for (const p of ((CV && CV.parts) || [])) {
+      const amt = Number(p.amt) || 0;
+      if (!(Math.abs(amt) > 0.0001)) continue;
+      const mk = String(p.mk || '');
+      const mnum = (mk.slice(0, 4) === String(yr)) ? (Number(mk.slice(5, 7)) || 0) : 0;
+      let e = cvBy.get(p.cust);
+      if (!e) cvBy.set(p.cust, e = { name: p.cust, amt: 0, months: new Map(), how: new Map() });
+      e.amt += amt;
+      e.months.set(mnum, (e.months.get(mnum) || 0) + amt);
+      e.how.set(p.how, (e.how.get(p.how) || 0) + amt);
+      cvMonth.set(mnum, (cvMonth.get(mnum) || 0) + amt);
+      cvTotal += amt;
+    }
+    // The carve names customers with the plan's own spelling (it resolves them
+    // through the same _autoMatch the rest of the page uses), so an exact hit is
+    // the normal case; the normalised index only catches punctuation drift.
+    const cvIdx = new Map();
+    for (const [k, v] of cvBy) { const n = cvNorm(k); if (n && !cvIdx.has(n)) cvIdx.set(n, v); }
+    const carveOn = !!CV;
+
+    if (!R.length && !cvTotal) {
       body.innerHTML = `<div style="padding:22px;font-family:var(--serif);font-size:14px;color:var(--ink-2);line-height:1.65;max-width:760px;">
         No EDLP lines for ${esc(yr)}. The plan is read from <code style="font-family:var(--mono);font-size:12px;">promo_plan_lines</code>
         where <code style="font-family:var(--mono);font-size:12px;">promo_type = 'EDLP'</code> — if the year's plan has not been loaded yet, that is why.</div>`;
@@ -30863,6 +30985,25 @@ render();
     }
     const custList = [...custs.values()].sort((a, b) => b.planned - a.planned);
     for (const c of custList) c.groups.sort((a, b) => b.planned - a.planned);
+
+    // Attach the carve, and admit the customers it found that the plan never
+    // listed. A chain that was deducted EDLP but never planned any is exactly
+    // the case worth seeing; dropping it because it has no plan row would make
+    // money disappear between this tab and the Category bucket.
+    if (carveOn) {
+      const used = new Set();
+      for (const c of custList) {
+        const e = cvBy.get(c.name) || cvIdx.get(cvNorm(c.name)) || null;
+        c.carve = (e && !used.has(e)) ? (used.add(e), e) : null;
+        c.deducted = c.carve ? c.carve.amt : 0;
+      }
+      for (const e of cvBy.values()) {
+        if (used.has(e)) continue;
+        custList.push({ name: e.name, planned: 0, earned: null, deducted: e.amt,
+                        hasUnits: false, groups: [], carve: e, planless: true });
+      }
+      custList.sort((a, b) => (b.planned - a.planned) || (b.deducted - a.deducted));
+    }
 
     const totPlanned  = custList.reduce((n, c) => n + c.planned, 0);
     const totDeducted = custList.reduce((n, c) => n + c.deducted, 0);
@@ -30899,15 +31040,21 @@ render();
     // be opened at all — clicking set a mangled key that the next render never
     // looked for. Indices are stable across renders because the sort is
     // deterministic, and they cannot be corrupted by a customer name.
+    // naPlanned / naEarned / naDeducted mean the column does not APPLY to this
+    // row, and render a dash. That is different from earned's null, which means
+    // the customer has no unit feed and says so in words. Both differ from $0.
+    const dash = '<span style="color:var(--ink-3);">\u2014</span>';
     const rowHtml = (o, indent, cls, dataAttr, caret) => {
-      const v = (o.earned == null) ? null : o.deducted - o.earned;
+      const v = (o.earned == null || o.naEarned || o.naDeducted) ? null : o.deducted - o.earned;
       return `<tr ${cls ? 'class="' + cls + '"' : ''} ${dataAttr || ''} style="${cls ? 'cursor:pointer;' : ''}">
         ${td(`<span style="padding-left:${indent}px;">${caret || ''}${esc(o.label)}</span>`)}
-        ${td(o.rate == null ? '<span style="color:var(--ink-3);">\u2014</span>' : '$' + Number(o.rate).toFixed(2), true, 'color:var(--ink-3);')}
-        ${td(money(o.planned), true)}
-        ${td(o.earned == null ? noUnits : money(o.earned), true, o.earned == null ? '' : 'font-weight:600;')}
-        ${td(money(o.deducted), true)}
-        ${td(v == null ? noUnits : '<strong style="color:' + tone(v) + ';">' + signed(v) + '</strong>', true)}
+        ${td(o.rate == null ? dash : '$' + Number(o.rate).toFixed(2), true, 'color:var(--ink-3);')}
+        ${td(o.naPlanned ? dash : money(o.planned), true)}
+        ${td(o.naEarned ? dash : o.earned == null ? noUnits : money(o.earned), true, o.earned == null ? '' : 'font-weight:600;')}
+        ${td(o.naDeducted ? dash : money(o.deducted), true)}
+        ${td((o.naEarned || o.naDeducted) ? dash
+             : v == null ? noUnits
+             : '<strong style="color:' + tone(v) + ';">' + signed(v) + '</strong>', true)}
       </tr>`;
     };
 
@@ -30916,18 +31063,34 @@ render();
     // list. EDLP is a monthly accrual and the question "which month did they
     // over-take" is not answerable by opening sixteen customers one at a time.
     const months = new Map();
+    const monthGet = (mn) => {
+      let m = months.get(mn);
+      if (!m) months.set(mn, m = { month: mn, planned: 0, earned: null, deducted: 0,
+                                   hasUnits: false, custs: new Map() });
+      return m;
+    };
+    const monthCust = (m, name) => {
+      let c = m.custs.get(name);
+      if (!c) m.custs.set(name, c = { name, planned: 0, earned: null, deducted: 0 });
+      return c;
+    };
     for (const r of R) {
-      let m = months.get(r.month);
-      if (!m) months.set(r.month, m = { month: r.month, planned: 0, earned: null, deducted: 0,
-                                        hasUnits: false, custs: new Map() });
+      const m = monthGet(r.month);
       m.planned += r.planned;
-      m.deducted += r.deducted;
       if (r.earned != null) { m.earned = (m.earned || 0) + r.earned; m.hasUnits = true; }
-      let c = m.custs.get(r.customer);
-      if (!c) m.custs.set(r.customer, c = { name: r.customer, planned: 0, earned: null, deducted: 0 });
+      const c = monthCust(m, r.customer);
       c.planned += r.planned;
-      c.deducted += r.deducted;
       if (r.earned != null) c.earned = (c.earned || 0) + r.earned;
+      if (!carveOn) { m.deducted += r.deducted; c.deducted += r.deducted; }
+    }
+    // The month a carved line belongs to is the month the PROMOTION ran, the
+    // same rule the rest of the page uses — UNFI pays months in arrears, so
+    // dating EDLP by the payment would file a December charge under April.
+    if (carveOn) for (const e of cvBy.values()) {
+      for (const [mn, amt] of e.months) {
+        monthGet(mn).deducted += amt;
+        monthCust(months.get(mn), e.name).deducted += amt;
+      }
     }
     const monthList = [...months.values()].sort((a, b) => a.month - b.month);
 
@@ -30936,9 +31099,13 @@ render();
 
     let bodyRows = '';
     if (_dedEdlpMode === 'month') {
+      // Month 0 is the carve that dates to a promotion OUTSIDE the selected
+      // year \u2014 UNFI's arrears again. It is named rather than shown as a dash,
+      // because "\u2014" beside real dollars reads as a bug.
+      const mLabel = (m) => MON[m] || 'Promo month outside ' + yr;
       bodyRows = monthList.map((m, mi) => {
         const open = _dedEdlpOpen.has('m:' + mi);
-        let out = rowHtml({ label: MON[m.month] || '\u2014', rate: null, planned: m.planned, earned: m.earned, deducted: m.deducted },
+        let out = rowHtml({ label: mLabel(m.month), rate: null, planned: m.planned, earned: m.earned, deducted: m.deducted },
           0, 'hl-edlp-mrow', 'data-k="m:' + mi + '"',
           `<span style="display:inline-block;width:14px;color:var(--ink-3);">${open ? '\u2212' : '+'}</span>`);
         if (!open) return out;
@@ -30953,17 +31120,36 @@ render();
         let out = rowHtml({ label: c.name, rate: null, planned: c.planned, earned: c.earned, deducted: c.deducted },
           0, 'hl-edlp-row', 'data-k="c:' + ci + '"',
           `<span style="display:inline-block;width:14px;color:var(--ink-3);">${cOpen ? '\u2212' : '+'}</span>`);
+        // PRODUCT GROUP IS THE PLAN'S GRAIN, NOT THE BOOK'S. Planned and earned
+        // exist per group; the deduction does not \u2014 a UNFI chargeback line is
+        // billed per chain per week across the whole range, and the carve
+        // attributes it to a customer, not to a product group. So these rows
+        // dash their deducted column rather than showing the old rate match,
+        // which was a different definition and made the customer total look
+        // wrong by the difference.
         for (const g of c.groups) {
           const myGi = gi++;
           if (!cOpen) continue;
           const gOpen = _dedEdlpOpen.has('g:' + myGi);
-          out += rowHtml({ label: g.group, rate: g.rate, planned: g.planned, earned: g.earned, deducted: g.deducted },
+          out += rowHtml({ label: g.group, rate: g.rate, planned: g.planned, earned: g.earned,
+                           deducted: g.deducted, naDeducted: carveOn },
             22, 'hl-edlp-row', 'data-k="g:' + myGi + '"',
             `<span style="display:inline-block;width:14px;color:var(--ink-3);">${gOpen ? '\u2212' : '+'}</span>`);
           if (!gOpen) continue;
           out += g.months.map(m => rowHtml(
-            { label: MON[m.month] || '\u2014', rate: m.rate, planned: m.planned, earned: m.earned, deducted: m.deducted },
+            { label: MON[m.month] || '\u2014', rate: m.rate, planned: m.planned, earned: m.earned,
+              deducted: m.deducted, naDeducted: carveOn },
             58, '', '', '')).join('');
+        }
+        // ...and how the deducted side was found, which DOES foot to the
+        // customer row above it.
+        if (cOpen && c.carve) {
+          for (const h of HOW_ORDER) {
+            const amt = c.carve.how.get(h) || 0;
+            if (!(Math.abs(amt) > 0.005)) continue;
+            out += rowHtml({ label: HOW_LBL[h], rate: null, naPlanned: true, earned: null,
+                             naEarned: true, deducted: amt }, 22, '', '', '');
+          }
         }
         return out;
       }).join('');
@@ -30973,7 +31159,9 @@ render();
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:20px;padding:4px 2px 6px;">
         ${fig('Planned ' + esc(yr), money(totPlanned), custList.length + ' customers \u00b7 ' + groups.length + ' groups')}
         ${fig('Earned', money(totEarned), covPct + '% of the plan has a unit feed')}
-        ${fig('Deducted', money(totDeducted), 'matched on the agreed rate')}
+        ${fig('Deducted', money(totDeducted), carveOn
+              ? 'the EDLP bucket, sliced by customer'
+              : 'matched on the agreed rate')}
         ${fig('Deducted \u2212 earned', signed(variance),
               'over the ' + withUnits.length + ' customer' + (withUnits.length === 1 ? '' : 's') + ' that can be measured',
               tone(variance))}
@@ -31006,12 +31194,18 @@ render();
 
       <p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:12px;line-height:1.6;max-width:80ch;">
         The footer's earned and variance cover only the ${withUnits.length} customer${withUnits.length === 1 ? '' : 's'} with a unit feed;
-        planned and deducted cover all ${custList.length}. Deducted is found two ways. Where parsed detail exists, a row is EDLP when its
-        per-unit charge equals that customer's agreed rate for that product group \u2014 customer first, rate second, because $0.52
-        belongs to more than one Giant; lines billed at one unit are excluded, since a lump sum stored with quantity 1 presents its
-        whole charge as a rate. Where a line's own reason code already says EDLP but no detail was ever parsed, the line counts at the
-        only grain it has and lands under <strong>(no item detail)</strong> \u2014 real money, no product and no rate, so earned stays
-        blank against it. A line is read one way or the other, never both.
+        planned and deducted cover all ${custList.length}.
+        ${carveOn ? `<strong>Deducted is the EDLP bucket on the Category tab, sliced by customer</strong> \u2014 ${money(totDeducted)}, the same
+        lines, so the two tabs foot to each other. It is found three ways, and a line is read one way only:
+        by reason code or document ${money(CV.doc)}${CV.cat > 0.005 ? `, by UNFI category A ${money(CV.cat)} \u2014 the
+        &ldquo;A Arranged by Vendor&rdquo; rows inside the weekly MCB lines, split across the chains billed on them` : ''},
+        and by agreed rate ${money(CV.rate)}, where a trade line's detail sits at one rate that is an agreed EDLP rate for its customer.
+        ${cvBy.has('(customer not identified)') ? 'Money Keel could not attribute to a chain is listed as <strong>(customer not identified)</strong> rather than dropped. ' : ''}
+        <strong>Product group is the plan's grain, not the book's</strong>: a chargeback is billed per chain per week across the whole
+        range, so the group rows carry planned and earned and dash the deducted column, and the rows that do foot to the customer are
+        the three above. ${CV.err ? 'EDLP found by rate is incomplete here \u2014 ' + esc(CV.err) : ''}`
+        : `Deducted could not be read from the deduction book on this render, so it falls back to the per-unit rate match in
+        <code>edlp_actuals()</code>; that is a narrower definition and will read low against the EDLP bucket on the Category tab.`}
         Corrections made with <strong>SET</strong> on the Deductions tab \u2014 customer, and the promo date that decides the month \u2014
         are read here too, so a fact is stated in one place and every tab follows. That is why this tab has no edit of its own.
       </p>`;
@@ -35731,8 +35925,51 @@ render();
           _dedEdlp = { key: ekey, rows: data || [] };
         } catch (e) { _dedEdlpErr = String(e && (e.message || e.hint) || e); }
       }
+      // DEDUCTED COMES FROM THE CARVE, NOT FROM THIS FUNCTION. edlp_actuals
+      // supplies planned and earned -- the plan, the product list and the WFM
+      // unit feed, a five-way join that belongs in SQL. Its own deducted column
+      // is a per-unit rate match and is now used only as the ITEMISATION under
+      // a customer, never as the customer or page total, because the book's
+      // definition of EDLP lives in _dedComputeRecon and the two disagreed by
+      // $127k. So the detail and the plan are warmed here the same way the
+      // Category tab warms them.
+      if (_detStale() || _planStale()) {
+        body.innerHTML = '<div class="hl-loading">Loading EDLP\u2026</div>';
+        try {
+          await Promise.all([
+            (async () => {
+              if (!_detStale()) return;
+              try { _dedDetail = Object.assign({ key: _detKey }, await _dedGetDetail()); }
+              catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
+            })(),
+            (async () => {
+              if (!_planStale()) return;
+              try { _dedPlan = Object.assign({ key: _planKey }, await _dedGetPlan()); }
+              catch (e) { _dedPlan = { key: _planKey, lines: [], err: String(e.message || e) }; }
+            })(),
+          ]);
+        } catch (e) { /* each branch records its own error */ }
+      }
+      let carve = null;
+      try {
+        const Re = _dedComputeRecon({ L, rmapBy, D: _dedDetail || { det: [], bmap: [] },
+          P: _dedPlan || { lines: [], err: null }, scopedIds: _scopedLineIds, dist: _dedDist,
+          distNames: Object.keys(_dedDistCounts || {}), lineRates, lineEdlp,
+          completedOnly: _dedRecCompleted, includePartial: _dedRecPartial, year });
+        // doc / rate / cat are summed from the parts, not from edlpDocTotal --
+        // that running total adds the category share into BOTH cat and doc (it
+        // predates the category path) and would show the split over-footing.
+        const _by = { document: 0, rate: 0, category: 0 };
+        for (const p of (Re.edlpParts || [])) _by[p.how] = (_by[p.how] || 0) + p.amt;
+        carve = { parts: Re.edlpParts || [], by: Re.edlpBy || new Map(), total: Re.edlpTotal || 0,
+                  doc: _by.document, rate: _by.rate, cat: _by.category,
+                  err: (_dedPlan && _dedPlan.err) || (_dedDetail && _dedDetail.err) || null };
+      } catch (e) {
+        console.warn('[deductions] EDLP carve failed:', e);
+        carve = { parts: [], by: new Map(), total: 0, doc: 0, rate: 0, cat: 0, err: String(e && e.message || e) };
+      }
       await _dedRenderEdlp(body, (_dedEdlp && _dedEdlp.rows) || [], _dedEdlpErr, {
-        esc, money, th, td, yr, year,
+        esc, money, th, td, yr, year, carve,
         rerender: () => renderDeductions(hostEl, filtersEl, year),
       });
       return;
@@ -38514,10 +38751,12 @@ ${(() => {
                        ? '<span style="font-family:var(--mono);font-size:10px;color:var(--lost);">' + money(v.offAgreed) + ' charged at a rate that is not the agreed one</span>'
                        : v.offRate > 0.005
                        ? '<span style="font-family:var(--mono);font-size:10px;color:var(--lost);">' + money(v.offRate) + ' does not multiply out</span>'
+                       : (v.byCat || 0) > 0.005 && (v.chargedSet && v.chargedSet.size)
+                       ? '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="UNFI bills a whole percent of case cost, so the per-unit rate lands within about 1.5% of the agreed one">per unit, within 2% of agreed</span>'
                        : (v.chargedSet && v.chargedSet.size)
                        ? '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">units \u00d7 rate ties</span>'
-                       : (v.byCat || 0) > 0.005
-                       ? '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="UNFI bills these rows as a % of wholesale inside a weekly chargeback, so there is no single per-unit rate to check">billed as MCB % \u00b7 no unit rate</span>'
+                       : (v.byCat || 0) > 0.005 && !(v.chargedSet && v.chargedSet.size)
+                       ? '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="UNFI bills these rows as a % of wholesale; the per-unit rate is filled in once the chargeback files are re-read (loader parse-5)">billed as MCB % \u00b7 rate not yet read</span>'
                        : '<span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);" title="no single-rate store detail on these lines yet">no detail to check</span>')}
                 </tr>`).join('')}
                 <tr style="border-top:2px solid var(--ink);">
@@ -38797,7 +39036,15 @@ ${(() => {
         const l = piece.l;
         const rm = rmapBy[l.reason_code];
         const bk = piece.bucket;
-        const catKey = rm && rm.keel_category ? rm.keel_category : (l.reason_code || 'Unresolved');
+        // A CARVED BUCKET NAMES ITS OWN CATEGORY. The category column is the
+        // reason map's keel_category, which for the weekly UNFI chargeback is
+        // 'MCB' -- so the EDLP bucket listed $161,202 of Wegmans, Giant and
+        // Thrive EDLP under a category called MCB. The money is in the right
+        // bucket and the label contradicts it. Inside EDLP and Early pay the
+        // category IS the bucket; which document it came off is the CODE row
+        // below, which still reads UNFI-MCB and still opens the WE files.
+        const carvedCat = (bk === 'EDLP' || bk === 'Early pay') ? bk : null;
+        const catKey = carvedCat || (rm && rm.keel_category ? rm.keel_category : (l.reason_code || 'Unresolved'));
         const code = l.reason_code || '(none)';
         const amt = Number(l.amount || 0);
         const fee = Number(l.processing_fee || 0);
@@ -38810,11 +39057,15 @@ ${(() => {
         if (l.reason_code) b.codes.add(l.reason_code);
 
         let c = b.cats.get(catKey);
-        if (!c) b.cats.set(catKey, c = { name: catKey, mapped: !!(rm && rm.keel_category), lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, codes: new Map() });
+        if (!c) b.cats.set(catKey, c = { name: catKey, mapped: !!carvedCat || !!(rm && rm.keel_category), lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, codes: new Map() });
         c.lines++; c.amount += amt; c.fee += fee; c.merch += mch; c.docAmt += doc;
 
         let cd = c.codes.get(code);
-        if (!cd) c.codes.set(code, cd = { code, desc: (rm && rm.kehe_description) || null,
+        if (!cd) c.codes.set(code, cd = { code,
+          // Say WHICH part of the document is here, so "UNFI-MCB · Weekly MCB
+          // chargebacks" under EDLP cannot be read as the whole chargeback.
+          desc: (l._part && carvedCat ? l._part.replace(/^EDLP share$/, 'the EDLP share') + ' of ' : '')
+                + ((rm && rm.kehe_description) || '') || null,
           retailer: (rm && rm.retailer) || null,
           lines: 0, amount: 0, fee: 0, merch: 0, docAmt: 0, months: new Map() });
         cd.lines++; cd.amount += amt; cd.fee += fee; cd.merch += mch; cd.docAmt += doc;
