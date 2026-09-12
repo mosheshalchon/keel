@@ -29330,7 +29330,7 @@ render();
   // not working" while the running file predated them, and there was no way to
   // tell a stale deploy from a broken change. Bump this whenever the trade rate
   // logic changes; it prints beside the register totals and to the console.
-  const _DED_BUILD = 'tr-49 faster register';
+  const _DED_BUILD = 'tr-51 one render at a time';
   const _dedCasePrice = (accts, upcKey) => {
     if (!_dedCasePrices || !upcKey) return null;
     const seen = new Set();
@@ -29883,6 +29883,8 @@ render();
   let _dedFilesCache = null;
   let _dedGapOpen = new Set();   // Support gaps: which categories are drilled into
   let _dedDetailLoading = false; // the register paints while the rollup is still in flight
+  let _dedPerf = [];             // [name, ms, rows] per blocking fetch, logged once per load
+  let _dedRenderSeq = 0;         // renderDeductions is re-entrant; only the newest may paint
   let _dedOpen = new Set();       // which customers are expanded
   const DED_PAGE = 25;
   let _dedCustLimit = DED_PAGE;   // banners shown before "show more"
@@ -34848,6 +34850,19 @@ render();
   }
 
   async function renderDeductions(hostEl, filtersEl, year) {
+    // ── ONE RENDER AT A TIME ─────────────────────────────────────────────
+    // This function awaits repeatedly and then reaches back into the DOM by id.
+    // When two renders overlap -- and they do: a nav, a pill, a tab and a
+    // keystroke all call it, and the async detail fetch calls it again -- the
+    // SECOND one replaces hostEl's contents, and when the first resumes its
+    // document.getElementById('hl-ded-body') returns null. That is the
+    // "Cannot set properties of null (setting 'innerHTML') at shell" in the
+    // console, and the overlap was also running every query twice.
+    //
+    // A sequence number, checked after each await point: a render that has been
+    // superseded stops quietly rather than painting over its successor.
+    const _rseq = ++_dedRenderSeq;
+    const _rstale = () => _rseq !== _dedRenderSeq;
     const sb = window.Auth.getClient();
     const brandId = window.BrandLibrary.getSession().brandId;
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -34859,13 +34874,40 @@ render();
 
     // Factory, not a builder — a supabase builder is single-use and parallel
     // .range() calls on one object overwrite each other's offsets.
+    // ── PAGES IN WAVES, NOT ONE AT A TIME ────────────────────────────────
+    // PostgREST caps a response at 1,000 rows, so a 4,871-line register is five
+    // requests -- and sequentially that is five full latency hops before the
+    // page can draw anything, with every other query in the Promise.all sitting
+    // behind the slowest of them. Fetching four pages at once makes the same
+    // register two hops.
+    //
+    // THE COST OF GUESSING is three empty requests on a table that happens to
+    // end on a page boundary. They run in parallel with pages that were needed
+    // anyway, so they cost no wall clock -- and asking for an exact count first,
+    // to avoid them, would be a count(*) over the whole table, which is the
+    // thing actually worth avoiding.
     const paged = async (mk, pageSize = 1000) => {
-      const out = [];
-      for (let from = 0; ; from += pageSize) {
-        const { data, error } = await mk().range(from, from + pageSize - 1);
-        if (error) throw new Error(error.message);
-        out.push(...(data || []));
-        if (!data || data.length < pageSize) break;
+      const first = await mk().range(0, pageSize - 1);
+      if (first.error) throw new Error(first.error.message);
+      let out = first.data || [];
+      if (out.length < pageSize) return out;
+      const WAVE = 4;
+      for (let base = 1; base < 200; base += WAVE) {
+        const res = await Promise.all(Array.from({ length: WAVE }, (_, i) => {
+          const from = (base + i) * pageSize;
+          return mk().range(from, from + pageSize - 1);
+        }));
+        let done = false;
+        for (const r of res) {
+          if (r.error) throw new Error(r.error.message);
+          const d = r.data || [];
+          out = out.concat(d);
+          // A SHORT PAGE IS THE END, and everything after it in this wave is
+          // past the end too -- so stop here rather than concatenating pages
+          // fetched on spec beyond it.
+          if (d.length < pageSize) { done = true; break; }
+        }
+        if (done) break;
       }
       return out;
     };
@@ -34925,10 +34967,18 @@ render();
       if (_dedRaw && _dedRaw.key === rawKey) {
         ({ checks, lines, rmap, lineRates = [], overrides = [], lineEdlp = [], keheShip = [] } = _dedRaw);
       } else {
+        // TIMED, so "painful to load" can become a number. One line in the
+        // console per load with the slowest piece named -- guessing at which of
+        // seven parallel queries is the gate costs more than measuring it.
+        const _t0 = (window.performance || Date).now(); _dedPerf = [];
+        const _mark = (name, pr) => pr.then(r => {
+          _dedPerf.push([name, Math.round((window.performance || Date).now() - _t0), Array.isArray(r) ? r.length : 0]);
+          return r;
+        });
         [checks, lines, rmap, lineRates, overrides, lineEdlp, keheShip] = await Promise.all([
-          paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true })),
-          paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks,backup_by,backup_by_email,backup_at').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true })),
-          paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true })),
+          _mark('checks', paged(() => sb.from('deduction_checks').select('*').eq('brand_id', brandId).order('check_date', { ascending: false }).order('id', { ascending: true }))),
+          _mark('lines', paged(() => sb.from('deduction_lines').select('id,invoice_no,doc_date,amount,is_deduction,reason_code,reason_source,dc_name,period,detail_parsed,processing_fee,detail_line_total,check_id,remarks,backup_by,backup_by_email,backup_at').eq('brand_id', brandId).eq('is_deduction', true).order('id', { ascending: true }))),
+          _mark('reason map', paged(() => sb.from('deduction_reason_map').select('*').eq('brand_id', brandId).order('reason_code', { ascending: true }))),
           // PER-LINE UNIT RATES. The rollup that feeds the detail does not carry
           // ship_qty or unit_chargeback, and the RATE is the only thing that
           // identifies EDLP: KeHE bills it through the SCAN channel and UNFI as
@@ -34963,6 +35013,10 @@ render();
             .order('month', { ascending: true })).catch(() => []),
         ]);
         _dedRaw = { key: rawKey, checks, lines, rmap, lineRates, overrides, lineEdlp, keheShip };
+        if (_rstale()) return;
+        _dedPerf.sort((a, b) => b[1] - a[1]);
+        console.log('[Keel] register loaded in ' + Math.round((window.performance || Date).now() - _t0)
+          + 'ms \u00b7 slowest: ' + _dedPerf.slice(0, 3).map(x => x[0] + ' ' + x[1] + 'ms/' + x[2] + ' rows').join(' \u00b7 '));
       }
       // Scope applied AFTER caching, so switching distributor is instant and
       // never refetches. A UNFI line can have a null check (their unfiled
@@ -35562,7 +35616,11 @@ render();
       renderDeductions(hostEl, filtersEl, year);
     });
 
+    // BELT AND BRACES. The sequence check above stops the common case; this
+    // stops the crash outright if a render is superseded by something that does
+    // not bump the sequence (a page-level nav rebuilding the shell under us).
     const body = document.getElementById('hl-ded-body');
+    if (!body || _rstale()) return;
     const rfsh = document.getElementById('hl-ded-refresh');
     if (rfsh) rfsh.onclick = () => { _dedBust(); renderDeductions(hostEl, filtersEl, year); };
     hostEl.querySelectorAll('.hl-ded-dist').forEach(b => b.onclick = () => {
@@ -35779,6 +35837,7 @@ render();
         body.innerHTML = '<div class="hl-loading">Loading store-level detail\u2026</div>';
         try { _dedDetail = Object.assign({ key: _detKey }, await _dedGetDetail()); }
         catch (e) { _dedDetail = { key: _detKey, det: [], bmap: [], err: String(e.message || e) }; }
+        if (_rstale()) return;
       }
     } else if (_dedView === 'lines') {
       // ── THE REGISTER DOES NOT WAIT FOR THE ROLLUP ──────────────────────
@@ -35804,7 +35863,7 @@ render();
             _dedDetailLoading = false;
             // Only repaint if the reader is still on this tab and has not
             // switched the distributor out from under the fetch.
-            if (_dedView === 'lines' && _k === _detKey) renderDeductions(hostEl, filtersEl, year);
+            if (_dedView === 'lines' && _k === _detKey && !_rstale()) renderDeductions(hostEl, filtersEl, year);
           });
       }
     }
@@ -38170,6 +38229,11 @@ render();
       // Removed from this page, unchanged on To-dos — one call site, no maths
       // touched, trivially reversible.
       const shell = (custHtml, recHtml) => {
+        // THE CRASH SITE. shell() runs after _dedWarm() and after the detail and
+        // plan fetches, so by the time it paints the reader may have navigated
+        // and `body` may be gone. Guarded here rather than only at the call
+        // sites: there are three of them and a fourth would forget.
+        if (!body || _rstale()) return;
         body.innerHTML = `<div class="ded-exec">${panelDist}${custHtml}${panelCat}${recHtml}</div>`;
         body.querySelectorAll('.hl-ded-goto').forEach(a => a.onclick = (e) => {
           e.preventDefault();
@@ -38186,6 +38250,7 @@ render();
       // with no loading state at all. The skeleton is painted ONLY when the probe
       // actually misses — which is a cold cache or a register that has changed.
       await _dedWarm();
+      if (_rstale()) return;
       const _cold = _detStale() || _planStale();
       if (_cold) {
         shell(panel('Top ' + TOPN + ' customers', '', '', wait('Loading store-level detail\u2026')),
